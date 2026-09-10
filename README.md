@@ -74,8 +74,9 @@ models/            模型适配层
 
 tools/             工具层
   tool.py            Tool(名字/描述/风险/参数模型/handler) + ToolRegistry
-  builtin.py         内置文件工具的装配（参数模型 + 风险等级）
+  builtin.py         内置工具的装配（参数模型 + 风险等级）
   filesystem.py      文件操作 + safe_path（工作区边界）
+  clock.py           当前时间（无参数、无状态、不需要注入任何东西）
 
 security/          权限层
   policy.py          PermissionPolicy：纯函数，只裁定 ALLOW / DENY / ASK
@@ -94,7 +95,7 @@ agents/            编排层
   agent.py           Agent：一个回合的循环
   retry.py           重试策略（只重试暂时性失败）
 
-tests/             77 个测试，跑完 0.3 秒
+tests/             全套测试，跑完不到一秒（含"每个模块都能导入"的冒烟测试）
 ```
 
 依赖方向是单向的，无环：
@@ -175,6 +176,9 @@ main     → 全部
   自己读 `guide.md` 之后写的摘要 —— 顺便当作"它真的能干活"的样例。
 - **`tools/filesystem.py` 里的 `safe_path`。** 它其实是一条安全策略，按职责该住在
   `security/`。留在工具里的原因是它和文件操作绑得太紧，搬走会让两边都变难读。
+- **`get_current_time` 只给本机时区。** 想看任意时区得引入 IANA 时区库（Windows 上
+  还要额外的 `tzdata` 依赖），那是"本来零依赖、不会失败"的工具凭空多出的失败点。
+  模型拿到带偏移的时间后可以自己换算，所以暂时不做。
 
 ## 尚未实现
 
