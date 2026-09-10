@@ -13,6 +13,8 @@ dependencies = [
     # 都是 Pydantic v2 的 API。它原本只是 openai 的传递依赖，这里显式声明，
     # 因为项目代码直接 import 它。
     "pydantic>=2",
+    # 读项目根的 .env。只用来装本地配置（主要是密钥），不参与任何运行时逻辑。
+    "python-dotenv>=1.0",
 ]
 
 [dependency-groups]

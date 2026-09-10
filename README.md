@@ -16,16 +16,26 @@
 # 1. 装依赖（会按 .python-version 准备 Python 3.12）
 uv sync
 
-# 2. 提供密钥 —— 源码里不留密钥，一律从环境变量读
-$env:DEEPSEEK_API_KEY = "sk-..."
-# 想长期生效（重开终端后仍有效）：
-# setx DEEPSEEK_API_KEY "sk-..."
+# 2. 提供密钥 —— 源码里不留密钥
+Copy-Item .env.example .env
+# 然后编辑 .env，填上：  DEEPSEEK_API_KEY=sk-...
+# .env 已经被 .gitignore 忽略，不会被提交。
 
 # 3. 跑起来
 uv run main.py
 ```
 
-可选环境变量：`DEEPSEEK_BASE_URL`（换网关）、`DEEPSEEK_MODEL`（换模型）。
+密钥也可以走环境变量，而且**环境变量的优先级高于 `.env`**：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "sk-..."      # 当前终端
+setx DEEPSEEK_API_KEY "sk-..."        # 永久（重开终端生效）
+```
+
+优先级是 **真实环境变量 > `.env` > 默认值**。这个方向不能反 —— 反了会让某天部署时
+被一个遗留的 `.env` 悄悄改到别的网关，而那种问题从源码里完全看不出来。
+
+可选配置项（`.env` 或环境变量都行）：`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`。
 
 跑测试：
 
@@ -147,10 +157,13 @@ main     → 全部
 
 | 目录 | 内容 | 进版本库吗 |
 |---|---|---|
+| `.env` | 本地密钥与配置（模板见 `.env.example`） | 否 |
 | `.sessions/` | 会话状态（含工具读到的文件正文） | 否 |
 | `.logs/` | 审计轨迹（含工具参数预览） | 否 |
 
-两者都在 `.gitignore` 里 —— 它们是本机产生的运行数据，不是源码。
+前两者是本地配置和运行数据，不是源码 —— `.gitignore` 里都排除了。
+`.env.example` 是例外：它是给人看的模板、不含真密钥，所以**它是要提交的**（`gitignore`
+里那条 `.env.*` 后面跟了一句 `!.env.example` 把它重新包含回来）。
 
 ## 已知的取舍
 

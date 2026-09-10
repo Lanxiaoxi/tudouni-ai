@@ -2,6 +2,9 @@
 # 绝不提交。源码进公开仓库，密钥不进。
 .env
 .env.*
+# 但模板要提交 —— 它是给人看的那一份，里面没有真密钥。
+# 注意顺序：gitignore 后出现的 ! 才能把上面已经排除的文件重新包含进来。
+!.env.example
 *.token
 .ericai_debug_token.txt
 
