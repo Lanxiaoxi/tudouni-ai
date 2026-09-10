@@ -1,0 +1,55 @@
+from dataclasses import dataclass, field
+from typing import Any
+
+
+class ModelError(Exception):
+    """模型调用的领域错误基类。
+
+    Agent 只认识这一层，不认识任何 SDK 异常 —— 和 tool_calls、usage 在适配层
+    归一化是同一个原则：provider 的细节不该漏到上层。将来换 provider，Agent
+    一行都不用改。
+    """
+
+
+class ModelTransientError(ModelError):
+    """暂时性失败：网络中断、超时、限流、5xx。
+
+    重试有意义 —— 这类失败下一秒钟可能就好了。
+    """
+
+
+class ModelFatalError(ModelError):
+    """确定性失败：401 鉴权失败、400 请求格式错、模型名不存在。
+
+    重试只是把同一个失败重复三遍，白花时间和钱，所以立即停。
+    """
+
+
+@dataclass
+class TokenUsage:
+    """一次模型调用的 token 用量。
+
+    在适配层归一化，Agent 就不必去碰 provider 专有的响应结构 —— 和 tool_calls
+    是同一个做法。
+
+    cached_tokens 是命中前缀缓存的那部分输入。它比未命中便宜大约 50 倍，所以
+    成本和未命中要分开记，否则账算不对。
+    """
+
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def miss_tokens(self) -> int:
+        """未命中缓存的输入 —— 按全价计费的那部分。"""
+        return self.prompt_tokens - self.cached_tokens
+
+
+@dataclass
+class ModelResponse:
+    """统一模型响应结构"""
+    content: str | None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    usage: TokenUsage | None = None
+    raw: Any = None

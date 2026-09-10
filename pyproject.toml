@@ -1,0 +1,37 @@
+[project]
+name = "agent-runtime"
+version = "0.1.0"
+description = "Minimal agent runtime with a pluggable chat-model adapter and tool registry"
+# 下界由代码决定，不是随意的：@dataclass(slots=True) 与运行时求值的 `X | None`
+# 注解都要求 3.10+；实际解释器由 .python-version 固定为 3.12。
+requires-python = ">=3.10"
+
+dependencies = [
+    "httpx>=0.27",
+    "openai>=1.0",
+    # 工具参数校验。必须 >=2：min_length / model_validate / model_json_schema
+    # 都是 Pydantic v2 的 API。它原本只是 openai 的传递依赖，这里显式声明，
+    # 因为项目代码直接 import 它。
+    "pydantic>=2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ 里靠 conftest.py 把仓库根加进 sys.path（package = false，包没被安装）。
+# 关掉缓存写入，免得在只读环境里报 warning。
+addopts = "-q"
+
+[tool.uv]
+# main.py 位于包目录内部，且通过 sys.path.insert 把父目录加进搜索路径后
+# `import agent_runtime`。若让 uv 构建安装本项目，扁平布局会把顶级模块解析成
+# main/models/tools/agents 而不是 agent_runtime，因此不打包。
+package = false
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
