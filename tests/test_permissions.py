@@ -11,6 +11,7 @@ import pytest
 from agent_runtime.agents import Agent
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import Decision, PermissionPolicy
+from agent_runtime.security.asker import _PREVIEW_LIMIT_BY_RISK, _preview
 from agent_runtime.state import Session
 from agent_runtime.tools.builtin import ListFilesArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
@@ -134,3 +135,45 @@ def test_policy_copies_the_set_it_is_given():
                 args_model=ListFilesArgs, handler=lambda **k: None)
     source.add(RiskLevel.MEDIUM)
     assert policy.decide(tool, {}) is Decision.ASK
+
+
+# --- 审批提示本身 -------------------------------------------------------
+#
+# 关卡决定「要不要问」，提示决定「问了有没有用」。一条被截断的提示会让审批退化成
+# 走过场 —— 用户看不全被审的东西，却要为此签字。
+
+def test_high_risk_arguments_are_not_truncated():
+    """高风险工具的判断依据**就是参数本身**，那里不能截断。
+
+    shell 命令是这一档的由来：`git status && rm -rf /` 的重点全在后半句，而 120 字符
+    的预览正好会把它切掉 —— 审批提示是那道关唯一的防线，它不能比被审的东西更短。
+    """
+    long_command = "echo " + "x" * 500
+    limit = _PREVIEW_LIMIT_BY_RISK[RiskLevel.HIGH]
+
+    assert limit is None
+    assert _preview(long_command, limit) == long_command
+
+
+def test_medium_risk_arguments_are_still_previewed():
+    """中低风险保持原样：write_file 的 content 有几千字符，全打出来会把 path 挤没。"""
+    preview = _preview("x" * 500, _PREVIEW_LIMIT_BY_RISK[RiskLevel.MEDIUM])
+
+    assert len(preview) < 500
+    assert "共 500 字符" in preview       # 截断必须标出真实长度，否则看不出来被截了
+
+
+def test_preview_flattens_newlines_without_losing_content():
+    """压平是多行命令必须做的（否则后面的参数被顶出屏幕），但它是**无损**的。
+
+    这和截断是两回事：压平只是换了表示法，藏不掉任何东西。
+    """
+    assert _preview("rm -rf /tmp\nrm -rf /var", None) == "rm -rf /tmp\\nrm -rf /var"
+
+
+def test_unknown_risk_level_falls_back_to_showing_everything():
+    """将来加了新等级而这张表忘了配，缺省必须是"全打出来"。
+
+    多显示一点是安全的失败方向，少显示才是危险的。
+    """
+    assert _PREVIEW_LIMIT_BY_RISK.get("brand-new-level") is None

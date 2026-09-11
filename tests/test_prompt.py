@@ -130,11 +130,22 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
 
     权限审批就是标准例子：risk 等级**故意不进 schema**（有测试盯着），所以「需要
     审批的工具会被拦下来问用户」是模型唯一能得知批准机制的途径。
+
+    权限范围那句必须限定成「**文件**工具」：加了 shell 之后，命令本来就能碰工作区
+    之外的路径。留着一句无条件的「你只能访问工作区目录」，提示词就变成了一句假话 ——
+    而模型要么因此不敢用 shell，要么学会提示词会骗它，两种都比不写更糟。
+
+    工具分工那条也只能住在这里：「读写文件用专用工具、别用 shell」讲的是几个工具
+    **之间**的关系，任何一个工具的描述都担不起它 —— shell 的描述在讲自己不受边界
+    约束，文件工具的描述在讲自己会怎么报错，谁都不会说"这件事该交给别人做"。
+    它还有个能算账的理由：read_file / list_files 是 LOW，自动放行；shell 是 HIGH，
+    每条都弹审批。用 shell 去读一个文件，等于白白打断用户一次。
     """
     prompt = load_system_prompt()
 
     assert "需要审批的工具会被运行时拦下来问用户" in prompt       # 批准机制
-    assert "你只能访问工作区目录" in prompt                       # 权限范围
+    assert "文件工具只能访问工作区目录" in prompt                 # 权限范围（限定在文件工具）
+    assert "不要用 shell 代替" in prompt                          # 工具之间的分工
     assert "改完文件后" in prompt                                 # 跨工具的收尾动作
 
 

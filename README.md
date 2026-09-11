@@ -67,6 +67,9 @@ main.py            组装：把下面这些接起来（薄入口）
 cli.py             参数解析、会话选择、交互循环、历史与审计的展示
 config.py          配置从环境变量来（源码里不留密钥）
 
+prompts/           系统提示词（给人读、给人改的文本，不是代码）
+  system.zh.md       静态部分；动态那几行由 state/session.py 拼在末尾
+
 models/            模型适配层
   base.py            ChatModel 抽象：complete(messages, tools) -> ModelResponse
   types.py           ModelResponse / TokenUsage / 三个领域异常
@@ -77,6 +80,7 @@ tools/             工具层
   builtin.py         内置工具的装配（参数模型 + 风险等级）
   filesystem.py      文件操作 + safe_path（工作区边界）
   clock.py           当前时间（无参数、无状态、不需要注入任何东西）
+  shell.py           命令执行 —— 唯一不受工作区边界约束的工具，因此只能走人工审批
 
 security/          权限层
   policy.py          PermissionPolicy：纯函数，只裁定 ALLOW / DENY / ASK
@@ -168,6 +172,13 @@ main     → 全部
 
 ## 已知的取舍
 
+- **`shell` 工具打破了工作区边界。** `safe_path` 拦得住 `../../evil.txt`，拦不住
+  `cd .. && rm -rf x` —— 后者走的是操作系统，不是 Python。所以它的风险等级是 HIGH：
+  默认策略（`auto_approve={LOW}`）下**每条命令都要人工审批**，而且审批提示里命令原文
+  不截断（用旧的那张 120 字符预览，`git status && … && rm -rf /` 的危险半句正好被切掉，
+  用户会在看不全的情况下签字）。真正的解法是操作系统级沙箱 —— Codex 的
+  read-only / workspace-write 就是 seatbelt 和 landlock 做的，本项目还没有。在那之前，
+  「每次都要人看一眼」是唯一诚实的默认值。
 - **`package = false` + `sys.path` 修补。** `pyproject.toml` 位于包目录内，所以项目
   根就是包本身，uv 无法把它当包安装。`main.py` 因此自己把父目录塞进 `sys.path`，
   `conftest.py` 做同一件事。想彻底解决要把项目根上移一级或改成嵌套布局，代价是
