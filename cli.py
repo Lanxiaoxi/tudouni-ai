@@ -189,6 +189,21 @@ def _ms_text(ms: int) -> str:
     return f"{ms / 60_000:.1f}min"
 
 
+def _tokens_text(count: int) -> str:
+    """token 数的人读形式。
+
+    要用它的地方量级差得很远：一轮的用量可能几千，而窗口是百万级。所以 1k 以下给精确值，
+    10k 以下给一位小数，再往上给整数 k，百万以上给 M —— 占比这种东西不需要四位有效数字。
+    """
+    if count < 1_000:
+        return str(count)
+    if count < 10_000:
+        return f"{count / 1000:.1f}k"
+    if count < 1_000_000:
+        return f"{count // 1000}k"
+    return f"{count / 1_000_000:.3g}M"
+
+
 def _print_timing(timing: Timing) -> None:
     """耗时那一行。没有任何耗时数据（旧日志）时什么都不说 —— 硬凑一行 0ms 只是噪声。"""
     if not (timing.model_ms or timing.tool_ms or timing.waited_ms):
@@ -210,6 +225,23 @@ def _print_timing(timing: Timing) -> None:
         parts.append(f"回合总 {_ms_text(timing.run_ms)}")
 
     print("耗时  " + "  ".join(parts))
+
+
+def last_prompt_tokens(events: Iterable[dict]) -> int | None:
+    """最近一次**成功**的模型调用实际发过去的输入 token 数；没有就返回 None。
+
+    取最后一条带 prompt_tokens 的 model_call：失败的尝试压根没有用量字段
+    （`_usage_fields` 拿不到 usage 就什么都不写），所以"有值"本身就等于"成功"。
+    一轮里可能调很多次模型，取**最后**那条 —— 上下文只增不减，最后那条最大，也最接近
+    下一次请求会发出去的大小。
+
+    为什么必须是这个实测值：本地估算需要 tokenizer（项目没有这个依赖），而且还得自己把
+    tool schemas 也算进去 —— 估出来的数会偏十几个百分点，而**报错的数比不报更坏**。
+    """
+    for event in reversed(list(events)):
+        if event.get("kind") == "model_call" and "prompt_tokens" in event:
+            return event["prompt_tokens"]
+    return None
 
 
 def last_turn_ms(events: Iterable[dict]) -> int | None:
@@ -369,27 +401,71 @@ def _turn_note(events: Iterable[dict]) -> str:
     return "" if ms is None else f"；本轮 {_ms_text(ms)}"
 
 
-def _stats_note(sink: JsonlSink | None, session: Session) -> str:
-    """末尾那句统计里由审计日志数出来的部分：累计用量 + 本轮耗时。
+def _context_note(events: Iterable[dict], context_tokens: int | None) -> str:
+    """末尾那句统计里的**上下文用量**：`上下文 2.0k/1M（0.2%）`。
 
-    **一次读取、两样统计共用同一批事件**，所以它们和 `--audit` 报的数字对得上。
+    两个口径上的事实，README 里也写了：
+
+      * 它是**上一次请求**实际发出去的大小，不是"现在" —— 下一次请求还要加上这一轮的
+        回答和工具结果，所以这个数是个**下界**。判断"离窗口还有多远"够用。
+      * 它**含命中缓存的那部分**（prompt_tokens 就是全部输入）。看窗口够不够要看总数，
+        看钱要看未命中 —— 后者已经在同一行的命中率里了。
+
+    context_tokens 为 None（模型不在 CONTEXT_WINDOWS 里）时**只报用量、不报占比**：
+    错的百分比比没有百分比更坏。
+    """
+    used = last_prompt_tokens(events)
+    if used is None:
+        return ""
+    if not context_tokens:
+        # 表里没有这个模型（或表里填了个 0 —— 那不是一个窗口）：**只报用量，不猜分母**，
+        # 也就没有百分比。错的百分比比没有百分比更坏。
+        return f"；上下文 {_tokens_text(used)}"
+
+    # 超过 100% 照原样报（"120.0%"），不夹到 100：那一轮就是发不出去了，把唯一的线索
+    # 抹平只会让人以为"刚好卡住"。
+    percent = used / context_tokens * 100
+    return (
+        f"；上下文 {_tokens_text(used)}/{_tokens_text(context_tokens)}"
+        f"（{percent:.1f}%）"
+    )
+
+
+def _stats_note(
+    sink: JsonlSink | None,
+    session: Session,
+    context_tokens: int | None = None,
+) -> str:
+    """末尾那句统计里由审计日志数出来的部分：累计用量 + 本轮耗时 + 上下文用量。
+
+    **一次读取、三样统计共用同一批事件**，所以它们和 `--audit` 报的数字对得上。
     传进来的 sink 必须**就是** Agent 的 on_event —— 它读的就是那份日志。
     """
     if sink is None:
         return ""
     events = list(sink.read(session.session_id))
-    return _usage_note(events) + _turn_note(events)
+    return (
+        _usage_note(events)
+        + _turn_note(events)
+        + _context_note(events, context_tokens)
+    )
 
 
-def run_repl(agent, session: Session, session_id: str, sink: JsonlSink | None = None) -> None:
+def run_repl(
+    agent,
+    session: Session,
+    session_id: str,
+    sink: JsonlSink | None = None,
+    context_tokens: int | None = None,
+) -> None:
     """多轮对话循环。
 
     这个 while 刻意留在 Agent 外面：Agent 的契约是"一个回合"，多轮循环属于驱动层，
     因为它的形态随环境而变（CLI 是循环、Web 是每请求一次、测试是遍历列表）。
     把循环塞进 Agent，它就得知道"从哪读用户输入"。
 
-    sink 只用来在每轮末尾报一次累计用量（见 `_usage_note`），默认不给就是不报 ——
-    它不影响对话本身，缺了也只是少一行统计。
+    sink 和 context_tokens 只影响每轮末尾那行统计（见 `_stats_note`）：模型窗口为 None
+    时就只报用量、不报占比。两者都不影响对话本身，缺了只是少几个字。
     """
     print("输入内容回车发送。空行、exit、quit 或 Ctrl+C 退出。\n")
     while True:
@@ -434,4 +510,5 @@ def run_repl(agent, session: Session, session_id: str, sink: JsonlSink | None = 
         # 步数用尽那条路仍然会说"接着跑：--session X"：那里的意思是"这一轮没走完"，
         # 和"你随时可以回来"是两件事，它每次也只在那一种情况下出现。
         print(f"\n（会话 {session_id!r}：{len(session.messages)} 条消息、"
-              f"{session.step_count()} 步{_stats_note(sink, session)}。）\n", file=sys.stderr)
+              f"{session.step_count()} 步{_stats_note(sink, session, context_tokens)}。）\n",
+              file=sys.stderr)

@@ -39,6 +39,24 @@ ENV_EXAMPLE_FILE = PROJECT_ROOT / ".env.example"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 
+# 各模型的上下文窗口（token）。它是**输入侧**的上限：真正发不出去的条件是"输入 + 输出"
+# 超过它，所以占比接近满之前就该有新会话。
+#
+# 为什么是一张表、而不是问 provider：OpenAI 兼容的响应里根本没有这个字段。
+# 为什么表里没有的名字**不给分母**（而不是猜一个）：这个项目可以指向任意网关，而
+# **错的百分比比没有百分比更坏** —— 它会被当成真的。所以 cli 那边只报用量、不报占比，
+# 启动时也会说一句该往哪加。
+#
+# 数据来源：DeepSeek 官方文档「模型 & 价格」的"上下文长度"（当前为 1M）。
+# 旧模型名 deepseek-v4-flash / deepseek-v4-flash-vision-exp 仍然可调用、由 V4.1-Flash
+# 提供服务，窗口与 Flash 相同，所以一并列上。
+CONTEXT_WINDOWS: dict[str, int] = {
+    "deepseek-flash": 1_000_000,
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4-flash-vision-exp": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
+}
+
 _ENV_API_KEY = "DEEPSEEK_API_KEY"
 _ENV_BASE_URL = "DEEPSEEK_BASE_URL"
 _ENV_MODEL = "DEEPSEEK_MODEL"
@@ -97,6 +115,15 @@ class ModelConfig:
             base_url=pick(_ENV_BASE_URL, DEFAULT_BASE_URL),
             model=pick(_ENV_MODEL, DEFAULT_MODEL),
         )
+
+    @property
+    def context_tokens(self) -> int | None:
+        """这个模型的上下文窗口；表里没有就返回 None（不猜）。
+
+        派生值，不存成字段 —— 它完全由 model 决定，存下来就有了两份事实
+        （和 Session.step_count、`Session` 里那句"步数不存字段"是同一个理由）。
+        """
+        return CONTEXT_WINDOWS.get(self.model)
 
 
 # --- 权限设置：工作区根目录的 .tudouni.json -------------------------------

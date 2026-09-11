@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.config import ENV_EXAMPLE_FILE, ConfigError, ModelConfig
+from agent_runtime.config import (
+    CONTEXT_WINDOWS,
+    DEFAULT_MODEL,
+    ENV_EXAMPLE_FILE,
+    ConfigError,
+    ModelConfig,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -117,3 +123,31 @@ def test_dotenv_does_not_leak_into_os_environ(workdir, monkeypatch):
     write_env(workdir, "DEEPSEEK_API_KEY=sk-from-file\n")
     ModelConfig.from_env(workdir / ".env")
     assert "DEEPSEEK_API_KEY" not in os.environ
+
+
+# --- 上下文窗口那张表 -----------------------------------------------------
+
+def test_the_default_model_has_a_declared_window():
+    """默认模型必须在表里 —— 否则每次启动都会打一句"没分母"，而那是默认体验。"""
+    cfg = ModelConfig(api_key="sk-x", base_url="x", model=DEFAULT_MODEL)
+    assert cfg.context_tokens == CONTEXT_WINDOWS[DEFAULT_MODEL]
+
+
+def test_an_unknown_model_has_no_window_rather_than_a_guess():
+    """表里没有就返回 None —— cli 那边据此只报用量、不报占比。
+
+    **错的百分比比没有百分比更坏**：它会被当成真的，而这项目可以指向任意网关。
+    """
+    cfg = ModelConfig(api_key="sk-x", base_url="x", model="some-gateway-alias")
+    assert cfg.context_tokens is None
+
+
+def test_configured_model_name_decides_the_window(workdir, monkeypatch):
+    """窗口跟着配置里的模型名走 —— 它是派生值，不是另一个要维护的字段。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-x")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+
+    cfg = ModelConfig.from_env(Path("definitely-does-not-exist.env"))
+
+    assert cfg.model == "deepseek-v4-pro"
+    assert cfg.context_tokens == CONTEXT_WINDOWS["deepseek-v4-pro"]

@@ -108,6 +108,14 @@ def main() -> int:
     # 检查之前，为的是「没配密钥也能查历史」，跟"要开会话了"是两回事。
     print_banner()
 
+    # 末尾那句统计里的"xx/yy"需要有 yy。响应里没有这个字段，所以它来自 config 里那张
+    # 按模型名的表；表里没有就**只报用量、不报占比**（错的百分比比没有百分比更坏）。
+    # 这句话只在真的缺分母时出现一次，而且它同时就是"该往哪加"的说明。
+    if cfg.context_tokens is None:
+        print(f"[上下文] 模型 {cfg.model!r} 不在 config.CONTEXT_WINDOWS 里，"
+              f"末尾只报上下文用量、不报占比；把它的窗口长度加进那张表即可。",
+              file=sys.stderr)
+
     session_id, session = resolve_session(store, args.session)
 
     model = OpenAICompatibleModel(
@@ -160,7 +168,8 @@ def main() -> int:
 
     # logs 同时交给 run_repl：末尾那句累计用量是从审计日志里数出来的，传的是
     # **同一个** sink（也就是同一个 on_event）—— 换成别的东西就会报出另一套数字。
-    run_repl(agent, session, session_id, logs)
+    # context_tokens 是那句话里 xxx/total 的分母。
+    run_repl(agent, session, session_id, logs, cfg.context_tokens)
     return 0
 
 
