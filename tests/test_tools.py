@@ -108,6 +108,27 @@ def test_workspace_root_itself_is_reachable_but_only_inside(workdir):
     assert fs.safe_path(".") == workspace.resolve()
 
 
+def test_tool_descriptions_are_not_bare_labels():
+    """描述是模型决定要不要调这个工具时唯一能看到的东西。
+
+    「写入文件内容」这样的标签等于没写。Claude Code 的 Tools 段比它的系统提示词
+    还长（44,145 字符 vs 12,399），说明说明书本来就该住在这里。这条挡的是"加新工具
+    时顺手写一行标签"。
+    """
+    registry = create_tool_registry(".")
+    for tool in registry.all():
+        assert len(tool.description) >= 15, f"{tool.name} 的描述太短，等于没写"
+
+
+def test_write_file_description_warns_that_it_overwrites():
+    """没有 edit 工具，只有整文件覆盖的 write_file —— 这条警告是防丢数据的。
+
+    真正的解法是加一个 edit 工具；在那之前，这句话必须留在模型看得见的地方。
+    """
+    registry = create_tool_registry(".")
+    assert "整个文件会被替换" in registry.get("write_file").description
+
+
 def test_registry_rejects_duplicate_names():
     registry = ToolRegistry()
     registry.register(Tool(name="t", description="d", risk=RiskLevel.LOW,

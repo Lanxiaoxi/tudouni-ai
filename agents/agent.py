@@ -225,6 +225,24 @@ class Agent:
         # 值"这件事在类型上成立，而不是靠读者推理。
         raise ModelError("模型调用重试逻辑异常：未预期的出路")
 
+    @staticmethod
+    def _budget_reminder(max_steps: int, step: int) -> dict[str, str]:
+        """一条只在本次请求里有效的步数提示。
+
+        **它不进 session.messages。** 三个理由：会话文件会平白多出几十条 user
+        消息；step_count() 靠「一条 assistant = 一步」派生，掺进 user 消息之后
+        「聊了多少轮」的语义就糊了；而且它逐轮变化，本来就不该被持久化。
+
+        也放不进系统提示词 —— 它逐轮衰减，等于每一轮都把缓存前缀打断一次。所以它
+        只能挂在载荷最末尾：那是整段对话里单价最贵的位置，却也正是唯一该变化的位置。
+        （一个回合 20 步 ≈ 200 个 token，相对于一次 read_file 动辄上万字符可以忽略。）
+
+        第 1 步它会紧跟真正的用户消息，形成连续两条 user。DeepSeek 的 OpenAI 兼容
+        接口接受这个形状，Aider 和 OpenHands 也都是逐轮往尾部追加提醒；但若将来换到
+        强制 user/assistant 交替的 provider，这里要改成挂到最后一条 tool 结果上。
+        """
+        return {"role": "user", "content": f"剩余步数：{max_steps - step}（含本次）"}
+
     def run(self, session: Session, user_input: str, max_steps: int = 20) -> str:
         # messages 不再每次新建，而是复用传入会话里已有的那份 —— 它让两次 run()
         # 之间、乃至两个进程之间，对话得以延续。会话是参数而不是 Agent 的身份，
@@ -252,7 +270,10 @@ class Agent:
             )
 
             response = self._complete_with_retry(
-                session, run_id, step + 1, messages, tool_schemas
+                session, run_id, step + 1,
+                # 步数提示是按本次载荷临时拼的，不写回 messages —— 见 _budget_reminder
+                [*messages, self._budget_reminder(max_steps, step)],
+                tool_schemas,
             )
 
             self._debug(

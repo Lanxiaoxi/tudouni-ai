@@ -31,10 +31,17 @@ class ScriptedModel(ChatModel):
 
     def __init__(self, script: list[ModelResponse]):
         self.script = list(script)
-        self.seen_message_counts: list[int] = []
+        # 存整份载荷，而不是只存条数：步数提示是每轮临时拼进请求、不进
+        # session.messages 的 —— 只有在这里才看得到它到底发出去了没有。
+        self.seen_messages: list[list[dict[str, Any]]] = []
+
+    @property
+    def seen_message_counts(self) -> list[int]:
+        """每次请求的消息条数。派生值 —— 不再另存一份。"""
+        return [len(messages) for messages in self.seen_messages]
 
     def complete(self, messages, tools=None):
-        self.seen_message_counts.append(len(messages))
+        self.seen_messages.append(list(messages))
         return self.script.pop(0) if self.script else ModelResponse(content="(剧本用尽)")
 
 

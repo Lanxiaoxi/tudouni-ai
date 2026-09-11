@@ -38,7 +38,11 @@ class ListFilesArgs(ToolArgs):
     path 带默认值，所以生成的 schema 里它不是必填 —— 模型可以省略它。
     """
 
-    path: str = Field(default=".", min_length=1, description="目录路径，默认为当前目录")
+    path: str = Field(
+        default=".",
+        min_length=1,
+        description="目录路径（相对于工作区），默认为工作区根目录",
+    )
 
 
 class GetCurrentTimeArgs(ToolArgs):
@@ -62,7 +66,11 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
 
     registry.register(Tool(
         name="read_file",
-        description="读取文件内容",
+        description=(
+            "读取指定文件的全部内容（按 UTF-8 解码，不分页）。"
+            "文件不存在、路径指向目录、或超出工作区都会报错。"
+            "同一个文件在一次任务里不要读第二遍。"
+        ),
         risk=RiskLevel.LOW,
         args_model=ReadFileArgs,
         handler=fs.read_file,
@@ -70,7 +78,11 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
 
     registry.register(Tool(
         name="write_file",
-        description="写入文件内容",
+        description=(
+            "把内容写入指定文件。整个文件会被替换 —— 不是追加，也不是局部修改；"
+            "缺失的父目录会自动创建。所以要改动一个已存在的文件，必须先 read_file "
+            "读出原文，再基于真实内容写出完整的新文本：凭记忆或凭猜测写会丢数据。"
+        ),
         risk=RiskLevel.MEDIUM,
         args_model=WriteFileArgs,
         handler=fs.write_file,
@@ -78,7 +90,10 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
 
     registry.register(Tool(
         name="list_files",
-        description="列出目录下的文件",
+        description=(
+            "列出目录下的条目名字。只列一层、不递归，也不返回大小、类型或修改时间。"
+            "要摸清目录结构就逐层调用；目录不存在或路径不是目录会报错。"
+        ),
         risk=RiskLevel.LOW,
         args_model=ListFilesArgs,
         handler=fs.list_files,
