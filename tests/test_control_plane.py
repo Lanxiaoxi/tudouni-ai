@@ -1,0 +1,94 @@
+"""控制面：agent 能写工作区里的任何东西，**除了这三样**。
+
+这条边界和 safe_path 那条是方向相反的两个问题：safe_path 防它出去，这里防它进来。
+之所以值得单独钉住，是因为 write_file 的边界正好是整个工作区，而 .tudouni.json
+就住在工作区根部 —— 能写它，就等于能给自己发权限。
+
+所以这里的断言都盯在**文件有没有真的被建出来**，而不是只看抛没抛异常：一个"先写入
+再报错"的实现也能让异常看起来正确。
+"""
+
+import pytest
+
+from agent_runtime.tools.filesystem import CONTROL_PLANE, FileSystem
+
+
+@pytest.fixture
+def fs(workdir):
+    return FileSystem(str(workdir))
+
+
+# --- 挡住 ---------------------------------------------------------------
+
+def test_write_file_refuses_the_permission_file(fs, workdir):
+    """能写它就能把 shell 加进免审批名单 —— 那就不叫权限策略了。"""
+    with pytest.raises(PermissionError, match="control plane"):
+        fs.write_file(".tudouni.json", '{"auto_approve_tools": ["shell"]}')
+
+    assert not (workdir / ".tudouni.json").exists()
+
+
+@pytest.mark.parametrize("path", [
+    ".sessions/20250101-000000.json",   # 能写它就能伪造"用户批准过"
+    ".logs/20250101-000000.jsonl",      # 能写它就能抹掉"谁批准了什么"
+    ".sessions",                        # 目录本身也不行
+    ".logs",
+])
+def test_write_file_refuses_session_and_log_paths(fs, workdir, path):
+    with pytest.raises(PermissionError, match="control plane"):
+        fs.write_file(path, "x")
+
+
+def test_every_entry_in_the_table_is_actually_enforced(fs):
+    """表里的每一项都要真的被挡住。
+
+    加一项到 CONTROL_PLANE 却忘了接上检查，是这张表唯一会静默失效的方式 ——
+    所以这里遍历表本身，而不是抄一份名字。
+    """
+    for name in CONTROL_PLANE:
+        with pytest.raises(PermissionError):
+            fs.write_file(name, "x")
+        with pytest.raises(PermissionError):
+            fs.write_file(f"{name}/inside.txt", "x")
+
+
+def test_the_check_does_not_depend_on_case(fs, workdir):
+    """Windows 的文件系统不区分大小写，`.TUDOUNI.JSON` 写下去就是同一个文件。"""
+    with pytest.raises(PermissionError):
+        fs.write_file(".TUDOUNI.JSON", "x")
+
+    assert not (workdir / ".tudouni.json").exists()
+
+
+def test_escaping_the_workspace_is_still_refused(fs):
+    """原有的那条边界不能被这次改动弄松。"""
+    with pytest.raises(PermissionError, match="escapes workspace"):
+        fs.write_file("../evil.txt", "x")
+
+
+# --- 放行 ---------------------------------------------------------------
+
+def test_reading_the_control_plane_is_still_allowed(fs, workdir):
+    """只挡写。读没有破坏性，而 agent 看不见自己项目的策略只会反复重试。"""
+    (workdir / ".tudouni.json").write_text('{"auto_approve": ["low"]}', encoding="utf-8")
+
+    assert "auto_approve" in fs.read_file(".tudouni.json")
+    assert ".tudouni.json" in fs.list_files(".")
+
+
+def test_normal_writes_still_work(fs, workdir):
+    assert fs.write_file("notes/a.md", "内容") == "Written: notes/a.md"
+    assert (workdir / "notes" / "a.md").read_text(encoding="utf-8") == "内容"
+
+
+def test_a_nested_copy_of_the_name_is_not_the_control_plane(fs, workdir):
+    """控制面是"根目录那个文件"，不是"叫这个名字的任何东西"。
+
+    挡住 sub/.tudouni.json 只会让模型读不懂为什么被拒 —— 而那不是策略文件，
+    没有任何东西会去读它。
+    """
+    fs.write_file("sub/.tudouni.json", "{}")
+    fs.write_file("tudouni.json", "{}")          # 少一个点也不是
+    fs.write_file("sessions/notes.md", "x")      # 少一个点也不是
+
+    assert (workdir / "sub" / ".tudouni.json").exists()
