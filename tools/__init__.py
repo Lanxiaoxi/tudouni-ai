@@ -10,34 +10,63 @@ from .ask import (
 )
 from .builtin import (
     EditFileArgs,
+    FetchWebArgs,
     GetCurrentTimeArgs,
     ListFilesArgs,
     ReadFileArgs,
     ShellArgs,
+    WebSearchArgs,
     WriteFileArgs,
     create_tool_registry,
 )
+from .text import truncate
 from .tool import RiskLevel, Tool, ToolArgs, ToolRegistry, ToolResult
+from .webfetch import Fetched, WebFetch, html_to_text
+
+from .websearch import (
+    Findings,
+    Hit,
+    SearchBackend,
+    SearchError,
+    SearchFatalError,
+    SearchTransientError,
+    TavilySearch,
+    WebSearch,
+)
 
 __all__ = [
     "ANSWERED",
     "Answer",
     "AskUserArgs",
     "EditFileArgs",
+    "FetchWebArgs",
+    "Fetched",
+    "Findings",
     "GetCurrentTimeArgs",
+    "Hit",
     "ListFilesArgs",
     "Questioner",
     "ReadFileArgs",
     "RiskLevel",
     "SKIPPED",
+    "SearchBackend",
+    "SearchError",
+    "SearchFatalError",
+    "SearchTransientError",
     "ShellArgs",
+    "TavilySearch",
     "Tool",
     "ToolArgs",
     "ToolRegistry",
     "ToolResult",
     "UNAVAILABLE",
+    "WebFetch",
+    "WebSearch",
+    "WebSearchArgs",
     "WriteFileArgs",
     "cli_questioner",
     "create_tool_registry",
+    "html_to_text",
+    "truncate",
     "unavailable_questioner",
 ]

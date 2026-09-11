@@ -23,6 +23,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .text import truncate
+
 
 # 命令的默认超时。
 #
@@ -184,13 +186,8 @@ def _format(returncode: int, output: str) -> str:
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     """超长输出取头尾两段。
 
-    **刻意不是「只留开头」** —— doc/guide.md 里那版 truncate() 就是这么写的。命令
-    输出的关键信息通常压在最后：报错、traceback、测试失败的汇总行。只留开头会让模型
-    看到一整屏正常的编译日志，而真正的失败正好被切掉 —— 那比截断本身更危险。
+    实现搬去了 tools/text.py —— 逐字相同的第三份要出现时（fetch_web），同一份事实就该
+    只有一个来源。这里留的是**门面**：默认上限仍然是本工具自己的 MAX_OUTPUT_CHARS
+    （每个工具的输出上限不一样，合并不了），名字也没变（test_shell.py 直接 import 它）。
     """
-    if len(text) <= limit:
-        return text
-
-    head = limit * 2 // 3
-    tail = limit - head
-    return f"{text[:head]}\n…[中间省略 {len(text) - limit} 字符]…\n{text[-tail:]}"
+    return truncate(text, limit)

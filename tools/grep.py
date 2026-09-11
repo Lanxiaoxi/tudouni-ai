@@ -45,6 +45,7 @@ import re
 from pathlib import Path
 
 from .filesystem import FileSystem
+from .text import truncate
 
 
 # 最多列出多少个有命中的文件。
@@ -141,12 +142,11 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     和 shell.py 里那个同名函数同一个理由：关键信息常常压在最后。这里大部分命中是
     "稀疏"的，但一个 minified 文件、或者一份恰好匹配到很多行的日志，完全可能把配额
     用光 —— 只留开头会让模型看不到后面那些文件。
+
+    实现搬去了 tools/text.py（fetch_web 是第三处要用它的地方），这里留门面：默认上限
+    仍然是本工具自己的 MAX_OUTPUT_CHARS。
     """
-    if len(text) <= limit:
-        return text
-    head = limit * 2 // 3
-    tail = limit - head
-    return f"{text[:head]}\n…[中间省略 {len(text) - limit} 字符]…\n{text[-tail:]}"
+    return truncate(text, limit)
 
 
 def _human_bytes(n: int) -> str:

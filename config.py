@@ -60,6 +60,10 @@ CONTEXT_WINDOWS: dict[str, int] = {
 _ENV_API_KEY = "DEEPSEEK_API_KEY"
 _ENV_BASE_URL = "DEEPSEEK_BASE_URL"
 _ENV_MODEL = "DEEPSEEK_MODEL"
+_ENV_TAVILY_KEY = "TAVILY_API_KEY"
+_ENV_TAVILY_URL = "TAVILY_BASE_URL"
+
+DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
 
 
 class ConfigError(Exception):
@@ -259,6 +263,56 @@ class PermissionConfig:
         把 shell 写成 shall 的人以为自己放行了，实际什么都没发生。
         """
         return frozenset((self.auto_approve_tools | self.deny_tools) - set(known))
+
+
+# --- 联网工具：Tavily 的密钥 ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class WebConfig:
+    """联网工具的配置。
+
+    密钥走这里（环境变量 / .env），**不进 `.tudouni.json`** —— 那个文件是策略，是要被
+    review、能被提交的；密钥不能 review 也不该被提交。这两类东西分开，和 ModelConfig
+    与 PermissionConfig 分开是同一条理由。
+
+    **缺密钥不是错误，不拦启动。** 这和 ModelConfig 缺 key 必须抛 ConfigError 是有意的
+    差别：模型密钥缺了整个程序什么都干不了；搜索密钥缺了只是少一个工具。混成一样会让
+    "只想用文件工具的人"被迫先去注册一个搜索服务。
+
+    代理由 httpx 的 trust_env 决定（main.py 里关掉了），不在这里做一个键 —— 一个
+    只有一半人看得懂的 HTTP_PROXY 变体，比让人显式写代码更坏。
+    """
+
+    tavily_api_key: str = ""
+    tavily_base_url: str = DEFAULT_TAVILY_BASE_URL
+
+    @classmethod
+    def from_env(cls, env_file: Path | None = None) -> "WebConfig":
+        """优先级和 ModelConfig **一字不差**：真实环境变量 > .env > 默认值。
+
+        复用同一份 .env：多一个文件就多一处"用户改错地方"的机会，而两个密钥填在同一个
+        文件里本来就是最省事的做法。
+        """
+        path = ENV_FILE if env_file is None else Path(env_file)
+        file_values = dotenv_values(path) if path.is_file() else {}
+
+        def pick(name: str, default: str = "") -> str:
+            from_env_var = os.environ.get(name, "").strip()
+            if from_env_var:
+                return from_env_var
+            from_file = (file_values.get(name) or "").strip()
+            return from_file or default
+
+        return cls(
+            tavily_api_key=pick(_ENV_TAVILY_KEY),
+            tavily_base_url=pick(_ENV_TAVILY_URL, DEFAULT_TAVILY_BASE_URL),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        """有没有配密钥。派生值，不存字段 —— 它完全由 tavily_api_key 决定。"""
+        return bool(self.tavily_api_key)
 
 
 def save_approvals(

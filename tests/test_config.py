@@ -13,16 +13,23 @@ import pytest
 from agent_runtime.config import (
     CONTEXT_WINDOWS,
     DEFAULT_MODEL,
+    DEFAULT_TAVILY_BASE_URL,
     ENV_EXAMPLE_FILE,
     ConfigError,
     ModelConfig,
+    WebConfig,
 )
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """清掉相关的环境变量，免得本机恰好设了而让测试互相干扰。"""
-    for name in ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"):
+    """清掉相关的环境变量，免得本机恰好设了而让测试互相干扰。
+
+    TAVILY_API_KEY 必须一起清：这台机器上它**真的设着**（开发时就是那么用的），
+    不清的话下面"缺密钥"那几条会在本机莫名其妙地绿/红 —— 而 CI 上它们是对的。
+    """
+    for name in ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL",
+                 "TAVILY_API_KEY", "TAVILY_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -151,3 +158,76 @@ def test_configured_model_name_decides_the_window(workdir, monkeypatch):
 
     assert cfg.model == "deepseek-v4-pro"
     assert cfg.context_tokens == CONTEXT_WINDOWS["deepseek-v4-pro"]
+
+
+# --- 联网工具的配置（WebConfig） ------------------------------------------
+#
+# 它和 ModelConfig 共用同一个 .env、同一套优先级，但**缺密钥的处置完全不同**：
+# 模型密钥缺了整个程序什么都干不了（ConfigError + 退出码 2），搜索密钥缺了只是少一个
+# 工具。这两件事混成一样，会让"只想用文件工具的人"被迫先去注册一个搜索服务。
+
+def test_web_key_is_read_from_the_same_env_file(workdir):
+    cfg = WebConfig.from_env(write_env(workdir, "TAVILY_API_KEY=tvly-from-file\n"))
+
+    assert cfg.tavily_api_key == "tvly-from-file"
+    assert cfg.tavily_base_url == DEFAULT_TAVILY_BASE_URL
+    assert cfg.enabled is True
+
+
+def test_web_env_var_wins_over_the_env_file(workdir, monkeypatch):
+    """和 ModelConfig 一字不差的优先级：真实环境变量 > .env > 默认值。"""
+    path = write_env(workdir, "TAVILY_API_KEY=tvly-from-file\n")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-from-env")
+
+    assert WebConfig.from_env(path).tavily_api_key == "tvly-from-env"
+
+
+def test_an_empty_web_key_counts_as_unset(workdir, monkeypatch):
+    """.env 里留空的那一行是"还没填"，不是"填了一个空密钥"。"""
+    path = write_env(workdir, "TAVILY_API_KEY=\n")
+
+    assert WebConfig.from_env(path).enabled is False
+    assert WebConfig.from_env(path).tavily_api_key == ""
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-from-env")
+    assert WebConfig.from_env(path).tavily_api_key == "tvly-from-env"
+
+
+def test_a_missing_web_key_is_not_an_error(workdir):
+    """**这条是它和 ModelConfig 的分界。**
+
+    缺搜索密钥不该拦启动：那只会逼着"只想用文件工具的人"先去注册一个搜索服务。
+    要说的那句话由 main.py 打到 stderr（"[联网] 没找到 TAVILY_API_KEY…"）。
+    """
+    cfg = WebConfig.from_env(workdir / "nope.env")
+
+    assert cfg.enabled is False
+    assert cfg.tavily_base_url == DEFAULT_TAVILY_BASE_URL
+
+
+def test_web_base_url_can_be_switched(workdir, monkeypatch):
+    """换网关的口子（和 DEEPSEEK_BASE_URL 同一个理由）。"""
+    monkeypatch.setenv("TAVILY_BASE_URL", "https://gateway.example/v1")
+
+    assert WebConfig.from_env(Path("nonexistent.env")).tavily_base_url == "https://gateway.example/v1"
+
+
+def test_env_example_documents_the_web_key_without_a_secret():
+    """模板是**会被提交**的那一份。
+
+    键名要出现在里面（否则没人知道该填什么），但它必须**是空的或者被注释掉**。
+    盯的不是"文本里不出现 tvly- 这几个字"：模板里"形如 tvly-..." 那句提示是有用的，
+    真该禁的是**一个真的值**。所以判据落在"赋值那一行有没有内容"上 —— 那正是密钥
+    会泄漏的那个位置，而提示、注释都不在那里。
+
+    （`test_env_example_exists_and_has_no_secret` 那条盯的是 "sk-"，同一个手法。
+    这里不能照抄它："sk-" 是 DeepSeek 密钥的固有前缀、不会出现在说明文字里，
+    而 "tvly-" 会。）
+    """
+    import re
+
+    text = ENV_EXAMPLE_FILE.read_text(encoding="utf-8")
+    assert "TAVILY_API_KEY" in text
+
+    assigned = re.findall(r"^\s*TAVILY_API_KEY\s*=\s*(\S+)", text, re.M)
+    assert assigned == [], f"模板里出现了真的密钥值：{assigned}"

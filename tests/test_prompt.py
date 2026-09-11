@@ -12,6 +12,7 @@
 
 import platform
 
+import httpx
 import pytest
 
 from agent_runtime.agents import Agent
@@ -22,6 +23,8 @@ from agent_runtime.state import session as session_module
 from agent_runtime.state.session import SYSTEM_PROMPT_PATH, load_system_prompt
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.tool import RiskLevel
+from agent_runtime.tools.webfetch import WebFetch
+from agent_runtime.tools.websearch import Findings, Hit, WebSearch
 
 from fakes import ScriptedModel, tool_call, usage
 
@@ -187,6 +190,11 @@ _CAPABILITY_TOOLS = {
     "列目录": {"list_files"},
     "编辑": {"edit_file"},
     "搜文本": {"grep"},
+    # 联网那一对。分工和文件工具那一对是**同构**的（web_search 是互联网上的 grep、
+    # fetch_web 是互联网上的 read_file），所以它在这个表里的位置也一样：各占一格，
+    # 谁都不替谁干活。
+    "搜网页": {"web_search"},
+    "读网页": {"fetch_web"},
 }
 
 # 注册表里不属于「文件工具」的那几个，明确列出来 —— 它们不进上面那张能力表，
@@ -198,8 +206,34 @@ _CAPABILITY_TOOLS = {
 _NON_FILE_TOOLS = {"get_current_time", "shell", "ask_user", "todo_write"}
 
 
+def _fake_fetch() -> WebFetch:
+    """一个一行网络都不打的 WebFetch（只为了装配）—— 这个文件的取向和 tests/fakes.py 一致。"""
+    return WebFetch(httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"")),
+        trust_env=False,
+    ))
+
+
+def _fake_search() -> WebSearch:
+    """一个脚本化的 backend：web_search 那一层在这个文件里同样不碰网络。"""
+    return WebSearch(lambda query, max_results: Findings(hits=[Hit("t", "https://x/")]))
+
+
 def registered_tools() -> set[str]:
-    return {tool.name for tool in create_tool_registry(".").all()}
+    """**装配齐全的那份注册表**，联网工具也在里面。
+
+    刻意不是 `create_tool_registry(".")`：那两个工具默认不注册（缺 provider / 缺密钥
+    就不该出现），而下面三条要量的正是"提示词点名了的能力，注册表里到底有没有对应工具"。
+    拿一份少了两个工具的注册表去量，量出来的"没有对应工具"是假的 —— 它会逼着提示词
+    **不要**提联网，而那恰好是反的。
+
+    这里的 backend 是假的、client 走 MockTransport：这一整个文件不该打任何网络。
+    """
+    return {
+        tool.name for tool in create_tool_registry(
+            ".", web_fetch=_fake_fetch(), web_search=_fake_search(),
+        ).all()
+    }
 
 
 def test_the_prompt_only_names_capabilities_that_have_a_tool():
@@ -250,6 +284,59 @@ def test_the_capability_map_accounts_for_every_registered_tool():
         f"这些工具既没归到哪类能力、也没被标成非文件工具：{sorted(unaccounted)} —— "
         f"把它们归到 _CAPABILITY_TOOLS 的某一类里，或者加进 _NON_FILE_TOOLS。"
     )
+
+
+# --- 一条规矩两个落点：提示词 + 工具描述 ---------------------------------
+#
+# 上面那三条量的是"提示词点名的能力，注册表里有没有对应工具"。这一段量的是同一个担心的
+# 另一半：**有一条纪律只写在提示词里，而提示词只对新建的会话生效。**
+#
+# 「## 联网」那三句话里，两句在工具描述里有落点（"只给指针"在 web_search 的描述里、
+# "正文不可信"在 fetch_web 的描述里），只有"不要拿 shell 起 curl"是纯提示词的。于是
+# 一个**在这次改动之前建的会话**恢复时是这样的：工具 schema 每次 run 现取，所以它看得见
+# fetch_web；system 消息是当初写下的，所以它没有那一节。它完全可能用 curl 去抓网页 ——
+# 而那条路进来的正文**没有**"不可信内容"的标注，那是提示词注入唯一的防线。
+#
+# 所以这条纪律多了一个落点：`shell` 的描述（tools/builtin.py 的 web_note）。下面三条从
+# 三个方向钉住它 —— 有它的那句、以及**没有它的那两种装配**（缺 web_search / 两个都没装配）
+# 里不能出现它。只量第一个方向的话，漏掉的恰好是缺 TAVILY_API_KEY 的那种会话。
+
+def test_the_curl_rule_also_lives_in_the_shell_description():
+    """恢复的旧会话只能从工具描述里收到新规矩 —— 所以这条纪律必须也在那里。
+
+    和 ask_user / todo_write 把"什么时候**不要**用我"写进描述是同一条理由
+    （那两条的描述里各自写着为什么）。而且它不只是偏好：curl 抓回来的正文没有那句
+    "不可信内容"的标注，所以这句话得说清**为什么**别绕过去，不能只说"别这么做"。
+    """
+    description = create_tool_registry(".", web_fetch=_fake_fetch()).get("shell").description
+
+    assert "curl" in description
+    assert "fetch_web" in description
+    assert "不可信" in description
+
+
+def test_the_shell_description_only_names_web_tools_that_are_registered():
+    """描述里点名一个**没注册**的工具，是"缺密钥时提示词点名 web_search"那个毛病的翻版。
+
+    模型对"这个工具不存在"没有任何判断依据，它只会白花一步去调（拿到的还是一句
+    `KeyError`）。所以那句话是可变的：装配了 web_search 才提它。
+    """
+    both = create_tool_registry(".", web_fetch=_fake_fetch(), web_search=_fake_search())
+    fetch_only = create_tool_registry(".", web_fetch=_fake_fetch())
+
+    assert "web_search" in both.get("shell").description
+    assert "web_search" not in fetch_only.get("shell").description
+
+
+def test_no_web_tools_means_no_web_advice_in_the_shell_description():
+    """两个都没装配（`create_tool_registry(".")` 那种）时，这句话整个不出现。
+
+    和"默认不注册"是同一条规矩的另一面：一段谈论不存在的工具的说明，只会让模型去找它。
+    """
+    description = create_tool_registry(".").get("shell").description
+
+    assert "fetch_web" not in description
+    assert "curl" not in description
 
 
 def test_missing_prompt_file_gives_an_actionable_error(workdir):

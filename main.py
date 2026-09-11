@@ -39,6 +39,7 @@ from agent_runtime.config import (
     ConfigError,
     ModelConfig,
     PermissionConfig,
+    WebConfig,
     save_approvals,
 )
 from agent_runtime.models import OpenAICompatibleModel
@@ -49,6 +50,8 @@ from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.ask import cli_questioner, unavailable_questioner
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.todo import TodoBoard, progress_line, todo_note
+from agent_runtime.tools.webfetch import USER_AGENT, WebFetch
+from agent_runtime.tools.websearch import TavilySearch, WebSearch
 
 SESSIONS_DIR = PROJECT_DIR / ".sessions"
 LOGS_DIR = PROJECT_DIR / ".logs"
@@ -145,6 +148,8 @@ def main() -> int:
         # 权限策略和密钥一起在这里读：两类配置错误都是「用户得先做点事」，
         # 都该在开出会话之前停下，而不是跑到第一次工具调用才炸。
         permissions = PermissionConfig.from_file()
+        # 联网工具的密钥**不在这一档**：缺了只是少一个工具，不是"什么都干不了"。
+        web = WebConfig.from_env()
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
@@ -171,17 +176,46 @@ def main() -> int:
         http_client=httpx.Client(),
     )
 
-    tools = create_tool_registry(
-        str(PROJECT_DIR),
-        # 提问通道和审批通道**分开装配**：审批回答"要不要执行"，它的答案改变权限；
-        # 提问回答"你要什么"，它的答案只是内容。两者唯一的共同点是"都需要有人在" ——
-        # 而 --autopilot 说的正是这件事本身，所以它同时管住两者：提问那一支拿到的是
-        # unavailable（如实说没有人回答，**不伪造答案、也不记成默许**）。
-        questioner=unavailable_questioner if args.autopilot else cli_questioner,
-        # 任务列表是**按会话的状态**，所以它只能在这里造（会话上面刚解析出来），而且
-        # 拿到的是 session.metadata 这个活字典 —— 写进去的东西跟着会话一起落盘。
-        todos=TodoBoard(session.metadata),
-    )
+    # 联网抓取用的 http client：**一个进程一个**，连接复用、TLS 握手只付一次。
+    #
+    # trust_env=False：环境变量里的 HTTP_PROXY 不该悄悄改掉这个程序的行为 ——
+    # 和 config 里"环境变量优先、但方向不能反"是同一个担心的两半。要代理就显式构造
+    # 一个 client 传进来。
+    http = httpx.Client(trust_env=False, headers={"User-Agent": USER_AGENT})
+
+    # 缺搜索密钥时把话说在 stderr 上，而不是"注册了再让模型去撞墙"：工具 schema 每一轮
+    # 都要发出去，而模型对"没有密钥"这件事无能为力 —— 它只会白花一步去调一次。这句话
+    # 让它变成"用户得先做点事"，和 [上下文]/[权限] 那几行是同一种做法。
+    if not web.tavily_api_key:
+        print("[联网] 没找到 TAVILY_API_KEY，web_search 未注册（fetch_web 不受影响）。"
+              "要启用就写进 .env：TAVILY_API_KEY=tvly-...", file=sys.stderr)
+
+    try:
+        tools = create_tool_registry(
+            str(PROJECT_DIR),
+            # 提问通道和审批通道**分开装配**：审批回答"要不要执行"，它的答案改变权限；
+            # 提问回答"你要什么"，它的答案只是内容。两者唯一的共同点是"都需要有人在" ——
+            # 而 --autopilot 说的正是这件事本身，所以它同时管住两者：提问那一支拿到的是
+            # unavailable（如实说没有人回答，**不伪造答案、也不记成默许**）。
+            questioner=unavailable_questioner if args.autopilot else cli_questioner,
+            # 任务列表是**按会话的状态**，所以它只能在这里造（会话上面刚解析出来），而且
+            # 拿到的是 session.metadata 这个活字典 —— 写进去的东西跟着会话一起落盘。
+            todos=TodoBoard(session.metadata),
+            # 联网那一对。**密钥的读取留在入口这一层**（tools/ 不能 import config，
+            # 依赖方向是单向的）—— 和 questioner / todos 走的是同一条路。
+            web_fetch=WebFetch(http),
+            web_search=(
+                WebSearch(
+                    TavilySearch(http, web.tavily_api_key, web.tavily_base_url),
+                    provider="tavily",
+                )
+                if web.tavily_api_key
+                else None
+            ),
+        )
+    except Exception:
+        http.close()
+        raise
     print("已注册工具:")
     for tool in tools.all():
         print(f"  - {tool.name:12} 风险={tool.risk.value}")
@@ -243,7 +277,12 @@ def main() -> int:
     # logs 同时交给 run_repl：末尾那句累计用量是从审计日志里数出来的，传的是
     # **同一个** sink（也就是同一个 on_event）—— 换成别的东西就会报出另一套数字。
     # context_tokens 是那句话里 xxx/total 的分母。
-    run_repl(agent, session, session_id, logs, cfg.context_tokens)
+    try:
+        run_repl(agent, session, session_id, logs, cfg.context_tokens)
+    finally:
+        # 会话结束就关掉：连接池里那些 keep-alive 的 socket 不该留到进程退出。
+        # （模型那个 client 由 OpenAI SDK 自己管，这里是**我们**建的那个。）
+        http.close()
     return 0
 
 
