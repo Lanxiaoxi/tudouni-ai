@@ -38,6 +38,13 @@ class Attempt:
     duration_ms: int
     error: str | None = None
     response: ModelResponse | None = None
+    # 这一次失败之后退避了多久才重试；None 表示不会再重试。
+    #
+    # 它必须单独记：duration_ms 只覆盖这一次请求的往返，而退避的 0.5 / 1 / 2 秒哪个
+    # 请求都不属于。少了这个字段，"失败两次 + 退避 3 秒"在日志里看起来就是两次很快的
+    # 调用，多出来的那 3 秒只能靠相邻事件的 ts 去猜 —— 而那正是排查"这一轮为什么这么慢"
+    # 时最容易漏掉的一段。
+    backoff_ms: int | None = None
 
 
 def call_with_retry(
@@ -47,32 +54,44 @@ def call_with_retry(
     on_attempt: Callable[[Attempt], None],
     *,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> ModelResponse:
     """调模型；暂时性失败按指数退避重试，确定性失败直接抛。
 
     sleep 可注入，测试里换成 no-op —— 验重试逻辑不该真的等 1.5 秒。
+
+    clock 也可以注入，而且**上层会把同一个时钟传下来**：一次回合里所有 duration_ms
+    必须出自同一个时钟，否则"模型 1.2s + 工具 0.3s"这种加法就是在混用两把尺子。
+    （顺带它也是 model_call 的耗时能被精确断言的前提。）
     """
     for number in range(1, MAX_ATTEMPTS + 1):
-        started = time.perf_counter()
+        started = clock()
 
         try:
             response = model.complete(messages=messages, tools=tools)
         except ModelFatalError as exc:
-            on_attempt(Attempt(number, "fatal", _elapsed_ms(started), error=str(exc)))
+            on_attempt(Attempt(number, "fatal", _elapsed_ms(started, clock()), error=str(exc)))
             raise
         except ModelTransientError as exc:
-            on_attempt(Attempt(number, "error", _elapsed_ms(started), error=str(exc)))
-            if number >= MAX_ATTEMPTS:
+            # 退避时长先算出来、随这次尝试一起报出去，然后才真的睡。顺序反过来的话，
+            # 事件里就没法带上"接下来要等多久"——而等待期间是没有任何事件可看的。
+            last = number >= MAX_ATTEMPTS
+            backoff = 0.0 if last else min(BACKOFF_BASE * 2 ** (number - 1), BACKOFF_CAP)
+            on_attempt(Attempt(
+                number, "error", _elapsed_ms(started, clock()), error=str(exc),
+                backoff_ms=None if last else int(backoff * 1000),
+            ))
+            if last:
                 raise
-            sleep(min(BACKOFF_BASE * 2 ** (number - 1), BACKOFF_CAP))
+            sleep(backoff)
             continue
 
-        on_attempt(Attempt(number, "ok", _elapsed_ms(started), response=response))
+        on_attempt(Attempt(number, "ok", _elapsed_ms(started, clock()), response=response))
         return response
 
     # 循环只可能由 return 或 raise 退出；这行是为了让"函数总有返回值"在类型上成立。
     raise ModelTransientError("重试逻辑异常：未预期的出路")
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.perf_counter() - started) * 1000)
+def _elapsed_ms(started: float, now: float) -> int:
+    return int((now - started) * 1000)

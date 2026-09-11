@@ -20,7 +20,7 @@
 """
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 
 from agent_runtime.security.asker import ApprovalAsker
@@ -51,11 +51,16 @@ def check_permission(
     policy: PermissionPolicy,
     asker: ApprovalAsker | None = None,
     memory: ApprovalMemory | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> GateResult:
     """裁定一次工具调用能不能执行。
 
     拒绝走的是第 4 阶段那条通道（回灌一段文字给模型），而不是直接终止任务 ——
     用户拒绝的通常只是"这一次的做法"，模型有机会换一种方式。
+
+    clock 是注入的，而且**上层传下来的是同一个时钟**：一次回合里 model_call /
+    permission / tool_result 的耗时必须出自同一把尺子，否则把它们相加是在混用三种
+    单位。顺带它也是 waited_ms 能被精确断言的前提（真实时钟只能断言"大于 0"）。
     """
     decision = policy.decide(tool, arguments)
 
@@ -100,9 +105,9 @@ def check_permission(
     # 将来的行为"这件事仍然能被审计看见。
     before = memory.tools() if memory is not None else frozenset()
 
-    started = time.perf_counter()
+    started = clock()
     approved = asker(tool, arguments)
-    waited_ms = int((time.perf_counter() - started) * 1000)
+    waited_ms = int((clock() - started) * 1000)
 
     if approved:
         remembered = (memory.tools() - before) if memory is not None else frozenset()

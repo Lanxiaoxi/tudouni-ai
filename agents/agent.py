@@ -34,6 +34,13 @@ Checkpoint = Callable[[Session], None]
 # 审计事件回调：Agent 报告「发生了什么」，注入的实现决定记到哪、什么格式。
 EventSink = Callable[[dict[str, Any]], None]
 
+# 计时的时钟。**注入而不是直接调 time.perf_counter**，理由和 retry.py 里 sleep 可注入
+# 一样：时间没法断言。测试里换成一个由假模型/假 handler 推进的假时钟，duration_ms 才能
+# 被钉成精确值；换成真实时钟，这类断言只能在 CI 上随机红。
+#
+# 必须是单调时钟：time.time() 会被 NTP 调整，测出来的"耗时"可能是负数。
+Clock = Callable[[], float]
+
 # 审计事件里参数预览的最大长度。参数可能很长（write_file 的 content），
 # 也可能含敏感内容，所以审计日志只留预览、从不记全文。
 AUDIT_PREVIEW_LIMIT = 200
@@ -92,6 +99,7 @@ class Agent:
         on_checkpoint: Checkpoint | None = None,
         on_event: EventSink | None = None,
         debug: bool = False,
+        clock: Clock = time.perf_counter,
     ):
         # 前三个是【能力】：每个应用构造一次，长期复用、可以跨会话共享。
         self.model = model
@@ -122,6 +130,10 @@ class Agent:
 
         self.debug = debug
 
+        # 时钟也是注入的：审计里的每个 duration_ms 都出自它，所以测试要能把它换成假的
+        # （见上面 Clock 那段）。
+        self.clock = clock
+
     def _emit(self, kind: str, session: Session, run_id: str, step: int, **data: Any) -> None:
         """报告一条审计事件。
 
@@ -144,6 +156,29 @@ class Agent:
             # 消息和它的 tool 结果之间），抛出去会留下悬空的 tool_calls，会话从此
             # 每轮都 400 —— 这个后果实测过。
             self._warn(f"审计事件写入失败（已忽略）: {type(exc).__name__}: {exc}")
+
+    def _finish_run(
+        self,
+        session: Session,
+        run_id: str,
+        step: int,
+        run_started: float,
+        stop_reason: str,
+    ) -> None:
+        """收尾：记一条 run_finished，并带上这一回合的墙上时间。
+
+        三个收尾点（答完 / 步数用尽 / 模型失败）都走这里 —— 事件长什么样只写一遍，
+        省得三处各写一份、日后漏掉 duration_ms 这种字段。
+
+        duration_ms 是**回合总时长**，和逐条 model_call / tool_result 的口径不重叠，
+        所以 CLI 那边可以直接把它们相减去算"未归因"。口径重叠过一次的代价这里记得：
+        工具耗时原本是从函数入口起表的，把等人审批也算了进去。
+        """
+        self._emit(
+            "run_finished", session, run_id, step,
+            stop_reason=stop_reason,
+            duration_ms=int((self.clock() - run_started) * 1000),
+        )
 
     def _checkpoint(self, session: Session) -> None:
         """在 messages 一致的时刻通知外部保存。
@@ -209,6 +244,7 @@ class Agent:
         step: int,
         messages: list[dict[str, Any]],
         tool_schemas: list[dict],
+        run_started: float,
     ) -> "ModelResponse":
         """调模型，并保证每一次尝试都留下一条审计记录。
 
@@ -224,10 +260,15 @@ class Agent:
             return call_with_retry(
                 self.model, messages, tool_schemas,
                 on_attempt=self._attempt_reporter(session, run_id, step),
+                # 同一个时钟传下去：一次回合里所有 duration_ms 必须出自同一把尺子，
+                # 否则"模型 1.2s + 工具 0.3s"这种加法没有意义。
+                clock=self.clock,
             )
         except Exception as exc:
-            self._emit("run_finished", session, run_id, step,
-                       stop_reason="model_fatal" if _is_fatal(exc) else "model_error")
+            self._finish_run(
+                session, run_id, step, run_started,
+                "model_fatal" if _is_fatal(exc) else "model_error",
+            )
             raise
 
     def _attempt_reporter(self, session: Session, run_id: str, step: int):
@@ -241,6 +282,10 @@ class Agent:
             }
             if attempt.error is not None:
                 data["error"] = self._preview(attempt.error, AUDIT_PREVIEW_LIMIT)
+            # 退避时长（只在这条失败的尝试还会重试时才有）：不记它的话，"这一轮为什么
+            # 慢了 3 秒"在日志里是看不出来的 —— 那段等待不属于任何一次请求。
+            if attempt.backoff_ms is not None:
+                data["backoff_ms"] = attempt.backoff_ms
             if attempt.response is not None:
                 data["tool_calls"] = len(attempt.response.tool_calls)
                 data.update(self._usage_fields(attempt.response.usage))
@@ -274,6 +319,11 @@ class Agent:
         return {"role": "user", "content": f"剩余步数：{max_steps - step}（含本次）"}
 
     def run(self, session: Session, user_input: str, max_steps: int = 40) -> str:
+        # 回合的起点：run_finished 里的 duration_ms 从这里算起。放在最前面（而不是从
+        # 第一次模型请求算起）是因为"这一轮花了多久"要含上追加消息、落盘这些开销 ——
+        # 它们没被单独埋点，交给 CLI 那行汇总里的"未归因"去吸收，比假装它们不存在诚实。
+        run_started = self.clock()
+
         # messages 不再每次新建，而是复用传入会话里已有的那份 —— 它让两次 run()
         # 之间、乃至两个进程之间，对话得以延续。会话是参数而不是 Agent 的身份，
         # 所以同一个 Agent 可以服务多个会话。
@@ -307,6 +357,7 @@ class Agent:
                 # 步数提示是按本次载荷临时拼的，不写回 messages —— 见 _budget_reminder
                 [*messages, self._budget_reminder(max_steps, step)],
                 tool_schemas,
+                run_started,
             )
 
             self._debug(
@@ -341,8 +392,7 @@ class Agent:
 
             if not response.tool_calls:
                 self._debug("   无工具调用 → 返回最终结果")
-                self._emit("run_finished", session, run_id, step + 1,
-                           stop_reason="answered")
+                self._finish_run(session, run_id, step + 1, run_started, "answered")
                 self._checkpoint(session)  # 完整：这条 assistant 消息没有任何 tool_call
                 return response.content or ""
 
@@ -384,7 +434,7 @@ class Agent:
         # 撞上限的位置在循环顶部，那里 messages 一致（上一步的结果全 append 完、
         # ★ 也落过盘了），所以这个 raise 不损坏会话。
         self._debug(f"!! 达到最大步数 {max_steps}，停止")
-        self._emit("run_finished", session, run_id, max_steps, stop_reason="max_steps")
+        self._finish_run(session, run_id, max_steps, run_started, "max_steps")
         self._checkpoint(session)
         raise StepLimitExceeded(max_steps, last_tools)
 
@@ -394,8 +444,13 @@ class Agent:
         四条出口都收敛到末尾那一次 _emit，而不是每处各发一次 —— 状态分类只有这里
         知道（校验失败、被拒、还是运行出错），所以判定留在内部；但"事件长什么样"
         只写一遍，免得四处各写一份、日后改漏。
+
+        **duration_ms 只算"执行"这一段。** 权限裁决（含等人审批）在它之前，而那段时间
+        已经记在 permission 事件的 waited_ms 里 —— 两边都算的话，一条等人 40 秒才被批准
+        的工具调用会显示成"这个工具要 40 秒"，拿它去判断哪个工具慢会完全跑偏，两份
+        数据相加也会重复。所以这里在放行之后才起表，被拒的那一支干脆记 0。
         """
-        started = time.perf_counter()
+        started = self.clock()
 
         try:
             tool = self.tools.get(call["name"])
@@ -407,6 +462,7 @@ class Agent:
             if denial is not None:
                 text, status = denial, "denied"
             else:
+                started = self.clock()          # ← 从这里才算"执行"
                 result = tool.execute(arguments)
                 text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
                 status = "ok"
@@ -427,12 +483,16 @@ class Agent:
                 self._warn("工具抛出未预期的异常，完整栈如下（给模型的文本已简化）：")
                 traceback.print_exc()
 
+        # denied 那一支什么都没执行：记 0 而不是"从函数入口算起的耗时"，否则这个数字
+        # 会变成审批开销的同义词（它属于 permission 事件）。
+        duration_ms = 0 if status == "denied" else int((self.clock() - started) * 1000)
+
         self._emit(
             "tool_result", session, run_id, step,
             tool=call["name"],
             status=status,      # ok / denied / invalid_args / error
             chars=len(text),    # 只记长度，不记全文 —— 全文已经在会话文件里了
-            duration_ms=int((time.perf_counter() - started) * 1000),
+            duration_ms=duration_ms,
         )
         return text
 
@@ -452,7 +512,8 @@ class Agent:
         permission 事件是审计最要紧的一项 —— "谁批准了什么"除了这里没有别的地方
         知道。无论放行还是拒绝都要发。
         """
-        result = check_permission(tool, arguments, self.policy, self.asker, self.memory)
+        result = check_permission(tool, arguments, self.policy, self.asker, self.memory,
+                                  clock=self.clock)
 
         _DEBUG_BY_OUTCOME = {
             "auto_allowed": "   ✓ 自动放行",
