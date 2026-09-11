@@ -140,12 +140,16 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     约束，文件工具的描述在讲自己会怎么报错，谁都不会说"这件事该交给别人做"。
     它还有个能算账的理由：read_file / list_files 是 LOW，自动放行；shell 是 HIGH，
     每条都弹审批。用 shell 去读一个文件，等于白白打断用户一次。
+
+    那个枚举还得**跟着工具集走**：加了 grep 却不把"搜文本"加进去，模型就可能仍然
+    去起 Select-String —— 而那条路每次都要人工审批。
     """
     prompt = load_system_prompt()
 
     assert "需要审批的工具会被运行时拦下来问用户" in prompt       # 批准机制
     assert "文件工具只能访问工作区目录" in prompt                 # 权限范围（限定在文件工具）
     assert "不要用 shell 代替" in prompt                          # 工具之间的分工
+    assert "搜文本用专用工具" in prompt                           # 分工的枚举里不能漏掉后加的那类操作
     assert "改完文件后" in prompt                                 # 跨工具的收尾动作
 
 
