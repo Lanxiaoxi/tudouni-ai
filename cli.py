@@ -12,6 +12,7 @@ DEEPSEEK_API_KEY 时会先看到"新会话"再看到报错。现在子命令分�
 import argparse
 import sys
 
+from agent_runtime.agents import StepLimitExceeded
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
 from agent_runtime.state import JsonSessionStore, Session
@@ -199,6 +200,13 @@ def run_repl(agent, session: Session, session_id: str) -> None:
         print(f"\n--- 用户输入: {line} ---\n")
         try:
             print(agent.run(session, line))
+        except StepLimitExceeded as exc:
+            # 撞上限既不是失败也不是回答，所以两条路都不走：**不走 stdout**（否则
+            # `> 对话.txt` 会把它当成答案的一部分），也不结束会话。会话在撞上限那
+            # 一刻是一致的，所以接着聊就行 —— 这句"能接着跑"是它和下面两类失败
+            # 最大的区别。
+            print(f"\n[本轮未收尾 · 步数用尽] {exc}", file=sys.stderr)
+            print(f"  接着跑：--session {session_id}", file=sys.stderr)
         except ModelFatalError as exc:
             # 重试没有意义的那类失败（鉴权、模型名、请求格式）—— 告诉用户原因，
             # 但**不退出**：一个回合失败不等于整个会话结束。

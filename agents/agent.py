@@ -56,6 +56,30 @@ def _is_fatal(exc: BaseException) -> bool:
     return isinstance(exc, ModelFatalError)
 
 
+class StepLimitExceeded(RuntimeError):
+    """步数预算用尽：任务既没失败，也没收尾。
+
+    单独一个类型、而不是返回一句"超过最大步数"的文本，理由是返回值和真正的答案
+    在同一条出口上：cli.py 会把它 print 到 **stdout**，于是 `> 对话.txt` 拿到的东西
+    里混进一句"已停止"，而用户从输出里分不出"答完了"和"被砍断了"。
+
+    它也不该混进 ModelError：处置方式完全不同 —— 会话是完好的、之前的工作都还在，
+    用户接着跑就行，不需要重试、也不需要改配置。
+
+    抛之前 run_finished 和 checkpoint 都已经发生（见 run 末尾），所以日志里能看出
+    是哪一轮撞的墙，会话也能原样续上。消息里把"可以接着跑"说出来，是因为那是它和
+    其它失败最大的区别。
+    """
+
+    def __init__(self, step: int, tools: list[str] | None = None):
+        detail = f"，最后一步仍在调用 {', '.join(tools)}" if tools else ""
+        super().__init__(
+            f"已达最大步数 {step}，任务未收尾{detail}。会话是完好的，可以直接接着跑。"
+        )
+        self.step = step
+        self.tools = list(tools or ())
+
+
 class Agent:
     def __init__(
         self,
@@ -243,7 +267,7 @@ class Agent:
         """
         return {"role": "user", "content": f"剩余步数：{max_steps - step}（含本次）"}
 
-    def run(self, session: Session, user_input: str, max_steps: int = 20) -> str:
+    def run(self, session: Session, user_input: str, max_steps: int = 40) -> str:
         # messages 不再每次新建，而是复用传入会话里已有的那份 —— 它让两次 run()
         # 之间、乃至两个进程之间，对话得以延续。会话是参数而不是 Agent 的身份，
         # 所以同一个 Agent 可以服务多个会话。
@@ -260,6 +284,9 @@ class Agent:
 
         # 工具定义在一次 run 里不会变，所以取一次就够；下行 debug 也就顺手用同一份。
         tool_schemas = self.tools.schemas()
+
+        # 最后一步调了哪些工具 —— 撞上限时它进异常消息，是"卡在什么上面"唯一的线索。
+        last_tools: list[str] = []
 
         for step in range(max_steps):
             self._debug(
@@ -313,6 +340,8 @@ class Agent:
                 self._checkpoint(session)  # 完整：这条 assistant 消息没有任何 tool_call
                 return response.content or ""
 
+            last_tools = [call["name"] for call in response.tool_calls]
+
             for call in response.tool_calls:
                 self._debug(
                     f"   → 工具调用 {call['name']}"
@@ -340,10 +369,18 @@ class Agent:
             #   一个发不出去的历史。
             self._checkpoint(session)
 
+        # 步数用尽：任务既没失败、也没收尾，所以它既不是返回值（会被 print 进
+        # stdout，装成答案），也不是 ModelError（那意味着重试或改配置）。
+        #
+        # 顺序要紧 —— 审计和落盘必须在 raise 之前完成。否则日志里只剩一条悬空的
+        # run_started，事后分不清这一轮是"步数用尽"还是"进程被杀在半路"；而异常
+        # 消息里承诺的"会话是完好的"，也得先真的存下去才算数。
+        # 撞上限的位置在循环顶部，那里 messages 一致（上一步的结果全 append 完、
+        # ★ 也落过盘了），所以这个 raise 不损坏会话。
         self._debug(f"!! 达到最大步数 {max_steps}，停止")
         self._emit("run_finished", session, run_id, max_steps, stop_reason="max_steps")
         self._checkpoint(session)
-        return "任务超过最大执行步数，已停止。"
+        raise StepLimitExceeded(max_steps, last_tools)
 
     def _execute_tool(self, call: dict, session: Session, run_id: str, step: int) -> str:
         """执行一次工具调用并返回给模型的文本。
