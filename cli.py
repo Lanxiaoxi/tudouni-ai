@@ -125,6 +125,118 @@ def summarize(events: Iterable[dict]) -> Usage:
     )
 
 
+# --- 耗时汇总 -------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Timing:
+    """一段事件里的耗时合计，单位毫秒。
+
+    每一项都是**互不重叠**的一段，所以能直接相加、也能拿总时长减出"未归因"：
+    模型往返（每次尝试一条）、工具执行（不含等人审批）、等人审批、重试退避。
+    口径重叠过一次的教训写在这里 —— 工具耗时原本从函数入口起表，把等人审批也算了
+    进去，于是它几乎等于人的思考时间，而那两个数一相加还会重复。
+    """
+
+    run_ms: int          # 各回合墙上时间之和（run_finished.duration_ms）
+    model_ms: int
+    tool_ms: int
+    waited_ms: int
+    backoff_ms: int
+
+    @property
+    def explained_ms(self) -> int:
+        return self.model_ms + self.tool_ms + self.waited_ms + self.backoff_ms
+
+    @property
+    def unattributed_ms(self) -> int:
+        """总时长里**没被埋点**的那部分：会话落盘、事件写入、解析与策略判定……
+
+        下界取 0：毫秒取整、以及从别处复制来的日志都可能让它算成负数，而负数在这里
+        没有任何解释价值。但它不是"补零"—— 它就是剩下多少，所以宁可显式说出来，
+        也不要让那几个分项看起来像是全部。
+        """
+        return max(0, self.run_ms - self.explained_ms)
+
+
+def summarize_time(events: Iterable[dict]) -> Timing:
+    """把耗时从事件里数出来。
+
+    和 `summarize()` 完全同一个模式：**不另记一份计时状态** —— 另记就有了两份事实，
+    早晚不一致。所以这里读的也是审计事件，而 Agent 那边只负责把它们记准。
+    """
+    def total(kind: str, field: str) -> int:
+        return sum(e.get(field, 0) for e in events if e.get("kind") == kind)
+
+    return Timing(
+        run_ms=total("run_finished", "duration_ms"),
+        model_ms=total("model_call", "duration_ms"),
+        tool_ms=total("tool_result", "duration_ms"),
+        waited_ms=total("permission", "waited_ms"),
+        backoff_ms=total("model_call", "backoff_ms"),
+    )
+
+
+def _ms_text(ms: int) -> str:
+    """毫秒转成人看的字符串。
+
+    秒以下保留整数毫秒：工具耗时常常就是几十毫秒，写成 "0.0s" 等于没说。
+    分钟以上换成 min —— 一个会话聊到几十分钟时，"1800.0s" 需要读者自己换算。
+    """
+    if ms < 1000:
+        return f"{ms}ms"
+    if ms < 60_000:
+        return f"{ms / 1000:.1f}s"
+    return f"{ms / 60_000:.1f}min"
+
+
+def _print_timing(timing: Timing) -> None:
+    """耗时那一行。没有任何耗时数据（旧日志）时什么都不说 —— 硬凑一行 0ms 只是噪声。"""
+    if not (timing.model_ms or timing.tool_ms or timing.waited_ms):
+        return
+
+    parts = [
+        f"模型 {_ms_text(timing.model_ms)}",
+        f"工具 {_ms_text(timing.tool_ms)}",
+    ]
+    # 没发生过的事不占位置：没人被问过审批时，那一项只是 0ms 的噪声。
+    if timing.waited_ms:
+        parts.append(f"等人审批 {_ms_text(timing.waited_ms)}")
+    if timing.backoff_ms:
+        parts.append(f"重试退避 {_ms_text(timing.backoff_ms)}")
+    # 回合总时长只有在记过 run_finished.duration_ms 的日志里才有（旧日志没有），
+    # 所以这两项跟着它一起出现或一起消失。
+    if timing.run_ms:
+        parts.append(f"未归因 {_ms_text(timing.unattributed_ms)}")
+        parts.append(f"回合总 {_ms_text(timing.run_ms)}")
+
+    print("耗时  " + "  ".join(parts))
+
+
+def last_turn_ms(events: Iterable[dict]) -> int | None:
+    """最近一个回合的墙上时间（毫秒）；配不成对就返回 None。
+
+    **按 run_id 配对**，而不是直接取最后一条 run_finished：一次回合在收尾之前就崩了的
+    话（Ctrl+C、进程被杀），日志里最后那条 run_finished 属于**上一轮** —— 把它当"本轮"
+    报出来，是在报一个跟这次无关的数字，而它看起来完全合理。
+
+    取的是 run_finished 里那个 duration_ms（Agent 记的），**不在这里重新计时**：那样
+    就有两份事实，而且 REPL 报的会和 `--audit` 报的对不上。
+    """
+    events = list(events)
+    started = [e for e in events if e.get("kind") == "run_started"]
+    if not started:
+        return None
+
+    run_id = started[-1].get("run_id")
+    finished = [
+        e for e in events
+        if e.get("kind") == "run_finished" and e.get("run_id") == run_id
+    ]
+    if not finished:
+        return None
+    return finished[-1].get("duration_ms")
+
+
 # --- 不需要模型的子命令 ---------------------------------------------------
 
 def print_sessions(store: JsonSessionStore) -> None:
@@ -194,6 +306,7 @@ def _print_audit_summary(events: list[dict]) -> None:
           f"  输出 {usage.completion} token")
     print(f"工具调用 {len(results)} 次  " +
           "  ".join(f"{k}={v}" for k, v in sorted(by_status.items())))
+    _print_timing(summarize_time(events))
     stops = [e.get("stop_reason") for e in events if e["kind"] == "run_finished"]
     if stops:
         print(f"回合结束原因  " + "  ".join(stops))
@@ -224,22 +337,17 @@ def resolve_session(store: JsonSessionStore, session_id: str | None) -> tuple[st
     return session_id, Session.new(session_id)
 
 
-def _usage_note(sink: JsonlSink | None, session: Session) -> str:
-    """交互循环末尾那句统计里的用量部分。返回空串表示没什么可报的。
+def _usage_note(events: Iterable[dict]) -> str:
+    """末尾那句统计里的用量部分。返回空串表示没什么可报的。
 
-    数字来自**审计日志**，而不是另记一份计数：那样就有了两份事实，早晚不一致 ——
-    和 `summarize` 是同一个函数，所以这里报的和 `--audit` 里那份对得上。代价是
-    每轮重读一次这个会话的 .jsonl，一个回合几十行，可以忽略。
+    数字来自**审计事件**，而不是另记一份计数：那样就有了两份事实，早晚不一致 ——
+    和 `summarize` 是同一个函数，所以这里报的和 `--audit` 里那份对得上。
 
     刻意按**会话累计**，和它旁边那个 `step_count()` 一致。累计值才是真实花费：
     每一轮都要为整段历史重付一次输入，那是成本的主项。想知道刚结束那一轮花了多少，
-    现在的答案是 `--audit`（那里有逐次的 model_call），不在这一行里。
-
-    传进来的 sink 必须**就是** Agent 的 on_event —— 它读的就是那份日志。
+    看这句里的"本轮耗时"和 `--audit` 里逐次的 model_call。
     """
-    if sink is None:
-        return ""
-    usage = summarize(sink.read(session.session_id))
+    usage = summarize(events)
     if not usage.prompt:
         # 一次成功的模型调用都没有（比如第一轮就鉴权失败）。硬凑一句"命中率 —"
         # 只是噪声 —— 没东西可报的时候就别说。
@@ -248,6 +356,29 @@ def _usage_note(sink: JsonlSink | None, session: Session) -> str:
     # "总共多少"更值得看一眼。
     return (f"；累计输入 {usage.prompt} token"
             f"（命中缓存 {usage.cached}、命中率 {usage.hit_rate}）")
+
+
+def _turn_note(events: Iterable[dict]) -> str:
+    """末尾那句统计里的**本轮耗时**。
+
+    它旁边那几个数都是**会话累计**（消息数、步数、token），只有这个是刚结束的那一轮 ——
+    所以标签必须写明"本轮"。累计时间本来也没什么意义（没人关心这个会话一共聊了多久），
+    而累计 token 有意义，因为那是钱：两者不能混在一起说。
+    """
+    ms = last_turn_ms(events)
+    return "" if ms is None else f"；本轮 {_ms_text(ms)}"
+
+
+def _stats_note(sink: JsonlSink | None, session: Session) -> str:
+    """末尾那句统计里由审计日志数出来的部分：累计用量 + 本轮耗时。
+
+    **一次读取、两样统计共用同一批事件**，所以它们和 `--audit` 报的数字对得上。
+    传进来的 sink 必须**就是** Agent 的 on_event —— 它读的就是那份日志。
+    """
+    if sink is None:
+        return ""
+    events = list(sink.read(session.session_id))
+    return _usage_note(events) + _turn_note(events)
 
 
 def run_repl(agent, session: Session, session_id: str, sink: JsonlSink | None = None) -> None:
@@ -297,5 +428,5 @@ def run_repl(agent, session: Session, session_id: str, sink: JsonlSink | None = 
         # 同一条线。stdout 只留"用户问 + Agent 答"的对话正文，`> 对话.txt` 拿到的
         # 才真是能回头读的东西；token 数字混进那份文件，就是往答案里掺元数据。
         print(f"\n（会话 {session_id!r}：{len(session.messages)} 条消息、"
-              f"{session.step_count()} 步{_usage_note(sink, session)}。"
+              f"{session.step_count()} 步{_stats_note(sink, session)}。"
               f"退出后可用 --session {session_id} 继续。）\n", file=sys.stderr)
