@@ -160,6 +160,13 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     # 停下来问一次（而且提问换不来放行，见 tools/builtin.py 里那条注册说明）。
     assert "不要用 ask_user 去问能不能做" in prompt                 # 提问 ≠ 审批
     assert "不要拿提问省事" in prompt                               # 先自己查
+    # 任务列表那两条也只能住在这里：「标已完成的依据是工具结果」讲的是**列表和工具结果
+    # 之间**的关系（todo_write 的描述说得出"怎么维护列表"，说不出"凭什么算做完"）；
+    # 「不要念给用户听」讲的是**列表和最终输出之间**的关系。少了它们，列表会退化成
+    # 一份自我感觉良好的对勾清单 —— 而"不要用已完成掩盖未做到的事"正是同一个担心的
+    # 另一半。
+    assert "标「已完成」的依据是工具结果" in prompt
+    assert "不要念给用户听" in prompt
 
 
 # --- 提示词里的能力枚举 vs 注册表：两份事实必须对得上 ---------------------
@@ -187,7 +194,8 @@ _CAPABILITY_TOOLS = {
 #
 # ask_user 也在这里：它不碰工作区，所以"文件工具的三种能力"里没有它那一格；
 # 但提示词里确实有它的用法约束（见 test_prompt_carries_the_rules...）。
-_NON_FILE_TOOLS = {"get_current_time", "shell", "ask_user"}
+# todo_write 同理：它是进度，不是文件操作。
+_NON_FILE_TOOLS = {"get_current_time", "shell", "ask_user", "todo_write"}
 
 
 def registered_tools() -> set[str]:

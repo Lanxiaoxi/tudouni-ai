@@ -48,6 +48,7 @@ from agent_runtime.state import JsonSessionStore
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.ask import cli_questioner, unavailable_questioner
 from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.todo import TodoBoard, progress_line, todo_note
 
 SESSIONS_DIR = PROJECT_DIR / ".sessions"
 LOGS_DIR = PROJECT_DIR / ".logs"
@@ -71,6 +72,20 @@ def report_permissions(policy: PermissionPolicy, memory: ApprovalMemory) -> None
     # 印象里只批准过一次 git add，而它此后一直静默生效。
     rules = ", ".join(format_rule(rule) for rule in sorted(memory.prefixes())) or "（无）"
     print(f"[权限] 命令规则（按前缀放行）{rules}", file=sys.stderr)
+
+
+def report_todos(session) -> None:
+    """恢复会话时，把当前任务列表说一遍。
+
+    **它必须有，因为列表比进程活得久。** 任务列表存在会话文件里（`session.metadata`），
+    所以恢复一个会话时，提示词里没有它、而历史里那一版可能已经是几十步之前的 ——
+    不说的话，用户看到的会是"它怎么突然开始更新一个我从没见过的列表"。
+
+    和 `report_permissions` 同一类东西：关于这次运行的既有状态，走 stderr。
+    """
+    line = progress_line(session.metadata)
+    if line:
+        print(f"[任务] {line}", file=sys.stderr)
 
 
 def _check_session_id(session_id: str | None) -> str | None:
@@ -163,6 +178,9 @@ def main() -> int:
         # 而 --autopilot 说的正是这件事本身，所以它同时管住两者：提问那一支拿到的是
         # unavailable（如实说没有人回答，**不伪造答案、也不记成默许**）。
         questioner=unavailable_questioner if args.autopilot else cli_questioner,
+        # 任务列表是**按会话的状态**，所以它只能在这里造（会话上面刚解析出来），而且
+        # 拿到的是 session.metadata 这个活字典 —— 写进去的东西跟着会话一起落盘。
+        todos=TodoBoard(session.metadata),
     )
     print("已注册工具:")
     for tool in tools.all():
@@ -192,6 +210,7 @@ def main() -> int:
         label=PERMISSION_FILE_NAME,
     )
     report_permissions(policy, memory)
+    report_todos(session)
 
     # autopilot 要在启动时大声说一次：它意味着接下来所有需要审批的工具都会**直接执行**，
     # 而这件事一旦忘了自己开着，事后看日志只会觉得"这个项目怎么什么都没问"。
@@ -211,6 +230,9 @@ def main() -> int:
         memory=memory,
         on_checkpoint=store.save,
         on_event=logs,
+        # 任务列表每轮都要重新贴在请求末尾（当前状态，不是让模型去翻历史找最近那一版）。
+        # 注入的是一段"怎么说"的实现：Agent 自己不知道任务列表长什么样。
+        session_notes=todo_note,
         debug=args.debug,
         # autopilot 只管审批那一关：工作区边界、控制面写入、拒绝名单都在它管不着的地方，
         # 所以它不是"关掉权限"，只是"这一轮没人可问"。

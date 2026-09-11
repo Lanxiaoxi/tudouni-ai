@@ -18,6 +18,7 @@ from agent_runtime.agents import StepLimitExceeded
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
 from agent_runtime.state import JsonSessionStore, Session
+from agent_runtime.tools.todo import progress_line
 
 
 # --- 启动横幅 -------------------------------------------------------------
@@ -342,7 +343,11 @@ def print_sessions(store: JsonSessionStore) -> None:
     print(f"已保存 {len(ids)} 个会话（{store.directory}）：")
     for session_id in ids:
         session = store.load(session_id)
-        print(f"  {session_id:22} {len(session.messages):3} 条消息、{session.step_count()} 步")
+        # 任务列表跨进程活着（它存在会话文件里），所以"哪个会话还剩着活"是选会话时
+        # 真正想知道的那件事之一 —— 它和消息条数一样，都是读一眼会话文件就有的事实。
+        todo = progress_line(session.metadata)
+        print(f"  {session_id:22} {len(session.messages):3} 条消息、{session.step_count()} 步"
+              + (f"；任务 {todo}" if todo else ""))
 
 
 def print_history(session: Session) -> None:
@@ -523,6 +528,20 @@ def _stats_note(
     )
 
 
+def _report_todos(session: Session, prefix: str = "[任务] ") -> None:
+    """把当前任务列表打一行到 stderr；没有列表就什么都不说。
+
+    行式终端里没有"常驻面板"这回事，所以进度只能靠每轮重打一遍。这一行是给**人**看的
+    —— 模型每轮看到的是载荷尾部那一份完整列表（见 tools/todo.py），两者刻意不是同一份
+    文本：模型要"还剩什么、现在做哪条"，人只要一眼看出做到哪了。
+
+    走 stderr：和提示符、横幅、每轮末尾那句统计同一条线，stdout 只留对话正文。
+    """
+    line = progress_line(session.metadata)
+    if line:
+        print(f"{prefix}{line}", file=sys.stderr)
+
+
 def run_repl(
     agent,
     session: Session,
@@ -563,6 +582,10 @@ def run_repl(
             # 最大的区别。
             print(f"\n[本轮未收尾 · 步数用尽] {exc}", file=sys.stderr)
             print(f"  接着跑：--session {session_id}", file=sys.stderr)
+            # 撞上限时"还剩什么"是最该说的一句：任务列表本来就记着它，而这时候用户
+            # 手上唯一的问题正是"还差多少"。它跨进程活着，所以下一次接着跑时模型也
+            # 会在请求尾部看到同一份列表。
+            _report_todos(session, prefix="  未做完的：")
         except ModelFatalError as exc:
             # 重试没有意义的那类失败（鉴权、模型名、请求格式）—— 告诉用户原因，
             # 但**不退出**：一个回合失败不等于整个会话结束。
@@ -581,6 +604,7 @@ def run_repl(
         #
         # 步数用尽那条路仍然会说"接着跑：--session X"：那里的意思是"这一轮没走完"，
         # 和"你随时可以回来"是两件事，它每次也只在那一种情况下出现。
+        _report_todos(session)
         print(f"\n（会话 {session_id!r}：{len(session.messages)} 条消息、"
               f"{session.step_count()} 步{_stats_note(sink, session, context_tokens)}。）\n",
               file=sys.stderr)

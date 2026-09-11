@@ -35,15 +35,21 @@ class ToolArgs(BaseModel):
 
     @classmethod
     def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> dict[str, Any]:
-        """剥掉 schema 顶层的 description。
+        """剥掉 schema 里的 description。
 
         Pydantic 会把模型类的 docstring 自动写成 schema 的 description，于是这些
         面向开发者的内部注释会被原样发给模型（而且每次请求都发）。工具对模型的
         说明由 Tool.description 负责，所以这里统一剥掉，避免噪声和内部注释外泄。
         只删顶层；字段级的 description（来自 Field(description=...)）保留。
+
+        **$defs 里也要剥。** 嵌套的 args 模型（`list[TodoItem]` 那种）它的 docstring
+        同样会被写成 $defs 条目的 description —— 只剥顶层就等于给"内部注释外泄"留了
+        一个只有嵌套模型才走得到的后门，而它照样每次请求都发。
         """
         json_schema = handler(core_schema)
         json_schema.pop("description", None)
+        for definition in json_schema.get("$defs", {}).values():
+            definition.pop("description", None)
         return json_schema
 
 

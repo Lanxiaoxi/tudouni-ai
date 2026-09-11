@@ -36,6 +36,14 @@ Checkpoint = Callable[[Session], None]
 # 审计事件回调：Agent 报告「发生了什么」，注入的实现决定记到哪、什么格式。
 EventSink = Callable[[dict[str, Any]], None]
 
+# 会话状态提示：给它会话的 metadata，返回一段要拼进这次请求末尾的文本（None = 不拼）。
+#
+# 为什么参数是 metadata 而不是 Session 本体：需要这段文本的是**工具层**（任务列表是
+# todo_write 的状态），而 `tools` 不能 import `state` —— README 里那条依赖方向
+# （tools 无内部依赖）就是这么走的。会话里能被工具层看见的、又要跨回合留存的那一块
+# 正好就是 metadata，所以这个签名既是最小的，也没有把 Session 整体交出去。
+SessionNotes = Callable[[Mapping[str, Any]], str | None]
+
 # 计时的时钟。**注入而不是直接调 time.perf_counter**，理由和 retry.py 里 sleep 可注入
 # 一样：时间没法断言。测试里换成一个由假模型/假 handler 推进的假时钟，duration_ms 才能
 # 被钉成精确值；换成真实时钟，这类断言只能在 CI 上随机红。
@@ -152,6 +160,7 @@ class Agent:
         memory: ApprovalMemory | None = None,
         on_checkpoint: Checkpoint | None = None,
         on_event: EventSink | None = None,
+        session_notes: SessionNotes | None = None,
         debug: bool = False,
         clock: Clock = time.perf_counter,
         autopilot: bool = False,
@@ -182,6 +191,15 @@ class Agent:
         # 契约和上面两个完全一样 —— Agent 知道「发生了什么、什么时候发生」，
         # 注入的实现决定「记到哪、什么格式」。所以它也不该自己拼路径、开文件。
         self.on_event = on_event
+
+        # session_notes 可以为空：不传就是"没有任何需要每轮重新贴上去的会话状态"。
+        #
+        # 它是这个类的第五个注入点，但和 session_notes 打交道的**不是 Agent 自己**：
+        # 那些文本由工具层提供（任务列表长什么样是 tools/todo.py 的知识），Agent 只
+        # 负责在每次请求的末尾把当前状态重新贴一遍。判定留在内部、沟通交给注入的实现
+        # —— 和 asker / questioner 同一条原则，只不过这一份注入的是"怎么说"而不是
+        # "去问谁"。
+        self.session_notes = session_notes
 
         self.debug = debug
 
@@ -399,6 +417,25 @@ class Agent:
         """
         return {"role": "user", "content": f"剩余步数：{max_steps - step}（含本次）"}
 
+    def _status_note(
+        self, session: Session, max_steps: int, step: int
+    ) -> dict[str, str]:
+        """这次请求尾部那条临时消息：会话状态（注入的）+ 步数预算。
+
+        **合成一条，而不是各挂一条。** 载荷尾部因此仍然只有一条临时消息（第 1 步是
+        "用户消息 + 这一条"），形状和只有步数提示时一模一样 —— 连续三条 user 是没必要
+        去赌 provider 宽容度的形状，而这个项目的第 1 步本来就已经是两条 user 了。
+
+        整条都不进 session.messages，理由见 _budget_reminder。
+        """
+        parts: list[str] = []
+        if self.session_notes is not None:
+            note = self.session_notes(session.metadata)
+            if note:
+                parts.append(note)
+        parts.append(self._budget_reminder(max_steps, step)["content"])
+        return {"role": "user", "content": "\n\n".join(parts)}
+
     def run(self, session: Session, user_input: str, max_steps: int = 40) -> str:
         # 回合的起点：run_finished 里的 duration_ms 从这里算起。放在最前面（而不是从
         # 第一次模型请求算起）是因为"这一轮花了多久"要含上追加消息、落盘这些开销 ——
@@ -435,8 +472,8 @@ class Agent:
 
             response = self._complete_with_retry(
                 session, run_id, step + 1,
-                # 步数提示是按本次载荷临时拼的，不写回 messages —— 见 _budget_reminder
-                [*messages, self._budget_reminder(max_steps, step)],
+                # 载荷尾部那条临时提醒是按本次请求拼的，不写回 messages —— 见 _status_note
+                [*messages, self._status_note(session, max_steps, step)],
                 tool_schemas,
                 run_started,
             )

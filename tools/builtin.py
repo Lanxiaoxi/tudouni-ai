@@ -25,6 +25,7 @@ from .shell import (
     Shell,
     shell_name,
 )
+from .todo import TodoArgs, TodoBoard
 from .tool import RiskLevel, Tool, ToolArgs, ToolRegistry
 
 
@@ -113,16 +114,24 @@ class ShellArgs(ToolArgs):
 
 
 def create_tool_registry(
-    workspace: str, questioner: Questioner | None = None
+    workspace: str,
+    questioner: Questioner | None = None,
+    todos: TodoBoard | None = None,
 ) -> ToolRegistry:
     """把内置工具装成一个注册表。
 
     workspace 既是文件工具的沙箱根，也是唯一能拦住"往工作区外面写"的东西 ——
     所以传进来的应该是项目目录，而不是它的父目录。
 
-    questioner 是**唯一一个人机通道的注入点**（ask_user 用）；不传就是"没有人可问"
-    （见 tools/ask.py 的 unavailable_questioner）。默认值不能是"能问、问出来算同意" ——
-    那是最坏的 fail-open。
+    后两个参数是**两个协作方**，形状不同，各自成一条：
+
+      * `questioner` 是一份**能力**（怎么问人），替 ask_user 挡住"怎么问"这件事；
+        不传就是"没有人可问"（见 tools/ask.py 的 unavailable_questioner）。
+      * `todos` 是一块**会话作用域的状态**（任务列表写在哪），必须在会话定下来之后
+        才造得出来（见 tools/todo.py 的 TodoBoard）；不传就是一个没人看得见的列表。
+
+    两个默认值都不能往"看起来能用"的方向偏：一个默认成"能问、问出来算同意"，一个
+    默认成"写了但没人读"，都是那种事后完全查不出来的失败。
     """
     fs = FileSystem(workspace)
     shell = Shell(workspace)
@@ -259,6 +268,35 @@ def create_tool_registry(
         args_model=AskUserArgs,
         handler=AskUser(questioner),
         interactive=True,
+    ))
+
+    # 任务列表。三条决定：
+    #
+    # 1. **风险 LOW。** 它只改会话里属于它自己的那一小块，碰不到工作区、也碰不到控制面
+    #    —— 所以放行它不该问人（Claude Code 那套任务管理工具同样是"不触发权限确认"）。
+    # 2. **不能并行。** 它写的是会话 metadata 这块共享状态，一批里两条同时跑就是
+    #    经典 lost update，而且两边都会报成功（和 edit_file 不能并行是同一个理由）。
+    #    不声明 parallel_safe 就够了：那一条会让整批退回串行。
+    # 3. **描述里必须写清"什么时候不要建列表"。** 这是最容易变成仪式的工具 —— 单步的
+    #    琐碎活也建一张三级列表，除了烧 token 和让模型忙着更新状态之外没有任何作用。
+    #    和 ask_user 同理，规则写在这里而不是只写提示词：恢复的旧会话看不到新提示词，
+    #    但每一轮都看得见工具描述。
+    registry.register(Tool(
+        name="todo_write",
+        description=(
+            "把你当前的多步计划整份写下来，让它在后面几十步里不会走丢。"
+            "**只在活儿明显不止一两步、而且你能列出具体步骤时用** —— 单步的琐碎事不要"
+            "建列表，也不要为了好看而建。\n"
+            "每次都要传**完整的新列表**：它会替换上一次的整份列表，不是增量。"
+            "开工前把步骤列出来；开始做哪条就把它标成 in_progress（真的在并行时可以"
+            "同时标好几条）；做完一条立刻标 completed，不要攒着一起标。"
+            "只要还有没做完的，列表里就该有一条 in_progress。全部完成时传空数组把列表"
+            "清掉。\n"
+            "它是进度，不是任务本身：别把时间花在反复整理列表上。"
+        ),
+        risk=RiskLevel.LOW,
+        args_model=TodoArgs,
+        handler=TodoBoard() if todos is None else todos,
     ))
 
     return registry
