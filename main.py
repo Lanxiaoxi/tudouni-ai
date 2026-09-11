@@ -104,7 +104,9 @@ def main() -> int:
     )
     print(f"审计日志写到 {logs.directory}\\{session_id}.jsonl")
 
-    run_repl(agent, session, session_id)
+    # logs 同时交给 run_repl：末尾那句累计用量是从审计日志里数出来的，传的是
+    # **同一个** sink（也就是同一个 on_event）—— 换成别的东西就会报出另一套数字。
+    run_repl(agent, session, session_id, logs)
     return 0
 
 

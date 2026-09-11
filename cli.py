@@ -11,6 +11,8 @@ DEEPSEEK_API_KEY 时会先看到"新会话"再看到报错。现在子命令分�
 
 import argparse
 import sys
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from agent_runtime.agents import StepLimitExceeded
 from agent_runtime.audit import JsonlSink
@@ -72,6 +74,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# --- 用量汇总 -------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Usage:
+    """一段事件里模型调用的用量合计。
+
+    下面各项只累加**成功**的调用：重试里失败的尝试没有 usage 字段（agents/retry.py
+    里 error / fatal 两种尝试都不带 response），把它们计进去只会把命中率算低 ——
+    而"花了多少"是唯一要回答的问题。
+    """
+
+    calls: int          # 所有 model_call 事件（含重试里的失败尝试）
+    ok_calls: int       # 其中 status=ok 的（"成功了几次"）。网关不回 usage 的调用
+                        # 仍算成功、但对下面各项贡献 0 —— 它和"有账可算的次数"不是
+                        # 一回事，所以 hit_rate 的分母是 prompt，不是它。
+    prompt: int
+    cached: int
+    miss: int
+    completion: int
+
+    @property
+    def hit_rate(self) -> str:
+        """命中率的展示形式。
+
+        没有输入 token 时返回 "—" 而不是 "0%"：0% 会让人以为缓存白白配错了，
+        而事实是一次缓存查询都还没发生过。两者必须能分辨出来。
+        """
+        return f"{self.cached / self.prompt:.0%}" if self.prompt else "—"
+
+
+def summarize(events: Iterable[dict]) -> Usage:
+    """把 model_call 事件汇总成用量。
+
+    --audit 末尾那份汇总和交互循环末尾那句统计共用这一个函数 —— 两边回答的是
+    同一个问题（"这批事件花了多少"），算出两个不同的数字才是 bug。
+    """
+    # 用 .get 而不是下标：这个函数现在每轮都在交互循环的末尾跑，而 JsonlSink.read
+    # 只跳过解析失败的行、不保证每行都有 kind（日志会被复制、拼接、汇总）。少一个键
+    # 不该让一轮本来正常的会话崩在收尾那一行上。
+    calls = [e for e in events if e.get("kind") == "model_call"]
+    ok = [e for e in calls if e.get("status") == "ok"]
+    return Usage(
+        calls=len(calls),
+        ok_calls=len(ok),
+        prompt=sum(e.get("prompt_tokens", 0) for e in ok),
+        cached=sum(e.get("cached_tokens", 0) for e in ok),
+        miss=sum(e.get("miss_tokens", 0) for e in ok),
+        completion=sum(e.get("completion_tokens", 0) for e in ok),
+    )
+
+
 # --- 不需要模型的子命令 ---------------------------------------------------
 
 def print_sessions(store: JsonSessionStore) -> None:
@@ -127,12 +180,7 @@ def print_audit(sink: JsonlSink, session_id: str) -> None:
 
 
 def _print_audit_summary(events: list[dict]) -> None:
-    calls = [e for e in events if e["kind"] == "model_call"]
-    ok_calls = [e for e in calls if e.get("status") == "ok"]
-    prompt = sum(e.get("prompt_tokens", 0) for e in ok_calls)
-    cached = sum(e.get("cached_tokens", 0) for e in ok_calls)
-    miss = sum(e.get("miss_tokens", 0) for e in ok_calls)
-    completion = sum(e.get("completion_tokens", 0) for e in ok_calls)
+    usage = summarize(events)
 
     results = [e for e in events if e["kind"] == "tool_result"]
     by_status: dict[str, int] = {}
@@ -140,10 +188,10 @@ def _print_audit_summary(events: list[dict]) -> None:
         by_status[event.get("status", "?")] = by_status.get(event.get("status", "?"), 0) + 1
 
     print("-" * 78)
-    hit_rate = f"{cached / prompt:.0%}" if prompt else "—"
-    print(f"模型调用 {len(calls)} 次（{len(ok_calls)} 次成功）"
-          f"  输入 {prompt} token（命中缓存 {cached} / 未命中 {miss}，命中率 {hit_rate}）"
-          f"  输出 {completion} token")
+    print(f"模型调用 {usage.calls} 次（{usage.ok_calls} 次成功）"
+          f"  输入 {usage.prompt} token（命中缓存 {usage.cached} / 未命中 {usage.miss}，"
+          f"命中率 {usage.hit_rate}）"
+          f"  输出 {usage.completion} token")
     print(f"工具调用 {len(results)} 次  " +
           "  ".join(f"{k}={v}" for k, v in sorted(by_status.items())))
     stops = [e.get("stop_reason") for e in events if e["kind"] == "run_finished"]
@@ -176,12 +224,41 @@ def resolve_session(store: JsonSessionStore, session_id: str | None) -> tuple[st
     return session_id, Session.new(session_id)
 
 
-def run_repl(agent, session: Session, session_id: str) -> None:
+def _usage_note(sink: JsonlSink | None, session: Session) -> str:
+    """交互循环末尾那句统计里的用量部分。返回空串表示没什么可报的。
+
+    数字来自**审计日志**，而不是另记一份计数：那样就有了两份事实，早晚不一致 ——
+    和 `summarize` 是同一个函数，所以这里报的和 `--audit` 里那份对得上。代价是
+    每轮重读一次这个会话的 .jsonl，一个回合几十行，可以忽略。
+
+    刻意按**会话累计**，和它旁边那个 `step_count()` 一致。累计值才是真实花费：
+    每一轮都要为整段历史重付一次输入，那是成本的主项。想知道刚结束那一轮花了多少，
+    现在的答案是 `--audit`（那里有逐次的 model_call），不在这一行里。
+
+    传进来的 sink 必须**就是** Agent 的 on_event —— 它读的就是那份日志。
+    """
+    if sink is None:
+        return ""
+    usage = summarize(sink.read(session.session_id))
+    if not usage.prompt:
+        # 一次成功的模型调用都没有（比如第一轮就鉴权失败）。硬凑一句"命中率 —"
+        # 只是噪声 —— 没东西可报的时候就别说。
+        return ""
+    # 命中率单列：未命中缓存的输入是成本大头（贵约 50 倍），所以"命中多少"比
+    # "总共多少"更值得看一眼。
+    return (f"；累计输入 {usage.prompt} token"
+            f"（命中缓存 {usage.cached}、命中率 {usage.hit_rate}）")
+
+
+def run_repl(agent, session: Session, session_id: str, sink: JsonlSink | None = None) -> None:
     """多轮对话循环。
 
     这个 while 刻意留在 Agent 外面：Agent 的契约是"一个回合"，多轮循环属于驱动层，
     因为它的形态随环境而变（CLI 是循环、Web 是每请求一次、测试是遍历列表）。
     把循环塞进 Agent，它就得知道"从哪读用户输入"。
+
+    sink 只用来在每轮末尾报一次累计用量（见 `_usage_note`），默认不给就是不报 ——
+    它不影响对话本身，缺了也只是少一行统计。
     """
     print("输入内容回车发送。空行、exit、quit 或 Ctrl+C 退出。\n")
     while True:
@@ -216,5 +293,9 @@ def run_repl(agent, session: Session, session_id: str) -> None:
             # 所以可以直接再试一次，或者退出后用 --session 继续。
             print(f"\n[本轮失败 · 重试后仍失败] {exc}", file=sys.stderr)
 
+        # 这行是**统计**，不是对话，所以走 stderr —— 和提示符、横幅、步数用尽那句
+        # 同一条线。stdout 只留"用户问 + Agent 答"的对话正文，`> 对话.txt` 拿到的
+        # 才真是能回头读的东西；token 数字混进那份文件，就是往答案里掺元数据。
         print(f"\n（会话 {session_id!r}：{len(session.messages)} 条消息、"
-              f"{session.step_count()} 步。退出后可用 --session {session_id} 继续。）\n")
+              f"{session.step_count()} 步{_usage_note(sink, session)}。"
+              f"退出后可用 --session {session_id} 继续。）\n", file=sys.stderr)
