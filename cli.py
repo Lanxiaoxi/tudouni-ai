@@ -17,6 +17,41 @@ from agent_runtime.models.types import ModelFatalError, ModelTransientError
 from agent_runtime.state import JsonSessionStore, Session
 
 
+# --- 启动横幅 -------------------------------------------------------------
+
+# 纯 ASCII，一个非 ASCII 字符都没有 —— 这不是审美选择，是兼容性。Windows 控制台在
+# 中文区域设置下是 cp936，框线字符（─│╭╯）和 emoji 要么直接抛 UnicodeEncodeError、
+# 要么显示成乱码。一个把启动搞崩的装饰图案比没有图案糟糕得多，而且这类问题只在别人
+# 的机器上出现。
+#
+# 最宽 69 列，80 列的终端不会折行。折行的图案只是一堆乱字符，而且折在哪一列取决于
+# 终端宽度，没法预测。
+#
+# 每一行末尾都带 \n：相邻字符串字面量是直接相接的，少一个就是把两行粘成一行。
+BANNER = (
+    "   .-~~~-.      _____   _   _   ____     ___    _   _   _   _    ___\n"
+    "  /  ,-.  \\    |_   _| | | | | |  _ \\   / _ \\  | | | | | \\ | |  |_ _|\n"
+    " |  (   )  |     | |   | | | | | | | | | | | | | | | | |  \\| |   | |\n"
+    "  \\  `-'  /      | |   | |_| | | |_| | | |_| | | |_| | | |\\  |   | |\n"
+    "   `-----'       |_|    \\___/  |____/   \\___/   \\___/  |_| \\_|  |___|\n"
+    "               a g e n t   r u n t i m e"
+)
+
+
+def print_banner() -> None:
+    """在正式信息之前打一幅启动图案。
+
+    **走 stderr，不走 stdout。** README 承诺 `uv run main.py > 对话.txt` 拿到的是干净
+    的答案，而横幅是装饰 —— 跑进那个文件里就是污染。这也正是它不需要 --no-banner
+    开关的原因：管道的 stdout 本来就不受影响。
+
+    刻意不收 file 参数：收了，早晚会有一半调用点把装饰又写回 stdout。
+    """
+    print(file=sys.stderr)
+    print(BANNER, file=sys.stderr)
+    print(file=sys.stderr)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent Runtime 命令行入口")
     parser.add_argument(

@@ -26,6 +26,7 @@ from agent_runtime.audit import JsonlSink
 from agent_runtime.cli import (
     build_parser,
     print_audit,
+    print_banner,
     print_history,
     print_sessions,
     resolve_session,
@@ -70,6 +71,11 @@ def main() -> int:
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
+
+    # 横幅放在配置检查**之后**：密钥没配就退出的那种启动，不需要先看一幅图案。
+    # 它也不属于 --list / --history / --audit 那三条路径 —— 那些子命令特意排在配置
+    # 检查之前，为的是「没配密钥也能查历史」，跟"要开会话了"是两回事。
+    print_banner()
 
     session_id, session = resolve_session(store, args.session)
 
