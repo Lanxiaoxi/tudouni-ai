@@ -7,6 +7,7 @@
 四种放行/拒绝的来路刻意分开记（outcome），因为它们事后要回答的问题不同：
 
     auto_allowed    风险等级在名单里 —— 没问过任何人，也不需要问
+    autopilot       这一轮开着 --autopilot —— 没人可问，也不需要问
     rule_allowed    这个**工具**你以前按过 t —— 问过，但问的不是这一次
     command_allowed 这条**命令**命中了 .tudouni.json 里的前缀规则 —— 也没问这一次
     approved        这一次问了人，人批准了
@@ -52,6 +53,7 @@ def check_permission(
     asker: ApprovalAsker | None = None,
     memory: ApprovalMemory | None = None,
     clock: Callable[[], float] = time.perf_counter,
+    autopilot: bool = False,
 ) -> GateResult:
     """裁定一次工具调用能不能执行。
 
@@ -61,11 +63,11 @@ def check_permission(
     clock 是注入的，而且**上层传下来的是同一个时钟**：一次回合里 model_call /
     permission / tool_result 的耗时必须出自同一把尺子，否则把它们相加是在混用三种
     单位。顺带它也是 waited_ms 能被精确断言的前提（真实时钟只能断言"大于 0"）。
+
+    autopilot 表示这一轮没人可问（`--autopilot`）。它**只管审批**：拒绝名单、工作区
+    边界、控制面写入这些都不归它管 —— 那些是"不许做"，不是"要不要问"。
     """
     decision = policy.decide(tool, arguments)
-
-    if decision is Decision.ALLOW:
-        return GateResult(None, "auto_allowed", decision, None)
 
     if decision is Decision.DENY:
         return GateResult(
@@ -73,6 +75,19 @@ def check_permission(
             "不要重试同样的调用，请改用其它方式完成任务。",
             "policy_denied", decision, None,
         )
+
+    # autopilot 排在 ALLOW 和那两条规则检查**之前**，是为了让审计好回答一个问题：
+    # "这次会话到底有没有人看着？" 排后面的话，等级名单里的工具会记成 auto_allowed、
+    # 命中规则的会记成 command_allowed，两种来路都和"正常开着审批的会话"长得一样，
+    # 于是只能靠推理去猜。现在开着 autopilot 的会话里，每一条放行都写着 autopilot。
+    #
+    # 它也排在两个规则检查之前：autopilot 单独就足以解释"为什么没问"，而且比
+    # "命中了哪条规则"更要紧 —— 规则是长期策略，autopilot 是这一轮的状态。
+    if autopilot:
+        return GateResult(None, "autopilot", decision, None)
+
+    if decision is Decision.ALLOW:
+        return GateResult(None, "auto_allowed", decision, None)
 
     # 人在之前某次审批里按过 t（整个工具）。这一支排在 no_asker **之前**：规则已经把
     # 答案给了，没有询问方式不影响这个答案 —— 反过来会让"配了免问规则却因为缺 asker

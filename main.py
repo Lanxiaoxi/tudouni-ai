@@ -155,6 +155,13 @@ def main() -> int:
     )
     report_permissions(policy, memory)
 
+    # autopilot 要在启动时大声说一次：它意味着接下来所有需要审批的工具都会**直接执行**，
+    # 而这件事一旦忘了自己开着，事后看日志只会觉得"这个项目怎么什么都没问"。
+    # 它也不做成配置项 —— 一次性的决定不该悄悄变成永久默认。
+    if args.autopilot:
+        print("[权限] autopilot：不询问任何审批，需要审批的工具会直接执行"
+              "（拒绝名单、工作区边界、控制面写入仍然生效）", file=sys.stderr)
+
     # 四个注入点，同一个原则：判定留在 Agent 内部，执行交给注入的实现。
     agent = Agent(
         model, tools, policy,
@@ -163,6 +170,9 @@ def main() -> int:
         on_checkpoint=store.save,
         on_event=logs,
         debug=args.debug,
+        # autopilot 只管审批那一关：工作区边界、控制面写入、拒绝名单都在它管不着的地方，
+        # 所以它不是"关掉权限"，只是"这一轮没人可问"。
+        autopilot=args.autopilot,
     )
     print(f"审计日志写到 {logs.directory}\\{session_id}.jsonl")
 

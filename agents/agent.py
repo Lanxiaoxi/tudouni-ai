@@ -100,6 +100,7 @@ class Agent:
         on_event: EventSink | None = None,
         debug: bool = False,
         clock: Clock = time.perf_counter,
+        autopilot: bool = False,
     ):
         # 前三个是【能力】：每个应用构造一次，长期复用、可以跨会话共享。
         self.model = model
@@ -133,6 +134,11 @@ class Agent:
         # 时钟也是注入的：审计里的每个 duration_ms 都出自它，所以测试要能把它换成假的
         # （见上面 Clock 那段）。
         self.clock = clock
+
+        # autopilot：这一轮没有人在键盘前，所以一律不问。它**只管审批** —— 工作区边界、
+        # 控制面写入、拒绝名单都不归它管（那些是"不许做"，不是"要不要问"）。审计里每次
+        # 放行会记成 outcome=autopilot，好回答"这次会话到底有没有人看着"。
+        self.autopilot = autopilot
 
     def _emit(self, kind: str, session: Session, run_id: str, step: int, **data: Any) -> None:
         """报告一条审计事件。
@@ -524,10 +530,11 @@ class Agent:
         知道。无论放行还是拒绝都要发。
         """
         result = check_permission(tool, arguments, self.policy, self.asker, self.memory,
-                                  clock=self.clock)
+                                  clock=self.clock, autopilot=self.autopilot)
 
         _DEBUG_BY_OUTCOME = {
             "auto_allowed": "   ✓ 自动放行",
+            "autopilot": "   ✓ 自动放行（autopilot：这一轮没人在看）",
             "rule_allowed": "   ✓ 自动放行（你之前按过 t）",
             "command_allowed": "   ✓ 自动放行（命中命令规则）",
             "approved": "   ✓ 用户批准",

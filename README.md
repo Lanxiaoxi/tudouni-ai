@@ -51,6 +51,7 @@ uv run main.py --session demo           # 接着 demo 这个会话聊（不存�
 uv run main.py --list                   # 列出已保存的会话
 uv run main.py --session demo --history # 看对话历史（不调用模型）
 uv run main.py --session demo --audit   # 看审计轨迹：token、权限裁决、耗时（不调用模型）
+uv run main.py --autopilot              # 这次运行不询问任何审批（见「权限与审批」）
 uv run main.py --debug                  # 把中间过程打到 stderr
 ```
 
@@ -108,6 +109,21 @@ uv run main.py --debug                  # 把中间过程打到 stderr
   整个工具 —— 粒度差着量级，所以那一行必须看得清；解析不出前缀（命令里有重定向之类）
   时干脆不提供 `t`。其余工具记的是工具名。
 - 一条规则**只记工具名或命令前缀，从不记参数**：作用范围必须一眼看得懂。
+
+### `--autopilot`：这次运行没有人可问
+
+```powershell
+uv run main.py --autopilot     # 需要审批的工具直接执行，一次都不问
+```
+
+- **它只管审批那一关。** 拒绝名单（`deny_tools`）、工作区边界、控制面写入都照旧生效 ——
+  那些是"不许做"，不是"要不要问"。所以它不是"关掉权限"，而是"这一轮没人可问"。
+- **审计里每一次放行记成 `outcome=autopilot`**，不是 `approved`。用一行
+  `asker=lambda t, a: True` 也能让它跑起来，但那样每次都会记成"有人批准了" —— 事后就没法
+  回答"这次会话到底有没有人看着"，而那正是追责时要问的第一句话。
+- 启动时用一行 stderr 说清它开着。**刻意不做成配置项**：一次性的决定不该悄悄变成永久默认。
+- 代价说明白：它 + `shell` 工具 = **任意命令无人过问地执行**（那本来就是唯一打破工作区
+  边界的工具）。真要无人值守，正确的解法是操作系统级沙箱，而不是把审批摘掉。
 
 ### `.tudouni.json`（工作区根目录）
 

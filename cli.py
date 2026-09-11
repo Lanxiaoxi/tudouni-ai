@@ -70,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="打印 --session 指定会话的审计轨迹（token、权限裁决、耗时），不调用模型",
     )
     parser.add_argument("--list", action="store_true", help="列出已保存的会话")
+    parser.add_argument(
+        "--autopilot", action="store_true",
+        help="不询问任何审批：需要审批的工具直接执行。拒绝名单、工作区边界、控制面写入"
+             "仍然生效；审计里每次放行记为 outcome=autopilot",
+    )
     parser.add_argument("--debug", action="store_true", help="把中间过程打到 stderr")
     return parser
 
