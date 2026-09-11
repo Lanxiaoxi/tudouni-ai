@@ -20,9 +20,15 @@ from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.state import session as session_module
 from agent_runtime.state.session import SYSTEM_PROMPT_PATH, load_system_prompt
+from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.tool import RiskLevel
 
 from fakes import ScriptedModel, tool_call, usage
+
+
+# 提示词与工具描述之间，连续重合多少个字才算「抄过去了」。
+# 中文里十几个字连着一模一样，不可能是巧合 —— 正常的措辞碰撞到不了这个长度。
+MIN_SHARED_PHRASE = 12
 
 
 def system_content(session: Session) -> str:
@@ -80,6 +86,56 @@ def test_editing_the_prompt_file_does_not_touch_already_saved_sessions(workdir, 
 
     assert system_content(Session.new("fresh")).startswith("全新的提示词")
     assert system_content(store.load("old")) == saved
+
+
+def overlapping_phrases(text: str, other: str, n: int = MIN_SHARED_PHRASE) -> list[str]:
+    """找出 text 与 other 之间所有长度为 n 的字面重合片段。"""
+    return [
+        other[start:start + n]
+        for start in range(max(len(other) - n + 1, 0))
+        if other[start:start + n] in text
+    ]
+
+
+def test_overlap_checker_rejects_a_pasted_phrase():
+    """先证明检查器本身有效 —— 否则下面那条可能是在跑一个永远为真的断言。"""
+    pasted = "整个文件会被替换，不是追加"
+    assert overlapping_phrases(pasted, pasted)
+    assert overlapping_phrases("完全无关的一句话", pasted) == []
+
+
+def test_prompt_does_not_restate_tool_descriptions():
+    """提示词里不许复述工具自己的行为 —— 同一份事实只写一遍。
+
+    这两处是最容易走岔的一对：工具行为改了、描述跟着改，提示词里那句旧话还留着，
+    于是模型在同一个请求里同时收到两份互相矛盾的说法。这里按「长片段的字面重合」
+    判 —— 十几个字连着一模一样，只可能是拷贝过去的。
+
+    删掉重复**不等于删掉信息**：工具描述在请求的 tools 数组里，提示词在 system
+    消息里，两者每次都一起发出去。事实只换了个位置，而且换到了模型决定要不要调这
+    个工具时更近的地方。
+    """
+    prompt = load_system_prompt()
+    violations = [
+        f"  {tool.name}: {phrase!r}"
+        for tool in create_tool_registry(".").all()
+        for phrase in overlapping_phrases(prompt, tool.description)
+    ]
+
+    assert not violations, "提示词复述了工具描述：\n" + "\n".join(violations)
+
+
+def test_prompt_carries_the_rules_no_tool_description_can_carry():
+    """有些事只能写在提示词里，因为没有别的地方会告诉模型。
+
+    权限审批就是标准例子：risk 等级**故意不进 schema**（有测试盯着），所以「需要
+    审批的工具会被拦下来问用户」是模型唯一能得知批准机制的途径。
+    """
+    prompt = load_system_prompt()
+
+    assert "需要审批的工具会被运行时拦下来问用户" in prompt       # 批准机制
+    assert "你只能访问工作区目录" in prompt                       # 权限范围
+    assert "改完文件后" in prompt                                 # 跨工具的收尾动作
 
 
 def test_missing_prompt_file_gives_an_actionable_error(workdir):

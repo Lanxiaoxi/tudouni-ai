@@ -69,7 +69,6 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
         description=(
             "读取指定文件的全部内容（按 UTF-8 解码，不分页）。"
             "文件不存在、路径指向目录、或超出工作区都会报错。"
-            "同一个文件在一次任务里不要读第二遍。"
         ),
         risk=RiskLevel.LOW,
         args_model=ReadFileArgs,
