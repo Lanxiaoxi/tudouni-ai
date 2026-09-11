@@ -45,6 +45,30 @@ class WriteFileArgs(ToolArgs):
     content: str = Field(description="文件内容")
 
 
+class EditFileArgs(ToolArgs):
+    """edit_file 的参数。
+
+    `old_string` 用 min_length=1：空串的 `str.count` 语义是"每个字符间隙都算一次"，
+    放过去会替换出一堆意料之外的东西。真正"找不到/不唯一"的判断在 handler 里 ——
+    那些只有读到文件正文之后才知道。
+
+    `replace_all` 带默认值 False：唯一匹配是**绝大多数**调用，而默认 False 意味着
+    模型必须显式说"我就是要全改"，才可能误伤多处命中。
+    """
+
+    path: str = Field(min_length=1, description="要修改的文件路径")
+    old_string: str = Field(
+        min_length=1,
+        description="要被替换掉的原文片段，必须和文件里的内容逐字符一致（含缩进和换行）",
+    )
+    new_string: str = Field(description="替换成的新内容；传空串表示删除这段")
+    replace_all: bool = Field(
+        default=False,
+        description="old_string 在文件里出现多次时：true 表示全部替换，false（默认）"
+                    "会拒绝执行并要求把 old_string 改得更长、更唯一",
+    )
+
+
 class ListFilesArgs(ToolArgs):
     """list_files 的参数。
 
@@ -153,10 +177,35 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
             "把内容写入指定文件。整个文件会被替换 —— 不是追加，也不是局部修改；"
             "缺失的父目录会自动创建。所以要改动一个已存在的文件，必须先 read_file "
             "读出原文，再基于真实内容写出完整的新文本：凭记忆或凭猜测写会丢数据。"
+            "只改其中一小段（尤其是文件很长时）应该用 edit_file，不必把整篇正文背出来写回去。"
         ),
         risk=RiskLevel.MEDIUM,
         args_model=WriteFileArgs,
         handler=fs.write_file,
+    ))
+
+    # 风险定 MEDIUM，和 write_file 同档：它就是"改文件"，只是改动范围更小。
+    # 不能因为"改得少"就降成 LOW —— 它照样能改工作区里任何一个文件（控制面除外），
+    # 而 LOW 是自动放行的。比 write_file 更安全的只是它的**形态**（只动一小段、
+    # 匹配不唯一就拒绝），不是它的**权限**。
+    #
+    # 它和 write_file 的分工必须写在描述里，因为**模型才是那个要做选择的人**：
+    # 它得知道"改一小段"该用 edit_file（只规定哪里变），而不是回退到整文件覆盖
+    # （要为没动过的部分也负责）—— 后者正是丢数据的来路。
+    registry.register(Tool(
+        name="edit_file",
+        description=(
+            "把文件里的一段原文替换成新内容，是修改已有文件的首选方式 —— "
+            "文件其余部分不经你的手，所以不会因为把没动过的内容背错而丢数据。\n"
+            "old_string 必须和文件里的原文**逐字符一致**（含缩进和换行），因此通常"
+            "要先 read_file 看清原文；凭记忆拼出来的片段会在匹配失败时被打回。\n"
+            "old_string 在文件里出现多次时，默认拒绝执行并要你把它改得唯一，"
+            "除非显式设 replace_all=true。文件不存在、或不是 UTF-8 文本，都改不了"
+            "（新建文件用 write_file）。"
+        ),
+        risk=RiskLevel.MEDIUM,
+        args_model=EditFileArgs,
+        handler=fs.edit_file,
     ))
 
     registry.register(Tool(

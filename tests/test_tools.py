@@ -120,13 +120,64 @@ def test_tool_descriptions_are_not_bare_labels():
         assert len(tool.description) >= 15, f"{tool.name} 的描述太短，等于没写"
 
 
-def test_write_file_description_warns_that_it_overwrites():
-    """没有 edit 工具，只有整文件覆盖的 write_file —— 这条警告是防丢数据的。
+def test_write_file_description_points_at_edit_file():
+    """整文件覆盖是防丢数据的那条警告必须留着 —— write_file 依然是它。
 
-    真正的解法是加一个 edit 工具；在那之前，这句话必须留在模型看得见的地方。
+    有了 edit_file 之后，危险换了个形态：模型可能仍然"为了改一行而写回整篇"。
+    所以描述里既要留着"整个文件会被替换"这句实话，也要说清改一小段该走哪条路。
     """
     registry = create_tool_registry(".")
-    assert "整个文件会被替换" in registry.get("write_file").description
+    description = registry.get("write_file").description
+
+    assert "整个文件会被替换" in description
+    assert "edit_file" in description
+
+
+def test_edit_file_risk_is_medium_not_low():
+    """edit_file 也是"改文件"，和 write_file 同档。
+
+    "改得少"是它更安全的**形态**，不是更低的**权限** —— 它照样能改工作区里任何
+    一个文件（控制面除外），而 LOW 是自动放行的。降档就等于给整文件覆盖开了一道
+    绕过审批的后门。
+    """
+    registry = create_tool_registry(".")
+    assert registry.get("edit_file").risk is RiskLevel.MEDIUM
+
+
+def test_edit_file_description_tells_the_model_when_to_use_it():
+    """模型是那个要选工具的人：描述得说清"改一小段用我、新建用 write_file"。"""
+    registry = create_tool_registry(".")
+    description = registry.get("edit_file").description
+
+    assert "write_file" in description   # 新建文件该去哪
+    assert "read_file" in description    # 逐字符一致要求它先读原文
+    assert "replace_all" in description  # 多处命中时的出口
+
+
+def test_edit_file_arguments_actually_reach_the_handler(workdir):
+    """注册表到 handler 之间那条缝：字段名没人钉住。
+
+    这里有**两份**独立的事实 —— EditFileArgs 的字段名，和 FileSystem.edit_file 的
+    参数名 —— 而它们只在 Tool.execute 里相遇。名字一漂移（replace_all 改名、
+    new_string 写成 new_text），真实会话里会抛 TypeError 变成"工具执行失败"，而
+    test_edit_file.py（测 handler）和上面几条（测注册表元数据）都还是绿的。
+
+    顺带把 replace_all 的缺省值也钉住：两处命中而没给这个参数时，它必须真的到了
+    handler 并且是 False（而不是 None 或者压根没传）。
+    """
+    (workdir / "a.txt").write_text("x\nx\n", encoding="utf-8")
+    registry = create_tool_registry(str(workdir))
+    edit_file = registry.get("edit_file")
+
+    refused = edit_file.execute({"path": "a.txt", "old_string": "x", "new_string": "y"})
+
+    assert "replace_all" in refused                      # 缺省 False → 拒绝改
+    assert (workdir / "a.txt").read_text(encoding="utf-8") == "x\nx\n"
+
+    assert "已替换" in edit_file.execute(
+        {"path": "a.txt", "old_string": "x", "new_string": "y", "replace_all": True}
+    )
+    assert (workdir / "a.txt").read_text(encoding="utf-8") == "y\ny\n"
 
 
 def test_registry_rejects_duplicate_names():

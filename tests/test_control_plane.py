@@ -6,6 +6,9 @@
 
 所以这里的断言都盯在**文件有没有真的被建出来**，而不是只看抛没抛异常：一个"先写入
 再报错"的实现也能让异常看起来正确。
+
+edit_file 走的是同一条 writable_path，所以这里也把它钉住一遍 —— 加一个能写文件的
+工具，最容易漏的就是控制面那条检查（write_file 挡住 ≠ edit_file 也挡住了）。
 """
 
 import pytest
@@ -64,6 +67,34 @@ def test_escaping_the_workspace_is_still_refused(fs):
     """原有的那条边界不能被这次改动弄松。"""
     with pytest.raises(PermissionError, match="escapes workspace"):
         fs.write_file("../evil.txt", "x")
+
+
+# --- edit_file 走的是同一条检查 ------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    ".tudouni.json",
+    ".sessions/20250101-000000.json",
+    ".logs/20250101-000000.jsonl",
+])
+def test_edit_file_also_refuses_the_control_plane(fs, workdir, path):
+    """edit_file 是另一个能改文件的工具，控制面必须同样挡住它。
+
+    这里让文件先**真的存在**（否则 edit 会先在"文件不存在"那一支返回 —— 那也能
+    "没改成"，但测的就不是控制面那条检查了）。
+    """
+    target = workdir / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("原始内容", encoding="utf-8")
+
+    with pytest.raises(PermissionError, match="control plane"):
+        fs.edit_file(path, "原始内容", "被改掉了")
+
+    assert target.read_text(encoding="utf-8") == "原始内容"
+
+
+def test_edit_file_still_refuses_escaping_the_workspace(fs):
+    with pytest.raises(PermissionError, match="escapes workspace"):
+        fs.edit_file("../evil.txt", "a", "b")
 
 
 # --- 放行 ---------------------------------------------------------------
