@@ -427,6 +427,11 @@ def run_repl(agent, session: Session, session_id: str, sink: JsonlSink | None = 
         # 这行是**统计**，不是对话，所以走 stderr —— 和提示符、横幅、步数用尽那句
         # 同一条线。stdout 只留"用户问 + Agent 答"的对话正文，`> 对话.txt` 拿到的
         # 才真是能回头读的东西；token 数字混进那份文件，就是往答案里掺元数据。
+        # 这一行只说"刚才发生了什么"：会话 id、规模、累计用量、本轮耗时。**不再复述怎么
+        # 续聊** —— 新会话在启动时已经说过一次（resolve_session 里那句"想回来继续它"），
+        # 恢复会话时启动那行也带着 id，每轮再刷一遍只是把同一句话说三十遍。
+        #
+        # 步数用尽那条路仍然会说"接着跑：--session X"：那里的意思是"这一轮没走完"，
+        # 和"你随时可以回来"是两件事，它每次也只在那一种情况下出现。
         print(f"\n（会话 {session_id!r}：{len(session.messages)} 条消息、"
-              f"{session.step_count()} 步{_stats_note(sink, session)}。"
-              f"退出后可用 --session {session_id} 继续。）\n", file=sys.stderr)
+              f"{session.step_count()} 步{_stats_note(sink, session)}。）\n", file=sys.stderr)
