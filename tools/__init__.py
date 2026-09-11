@@ -1,7 +1,6 @@
 from .builtin import (
     EditFileArgs,
     GetCurrentTimeArgs,
-    GrepArgs,
     ListFilesArgs,
     ReadFileArgs,
     ShellArgs,
@@ -13,7 +12,6 @@ from .tool import RiskLevel, Tool, ToolArgs, ToolRegistry
 __all__ = [
     "EditFileArgs",
     "GetCurrentTimeArgs",
-    "GrepArgs",
     "ListFilesArgs",
     "ReadFileArgs",
     "RiskLevel",

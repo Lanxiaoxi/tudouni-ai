@@ -1,30 +1,22 @@
-"""grep 工具。
+"""grep 工具的实现。
 
-它和 shell 是同一个能力的两种走法，所以这组测试盯的第一件事是**分工**：
-grep 走的是 FileSystem.safe_path 那条边界（只在工作区内），因此它是 LOW 风险、
-默认自动放行；而"搜文本"这件事交给 shell 做就要每次人工审批。这条分工一旦退化
-（比如 grep 不小心能搜到工作区外面），自动放行就变成了一个洞。
+**它已经取消注册**：不再出现在 create_tool_registry 里，模型看不到它、也不会被
+调用。这里保留的是 tools/grep.py 本身的实现测试 —— 那艘船还在，只是没挂在这条
+装配线上。
 
-其余几条盯的是"结果能不能被模型用起来"：行号要对、没匹配到要说清楚、正则写错要
-指出是正则的错、超长输出要截断但保留头尾、二进制/超大文件要跳过。
+实现层的契约没变：路径走 FileSystem.safe_path（只在工作区内）；结果里的路径要能
+直接喂给 read_file；行号要对、没匹配到要说清楚、正则写错要指出是正则的错、超长
+输出要截断但保留头尾、二进制/超大文件要跳过。
 """
 
 import pytest
 
-from agent_runtime.tools.builtin import GrepArgs, create_tool_registry
+from agent_runtime.tools.filesystem import FileSystem
 from agent_runtime.tools.grep import (
     MAX_LINE_CHARS,
-    MAX_MAX_FILES,
     _truncate,
     grep,
 )
-from agent_runtime.tools.tool import RiskLevel
-
-from fakes import ScriptedModel, tool_call, usage
-from agent_runtime.agents import Agent
-from agent_runtime.models.types import ModelResponse
-from agent_runtime.security import Decision, PermissionPolicy
-from agent_runtime.state import Session
 
 
 @pytest.fixture
@@ -79,17 +71,16 @@ def test_reported_paths_are_usable_by_read_file(tree):
     "builtin.py"，而 read_file("builtin.py") 直接 FileNotFoundError —— 模型会以为
     文件不存在，而不是以为路径错了。
     """
-    registry = create_tool_registry(str(tree))
-    result = registry.get("grep").execute({"pattern": "TODO", "path": "pkg"})
+    result = grep(str(tree), "TODO", path="pkg")
 
     assert result.splitlines()[0].split(" (")[0] == "pkg/b.py"
-    registry.get("read_file").execute({"path": "pkg/b.py"})   # 不抛，就证明这个路径是真的
+    FileSystem(str(tree)).read_file("pkg/b.py")   # 不抛，就证明这个路径是真的
 
 
 # --- 边界：不越界、不抛异常 --------------------------------------------
 
 def test_escaping_the_workspace_is_blocked(tree):
-    """工作区边界 —— 这条是 grep 能定 LOW 风险、自动放行的前提。"""
+    """工作区边界 —— 这条是它敢只读、不越界的根据。"""
     with pytest.raises(PermissionError):
         grep(str(tree), "TODO", path="../..")
 
@@ -117,7 +108,7 @@ def test_no_match_is_a_clear_message(tree):
 
 
 def test_invalid_regex_blames_the_regex(tree):
-    """正则语法错是**模型自己**写错了，得让它知道改的是 pattern，不是 path。"""
+    """正则语法错是**调用方自己**写错了，得让它知道改的是 pattern，不是 path。"""
     result = grep(str(tree), "a(")
 
     assert "正则表达式无效" in result
@@ -237,54 +228,3 @@ def test_binary_and_oversized_files_are_skipped_and_counted(workdir):
 
     assert "one.py" in result
     assert "blob.bin" not in result
-
-
-# --- 装配层 -------------------------------------------------------------
-
-def test_grep_is_low_risk_and_auto_approved():
-    """它走的是文件沙箱那条路，所以能进 auto_approve —— 这正是它存在的理由。"""
-    tool = create_tool_registry(".").get("grep")
-
-    assert tool.risk is RiskLevel.LOW
-    assert PermissionPolicy({RiskLevel.LOW}).decide(tool, {"pattern": "x"}) is Decision.ALLOW
-
-
-def test_schema_shows_pattern_required_and_bounds():
-    params = create_tool_registry(".").get("grep").parameters
-
-    assert params["required"] == ["pattern"]
-    assert params["properties"]["max_files"]["minimum"] == 1
-    assert params["properties"]["max_files"]["maximum"] == MAX_MAX_FILES
-    assert params["properties"]["path"]["default"] == "."
-
-
-def test_extra_arguments_are_rejected():
-    with pytest.raises(Exception) as exc:
-        create_tool_registry(".").get("grep").execute({"pattern": "x", "bogus": 1})
-    assert "bogus" in str(exc.value)
-
-
-def test_max_files_out_of_range_is_rejected():
-    with pytest.raises(Exception):
-        GrepArgs(pattern="x", max_files=0)
-    with pytest.raises(Exception):
-        GrepArgs(pattern="x", max_files=MAX_MAX_FILES + 1)
-
-
-def test_agent_can_use_grep_without_approval(workdir):
-    """端到端：默认策略下 grep 被自动放行，模型能拿到真实命中。"""
-    (workdir / "app.py").write_text("def main():\n    pass\n", encoding="utf-8")
-    model = ScriptedModel([
-        ModelResponse(content=None,
-                      tool_calls=[tool_call("grep", {"pattern": "def main"})],
-                      usage=usage()),
-        ModelResponse(content="找到 main", usage=usage()),
-    ])
-    agent = Agent(model, create_tool_registry(str(workdir)),
-                  PermissionPolicy({RiskLevel.LOW}), asker=lambda t, a: False)
-    session = Session.new("s")
-    agent.run(session, "找 main")
-
-    tool_result = [m for m in session.messages if m["role"] == "tool"][-1]["content"]
-    assert "app.py" in tool_result
-    assert "def main():" in tool_result

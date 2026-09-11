@@ -16,11 +16,6 @@ from pydantic import Field
 
 from .clock import get_current_time
 from .filesystem import FileSystem
-from .grep import (
-    MAX_FILES as GREP_MAX_FILES,
-    MAX_MAX_FILES as GREP_MAX_MAX_FILES,
-    grep,
-)
 from .shell import (
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_SECONDS,
@@ -79,39 +74,6 @@ class ListFilesArgs(ToolArgs):
         default=".",
         min_length=1,
         description="目录路径（相对于工作区），默认为工作区根目录",
-    )
-
-
-class GrepArgs(ToolArgs):
-    """grep 的参数。
-
-    `path` / `include` / `ignore_case` / `max_files` 都带默认值，所以最常见的那种
-    调用（"全项目搜一个词"）只需要 `pattern` 一个字段 —— schema 里必填的也只有它。
-
-    `max_files` 的上下界写成 ge/le，理由和 shell 的 timeout_seconds 一模一样：范围
-    必须和 schema 同源，模型才可能**提前**看到「最多 100 个文件」，而不是事后收到一个
-    被悄悄改过的值 —— 而且工具调用每次都要过人工审批，撞一次参数错误就得再问一次人。
-    """
-
-    pattern: str = Field(
-        min_length=1,
-        description="要搜的正则表达式（Python re 语法），逐行匹配",
-    )
-    path: str = Field(
-        default=".",
-        min_length=1,
-        description="从哪个目录开始递归搜（相对于工作区），默认为工作区根目录",
-    )
-    include: str | None = Field(
-        default=None,
-        description="只搜文件名匹配这个 glob 的文件（如 '*.py'）。不填则搜目录下所有文件",
-    )
-    ignore_case: bool = Field(default=False, description="是否忽略大小写")
-    max_files: int = Field(
-        default=GREP_MAX_FILES,
-        ge=1,
-        le=GREP_MAX_MAX_FILES,
-        description="最多列出多少个有命中的文件。命中很多时用它只拿一部分结果",
     )
 
 
@@ -217,30 +179,6 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
         risk=RiskLevel.LOW,
         args_model=ListFilesArgs,
         handler=fs.list_files,
-    ))
-
-    # 风险定 LOW：它和 read_file / list_files 走的是同一条边界（safe_path），只读、
-    # 不写、不越界，放行不需要问人。
-    #
-    # 和 shell 的分工必须写在描述里，因为**模型才是那个要做选择的人**：它得知道
-    # "搜文本"该用这个工具（自动放行），而不是起一条 Select-String / grep -r 命令
-    # （那条 HIGH 风险，每次都得让人批准）。上限数字从 grep.py 的常量插值来，不手抄
-    # 第二份 —— 和 tool.py 里「schema 由 args_model 推导」是同一条原则。逐参数的约束
-    # （default/minimum/maximum）不复述在这里，那是它们各自 schema 的事。
-    registry.register(Tool(
-        name="grep",
-        description=(
-            "在工作区里按正则（Python re 语法）逐行搜文本，结果按文件分组："
-            "每组第一行是 相对工作区的路径（命中数），往下每行是 行号:该行内容。"
-            "那个路径可以原样交给 read_file 去读原文件。"
-            f"只读、不越出工作区；比在 shell 里跑 Select-String / grep -r 省事，后者每次都要人工审批。"
-            f"一次最多列出 {GREP_MAX_FILES} 个有命中的文件（可用 max_files 调，上限 {GREP_MAX_MAX_FILES}），"
-            f"单个文件命中过多时只列前一部分并标注。"
-            f"它只回答'哪儿有'，不返回整段正文。"
-        ),
-        risk=RiskLevel.LOW,
-        args_model=GrepArgs,
-        handler=lambda **kwargs: grep(workspace, **kwargs),
     ))
 
     # 风险定 LOW：它只读时钟、没有副作用、不碰工作区，放行不需要问人 ——
