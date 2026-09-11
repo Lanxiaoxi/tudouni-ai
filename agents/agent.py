@@ -4,7 +4,7 @@ import time
 import traceback
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -19,7 +19,7 @@ from agent_runtime.security.gate import check_permission
 from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.security.policy import PermissionPolicy
 from agent_runtime.state import Session
-from agent_runtime.tools.tool import Tool, ToolRegistry
+from agent_runtime.tools.tool import Tool, ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
     from agent_runtime.models.types import ModelResponse
@@ -90,6 +90,17 @@ class _Outcome:
     # 它不在工作线程里直接打印，是因为 traceback.print_exc() 是一行一次写 —— 两个
     # 线程同时打会交错成一段读不懂的东西。带回主线程由 _report_tool_bug 打。
     traceback: str | None = None
+    # 工具自己带回来的审计字段（`ToolResult.audit`）。**排在最后**：前四个字段有位置
+    # 参数的调用点（`_prepare` / `_run` 里那几个 _Outcome(...)），插在中间会静默地把
+    # traceback 挪到 audit 上去。
+    #
+    # 为什么要留这么一条通道：ask_user 的 duration_ms **含等人的时间**（它就阻塞在
+    # 人的输入上），而 cli 那边要把那一段减出来单列成"等人回答" —— 否则"我看了 30 秒
+    # 才回答"会显示成"这个工具花了 30 秒"。审批没有这个问题，因为裁决和计时都在
+    # `_prepare` 里、本来就单独计时；提问发生在 handler 里，只有工具自己知道等了多久。
+    #
+    # 它**不是**给模型的：回灌进对话历史的只有 text，答案正文也在那里，不记第二遍。
+    audit: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,6 +580,9 @@ class Agent:
             status=outcome.status,      # ok / denied / invalid_args / error
             chars=len(outcome.text),    # 只记长度，不记全文 —— 全文已经在会话文件里了
             duration_ms=outcome.duration_ms,
+            # 工具自己知道、而这一层推不出来的字段（ask_user 的 question_status /
+            # human_wait_ms）。键名由工具负责不撞上面那几个 —— 它们已经在这里了。
+            **outcome.audit,
             # 只有真并发了才写这个键：没有它，事后从日志里分不出这一批是并发还是逐条，
             # 而"这一批为什么快/慢"正是拿着日志要回答的问题。
             **({"parallel": True} if parallel else {}),
@@ -695,6 +709,17 @@ class Agent:
         started = self.clock()          # ← 从这里才算"执行"
         try:
             result = tool.execute(arguments)
+
+            # ToolResult 是"文本 + 审计字段"的那种返回值（目前只有 ask_user）。放在
+            # json.dumps 那一步**之前**：它不是要序列化的数据，而是已经渲染好的文本，
+            # 只是多带了几个只有工具自己知道的字段。
+            if isinstance(result, ToolResult):
+                return _Outcome(
+                    result.text, "ok",
+                    int((self.clock() - started) * 1000),
+                    audit=result.audit,
+                )
+
             text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             return _Outcome(text, "ok", int((self.clock() - started) * 1000))
 

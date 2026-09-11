@@ -9,6 +9,7 @@ from typing import Any
 
 from agent_runtime.models.base import ChatModel
 from agent_runtime.models.types import ModelResponse, TokenUsage
+from agent_runtime.tools.ask import ANSWERED, Answer, AskUserArgs
 from agent_runtime.tools.builtin import ListFilesArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
 
@@ -75,9 +76,32 @@ class ExplodingModel(ChatModel):
         return ModelResponse(content="恢复了", usage=usage())
 
 
+class ScriptedQuestioner:
+    """脚本化的提问者：按顺序吐出预置答案，并记下被问了什么。
+
+    和 ScriptedModel 同一模式（手写的假实现，不用 mock）—— 而且回答里的 waited_ms 是
+    预置的，所以"等人回答"那一项在测试里能被钉成精确值，而真实时钟只能断言"大于 0"。
+
+    剧本用完时返回一个**显眼的占位文本**而不是报错：测试失败时看到的应该是断言失败，
+    不是"剧本用尽"这种误导性错误（和 ScriptedModel 同一条）。传入 Answer 可以精确控制
+    status / waited_ms，传字符串就是一次普通的回答。
+    """
+
+    def __init__(self, *replies: str | Answer):
+        self.replies = list(replies)
+        # 被问了什么 —— 提问这一侧的"handler 真的跑了吗"的证据（见 _prepare/_run）。
+        self.asked: list[AskUserArgs] = []
+
+    def __call__(self, question: AskUserArgs) -> Answer:
+        self.asked.append(question)
+        if not self.replies:
+            return Answer("(剧本用尽)", ANSWERED, 0)
+        reply = self.replies.pop(0)
+        return reply if isinstance(reply, Answer) else Answer(reply, ANSWERED, 0)
+
+
 class Collector:
     """收集审计事件。本身可调用，正好直接当 on_event。"""
-
     def __init__(self):
         self.events: list[dict[str, Any]] = []
 

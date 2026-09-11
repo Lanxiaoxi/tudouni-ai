@@ -137,9 +137,12 @@ class Timing:
     """一段事件里的耗时合计，单位毫秒。
 
     每一项都是**互不重叠**的一段，所以能直接相加、也能拿总时长减出"未归因"：
-    模型往返（每次尝试一条）、工具执行（不含等人审批）、等人审批、重试退避。
-    口径重叠过一次的教训写在这里 —— 工具耗时原本从函数入口起表，把等人审批也算了
-    进去，于是它几乎等于人的思考时间，而那两个数一相加还会重复。
+    模型往返（每次尝试一条）、工具执行（不含等人审批，也不含等人回答）、等人审批、
+    等人回答、重试退避。口径重叠过一次的教训写在这里 —— 工具耗时原本从函数入口起表，
+    把等人审批也算了进去，于是它几乎等于人的思考时间，而那两个数一相加还会重复。
+
+    **"等人回答"是唯一减出来的一段**（见下面 human_ms）：审批那一段本来就住在裁决里、
+    从没进过工具耗时，而提问发生在 handler 内部，不减它就没有第二个地方能把它分开。
 
     **工具那一段在并行之后换了口径。** 只读工具整批并发时，逐条 duration_ms 之和已经
     大于它占用的墙上时间（两个 5 秒的工具并行：和是 10 秒，墙上只花了 5 秒），再拿
@@ -153,6 +156,14 @@ class Timing:
     tool_ms: int
     waited_ms: int
     backoff_ms: int
+    # 等人**回答提问**的时间（ask_user 阻塞在人的输入上的那一段）。
+    #
+    # 它和 waited_ms（等人审批）分开，因为来路不同、事后要问的问题也不同：审批是
+    # runtime 拦住了一次工具调用，提问是模型自己发起的一次交互。而它**必须单独存在**
+    # 的理由是另一条：ask_user 的 handler 就阻塞在人的输入上，那段时间**已经**算进了
+    # 它的 duration_ms —— 不从 tool_ms 里减出来，"我看了 30 秒才回答"会被报成
+    # "这个工具花了 30 秒"，而工具本身只花了几微秒。
+    human_ms: int = 0
     # 并行省下来的时间 = 并行批次里"逐条耗时之和 - 实际墙上时间"。
     #
     # 它是**派生值，不是一段**：上面那几项相加等于回合总，而它不参与那个等式（省掉的
@@ -161,7 +172,13 @@ class Timing:
 
     @property
     def explained_ms(self) -> int:
-        return self.model_ms + self.tool_ms + self.waited_ms + self.backoff_ms
+        # human_ms 是**从 tool_ms 里减出来的那一份**，所以必须加回这个等式：不加，
+        # 等人的时间就会掉进"未归因"，而那一项的名字是"没被埋点的部分" —— 它是被
+        # 埋了点的那一段。
+        return (
+            self.model_ms + self.tool_ms + self.waited_ms
+            + self.backoff_ms + self.human_ms
+        )
 
     @property
     def unattributed_ms(self) -> int:
@@ -198,12 +215,23 @@ def summarize_time(events: Iterable[dict]) -> Timing:
     batch_sum = tool_durations(parallel=True)
     batch_wall = total("tool_batch", "wall_ms")
 
+    # 等人回答提问的那一段：**从工具耗时里减出来**，单列成 human_ms。
+    #
+    # 工具耗时原来是从 handler 入口起表的，而 ask_user 的 handler 整段时间都阻塞在人的
+    # 输入上 —— 不减，"我看了 30 秒才回答"就报成"这个工具要 30 秒"。审批没有这个问题
+    # （裁决在 _prepare 里，本来就单独计时），提问发生在 handler 里，只有工具自己能报。
+    # 下界取 0 的理由和下面 unattributed_ms 一样：从别处复制来的日志、毫秒取整都可能
+    # 让它减成负数，而负数在这里没有解释价值。
+    human_ms = total("tool_result", "human_wait_ms")
+    tool_ms = max(0, tool_durations(parallel=False) + batch_wall - human_ms)
+
     return Timing(
         run_ms=total("run_finished", "duration_ms"),
         model_ms=total("model_call", "duration_ms"),
-        tool_ms=tool_durations(parallel=False) + batch_wall,
+        tool_ms=tool_ms,
         waited_ms=total("permission", "waited_ms"),
         backoff_ms=total("model_call", "backoff_ms"),
+        human_ms=human_ms,
         saved_ms=max(0, batch_sum - batch_wall),
     )
 
@@ -238,7 +266,7 @@ def _tokens_text(count: int) -> str:
 
 def _print_timing(timing: Timing) -> None:
     """耗时那一行。没有任何耗时数据（旧日志）时什么都不说 —— 硬凑一行 0ms 只是噪声。"""
-    if not (timing.model_ms or timing.tool_ms or timing.waited_ms):
+    if not (timing.model_ms or timing.tool_ms or timing.waited_ms or timing.human_ms):
         return
 
     parts = [
@@ -249,9 +277,11 @@ def _print_timing(timing: Timing) -> None:
     # 时间），也不参与末尾的相加 —— 它正是被省掉、没进入回合总的那一段。
     if timing.saved_ms:
         parts.append(f"（并行省 {_ms_text(timing.saved_ms)}）")
-    # 没发生过的事不占位置：没人被问过审批时，那一项只是 0ms 的噪声。
+    # 没发生过的事不占位置：没人被问过审批、没人被提问过时，那两项只是 0ms 的噪声。
     if timing.waited_ms:
         parts.append(f"等人审批 {_ms_text(timing.waited_ms)}")
+    if timing.human_ms:
+        parts.append(f"等人回答 {_ms_text(timing.human_ms)}")
     if timing.backoff_ms:
         parts.append(f"重试退避 {_ms_text(timing.backoff_ms)}")
     # 回合总时长只有在记过 run_finished.duration_ms 的日志里才有（旧日志没有），

@@ -46,6 +46,7 @@ from agent_runtime.security import ApprovalMemory, PermissionPolicy, cli_asker
 from agent_runtime.security.commands import format_rule
 from agent_runtime.state import JsonSessionStore
 from agent_runtime.state.session import is_valid_session_id
+from agent_runtime.tools.ask import cli_questioner, unavailable_questioner
 from agent_runtime.tools.builtin import create_tool_registry
 
 SESSIONS_DIR = PROJECT_DIR / ".sessions"
@@ -155,7 +156,14 @@ def main() -> int:
         http_client=httpx.Client(),
     )
 
-    tools = create_tool_registry(str(PROJECT_DIR))
+    tools = create_tool_registry(
+        str(PROJECT_DIR),
+        # 提问通道和审批通道**分开装配**：审批回答"要不要执行"，它的答案改变权限；
+        # 提问回答"你要什么"，它的答案只是内容。两者唯一的共同点是"都需要有人在" ——
+        # 而 --autopilot 说的正是这件事本身，所以它同时管住两者：提问那一支拿到的是
+        # unavailable（如实说没有人回答，**不伪造答案、也不记成默许**）。
+        questioner=unavailable_questioner if args.autopilot else cli_questioner,
+    )
     print("已注册工具:")
     for tool in tools.all():
         print(f"  - {tool.name:12} 风险={tool.risk.value}")
@@ -189,10 +197,14 @@ def main() -> int:
     # 而这件事一旦忘了自己开着，事后看日志只会觉得"这个项目怎么什么都没问"。
     # 它也不做成配置项 —— 一次性的决定不该悄悄变成永久默认。
     if args.autopilot:
-        print("[权限] autopilot：不询问任何审批，需要审批的工具会直接执行"
-              "（拒绝名单、工作区边界、控制面写入仍然生效）", file=sys.stderr)
+        print("[权限] autopilot：不询问任何审批，需要审批的工具会直接执行；"
+              "也不会向你提问 —— 模型调 ask_user 会拿到「没有人回答」，"
+              "并被告知自己决定、把假设说出来（拒绝名单、工作区边界、控制面写入仍然生效）",
+              file=sys.stderr)
 
     # 四个注入点，同一个原则：判定留在 Agent 内部，执行交给注入的实现。
+    # （提问通道是第五个，但它在上面装配工具时就注入了 —— 它不属于 Agent：Agent 只看见
+    # 一次普通的工具调用，ask_user 会不会阻塞在人的输入上，它不知道也不需要知道。）
     agent = Agent(
         model, tools, policy,
         asker=partial(cli_asker, memory=memory),

@@ -58,6 +58,30 @@ def test_nothing_is_printed_when_the_log_has_no_timing_at_all(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_the_human_wait_is_subtracted_from_the_tool_time(capsys):
+    """等人**回答提问**的时间不在工具耗时里。
+
+    ask_user 的 handler 整段时间都阻塞在人的输入上，所以那一段已经算进了它的
+    duration_ms —— 不减去，"我看了 29 秒才回答"会报成"这个工具花了 29 秒"，而工具
+    本身只花了几微秒。这和当年审批那条是同一个坑（裁决与计时分开，见 test_timing.py）。
+
+    它还必须**加回"已解释"那一侧**：不加，等人的时间会掉进"未归因"，而那一项的名字
+    是"没被埋点的部分"—— 它明明被埋了点。
+    """
+    timing = summarize_time([
+        {"kind": "tool_result", "tool": "ask_user", "duration_ms": 30000,
+         "human_wait_ms": 29000},
+        {"kind": "run_finished", "duration_ms": 60000},
+    ])
+
+    assert (timing.tool_ms, timing.human_ms) == (1000, 29000)
+    assert timing.explained_ms == 30000
+    assert timing.unattributed_ms == 30000
+
+    _print_timing(timing)
+    assert "等人回答 29.0s" in capsys.readouterr().out
+
+
 def test_parts_that_never_happened_are_left_out(capsys):
     """没人被问过审批、也没重试过，那两项就不出现（0ms 的项是纯噪声）。"""
     _print_timing(summarize_time([
@@ -67,4 +91,5 @@ def test_parts_that_never_happened_are_left_out(capsys):
 
     line = capsys.readouterr().out
     assert "等人审批" not in line
+    assert "等人回答" not in line
     assert "重试退避" not in line

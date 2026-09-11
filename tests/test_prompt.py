@@ -154,6 +154,12 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     assert "不要用 shell 替代" in prompt                           # 工具之间的分工
     assert "读写" in prompt                                        # 分工的枚举
     assert "写/编辑后必须验证" in prompt                           # 跨工具的收尾动作
+    # 提问的用法约束。它只能住在这里，因为它是**几个东西之间**的关系：ask_user 的描述
+    # 说得出"什么时候别用我"，但说不出"审批那一关不该由你来问"—— 那句话讲的是提问和
+    # 审批关卡之间的分工。少了它，模型会把 ask_user 当成征求意见的万金油，每做一步都
+    # 停下来问一次（而且提问换不来放行，见 tools/builtin.py 里那条注册说明）。
+    assert "不要用 ask_user 去问能不能做" in prompt                 # 提问 ≠ 审批
+    assert "不要拿提问省事" in prompt                               # 先自己查
 
 
 # --- 提示词里的能力枚举 vs 注册表：两份事实必须对得上 ---------------------
@@ -178,7 +184,10 @@ _CAPABILITY_TOOLS = {
 
 # 注册表里不属于「文件工具」的那几个，明确列出来 —— 它们不进上面那张能力表，
 # 但也不能就这么从表里"漏掉"，否则下面第三条测试会红得没道理。
-_NON_FILE_TOOLS = {"get_current_time", "shell"}
+#
+# ask_user 也在这里：它不碰工作区，所以"文件工具的三种能力"里没有它那一格；
+# 但提示词里确实有它的用法约束（见 test_prompt_carries_the_rules...）。
+_NON_FILE_TOOLS = {"get_current_time", "shell", "ask_user"}
 
 
 def registered_tools() -> set[str]:

@@ -14,6 +14,7 @@ import 整个应用入口（连带把 CLI、httpx、配置全都拖进来）。
 
 from pydantic import Field
 
+from .ask import AskUser, AskUserArgs, Questioner
 from .clock import get_current_time
 from .filesystem import FileSystem
 from .shell import (
@@ -111,11 +112,17 @@ class ShellArgs(ToolArgs):
     )
 
 
-def create_tool_registry(workspace: str) -> ToolRegistry:
+def create_tool_registry(
+    workspace: str, questioner: Questioner | None = None
+) -> ToolRegistry:
     """把内置工具装成一个注册表。
 
     workspace 既是文件工具的沙箱根，也是唯一能拦住"往工作区外面写"的东西 ——
     所以传进来的应该是项目目录，而不是它的父目录。
+
+    questioner 是**唯一一个人机通道的注入点**（ask_user 用）；不传就是"没有人可问"
+    （见 tools/ask.py 的 unavailable_questioner）。默认值不能是"能问、问出来算同意" ——
+    那是最坏的 fail-open。
     """
     fs = FileSystem(workspace)
     shell = Shell(workspace)
@@ -222,6 +229,36 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
         risk=RiskLevel.HIGH,
         args_model=ShellArgs,
         handler=shell.run,
+    ))
+
+    # 提问工具。三条决定：
+    #
+    # 1. **风险 LOW。** 提问没有副作用、不碰工作区、不改任何状态，所以放行它不该问人
+    #    —— 否则会变成"为了问一个问题，先弹一次审批"，而那个审批本身才是打断。
+    #    （若有人把 auto_approve 配成空集，它确实会被先审一次：荒诞但 fail-closed，
+    #    不为它在策略里开后门。）
+    # 2. **interactive=True。** 它的 handler 阻塞在人的输入上，所以永远不能并行 ——
+    #    见 tool.py 里那条注册期校验。
+    # 3. **描述里必须带负面清单。** 这是唯一一条"什么时候**不要**用我"比"怎么用我"
+    #    更要紧的工具：提示词可能对老会话已经过期（system 消息只在新建会话时写一次），
+    #    而工具描述每一轮都发。规则写在这里，恢复的旧会话也一定看得到。
+    #
+    # 它**不产生任何权限效果**：拿到"用户同意了"不会让下一个 shell 调用免审。这条不是
+    # 风格问题 —— 能靠提问换放行的话，模型自己编一句"我已征得同意"就成了绕过审批的路。
+    registry.register(Tool(
+        name="ask_user",
+        description=(
+            "向用户提一个问题，并把他的回答作为这次调用的结果拿到。"
+            "只在缺了它就没法选对工具或参数时才用：能从工作区里自己查清的一律自己查，"
+            "偏好类的问题不要问。更不要拿它去征求执行许可 —— 审批由 runtime 负责，"
+            "你照常调用即可；用提问代替审批只会多一次打断。"
+            "options 给了就按编号显示给用户，留空表示让他自由作答。"
+            "一次只问一个问题，同一个问题不要问第二遍。"
+        ),
+        risk=RiskLevel.LOW,
+        args_model=AskUserArgs,
+        handler=AskUser(questioner),
+        interactive=True,
     ))
 
     return registry

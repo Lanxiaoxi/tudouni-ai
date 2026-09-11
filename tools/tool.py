@@ -1,5 +1,5 @@
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -48,6 +48,23 @@ class ToolArgs(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolResult:
+    """比"一段文本"多一点的返回值：回灌给模型的文本 + 只有工具自己知道的审计字段。
+
+    绝大多数工具直接返回字符串（`_run` 把它当文本用），不需要这个类型。需要它的只有
+    那种**耗时里含等人的时间**的工具（ask_user）：它的 duration_ms 会落进 tool_result
+    事件，而等人那一段在汇总里必须能减出来（见 cli.summarize_time）—— 否则"我看了 30 秒
+    才回答"会显示成"这个工具花了 30 秒"，和当年审批那条一模一样。
+
+    所以 audit 里放的是**工具唯一知道、而 Agent 推不出来**的事实，不是"随便什么元数据"：
+    它已经能看见 tool 名、status、chars、duration_ms，别把那些再抄一遍。
+    """
+
+    text: str
+    audit: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class Tool:
     name: str
     description: str
@@ -73,6 +90,17 @@ class Tool:
     # 是 LOW。要并行就不能在批内弹审批 —— asker 走的是 stdin，两条审批同时问会
     # 互相抢输入，而"谁批准了哪一条"也没法回答了。
     parallel_safe: bool = False
+
+    # 这个工具的 handler 会**阻塞在人的输入上**（目前的唯一一个：ask_user）。
+    #
+    # 为什么不能只靠"记得别给它标 parallel_safe"：ask_user 的风险是 LOW，而上面那条
+    # 注册期校验只管"标了并行却不是 LOW" —— 于是"会问人"+"标了并行"这个组合**能**
+    # 通过校验，跑到真实会话里才变成两条提问互相抢 stdin，而"谁回答了哪一条"也就没
+    # 法回答了。这个字段把那句话变成启动时就炸的坏配置（和 risk 不给默认值是同一个
+    # 手法：让"忘了"这件事不可能悄悄发生）。
+    #
+    # 默认 False 是 fail-closed：漏声明的后果只是"少一条启动期校验"，不是"多问了一次人"。
+    interactive: bool = False
 
     @property
     def parameters(self) -> JsonSchema:
@@ -135,6 +163,15 @@ class ToolRegistry:
                 f"{tool.name} 声明了 parallel_safe，但风险等级是 {tool.risk.value}："
                 f"能并行执行的工具必须是 low。\n"
                 f"  并行的前提是批内不弹审批（审批走 stdin，两条同时问会互相抢输入）。"
+            )
+
+        # 和上面那条是同一个理由的另一半：会问人的工具**永远**不能并行，而且它跟风险
+        # 等级无关 —— 上面那条拦不住它（LOW 是自动放行档，正好绕开）。两条合起来才
+        # 说完"能并行的前提是批内没有任何人在说话"。
+        if tool.interactive and tool.parallel_safe:
+            raise ValueError(
+                f"{tool.name} 会阻塞在人的输入上（interactive），不能声明 parallel_safe："
+                f"两条提问同时问会互相抢输入，而「谁回答了哪一条」也就没法回答了。"
             )
 
         self._tools[tool.name] = tool
