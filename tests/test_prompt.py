@@ -152,8 +152,87 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     assert "需要审批的工具由 runtime 拦截并询问用户" in prompt      # 批准机制
     assert "文件工具只能访问工作区" in prompt                      # 权限范围（限定在文件工具）
     assert "不要用 shell 替代" in prompt                           # 工具之间的分工
-    assert "搜文本" in prompt                                      # 分工的枚举里不能漏掉后加的那类操作
+    assert "读写" in prompt                                        # 分工的枚举
     assert "写/编辑后必须验证" in prompt                           # 跨工具的收尾动作
+
+
+# --- 提示词里的能力枚举 vs 注册表：两份事实必须对得上 ---------------------
+#
+# 提示词按**能力**分工（"读写、列目录…用专用工具"），注册表按**工具名**装配。
+# 这两份东西各改一半就会走岔，而两个方向都出现过：
+#
+#   * 加了 grep 却没往枚举里写"搜文本" —— 模型可能仍然去起 Select-String，
+#     而那条路是 HIGH 风险、每次都打断用户；
+#   * 删了 grep 却没从枚举里拿掉"搜文本" —— 那句话就成了假话，模型会去找一个
+#     不存在的工具（或者干脆回退到 shell，正是那句话要防的事）。
+#
+# 所以这里两边都钉住，另外再钉住这张映射表本身要覆盖整个注册表 —— 加了新工具却忘了
+# 归类，那条会红（和 Tool.risk 不给默认值是同一个手法：让"忘了"这件事不可能悄悄发生）。
+
+_CAPABILITY_TOOLS = {
+    "读写": {"read_file", "write_file", "edit_file"},
+    "列目录": {"list_files"},
+    "编辑": {"edit_file"},
+    "搜文本": {"grep"},
+}
+
+# 注册表里不属于「文件工具」的那几个，明确列出来 —— 它们不进上面那张能力表，
+# 但也不能就这么从表里"漏掉"，否则下面第三条测试会红得没道理。
+_NON_FILE_TOOLS = {"get_current_time", "shell"}
+
+
+def registered_tools() -> set[str]:
+    return {tool.name for tool in create_tool_registry(".").all()}
+
+
+def test_the_prompt_only_names_capabilities_that_have_a_tool():
+    """提示词点名了某类能力，注册表里就得有干这活儿的工具 —— 否则那句话是假话。"""
+    prompt = load_system_prompt()
+    registered = registered_tools()
+
+    missing = [
+        capability for capability, tools in _CAPABILITY_TOOLS.items()
+        if capability in prompt and not (tools & registered)
+    ]
+
+    assert not missing, (
+        f"提示词点名了这些能力，但注册表里没有对应工具：{missing}"
+        f"（现在的注册表：{sorted(registered)}）—— 那句分工成了假话，"
+        f"模型会去找一个不存在的工具，或者干脆回退到 shell。"
+    )
+
+
+def test_every_registered_file_tool_is_named_in_the_prompt():
+    """反方向：注册了的文件工具，提示词的分工里得点名它那类活。"""
+    prompt = load_system_prompt()
+    registered = registered_tools()
+
+    missing = [
+        capability for capability, tools in _CAPABILITY_TOOLS.items()
+        if (tools & registered) and capability not in prompt
+    ]
+
+    assert not missing, (
+        f"这些能力有工具，但提示词的分工里没提：{missing} —— "
+        f"模型不知道该用专用工具，可能仍然去起 shell 命令去干（那条路每次都要审批）。"
+    )
+
+
+def test_the_capability_map_accounts_for_every_registered_tool():
+    """映射表自己也得跟着工具集走：加了新工具却忘了归到哪一类，这条会红。
+
+    这是刻意的"忘了就红"：否则新工具既不在能力表里、也不在_非文件工具_里，
+    上面两条测试会**静默地**不再覆盖它。
+    """
+    registered = registered_tools()
+    mapped = set().union(*_CAPABILITY_TOOLS.values())
+
+    unaccounted = registered - mapped - _NON_FILE_TOOLS
+
+    assert not unaccounted, (
+        f"这些工具既没归到哪类能力、也没被标成非文件工具：{sorted(unaccounted)} —— "
+        f"把它们归到 _CAPABILITY_TOOLS 的某一类里，或者加进 _NON_FILE_TOOLS。"
+    )
 
 
 def test_missing_prompt_file_gives_an_actionable_error(workdir):
