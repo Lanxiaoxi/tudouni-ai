@@ -49,7 +49,16 @@ class TokenUsage:
 @dataclass
 class ModelResponse:
     """统一模型响应结构"""
+
     content: str | None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     usage: TokenUsage | None = None
+    # 思维链（思考模式）。它**不是**上一步的回复，而是同一次调用里、模型在给出
+    # content / tool_calls 之前先吐的一段草稿；provider 把它和 content 同级返回。
+    #
+    # 目前只用来显示（--debug 打在 stderr），**不回传**给 API。这条是有代价的：
+    # 官方文档说携带 tools 的请求必须完整回传 reasoning_content，否则 400 ——
+    # 而本项目每轮都带 tools。当前端点没有严格执行，但这是个已知的偏离，
+    # 详见 models/openai_compatible.py 里 _extract_reasoning 的说明。
+    reasoning: str | None = None
     raw: Any = None

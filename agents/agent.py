@@ -364,6 +364,17 @@ class Agent:
                 f"   ← 模型返回  content={'有' if response.content else '无'}  "
                 f"tool_calls={len(response.tool_calls)}"
             )
+            if response.reasoning:
+                # 思考过程**整段打，不截断** —— 和下面 content 的预览不一样，理由是
+                # "别处能不能看到"：答案在 stdout 上有全文，所以 debug 只给一眼预览；
+                # 思维链别处根本看不到，截断它等于不给看。
+                #
+                # 非流式拿不到"逐字"：这段文字是整块回来的，只能等它回来之后一次打完。
+                # 想要 Claude Code 那种实时效果得先把适配层改成流式（另一件事）。
+                self._debug(
+                    f"      thinking（{len(response.reasoning)} 字符）:\n"
+                    f"{response.reasoning}"
+                )
             if response.content:
                 self._debug(f"      content: {self._preview(response.content)}")
 

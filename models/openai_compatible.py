@@ -140,5 +140,25 @@ class OpenAICompatibleModel(ChatModel):
             content=message.content,
             tool_calls=tool_calls,
             usage=_extract_usage(response),
+            reasoning=_extract_reasoning(message),
             raw=response,
         )
+
+
+def _extract_reasoning(message: Any) -> str | None:
+    """取思维链（思考模式的 `reasoning_content`）；没有就返回 None。
+
+    **取出来只为显示，不回传。** 这里记一笔已知的偏离，免得下一个读代码的人以为
+    "既然读了为什么不回传"：官方文档说携带 `tools` 的请求**必须完整回传**
+    `reasoning_content`（即使那一轮没实际调用工具），否则 API 返回 400；而本项目
+    每一轮都带 tools（7 个工具全量发出去）。当前端点没有严格执行这一点（实测跑得通），
+    但换端点、或者网关收紧之后，症状会是"这一步直接发不出去"（ModelFatalError）。
+    第二个代价小一些但真实：不回传等于模型每一步都重新想，多步任务的连贯性会打折。
+
+    getattr 而不是属性访问：不同网关对 message 的填充程度差别很大 —— `_extract_usage`
+    那段注释里已经为同一件事吃过一次亏。空串也当没有（有的网关用空串占位）。
+    """
+    value = getattr(message, "reasoning_content", None)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
