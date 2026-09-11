@@ -146,11 +146,14 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     """
     prompt = load_system_prompt()
 
-    assert "需要审批的工具会被运行时拦下来问用户" in prompt       # 批准机制
-    assert "文件工具只能访问工作区目录" in prompt                 # 权限范围（限定在文件工具）
-    assert "不要用 shell 代替" in prompt                          # 工具之间的分工
-    assert "搜文本用专用工具" in prompt                           # 分工的枚举里不能漏掉后加的那类操作
-    assert "改完文件后" in prompt                                 # 跨工具的收尾动作
+    # 断言钉的是**事实还在不在**，引用的措辞跟着提示词走。提示词是给人读、给人改的文本，
+    # 「改一次措辞就红一次」的测试只会被顺手改掉，保护不了下面这五件事 —— 而它们没有
+    # 别的地方可住（每一条的理由见 docstring）。
+    assert "需要审批的工具由 runtime 拦截并询问用户" in prompt      # 批准机制
+    assert "文件工具只能访问工作区" in prompt                      # 权限范围（限定在文件工具）
+    assert "不要用 shell 替代" in prompt                           # 工具之间的分工
+    assert "搜文本" in prompt                                      # 分工的枚举里不能漏掉后加的那类操作
+    assert "写/编辑后必须验证" in prompt                           # 跨工具的收尾动作
 
 
 def test_missing_prompt_file_gives_an_actionable_error(workdir):
