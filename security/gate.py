@@ -5,7 +5,17 @@
 那边的 _check_permission 从"决策 + 拼审计参数"的七十多行缩成一次调用加一次上报。
 
 四种放行/拒绝的来路刻意分开记（outcome），因为它们事后要回答的问题不同：
-"谁批准的"和"策略直接禁止的"在追责时是两件事。
+
+    auto_allowed    风险等级在名单里 —— 没问过任何人，也不需要问
+    rule_allowed    你**以前**按过 t —— 问过，但问的不是这一次
+    approved        这一次问了人，人批准了
+    user_denied     这一次问了人，人拒绝了
+    policy_denied   策略直接禁止，问都不用问
+    no_asker        要问却没配询问方式，按拒绝处理
+
+"谁批准的"和"策略直接禁止的"在追责时是两件事；而"人批准的"和"人以前批准过、之后
+一直自动放行"同样是两件事 —— 后者是日志里唯一能解释"这条 shell 命令怎么没问就跑了"
+的线索。
 """
 
 import time
@@ -13,6 +23,7 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from agent_runtime.security.asker import ApprovalAsker
+from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.security.policy import Decision, PermissionPolicy
 from agent_runtime.tools.tool import Tool
 
@@ -21,9 +32,12 @@ class GateResult(NamedTuple):
     """一次权限裁决的结果。"""
 
     denial: str | None      # None 表示放行；有值就是回灌给模型的拒绝文案
-    outcome: str            # auto_allowed / policy_denied / no_asker / approved / user_denied
+    outcome: str            # 见模块 docstring 里那张表
     decision: Decision
     waited_ms: int | None   # 只在真的问过人才有值
+    # 这一次裁决**新增**的免问规则（人按了 t）。审计要记它：一次批准同时改变了将来
+    # 的行为，那不是"谁批准了什么"里可以省掉的一半。空集合表示这次没有新增。
+    remembered: frozenset[str] = frozenset()
 
 
 def check_permission(
@@ -31,6 +45,7 @@ def check_permission(
     arguments: Mapping[str, Any],
     policy: PermissionPolicy,
     asker: ApprovalAsker | None = None,
+    memory: ApprovalMemory | None = None,
 ) -> GateResult:
     """裁定一次工具调用能不能执行。
 
@@ -49,6 +64,12 @@ def check_permission(
             "policy_denied", decision, None,
         )
 
+    # 人在之前某次审批里按过 t。这一支排在 no_asker **之前**：规则已经把答案给了，
+    # 没有询问方式不影响这个答案 —— 反过来会让"配了免问规则却因为缺 asker 被拒"
+    # 这种荒唐结果出现。
+    if memory is not None and tool.name in memory:
+        return GateResult(None, "rule_allowed", decision, None)
+
     if asker is None:
         # fail-closed：要审批却没配询问方式，一律拒绝，绝不默认放行。
         return GateResult(
@@ -57,12 +78,18 @@ def check_permission(
             "no_asker", decision, None,
         )
 
+    # 问之前先给记忆拍一张快照，问完再比一次：多出来的就是这次按键留下的规则。
+    # 这样 asker 的契约（工具和参数进去、布尔出来）不用改，而"这次批准顺带改了
+    # 将来的行为"这件事仍然能被审计看见。
+    before = memory.tools() if memory is not None else frozenset()
+
     started = time.perf_counter()
     approved = asker(tool, arguments)
     waited_ms = int((time.perf_counter() - started) * 1000)
 
     if approved:
-        return GateResult(None, "approved", decision, waited_ms)
+        remembered = (memory.tools() - before) if memory is not None else frozenset()
+        return GateResult(None, "approved", decision, waited_ms, remembered)
 
     return GateResult(
         f"权限拒绝：用户拒绝执行 {tool.name}。"

@@ -14,6 +14,7 @@ from agent_runtime.models.base import ChatModel
 from agent_runtime.models.types import ModelFatalError, TokenUsage
 from agent_runtime.security.asker import ApprovalAsker
 from agent_runtime.security.gate import check_permission
+from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.security.policy import PermissionPolicy
 from agent_runtime.state import Session
 from agent_runtime.tools.tool import Tool, ToolRegistry
@@ -87,6 +88,7 @@ class Agent:
         tools: ToolRegistry,
         policy: PermissionPolicy,
         asker: ApprovalAsker | None = None,
+        memory: ApprovalMemory | None = None,
         on_checkpoint: Checkpoint | None = None,
         on_event: EventSink | None = None,
         debug: bool = False,
@@ -103,6 +105,10 @@ class Agent:
         # asker 可以为空：若策略把所有等级都放进 auto_approve，ASK 永远不会发生，
         # 就不必塞一个用不到的询问函数。但真要 ASK 而没有 asker 时按拒绝处理。
         self.asker = asker
+        # memory 可以为空：不传就是「这一次的批准只管这一次」（测试、无人值守都用
+        # 得上）。它和 asker 是一对 —— asker 问出答案，memory 记住人说过「别再问」，
+        # 而它是不是存在，决定了审批提示里有没有那个 t。
+        self.memory = memory
         # on_checkpoint 可以为空：不传就是不持久化（测试、一次性任务都用得上）。
         # 方向很重要 —— Agent 只知道「什么时候存是安全的」，不知道「存到哪、什么
         # 格式、要不要存」。这和 asker 是同一条原则：判定留在内部，执行交给注入的
@@ -446,10 +452,11 @@ class Agent:
         permission 事件是审计最要紧的一项 —— "谁批准了什么"除了这里没有别的地方
         知道。无论放行还是拒绝都要发。
         """
-        result = check_permission(tool, arguments, self.policy, self.asker)
+        result = check_permission(tool, arguments, self.policy, self.asker, self.memory)
 
         _DEBUG_BY_OUTCOME = {
             "auto_allowed": "   ✓ 自动放行",
+            "rule_allowed": "   ✓ 自动放行（你之前按过 t）",
             "approved": "   ✓ 用户批准",
             "user_denied": "   ✗ 用户拒绝",
             "policy_denied": "   ✗ 权限拒绝（策略禁止）",
@@ -467,6 +474,9 @@ class Agent:
             arguments=self._preview(json.dumps(arguments, ensure_ascii=False), AUDIT_PREVIEW_LIMIT),
             # 等待审批的时长只在真的问过人才有意义
             **({} if result.waited_ms is None else {"waited_ms": result.waited_ms}),
+            # 这一次批准**顺带**改了将来的行为（人按了 t）。省掉它的话，日志里那次
+            # 批准看起来就只是"批准了一次"，而后面几十次 shell 无人问津的原因只能靠猜。
+            **({} if not result.remembered else {"remembered": sorted(result.remembered)}),
         )
         return result.denial
 

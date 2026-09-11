@@ -4,7 +4,7 @@ PermissionPolicy 只裁定「要不要问」，真正去问的是这里的东西
 
 把它做成一个可注入的可调用对象，是为了让同一份 Agent 代码同时服务几种场合：
 
-    CLI        → cli_asker（问终端）
+    CLI        → cli_asker（问终端；配了 memory 时多给一个 t）
     测试        → 一个脚本化的假 asker（零 stdin、零 mock）
     无人值守     → lambda tool, args: True（全部放行）
     将来的 Web  → 挂起并等待审批结果的 asker
@@ -16,10 +16,16 @@ import sys
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from agent_runtime.config import PERMISSION_FILE_NAME
+from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.tools.tool import RiskLevel, Tool
 
 
 # 一个 asker：给它工具和参数，回答「是否批准执行」。
+#
+# 「t（以后别再问）」不由这个返回类型表达：它由 asker 写进 memory，而 gate 用问前
+# 问后的快照差把这件事记进审计（见 security/gate.py）。所以既有那些只返回布尔的
+# asker（脚本化的假 asker、无人值守的 lambda）一行都不用改。
 ApprovalAsker = Callable[[Tool, Mapping[str, Any]], bool]
 
 # 审批提示里每个参数值的最大预览长度，**按风险分级**。
@@ -51,10 +57,30 @@ def _preview(value: Any, limit: int | None) -> str:
     return f"{flat[:limit]}…(共 {len(flat)} 字符)"
 
 
-def cli_asker(tool: Tool, arguments: Mapping[str, Any]) -> bool:
+# 按 t 之后会发生什么，**按风险分开说**。中低风险的后果只是"以后少一次确认"；
+# 高风险不是 —— 对 shell 按 t 意味着你**再也看不见它要执行什么**，而命令原文正是
+# 那道关唯一的判断依据（见上面 _PREVIEW_LIMIT_BY_RISK 那一段）。用同一句"以后不再
+# 询问"盖住这两种情况，等于把最要紧的那半句省掉了。
+_REMEMBER_CONSEQUENCE: dict[RiskLevel, str] = {
+    RiskLevel.HIGH: "以后每次都直接执行，你不会再看到它要做什么",
+}
+_REMEMBER_DEFAULT_CONSEQUENCE = "以后不再询问这个工具"
+
+
+def _remember_hint(tool: Tool) -> str:
+    """t 那一行的说明。缺省是"以后不再询问"，新等级忘了配也落在安全的说法上。"""
+    consequence = _REMEMBER_CONSEQUENCE.get(tool.risk, _REMEMBER_DEFAULT_CONSEQUENCE)
+    return f"{consequence}（写进 {PERMISSION_FILE_NAME}，下次启动仍然有效）"
+
+
+def cli_asker(
+    tool: Tool,
+    arguments: Mapping[str, Any],
+    memory: ApprovalMemory | None = None,
+) -> bool:
     """在终端上征求用户批准。
 
-    三个细节都是刻意的：
+    四个细节都是刻意的：
 
     1. **提示写 stderr。** input() 自己的提示语走 stdout，而 stdout 是 Agent 最终
        产出的通道 —— 混进去会污染结果（重定向到文件时最明显）。所以提示一律用
@@ -67,7 +93,17 @@ def cli_asker(tool: Tool, arguments: Mapping[str, Any]) -> bool:
 
     3. **读不到输入时返回 False（拒绝）。** 非交互环境（管道、CI、将来的 Web）里
        input() 会抛 EOFError。默认放行等于「无人值守时静默执行中风险操作」，
-       默认拒绝才是安全的失败方向。
+       默认拒绝才是安全的失败方向。回车也走这一支 —— 提示是 [y/N]，不是 [Y/n]。
+
+       **OSError 也算"读不到"。** stdin 被接走或者已关闭时（pytest 的捕获、
+       把 stdin 关掉的守护进程）input() 抛的是 OSError 而不是 EOFError，而它
+       冒出去会穿过 gate 落到 Agent 的 except Exception 上，把一次审批变成
+       "工具执行失败" —— 一个读不到输入的环境，答案和 EOF 完全一样：拒绝。
+       这里只有 input() 一条语句，所以 OSError 只可能来自 stdin。
+
+    4. **t 只在真的能记住时才给。** memory 为 None 时提示里没有 t，而打进来的 t
+       会落到"不是 y"那一支（拒绝）。答应了却记不住比拒绝更坏：用户以为已经永久
+       放行了，下一次却还被问，而他会以为是程序坏了。
     """
     # 用 .get 而不是 []：将来加了新的风险等级而这张表忘了配，缺省值是「原样打全」。
     # 多显示一点是安全的失败方向，少显示才是危险的。
@@ -78,12 +114,26 @@ def cli_asker(tool: Tool, arguments: Mapping[str, Any]) -> bool:
 
     print(f"[审批] 工具 {tool.name}  风险 {tool.risk.value}", file=sys.stderr)
     print(f"[审批] 参数 {args_preview}", file=sys.stderr)
-    print("[审批] 是否执行？[y/N] ", end="", file=sys.stderr, flush=True)
+
+    can_remember = memory is not None
+    if can_remember:
+        print(f"[审批] t = {_remember_hint(tool)}", file=sys.stderr)
+        print("[审批] 是否执行？[y/N/t] ", end="", file=sys.stderr, flush=True)
+    else:
+        print("[审批] 是否执行？[y/N] ", end="", file=sys.stderr, flush=True)
 
     try:
         answer = input()
-    except EOFError:
+    except (EOFError, OSError):
         print(file=sys.stderr)  # 补个换行，免得后续输出接在提示后面
         return False
 
-    return answer.strip().lower() in {"y", "yes"}
+    answer = answer.strip().lower()
+
+    if answer == "t" and can_remember:
+        # 记在这里而不是返回给 gate：asker 的返回类型保持布尔，而 gate 用问前问后的
+        # 快照差看见这次新增（见 security/gate.py）。
+        memory.grant(tool.name)
+        return True
+
+    return answer in {"y", "yes"}
