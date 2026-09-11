@@ -457,6 +457,7 @@ class Agent:
         _DEBUG_BY_OUTCOME = {
             "auto_allowed": "   ✓ 自动放行",
             "rule_allowed": "   ✓ 自动放行（你之前按过 t）",
+            "command_allowed": "   ✓ 自动放行（命中命令规则）",
             "approved": "   ✓ 用户批准",
             "user_denied": "   ✗ 用户拒绝",
             "policy_denied": "   ✗ 权限拒绝（策略禁止）",
@@ -477,6 +478,9 @@ class Agent:
             # 这一次批准**顺带**改了将来的行为（人按了 t）。省掉它的话，日志里那次
             # 批准看起来就只是"批准了一次"，而后面几十次 shell 无人问津的原因只能靠猜。
             **({} if not result.remembered else {"remembered": sorted(result.remembered)}),
+            # 凭哪条命令规则放过的。没有它，日志只能看出"这条命令没问过"，看不出凭哪一条
+            # —— 而"撤掉哪条规则能把它变回要问"正是事后最想知道的事。
+            **({} if result.rule is None else {"rule": " ".join(result.rule)}),
         )
         return result.denial
 

@@ -66,18 +66,18 @@ uv run main.py --debug                  # 把中间过程打到 stderr
 
 ```
 [审批] 工具 shell  风险 high
-[审批] 参数 command=git status
-[审批] t = 以后每次都直接执行，你不会再看到它要做什么（写进 .tudouni.json，下次启动仍然有效）
+[审批] 参数 command=git add -p x.py
+[审批] t = 以后 git add 开头的命令都直接执行，不会再给你看（写进 .tudouni.json，下次启动仍然有效）
 [审批] 是否执行？[y/N/t]
 ```
 
 - **`y` 批准这一次；`N`（回车）拒绝。** 默认是拒绝不是批准：连续审批里最容易做的
   动作就是一路回车，而"回车即执行"等于把最危险的那条路改成手滑也能过。
-- **`t` = 以后不再问这个工具**，写进 `.tudouni.json` 并且**立刻生效**，下次启动仍然
-  有效。提示会写清它到底把什么给出去了 —— 对 `shell` 那不是"少一次确认"，而是你
-  **再也看不见它要执行什么**，而命令原文正是那道关唯一的判断依据。
-- 一条规则**只记工具名、不记参数**：作用范围必须一眼看得懂。（参数级规则如"只放行
-  `git status`"签名早就留好了，但前缀匹配能被 `git status; rm -rf x` 绕过。）
+- **`t` 记住"以后别再问"**，写进 `.tudouni.json` 并且**立刻生效**，下次启动仍然有效。
+  提示会把记住的东西原样写出来。对 `shell` 记的是**命令前缀**（`git add` 开头），不是
+  整个工具 —— 粒度差着量级，所以那一行必须看得清；解析不出前缀（命令里有重定向之类）
+  时干脆不提供 `t`。其余工具记的是工具名。
+- 一条规则**只记工具名或命令前缀，从不记参数**：作用范围必须一眼看得懂。
 
 ### `.tudouni.json`（工作区根目录）
 
@@ -85,7 +85,8 @@ uv run main.py --debug                  # 把中间过程打到 stderr
 {
   "auto_approve": ["low"],
   "auto_approve_tools": ["shell"],
-  "deny_tools": ["git_commit"]
+  "deny_tools": ["git_commit"],
+  "shell_allow": ["git add", "ls", "python -m pytest"]
 }
 ```
 
@@ -94,17 +95,48 @@ uv run main.py --debug                  # 把中间过程打到 stderr
 | `auto_approve` | 按风险等级直接放行。**只收 `low` / `medium`** |
 | `auto_approve_tools` | 按工具名直接放行 —— `high` 只能这样点名 |
 | `deny_tools` | 按工具名直接拒绝，问都不问 |
+| `shell_allow` | 按**命令前缀**直接放行（只对带命令行的工具即 `shell` 有意义） |
 
 - **为什么 `high` 不能按等级放行。** 等级是工具自己声明的，所以"放行所有 high"会随着
   将来新加的工具自动变宽：新加一个 high 的 `delete_file`，它一注册就已经是免审批的，
   而写规则的人从没听说过它。按名字点名不会 —— 名单里写了哪个工具，放行的就是哪个。
   这正是 `Tool.risk` 不给默认值要防的那件事。
-- 不认识的键、坏 JSON、同一个工具既放行又拒绝 —— 一律报错停下（stderr + 退出码 2，
-  和没配密钥同一档）。写错一个键名而它静默不生效，是最坏的失败形态。
+- 不认识的键、坏 JSON、同一个工具既放行又拒绝、规则里带分隔符 —— 一律报错停下
+  （stderr + 退出码 2，和没配密钥同一档）。写错一个键名而它静默不生效，是最坏的失败形态。
 - 文件不存在不是错误：缺省就是内置默认（只有 `low` 自动放行）。
-- 每次启动都会把生效范围打到 stderr：`[权限] 按等级自动放行 low；点名免问 shell`。
+- 每次启动都会把生效范围打到 stderr：
+  `[权限] 按等级自动放行 low；点名免问 shell` / `[权限] 命令规则（按前缀放行）git add`。
   「按一次 t 就永久生效」是最容易忘掉的那类设置，而这份文件攒上几条之后，光盯着它
   已经答不出"现在到底还有什么会问我"。
+
+### 命令规则：`shell_allow` 的粒度与边界
+
+规则是**命令前缀**，按 token 匹配（不是字符串前缀）：
+
+| 命令 | 规则 `git add` | 规则 `git` |
+|---|---|---|
+| `git add -p x.py` | ✓ | ✓ |
+| `git commit -m x` | ✗ 问 | ✓ |
+| `git commit-graph write` | ✗ 问 | ✓ |
+| `git -C /tmp add` | ✗ 问 | ✓ |
+
+三条不能妥协的（实现与理由在 `security/commands.py`）：
+
+1. **整条命令行要逐段覆盖。** `git status && rm -rf build` 在规则 `git` 下**也要问**，
+   因为第二段没人认领。段按 `;`、`&&`、`||`、`|`、`&`、换行拆开（引号内的不算）。
+   只匹配第一段是这个功能最典型、也最危险的错法。
+2. **看不懂就问。** 命令替换 `$( )`、反引号、重定向 `>` `<`、`${`、引号不成对，一律
+   落到"问"。重定向尤其要挡：它能把一条只读命令变成写文件，而写文件该走 `write_file`
+   那条审批。
+3. **按 token 比，不按字符串比。** 规则 `git commit` 不能匹配 `git commit-graph` ——
+   `startswith("git commit")` 会，那是一条静默放行。
+
+**它不判断安全性，只做保守匹配。** 所以有一条必须先说清的事实：**写裸程序名
+（`git`、`python`、`make`）约等于放开整个 `shell` 工具** —— `git -c alias.x='!rm -rf x' x`、
+`git bisect run <任意命令>`、`git rebase --exec <任意命令>`、以及 `git commit` 会去跑的
+`.git/hooks/*`，都能从"允许 git"里长出来。想让规则真的收窄什么，就写到子命令这一层。
+这是**易用性换来的**：它减少打断，不是安全边界 —— 真正的边界是操作系统级沙箱，本项目
+还没有（见下面「已知的取舍」）。
 
 ## 架构
 
@@ -131,9 +163,10 @@ tools/             工具层
 
 security/          权限层
   policy.py          PermissionPolicy：纯函数，只裁定 ALLOW / DENY / ASK
-  gate.py            关卡：把策略 + asker + memory 变成一次裁决（六种来路分开记）
+  gate.py            关卡：把策略 + asker + memory 变成一次裁决（七种来路分开记）
   asker.py           询问方式（CLI 版走终端，认 y/N/t；测试版是脚本化的假实现）
-  memory.py          按 t 记住的工具名 —— 唯一可变的那份权限状态
+  memory.py          人按 t 记住的东西（工具名 / 命令前缀）—— 唯一可变的那份状态
+  commands.py        命令行的拆解与规则匹配：纯函数，看不懂就返回"没覆盖"
 
 state/             状态层
   session.py         Session（会话的全部事实）+ session_id 合法性
@@ -156,8 +189,8 @@ tests/             全套测试（含"每个模块都能导入"的冒烟测试�
 models   （无内部依赖）
 tools    （无内部依赖）
 state    （无内部依赖）
-config   （无内部依赖，只读 .env 和 .tudouni.json）
-security → tools, config
+config   → security.commands（校验 shell_allow 里的规则语法；密钥那条路仍然是环境变量）
+security → tools（commands.py 自己无内部依赖）
 audit    → state
 agents   → audit, models, security, state, tools
 main     → 全部
@@ -248,11 +281,16 @@ main     → 全部
   `cd .. && rm -rf x` —— 后者走的是操作系统，不是 Python。所以它的风险等级是 HIGH：
   默认策略（`auto_approve=("low",)`）下**每条命令都要人工审批**，而且审批提示里命令
   原文不截断（用旧的那张 120 字符预览，`git status && … && rm -rf /` 的危险半句正好
-  被切掉，用户会在看不全的情况下签字）。**唯一能放开它的是点名** —— `.tudouni.json`
-  的 `auto_approve_tools`，或者审批时按 `t`；按下 `t` 的瞬间提示会直说"以后你不会再
-  看到它要做什么"。真正的解法是操作系统级沙箱 —— Codex 的
-  read-only / workspace-write 就是 seatbelt 和 landlock 做的，本项目还没有。在那之前，
-  「每次都要人看一眼」是唯一诚实的默认值。
+  被切掉，用户会在看不全的情况下签字）。能放开它的有三条路，粗到细：`.tudouni.json`
+  的 `auto_approve_tools` 点名整个 `shell`、按 `t` 记住一条**命令前缀**
+  （`shell_allow`）、或者手写一条前缀规则。**这三条都是"人预先声明信任"，不是系统
+  判断安全** —— 而且写裸程序名（`git`）约等于放开整个工具（理由见上面那节）。
+  真正的解法是操作系统级沙箱 —— Codex 的 read-only / workspace-write 就是 seatbelt 和
+  landlock 做的，本项目还没有。在那之前，「每次都要人看一眼」是唯一诚实的默认值。
+- **`.git/` 仍然在 agent 的可写范围内。** `.git/config` 的 `core.pager` /
+  `core.sshCommand` 和 `.git/hooks/*` 都能让一条**已被放行**的 `git` 命令去执行任意
+  东西，而且不需要经过 shell 审批。控制面拒绝表（`.tudouni.json` / `.sessions/` /
+  `.logs/`）目前不含 `.git/`。
 - **`package = false` + `sys.path` 修补。** `pyproject.toml` 位于包目录内，所以项目
   根就是包本身，uv 无法把它当包安装。`main.py` 因此自己把父目录塞进 `sys.path`，
   `conftest.py` 做同一件事。想彻底解决要把项目根上移一级或改成嵌套布局，代价是

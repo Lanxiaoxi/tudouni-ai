@@ -16,7 +16,12 @@ import sys
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from agent_runtime.config import PERMISSION_FILE_NAME
+from agent_runtime.security.commands import (
+    Rule,
+    command_of,
+    command_parameter,
+    suggest_prefix,
+)
 from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.tools.tool import RiskLevel, Tool
 
@@ -67,10 +72,20 @@ _REMEMBER_CONSEQUENCE: dict[RiskLevel, str] = {
 _REMEMBER_DEFAULT_CONSEQUENCE = "以后不再询问这个工具"
 
 
-def _remember_hint(tool: Tool) -> str:
-    """t 那一行的说明。缺省是"以后不再询问"，新等级忘了配也落在安全的说法上。"""
+def _remember_hint(tool: Tool, target: Rule | str, label: str) -> str:
+    """t 那一行的说明 —— 它必须说清"按下去会记住什么"。
+
+    命令类工具记的是一条**前缀**（`git add`），不是"整个 shell 免问"：两者的后果差着
+    量级，而人唯一的判断依据就是这一行。缺省那句跟着风险等级走，新等级忘了配也落在
+    安全的说法上。
+    """
+    if isinstance(target, tuple):
+        return (
+            f"以后 {' '.join(target)} 开头的命令都直接执行，不会再给你看"
+            f"（写进 {label}，下次启动仍然有效）"
+        )
     consequence = _REMEMBER_CONSEQUENCE.get(tool.risk, _REMEMBER_DEFAULT_CONSEQUENCE)
-    return f"{consequence}（写进 {PERMISSION_FILE_NAME}，下次启动仍然有效）"
+    return f"{consequence}（写进 {label}，下次启动仍然有效）"
 
 
 def cli_asker(
@@ -101,9 +116,12 @@ def cli_asker(
        "工具执行失败" —— 一个读不到输入的环境，答案和 EOF 完全一样：拒绝。
        这里只有 input() 一条语句，所以 OSError 只可能来自 stdin。
 
-    4. **t 只在真的能记住时才给。** memory 为 None 时提示里没有 t，而打进来的 t
-       会落到"不是 y"那一支（拒绝）。答应了却记不住比拒绝更坏：用户以为已经永久
-       放行了，下一次却还被问，而他会以为是程序坏了。
+    4. **t 只在真的能记住时才给，而且记住什么要说清楚。** memory 为 None 时提示里
+       没有 t，打进来的 t 会落到"不是 y"那一支（拒绝）—— 答应了却记不住比拒绝更坏：
+       用户以为已经永久放行了，下一次却还被问。命令类工具（shell）记的是**命令前缀**
+       （`git add` 开头），不是整个 shell；前缀推不出来时（命令行里有重定向、命令替换
+       之类，解析器不肯猜）干脆不提供 t —— 一个按键记下"整个 shell 免问"和这个功能的
+       初衷正好相反。
     """
     # 用 .get 而不是 []：将来加了新的风险等级而这张表忘了配，缺省值是「原样打全」。
     # 多显示一点是安全的失败方向，少显示才是危险的。
@@ -112,12 +130,21 @@ def cli_asker(
         f"{name}={_preview(value, limit)}" for name, value in arguments.items()
     )
 
+    # 按 t 该记住什么：命令类工具记前缀，其余工具记工具名。推不出来就是 None ——
+    # None 表示"这次不提供 t"，而不是"记住整个工具"。
+    target: Rule | str | None = None
+    if memory is not None:
+        if command_parameter(tool.name) is None:
+            target = tool.name
+        else:
+            command = command_of(tool.name, arguments)
+            target = suggest_prefix(command) if command is not None else None
+
     print(f"[审批] 工具 {tool.name}  风险 {tool.risk.value}", file=sys.stderr)
     print(f"[审批] 参数 {args_preview}", file=sys.stderr)
 
-    can_remember = memory is not None
-    if can_remember:
-        print(f"[审批] t = {_remember_hint(tool)}", file=sys.stderr)
+    if target is not None:
+        print(f"[审批] t = {_remember_hint(tool, target, memory.label)}", file=sys.stderr)
         print("[审批] 是否执行？[y/N/t] ", end="", file=sys.stderr, flush=True)
     else:
         print("[审批] 是否执行？[y/N] ", end="", file=sys.stderr, flush=True)
@@ -130,10 +157,13 @@ def cli_asker(
 
     answer = answer.strip().lower()
 
-    if answer == "t" and can_remember:
+    if answer == "t" and target is not None:
         # 记在这里而不是返回给 gate：asker 的返回类型保持布尔，而 gate 用问前问后的
         # 快照差看见这次新增（见 security/gate.py）。
-        memory.grant(tool.name)
+        if isinstance(target, str):
+            memory.grant(target)
+        else:
+            memory.grant_prefix(target)
         return True
 
     return answer in {"y", "yes"}

@@ -15,7 +15,7 @@ import pytest
 from agent_runtime.config import (
     ConfigError,
     PermissionConfig,
-    save_auto_approve_tools,
+    save_approvals,
 )
 
 
@@ -149,7 +149,7 @@ def test_unknown_tools_flags_typos_but_does_not_fail(workdir):
 
 def test_save_creates_the_file_and_survives_a_round_trip(workdir):
     path = workdir / ".tudouni.json"
-    save_auto_approve_tools(path, {"shell"})
+    save_approvals(path, tools={"shell"}, prefixes=())
 
     cfg = PermissionConfig.from_file(path)          # 写出来的必须自己能读回去
     assert cfg.auto_approve_tools == frozenset({"shell"})
@@ -157,24 +157,24 @@ def test_save_creates_the_file_and_survives_a_round_trip(workdir):
 
 
 def test_save_keeps_the_other_keys_and_their_order(workdir):
-    """只动 auto_approve_tools 一个键 —— 手写的部分不该因为按了一次 t 被重排。"""
+    """只动它自己那两个键 —— 手写的部分不该因为按了一次 t 被重排。"""
     path = write_json(workdir, {
         "deny_tools": ["git_commit"],
         "auto_approve": ["low", "medium"],
     })
 
-    save_auto_approve_tools(path, {"shell"})
+    save_approvals(path, tools={"shell"}, prefixes=())
 
     assert list(json.loads(path.read_text(encoding="utf-8"))) == [
-        "deny_tools", "auto_approve", "auto_approve_tools",
+        "deny_tools", "auto_approve", "auto_approve_tools", "shell_allow",
     ]
 
 
 def test_save_is_sorted_and_idempotent(workdir):
     path = workdir / ".tudouni.json"
-    save_auto_approve_tools(path, {"shell", "write_file"})
+    save_approvals(path, tools={"shell", "write_file"}, prefixes=())
     first = path.read_text(encoding="utf-8")
-    save_auto_approve_tools(path, {"write_file", "shell"})
+    save_approvals(path, tools={"write_file", "shell"}, prefixes=())
 
     assert path.read_text(encoding="utf-8") == first      # 同样的集合，同样的文件
     assert json.loads(first)["auto_approve_tools"] == ["shell", "write_file"]
@@ -183,7 +183,7 @@ def test_save_is_sorted_and_idempotent(workdir):
 def test_save_leaves_no_temp_file_behind(workdir):
     """先写临时文件再 os.replace —— 但临时文件不能留在工作区里。"""
     path = workdir / ".tudouni.json"
-    save_auto_approve_tools(path, {"shell"})
+    save_approvals(path, tools={"shell"}, prefixes=())
 
     assert sorted(p.name for p in workdir.iterdir()) == [".tudouni.json"]
 
@@ -193,6 +193,51 @@ def test_save_refuses_to_overwrite_a_file_it_cannot_read(workdir):
     path = write(workdir, '{"deny_tools": ["git_commit",}')
 
     with pytest.raises(ConfigError):
-        save_auto_approve_tools(path, {"shell"})
+        save_approvals(path, tools={"shell"}, prefixes=())
 
     assert path.read_text(encoding="utf-8") == '{"deny_tools": ["git_commit",}'
+
+
+# --- 命令规则（shell_allow）---------------------------------------------
+
+def test_shell_allow_becomes_token_rules(workdir):
+    """规则是**命令前缀**，存进内存时已经切成 token —— 匹配阶段不再解析字符串。"""
+    cfg = PermissionConfig.from_file(write_json(workdir, {
+        "shell_allow": ["git add", "python -m pytest", "ls"],
+    }))
+
+    assert cfg.shell_allow == (("git", "add"), ("python", "-m", "pytest"), ("ls",))
+
+
+def test_a_rule_with_a_separator_is_an_error(workdir):
+    """规则是前缀，不是命令 —— 写成分号拼接就是在把两条命令伪装成一条规则。"""
+    with pytest.raises(ConfigError) as exc:
+        PermissionConfig.from_file(write_json(workdir, {"shell_allow": ["git add; rm -rf /"]}))
+
+    assert "shell_allow" in str(exc.value)
+
+
+def test_a_rule_with_a_redirect_is_an_error(workdir):
+    with pytest.raises(ConfigError):
+        PermissionConfig.from_file(write_json(workdir, {"shell_allow": ["git log > out.txt"]}))
+
+
+def test_save_writes_both_kinds_of_grant_and_round_trips(workdir):
+    """两类记忆共用一次落盘：工具名和命令前缀，写出来的必须自己能读回去。"""
+    path = workdir / ".tudouni.json"
+    save_approvals(path, tools={"write_file"}, prefixes={("git", "add"), ("ls",)})
+
+    cfg = PermissionConfig.from_file(path)
+    assert cfg.auto_approve_tools == frozenset({"write_file"})
+    assert set(cfg.shell_allow) == {("git", "add"), ("ls",)}
+    assert cfg.auto_approve == ("low",)          # 缺省不被这次写入改掉
+
+
+def test_save_re_quotes_tokens_that_contain_spaces(workdir):
+    """含空格的 token 要重新加引号，否则写回去再读出来就变成两个 token ——
+    配置被自己的写回步骤改坏是最难查的一类 bug。"""
+    path = workdir / ".tudouni.json"
+    rule = ("git", "commit", "-m", "wip wip")
+    save_approvals(path, tools=(), prefixes={rule})
+
+    assert PermissionConfig.from_file(path).shell_allow == (rule,)

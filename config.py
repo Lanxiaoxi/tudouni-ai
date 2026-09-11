@@ -29,6 +29,8 @@ from typing import Any
 
 from dotenv import dotenv_values
 
+from agent_runtime.security.commands import Rule, format_rule, parse_rule
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_FILE = PROJECT_ROOT / ".env"
@@ -106,7 +108,7 @@ PERMISSION_FILE_NAME = PERMISSION_FILE.name
 # 认识的**全部**键。多一个不认识的键就报错 —— 理由和 ToolArgs 的 extra="forbid"
 # 是同一个：写错一个键名而它静默不生效，是最坏的失败形态。你以为自己放行了或者
 # 拒绝了什么，其实什么都没发生，而且没有任何地方会告诉你。
-_KNOWN_PERMISSION_KEYS = ("auto_approve", "auto_approve_tools", "deny_tools")
+_KNOWN_PERMISSION_KEYS = ("auto_approve", "auto_approve_tools", "deny_tools", "shell_allow")
 
 # 按等级放行只收这两个，high 必须走 auto_approve_tools 点名 —— 见 PermissionConfig。
 _LEVELS_ALLOWED_IN_FILE = ("low", "medium")
@@ -123,12 +125,13 @@ DEFAULT_AUTO_APPROVE = ("low",)
 class PermissionConfig:
     """`.tudouni.json` 里的权限设置。
 
-    三个键，都只有"收窄"和"点名"两种写法，没有"按等级放开一切"：
+    四个键，都只有"收窄"和"点名"两种写法，没有"按等级放开一切"：
 
         {
           "auto_approve": ["low"],             // 按风险等级直接放行
           "auto_approve_tools": ["shell"],     // 按工具名直接放行
-          "deny_tools": ["git_commit"]         // 按工具名直接拒绝，问都不问
+          "deny_tools": ["git_commit"],        // 按工具名直接拒绝，问都不问
+          "shell_allow": ["git add", "ls"]     // 按命令前缀直接放行（只对 shell 有意义）
         }
 
     **为什么 high 不能写进 auto_approve。** 等级是工具自己声明的，所以"放行所有
@@ -143,11 +146,22 @@ class PermissionConfig:
     想表达"什么都不自动放行"，就在文件里显式写 `"auto_approve": []`。
 
     文件不存在不是错误（和 .env 一样），全部取默认值。
+
+    **shell_allow 是命令前缀，不是命令。** 规则 `git add` 覆盖 `git add -p x.py`，
+    但不覆盖 `git commit`；规则 `git` 覆盖所有以 git 开头的段（包括它的全局选项）。
+    语义和边界写在 security/commands.py 里，那里还写着三条不能妥协的：整条命令行要
+    逐段覆盖、看不懂就去问人、按 token 比而不是按字符串比。
+
+    一个必须先说清的事实：**写裸程序名（`git`、`python`、`make`）约等于放开整个 shell
+    工具** —— `git -c alias.x='!rm -rf x' x`、`git bisect run <任意命令>`、`git commit`
+    会跑的 .git/hooks 都能从"允许 git"里长出来。想让规则真的收窄什么，就写到子命令
+    （`git add`）这一层。
     """
 
     auto_approve: tuple[str, ...] = DEFAULT_AUTO_APPROVE
     auto_approve_tools: frozenset[str] = frozenset()
     deny_tools: frozenset[str] = frozenset()
+    shell_allow: tuple[Rule, ...] = ()
 
     @classmethod
     def from_file(cls, path: Path | None = None) -> "PermissionConfig":
@@ -197,10 +211,18 @@ class PermissionConfig:
                 f"别让策略去猜哪个算数"
             )
 
+        shell_allow: list[Rule] = []
+        for text in _string_list(raw, "shell_allow", path):
+            try:
+                shell_allow.append(parse_rule(text))
+            except ValueError as exc:
+                raise ConfigError(f"{PERMISSION_FILE_NAME} 的 shell_allow 里有一条写错的规则：{exc}") from None
+
         return cls(
             auto_approve=tuple(levels),
             auto_approve_tools=auto_approve_tools,
             deny_tools=deny_tools,
+            shell_allow=tuple(shell_allow),
         )
 
     def unknown_tools(self, known: Iterable[str]) -> frozenset[str]:
@@ -212,11 +234,19 @@ class PermissionConfig:
         return frozenset((self.auto_approve_tools | self.deny_tools) - set(known))
 
 
-def save_auto_approve_tools(path: Path, tools: Iterable[str]) -> None:
-    """把一组工具名写回 `.tudouni.json` 的 auto_approve_tools。
+def save_approvals(
+    path: Path,
+    *,
+    tools: Iterable[str],
+    prefixes: Iterable[Rule],
+) -> None:
+    """把"人说过别再问"的东西写回 `.tudouni.json`。
 
-    这是**人在审批时按 t** 留下的改动，所以只动这一个键：其余键、以及键的顺序都
-    原样保留，人在这份文件里手写的东西不会因为按了一次 t 就被重排或丢掉。
+    两类分别进 `auto_approve_tools`（工具名）和 `shell_allow`（命令前缀）—— 它们是
+    同一件事的两种粒度，所以共用这一个落盘口，也就不会出现"只写了一半"的状态。
+
+    这是**人在审批时按 t** 留下的改动，所以只动这两个键：其余键、以及键的顺序都原样
+    保留，人在这份文件里手写的东西不会因为按了一次 t 就被重排或丢掉。
 
     先写临时文件再 os.replace —— 和会话状态文件同一个理由：磁盘上任何时刻要么是旧的
     完整版，要么是新的完整版，不存在"写了一半"的形态。这个文件最需要它的时候，正是
@@ -226,6 +256,7 @@ def save_auto_approve_tools(path: Path, tools: Iterable[str]) -> None:
     """
     raw = _read_json_object(path) if path.is_file() else {}
     raw["auto_approve_tools"] = sorted(set(tools))
+    raw["shell_allow"] = sorted({format_rule(rule) for rule in prefixes})
 
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

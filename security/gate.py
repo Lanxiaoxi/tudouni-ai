@@ -7,15 +7,16 @@
 四种放行/拒绝的来路刻意分开记（outcome），因为它们事后要回答的问题不同：
 
     auto_allowed    风险等级在名单里 —— 没问过任何人，也不需要问
-    rule_allowed    你**以前**按过 t —— 问过，但问的不是这一次
+    rule_allowed    这个**工具**你以前按过 t —— 问过，但问的不是这一次
+    command_allowed 这条**命令**命中了 .tudouni.json 里的前缀规则 —— 也没问这一次
     approved        这一次问了人，人批准了
     user_denied     这一次问了人，人拒绝了
     policy_denied   策略直接禁止，问都不用问
     no_asker        要问却没配询问方式，按拒绝处理
 
-"谁批准的"和"策略直接禁止的"在追责时是两件事；而"人批准的"和"人以前批准过、之后
-一直自动放行"同样是两件事 —— 后者是日志里唯一能解释"这条 shell 命令怎么没问就跑了"
-的线索。
+"谁批准的"和"策略直接禁止的"在追责时是两件事；"人批准的"、"人以前批准过、之后一直
+自动放行"、"人预先写下的一条命令规则放过的"同样是三件事 —— 它们分别是**这一次**有人
+看过、以及两种没有人在场的放行，而最后一种还要多回答一句"是哪条规则"。
 """
 
 import time
@@ -23,6 +24,7 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from agent_runtime.security.asker import ApprovalAsker
+from agent_runtime.security.commands import Rule, command_of, covered
 from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.security.policy import Decision, PermissionPolicy
 from agent_runtime.tools.tool import Tool
@@ -38,6 +40,9 @@ class GateResult(NamedTuple):
     # 这一次裁决**新增**的免问规则（人按了 t）。审计要记它：一次批准同时改变了将来
     # 的行为，那不是"谁批准了什么"里可以省掉的一半。空集合表示这次没有新增。
     remembered: frozenset[str] = frozenset()
+    # 命中的命令前缀规则（outcome == command_allowed 时才有值）。它回答的是
+    # "这条命令为什么没问" —— 没有它，日志里只能看出"没问过"，看不出凭哪一条。
+    rule: Rule | None = None
 
 
 def check_permission(
@@ -64,11 +69,23 @@ def check_permission(
             "policy_denied", decision, None,
         )
 
-    # 人在之前某次审批里按过 t。这一支排在 no_asker **之前**：规则已经把答案给了，
-    # 没有询问方式不影响这个答案 —— 反过来会让"配了免问规则却因为缺 asker 被拒"
-    # 这种荒唐结果出现。
+    # 人在之前某次审批里按过 t（整个工具）。这一支排在 no_asker **之前**：规则已经把
+    # 答案给了，没有询问方式不影响这个答案 —— 反过来会让"配了免问规则却因为缺 asker
+    # 被拒"这种荒唐结果出现。
     if memory is not None and tool.name in memory:
         return GateResult(None, "rule_allowed", decision, None)
+
+    # 命令前缀规则：比"整个工具免问"更细的一层。
+    #
+    # 它排在整工具那条**后面**，是为了让审计里报出来的原因总是"单独就足够"的那一个：
+    # 工具已经被整体免问时，报"命中了哪条命令规则"会让人以为撤掉那条规则它就会重新
+    # 被问，而事实不是这样。
+    if memory is not None:
+        command = command_of(tool.name, arguments)
+        if command is not None:
+            matched = covered(command, memory.prefixes())
+            if matched is not None:
+                return GateResult(None, "command_allowed", decision, None, rule=matched)
 
     if asker is None:
         # fail-closed：要审批却没配询问方式，一律拒绝，绝不默认放行。

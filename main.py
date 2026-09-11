@@ -35,13 +35,15 @@ from agent_runtime.cli import (
 )
 from agent_runtime.config import (
     PERMISSION_FILE,
+    PERMISSION_FILE_NAME,
     ConfigError,
     ModelConfig,
     PermissionConfig,
-    save_auto_approve_tools,
+    save_approvals,
 )
 from agent_runtime.models import OpenAICompatibleModel
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, cli_asker
+from agent_runtime.security.commands import format_rule
 from agent_runtime.state import JsonSessionStore
 from agent_runtime.tools.builtin import create_tool_registry
 
@@ -62,6 +64,11 @@ def report_permissions(policy: PermissionPolicy, memory: ApprovalMemory) -> None
     print(f"[权限] 按等级自动放行 {levels}；点名免问 {named}", file=sys.stderr)
     if policy.deny_tools:
         print(f"[权限] 直接拒绝 {', '.join(sorted(policy.deny_tools))}", file=sys.stderr)
+
+    # 命令规则单列一行：它是"按一次 t 记住哪条前缀"的产物，也是最容易被忘掉的一条 ——
+    # 印象里只批准过一次 git add，而它此后一直静默生效。
+    rules = ", ".join(format_rule(rule) for rule in sorted(memory.prefixes())) or "（无）"
+    print(f"[权限] 命令规则（按前缀放行）{rules}", file=sys.stderr)
 
 
 def main() -> int:
@@ -128,11 +135,15 @@ def main() -> int:
         deny_tools=permissions.deny_tools,
     )
 
-    # 人按 t 记下的工具名。落盘那一半是注入进来的 —— memory 自己不碰文件，
-    # 所以它在测试里是纯内存的。
+    # 人按 t 记下的东西：工具名，以及命令前缀（shell 那种"一条命令一个样"的粒度）。
+    # 落盘那一半是注入进来的 —— memory 自己不碰文件，所以它在测试里是纯内存的。
     memory = ApprovalMemory(
         permissions.auto_approve_tools,
-        on_change=lambda names: save_auto_approve_tools(PERMISSION_FILE, names),
+        on_change=lambda tools, prefixes: save_approvals(
+            PERMISSION_FILE, tools=tools, prefixes=prefixes
+        ),
+        prefixes=permissions.shell_allow,
+        label=PERMISSION_FILE_NAME,
     )
     report_permissions(policy, memory)
 

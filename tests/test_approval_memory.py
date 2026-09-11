@@ -70,7 +70,7 @@ def test_tools_returns_a_snapshot_not_a_live_view():
 
 def test_persist_is_called_once_per_new_name():
     saved: list[frozenset[str]] = []
-    memory = ApprovalMemory(on_change=saved.append)
+    memory = ApprovalMemory(on_change=lambda tools, prefixes: saved.append(tools))
 
     memory.grant("shell")
     memory.grant("shell")           # 没新东西，不该再写一遍文件
@@ -79,10 +79,27 @@ def test_persist_is_called_once_per_new_name():
     assert saved == [frozenset({"shell"}), frozenset({"shell", "write_file"})]
 
 
+def test_persist_receives_both_kinds_of_grant():
+    """两类记忆共用一次落盘 —— 回调必须同时拿到它们，否则写回文件时会把另一半丢掉。"""
+    saved = []
+    memory = ApprovalMemory(on_change=lambda tools, prefixes: saved.append((tools, prefixes)))
+
+    memory.grant_prefix(("git", "add"))
+
+    assert saved == [(frozenset(), frozenset({("git", "add")}))]
+
+
+def test_grant_prefix_is_idempotent():
+    memory = ApprovalMemory()
+    assert memory.grant_prefix(("git", "add")) is True
+    assert memory.grant_prefix(("git", "add")) is False
+    assert memory.prefixes() == frozenset({("git", "add")})
+
+
 def test_persist_failure_keeps_the_memory_and_says_so(capsys):
     """落盘失败不能往外抛：agent 的 except Exception 就在外面，抛出去会让这一轮
     本来合法的工具调用变成"工具执行失败"。但也不能是静默失败。"""
-    def broken(_names):
+    def broken(_tools, _prefixes):
         raise OSError("磁盘满了")
 
     memory = ApprovalMemory(on_change=broken)
@@ -232,20 +249,83 @@ def test_the_t_option_is_only_shown_when_it_can_be_honored(typed, capsys):
     assert "[y/N]" in without
 
 
-def test_high_risk_says_what_t_really_gives_away(typed, capsys):
-    """对 shell 按 t 不是"少一次确认"，而是**再也看不见它要执行什么** ——
-    而命令原文正是那道关唯一的判断依据。"""
-    typed("n")
-    cli_asker(make_tool(RiskLevel.HIGH, "shell"), {"command": "ls"}, memory=ApprovalMemory())
-
-    hint = [line for line in capsys.readouterr().err.splitlines() if "t = " in line]
-    assert hint and "不会再看到" in hint[0]
-    assert PERMISSION_FILE_NAME in hint[0]      # 说清它被写进了哪个文件
-
-
 def test_medium_risk_uses_the_ordinary_wording(typed, capsys):
     typed("n")
     cli_asker(make_tool(), {}, memory=ApprovalMemory())
 
     hint = [line for line in capsys.readouterr().err.splitlines() if "t = " in line]
     assert hint and "以后不再询问这个工具" in hint[0]
+
+
+# --- 命令类工具：t 记的是前缀，不是整个 shell -----------------------------
+
+def hint_of(capsys) -> str:
+    lines = [line for line in capsys.readouterr().err.splitlines() if "t = " in line]
+    return lines[0] if lines else ""
+
+
+def test_t_on_a_command_tool_offers_a_prefix(typed, capsys):
+    """对 shell 按 t 不是"整个 shell 免问"，而是"这条命令前缀免问"。
+
+    提示必须把前缀原样写出来、并说清它落在哪个文件 —— 人唯一的判断依据就是这一行。
+    """
+    typed("n")
+    cli_asker(
+        make_tool(RiskLevel.HIGH, "shell"),
+        {"command": "git add -p x.py"},
+        memory=ApprovalMemory(label=PERMISSION_FILE_NAME),
+    )
+
+    hint = hint_of(capsys)
+    assert "git add" in hint
+    assert "不会再给你看" in hint               # 之后它要执行什么，你不会再看到
+    assert "shell" not in hint                  # 不是整个工具
+    assert PERMISSION_FILE_NAME in hint
+
+
+def test_t_on_a_command_tool_records_the_prefix(typed):
+    typed("t")
+    memory = ApprovalMemory()
+    tool = make_tool(RiskLevel.HIGH, "shell")
+
+    assert cli_asker(tool, {"command": "git add -p x.py"}, memory=memory) is True
+
+    assert memory.prefixes() == frozenset({("git", "add")})
+    assert memory.tools() == frozenset()        # 没有顺手把整个 shell 记下来
+
+
+def test_t_is_not_offered_when_the_command_cannot_be_parsed(typed, capsys):
+    """解析不了就不提供 t：一个按键记下"整个 shell 免问"与这个功能的初衷正好相反。"""
+    typed("t")
+    memory = ApprovalMemory()
+
+    assert cli_asker(make_tool(RiskLevel.HIGH, "shell"),
+                     {"command": "git log > out.txt"}, memory=memory) is False
+
+    assert memory.prefixes() == frozenset()
+    assert memory.tools() == frozenset()        # 也没有退回"记住整个工具"
+    stderr = capsys.readouterr().err
+    assert "t = " not in stderr                 # 提示里根本没给这个选项
+    assert "[y/N]" in stderr
+
+
+def test_t_is_not_offered_for_a_chained_command(typed, capsys):
+    """链式命令也不提供 t —— 推出来的前缀盖不住整条链，按了也白按。"""
+    typed("t")
+    memory = ApprovalMemory()
+
+    assert cli_asker(make_tool(RiskLevel.HIGH, "shell"),
+                     {"command": "git status && rm -rf build"}, memory=memory) is False
+
+    assert memory.prefixes() == frozenset()
+    stderr = capsys.readouterr().err
+    assert "t = " not in stderr
+    assert "[y/N]" in stderr
+
+
+def test_a_bare_program_name_is_what_the_hint_shows_too(typed, capsys):
+    """`ls -la` 推出的前缀是 `ls`（第二个 token 是选项）—— 提示照实说，人自己判断。"""
+    typed("n")
+    cli_asker(make_tool(RiskLevel.HIGH, "shell"), {"command": "ls -la"}, memory=ApprovalMemory())
+
+    assert "ls 开头的命令" in hint_of(capsys)
