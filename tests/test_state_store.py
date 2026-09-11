@@ -13,6 +13,7 @@ from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import JsonSessionStore, Session
+from agent_runtime.state.store import STATE_VERSION
 from agent_runtime.tools.tool import RiskLevel
 
 from fakes import ScriptedModel, usage
@@ -99,6 +100,65 @@ def test_load_tolerates_unknown_fields(workdir):
     path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
 
     assert store.load("s").session_id == "s"
+
+
+# --- 版本：它必须真的被读 ------------------------------------------------
+#
+# 字段过滤（上面那条）容忍的是"多了几个键"；它容忍不了"同一个键的含义变了"。
+# 后者要靠 STATE_VERSION：写的时候记下版本，读的时候据它决定要不要信这份文件。
+# 这一段盯的就是"版本不是只写不读"。
+
+def test_save_stamps_the_current_version(workdir):
+    """落盘时带上版本号 —— 否则读取端根本没有可据以判断的东西。"""
+    store = JsonSessionStore(workdir)
+    store.save(Session("s"))
+
+    raw = json.loads((workdir / "s.json").read_text(encoding="utf-8"))
+    assert raw["version"] == STATE_VERSION
+
+
+def test_load_rejects_a_newer_version(workdir):
+    """更新版本写的文件不能硬读。
+
+    真正的危险不是"读出错"，而是**静默地读成另一个意思**：将来的格式改了，
+    旧程序照样把能对上的字段塞进 Session，于是拿着一份自己没读懂的历史继续跑。
+    所以这里要主动停下，并说清该怎么处置。
+    """
+    store = JsonSessionStore(workdir)
+    store.save(Session("s"))
+    path = workdir / "s.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["version"] = STATE_VERSION + 1
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        store.load("s")
+
+    assert "更新版本" in str(exc.value)
+
+
+def test_load_accepts_the_current_version(workdir):
+    """本版本写的照常读 —— 上面那条拦的是"更新"，不是把自己也拦了。"""
+    store = JsonSessionStore(workdir)
+    store.save(Session("s", [{"role": "user", "content": "你好"}]))
+
+    assert json.loads((workdir / "s.json").read_text(encoding="utf-8"))["version"] == STATE_VERSION
+    assert store.load("s").messages[0]["content"] == "你好"
+
+
+def test_load_accepts_a_file_from_before_the_version_field(workdir):
+    """本字段落地**之前**写的文件没有 version —— 那时就是这个格式，当作 1。
+
+    这条是"不许把旧会话全弄丢"的那一半：加一个字段不该让已经躺在硬盘上的会话
+    打不开。
+    """
+    path = workdir / "s.json"
+    path.write_text(
+        json.dumps({"session_id": "s", "messages": [], "metadata": {}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    assert JsonSessionStore(workdir).load("s").session_id == "s"
 
 
 def test_sink_appends_and_skips_torn_line(workdir):

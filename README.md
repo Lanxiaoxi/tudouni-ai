@@ -209,7 +209,7 @@ tools/             工具层
 
 security/          权限层
   policy.py          PermissionPolicy：纯函数，只裁定 ALLOW / DENY / ASK
-  gate.py            关卡：把策略 + asker + memory 变成一次裁决（七种来路分开记）
+  gate.py            关卡：把策略 + asker + memory 变成一次裁决（每条来路分开记）
   asker.py           询问方式（CLI 版走终端，认 y/N/t；测试版是脚本化的假实现）
   memory.py          人按 t 记住的东西（工具名 / 命令前缀）—— 唯一可变的那份状态
   commands.py        命令行的拆解与规则匹配：纯函数，看不懂就返回"没覆盖"

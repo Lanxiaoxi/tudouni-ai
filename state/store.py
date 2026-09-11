@@ -79,6 +79,21 @@ class JsonSessionStore:
     def load(self, session_id: str) -> Session:
         raw = json.loads(self._path(session_id).read_text(encoding="utf-8"))
 
+        # 先看版本，再看字段。载荷是 {"version": N, **asdict(session)}，而 version 是
+        # **读取端唯一能据以决定"要不要信这份文件"的东西** —— 字段过滤能容忍"多了几个
+        # 键"，但容忍不了"同一个键的含义变了"（比如将来 messages 里出现一种新的内部
+        # 消息）。那种变化要在写的时候就 bump STATE_VERSION，读的时候在这里拦下，
+        # 而不是让它静默地当成新格式读进来。
+        #
+        # 缺 version 的文件（本字段落地之前写的）当作 1 —— 那时就是这个格式。
+        version = raw.get("version", 1)
+        if version > STATE_VERSION:
+            raise ValueError(
+                f"会话 {session_id!r} 是更新版本写的（文件 version={version}，"
+                f"本程序认识的最高版本是 {STATE_VERSION}）；升级程序再打开它，"
+                f"否则可能读错格式。"
+            )
+
         # 只挑自己认识的字段。会话文件躺在硬盘上，比代码活得久 —— 直接
         # Session(**raw) 的话，将来多一个字段就会让所有旧会话都打不开。
         known = {f.name for f in fields(Session)}

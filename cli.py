@@ -323,7 +323,13 @@ def print_audit(sink: JsonlSink, session_id: str) -> None:
             if k not in ("ts", "kind", "session_id", "run_id", "step")
         }
         body = " ".join(f"{k}={v}" for k, v in payload.items())
-        print(f"{event['ts'][11:]} {event['kind']:<13} step={event['step']:<3} {body[:100]}")
+        # 全部用 .get 而不是下标 —— 理由和 `summarize` 里那段一样，而且更要紧：这个
+        # 函数读的日志来自硬盘（会被复制、拼接、手工编辑，进程被杀还会留下半截行），
+        # 而 JsonlSink.read 只跳过解析失败的行、不保证每行都完整。少一个键就让整条
+        # `--audit` 崩掉，等于把"事后排查"的工具毁在最需要它的场景里。缺的字段显示
+        # 成 "?"，让那一行照样打得出来。
+        print(f"{str(event.get('ts'))[11:]} {event.get('kind', '?'):<13} "
+              f"step={event.get('step', '?'):<3} {body[:100]}")
 
     _print_audit_summary(events)
 
@@ -331,7 +337,7 @@ def print_audit(sink: JsonlSink, session_id: str) -> None:
 def _print_audit_summary(events: list[dict]) -> None:
     usage = summarize(events)
 
-    results = [e for e in events if e["kind"] == "tool_result"]
+    results = [e for e in events if e.get("kind") == "tool_result"]
     by_status: dict[str, int] = {}
     for event in results:
         by_status[event.get("status", "?")] = by_status.get(event.get("status", "?"), 0) + 1
@@ -344,7 +350,7 @@ def _print_audit_summary(events: list[dict]) -> None:
     print(f"工具调用 {len(results)} 次  " +
           "  ".join(f"{k}={v}" for k, v in sorted(by_status.items())))
     _print_timing(summarize_time(events))
-    stops = [e.get("stop_reason") for e in events if e["kind"] == "run_finished"]
+    stops = [e.get("stop_reason") for e in events if e.get("kind") == "run_finished"]
     if stops:
         print(f"回合结束原因  " + "  ".join(stops))
     print("提示：未命中缓存的输入是成本大头（官方价里它比命中贵约 50 倍），"

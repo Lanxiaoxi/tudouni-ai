@@ -45,6 +45,7 @@ from agent_runtime.models import OpenAICompatibleModel
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, cli_asker
 from agent_runtime.security.commands import format_rule
 from agent_runtime.state import JsonSessionStore
+from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin import create_tool_registry
 
 SESSIONS_DIR = PROJECT_DIR / ".sessions"
@@ -65,15 +66,44 @@ def report_permissions(policy: PermissionPolicy, memory: ApprovalMemory) -> None
     if policy.deny_tools:
         print(f"[权限] 直接拒绝 {', '.join(sorted(policy.deny_tools))}", file=sys.stderr)
 
-    # 命令规则单列一行：它是"按一次 t 记住哪条前缀"的产物，也是最容易被忘掉的一条 ——
+    # 命令行规则单列一行：它是"按一次 t 记住哪条前缀"的产物，也是最容易被忘掉的一条 ——
     # 印象里只批准过一次 git add，而它此后一直静默生效。
     rules = ", ".join(format_rule(rule) for rule in sorted(memory.prefixes())) or "（无）"
     print(f"[权限] 命令规则（按前缀放行）{rules}", file=sys.stderr)
 
 
+def _check_session_id(session_id: str | None) -> str | None:
+    """`--session` 是用户直接敲进来的字符串，写错了要能照着改。
+
+    校验规则本身在 state/session.py（它描述的是"什么算合法会话 id"），而这条只负责
+    把"不合法"翻译成一句人话。**必须在碰 store 之前**做，否则 ValueError 会从
+    `store.load` / `_path` 里冒出来，用户在终端上看到的是一整段 Python 栈 —— 而
+    `--session` 写错（带空格、带斜杠、复制进来一个 Windows 路径）是最常见的手滑，
+    项目别处（ConfigError、缺密钥）刻意都做到了"报错 + 退出码 2"。
+
+    返回 None 表示没问题；返回字符串就是那棵写好的报错文案。
+    """
+    if session_id is None or is_valid_session_id(session_id):
+        return None
+    return (
+        f"非法的 --session：{session_id!r}\n"
+        f"  会话 id 只能由字母、数字、下划线、连字符组成，长度 1~64 ——\n"
+        f"  因为它会被拿去拼文件名（.sessions/<id>.json 和 .logs/<id>.jsonl）。\n"
+        f"  用 --list 看一下有哪些现成的 id。"
+    )
+
+
 def main() -> int:
     """返回退出码：配置缺失是"用户得先做点事"，脚本调用方应该能看出失败。"""
     args = build_parser().parse_args()
+
+    # 会话 id 的合法性在这里一次查清，早于任何会碰它的东西。--list 不看这个参数，
+    # 但传了非法值仍然报错 —— 一个地方查一次，比让三条子命令各自去猜自己会不会用
+    # 到它可靠。
+    if (problem := _check_session_id(args.session)) is not None:
+        print(problem, file=sys.stderr)
+        return 2
+
     store = JsonSessionStore(SESSIONS_DIR)
     logs = JsonlSink(LOGS_DIR)
 
