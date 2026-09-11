@@ -140,6 +140,12 @@ class Timing:
     模型往返（每次尝试一条）、工具执行（不含等人审批）、等人审批、重试退避。
     口径重叠过一次的教训写在这里 —— 工具耗时原本从函数入口起表，把等人审批也算了
     进去，于是它几乎等于人的思考时间，而那两个数一相加还会重复。
+
+    **工具那一段在并行之后换了口径。** 只读工具整批并发时，逐条 duration_ms 之和已经
+    大于它占用的墙上时间（两个 5 秒的工具并行：和是 10 秒，墙上只花了 5 秒），再拿
+    这个和去减"未归因"就会减出负数、被 max(0, ...) 吞掉 —— 报出一行恒为 0 的"未归因"，
+    而它看起来完全正常。所以并行批次读的是 `tool_batch.wall_ms`（那一批实际占了多久），
+    逐条的和挪去回答另一个问题：省下了多少（见 saved_ms）。
     """
 
     run_ms: int          # 各回合墙上时间之和（run_finished.duration_ms）
@@ -147,6 +153,11 @@ class Timing:
     tool_ms: int
     waited_ms: int
     backoff_ms: int
+    # 并行省下来的时间 = 并行批次里"逐条耗时之和 - 实际墙上时间"。
+    #
+    # 它是**派生值，不是一段**：上面那几项相加等于回合总，而它不参与那个等式（省掉的
+    # 时间本来就不在回合总里）。所以它单独显示，且不被 "未归因" 减掉。
+    saved_ms: int = 0
 
     @property
     def explained_ms(self) -> int:
@@ -169,15 +180,31 @@ def summarize_time(events: Iterable[dict]) -> Timing:
     和 `summarize()` 完全同一个模式：**不另记一份计时状态** —— 另记就有了两份事实，
     早晚不一致。所以这里读的也是审计事件，而 Agent 那边只负责把它们记准。
     """
+    # 一份事件要被数好几遍（下面按 kind 分别求和），所以先落成一份。
+    events = list(events)
+
     def total(kind: str, field: str) -> int:
         return sum(e.get(field, 0) for e in events if e.get("kind") == kind)
+
+    def tool_durations(parallel: bool) -> int:
+        return sum(
+            e.get("duration_ms", 0) for e in events
+            if e.get("kind") == "tool_result" and bool(e.get("parallel")) is parallel
+        )
+
+    # 并行批次：逐条之和是"各工具自己花了多久"（彼此重叠），批次墙上时间才是
+    # "这一批占用了多久"。老日志里根本没有 tool_batch 事件，两项都算 0，
+    # 于是 tool_ms 退化回原来的"逐条相加"—— 旧数字一个都不变。
+    batch_sum = tool_durations(parallel=True)
+    batch_wall = total("tool_batch", "wall_ms")
 
     return Timing(
         run_ms=total("run_finished", "duration_ms"),
         model_ms=total("model_call", "duration_ms"),
-        tool_ms=total("tool_result", "duration_ms"),
+        tool_ms=tool_durations(parallel=False) + batch_wall,
         waited_ms=total("permission", "waited_ms"),
         backoff_ms=total("model_call", "backoff_ms"),
+        saved_ms=max(0, batch_sum - batch_wall),
     )
 
 
@@ -218,6 +245,10 @@ def _print_timing(timing: Timing) -> None:
         f"模型 {_ms_text(timing.model_ms)}",
         f"工具 {_ms_text(timing.tool_ms)}",
     ]
+    # 并行省下来的那一份单列。它不参与上面那句"工具"里（那里报的是真实占用的墙上
+    # 时间），也不参与末尾的相加 —— 它正是被省掉、没进入回合总的那一段。
+    if timing.saved_ms:
+        parts.append(f"（并行省 {_ms_text(timing.saved_ms)}）")
     # 没发生过的事不占位置：没人被问过审批时，那一项只是 0ms 的噪声。
     if timing.waited_ms:
         parts.append(f"等人审批 {_ms_text(timing.waited_ms)}")

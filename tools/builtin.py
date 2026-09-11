@@ -122,6 +122,15 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
 
     registry = ToolRegistry()
 
+    # 三个 parallel_safe 的工具就是那三个**只读**的：read_file / list_files /
+    # get_current_time。判定标准只有一条 —— handler 有没有副作用，而这三个连一个
+    # 字节都不写、也不碰任何共享状态，所以同一批里怎么排都不会互相影响。
+    #
+    # 其余三个（write_file / edit_file / shell）**刻意不标**：
+    #   * edit_file 是"读进来、改一段、整份写回去"，两个并发调用会互相盖掉对方
+    #     （经典 lost update），而且两边都返回"已替换 1 处" —— 静默丢数据。
+    #   * write_file 不是原子写（写了一半的文件会被同批的 read_file 读到）。
+    #   * shell 能改工作区里任何东西，"这两条命令彼此独立"运行时**无法验证**。
     registry.register(Tool(
         name="read_file",
         description=(
@@ -131,6 +140,7 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
         risk=RiskLevel.LOW,
         args_model=ReadFileArgs,
         handler=fs.read_file,
+        parallel_safe=True,
     ))
 
     registry.register(Tool(
@@ -179,6 +189,7 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
         risk=RiskLevel.LOW,
         args_model=ListFilesArgs,
         handler=fs.list_files,
+        parallel_safe=True,
     ))
 
     # 风险定 LOW：它只读时钟、没有副作用、不碰工作区，放行不需要问人 ——
@@ -189,6 +200,7 @@ def create_tool_registry(workspace: str) -> ToolRegistry:
         risk=RiskLevel.LOW,
         args_model=GetCurrentTimeArgs,
         handler=get_current_time,
+        parallel_safe=True,
     ))
 
     # 风险定 HIGH，而且**刻意不做参数级判断** —— 理由见 tools/shell.py 的模块注释。

@@ -3,6 +3,8 @@ import sys
 import time
 import traceback
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -45,6 +47,13 @@ Clock = Callable[[], float]
 # 也可能含敏感内容，所以审计日志只留预览、从不记全文。
 AUDIT_PREVIEW_LIMIT = 200
 
+# 一个批次里最多同时跑几个工具。
+#
+# 它挡的是"模型一口气给出 30 个调用"那种极端形状：read_file 会把整份文件读进内存、
+# 结果再整份进入下一轮请求，并发度等于批次大小的话，句柄和内存都会出现一个没有必要的
+# 尖峰。实测最常见的批是 2~5 个，所以这个上限在正常形状上永远不会碰到。
+MAX_PARALLEL = 8
+
 # 工具在正常工作流程里会抛的异常 —— 它们代表"这次调用没成功"，不是 bug。
 # 其余异常一律当疑似 bug：给模型的消息照旧，但 stderr 要留下完整 traceback。
 _TOOL_LEVEL_ERRORS = (
@@ -62,6 +71,40 @@ def _is_fatal(exc: BaseException) -> bool:
     两者在审计里必须是不同的 stop_reason：前者要用户改配置，后者可以直接再试。
     """
     return isinstance(exc, ModelFatalError)
+
+
+@dataclass(frozen=True, slots=True)
+class _Outcome:
+    """一次工具调用的结局：给模型的文本 + 审计用的状态和耗时。
+
+    它取代了原来"直接从 `_execute_tool` 返回一个字符串"：状态和耗时只有那一层
+    知道，而**事件由主线程发**（见 `_run`），所以判定和上报之间需要一个能带过线程
+    边界的载体。
+    """
+
+    text: str
+    status: str                     # ok / denied / invalid_args / error
+    duration_ms: int
+    # 工具抛出的**非预期**异常的完整栈（疑似我们自己的 bug）。
+    #
+    # 它不在工作线程里直接打印，是因为 traceback.print_exc() 是一行一次写 —— 两个
+    # 线程同时打会交错成一段读不懂的东西。带回主线程由 _report_tool_bug 打。
+    traceback: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Prepared:
+    """一次工具调用的前半段：裁决已经做完，执行随时可以开始。
+
+    **"裁决"和"执行"必须能分开**，因为并行的只有后半段：asker 走 stdin，两条审批
+    同时问会互相抢输入，所以裁决一律留在主线程、按原顺序发生（见 security/asker.py）。
+    """
+
+    call: dict[str, Any]
+    tool: Tool | None               # None：准备阶段就已经定局，见 settled
+    arguments: dict[str, Any] | None
+    parallel_safe: bool
+    settled: _Outcome | None        # 有值表示不需要再执行（准备失败、或被拒）
 
 
 class StepLimitExceeded(RuntimeError):
@@ -218,6 +261,27 @@ class Agent:
         """
         if self.debug:
             print(f"[debug] {message}", file=sys.stderr)
+
+    def _debug_lazy(self, build: Callable[[], str]) -> None:
+        """`_debug` 的惰性版：debug 关着时**连字符串都不去拼**。
+
+        什么时候必须用它：消息里含 `_preview(...)`、或者要把一段可能很长的正文拼进去
+        时。两个理由，都不是洁癖：
+
+          1. `_preview` 不是 O(1) —— 它先把换行压平再截断，也就是把整段文本扫一遍；
+          2. f-string 的实参**在进 _debug 之前就求值了**，所以 debug 关着的时候，那次
+             扫描的产物会被立刻丢掉。
+
+        实测：一个 8MB 的 read_file 结果白扫约 10ms，一批五个就是 50ms —— 而这条路径
+        对**默认不开 debug** 的每一次工具调用都成立。也就是说：不开 debug 的会话一直在
+        替 debug 买单。
+
+        参数是 `Callable[[], str]` 而不是字符串，是为了让上面那句话在签名上就成立：
+        传进来的东西**只有真要打的时候才求值**。短消息（几个字段拼一拼）直接用
+        `_debug` 就好，套一层 lambda 只是噪声。
+        """
+        if self.debug:
+            self._debug(build())
 
     @staticmethod
     def _preview(text: str, limit: int = DEBUG_PREVIEW_LIMIT) -> str:
@@ -377,12 +441,16 @@ class Agent:
                 #
                 # 非流式拿不到"逐字"：这段文字是整块回来的，只能等它回来之后一次打完。
                 # 想要 Claude Code 那种实时效果得先把适配层改成流式（另一件事）。
-                self._debug(
-                    f"      thinking（{len(response.reasoning)} 字符）:\n"
-                    f"{response.reasoning}"
+                #
+                # 用惰性版：这段正文可能几千字，拼进 f-string 就是一次整段拷贝。
+                self._debug_lazy(
+                    lambda: f"      thinking（{len(response.reasoning)} 字符）:\n"
+                            f"{response.reasoning}"
                 )
             if response.content:
-                self._debug(f"      content: {self._preview(response.content)}")
+                self._debug_lazy(
+                    lambda: f"      content: {self._preview(response.content)}"
+                )
 
             assistant_message = {
                 "role": "assistant",
@@ -415,26 +483,15 @@ class Agent:
 
             last_tools = [call["name"] for call in response.tool_calls]
 
-            for call in response.tool_calls:
-                self._debug(
-                    f"   → 工具调用 {call['name']}"
-                    f"({self._preview(call['arguments'], 120)})"
-                )
+            # 一批走完（可能并发、也可能逐条，见 _run_batch），结果一一对应地回到
+            # messages 里 —— 顺序永远是模型给出的顺序。
+            outcomes = self._run_batch(response.tool_calls, session, run_id, step + 1)
 
-                self._emit(
-                    "tool_call", session, run_id, step + 1,
-                    tool=call["name"],
-                    arguments=self._preview(call["arguments"], AUDIT_PREVIEW_LIMIT),
-                )
-
-                result = self._execute_tool(call, session, run_id, step + 1)
-
-                self._debug(f"   ← 工具结果 ({len(result)} 字符): {self._preview(result)}")
-
+            for call, outcome in zip(response.tool_calls, outcomes):
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": result,
+                    "content": outcome.text,
                 })
 
             # ★ 唯一的常规落盘点：到这里 assistant 的每个 tool_call 都有了对应的
@@ -455,17 +512,146 @@ class Agent:
         self._checkpoint(session)
         raise StepLimitExceeded(max_steps, last_tools)
 
-    def _execute_tool(self, call: dict, session: Session, run_id: str, step: int) -> str:
-        """执行一次工具调用并返回给模型的文本。
+    # --- 一批工具调用 -------------------------------------------------------
 
-        四条出口都收敛到末尾那一次 _emit，而不是每处各发一次 —— 状态分类只有这里
-        知道（校验失败、被拒、还是运行出错），所以判定留在内部；但"事件长什么样"
-        只写一遍，免得四处各写一份、日后改漏。
+    def _parallel_safe(self, call: dict) -> bool:
+        """这条调用所在的工具声明了"能并行"吗。
 
-        **duration_ms 只算"执行"这一段。** 权限裁决（含等人审批）在它之前，而那段时间
-        已经记在 permission 事件的 waited_ms 里 —— 两边都算的话，一条等人 40 秒才被批准
-        的工具调用会显示成"这个工具要 40 秒"，拿它去判断哪个工具慢会完全跑偏，两份
-        数据相加也会重复。所以这里在放行之后才起表，被拒的那一支干脆记 0。
+        用 `.get` 是为了让"工具名不认识"落到 False（回退串行）而不是抛出来 ——
+        真正该报的那个错由 _prepare 在里面按原来的方式报，这里只负责选路径。
+        """
+        try:
+            return self.tools.get(call["name"]).parallel_safe
+        except KeyError:
+            return False
+
+    def _run_batch(
+        self, batch: list[dict], session: Session, run_id: str, step: int
+    ) -> list[_Outcome]:
+        """跑完一批工具调用，返回与 batch **一一对应**（同序）的结局。
+
+        **串行是默认，并行是例外**，而例外只在一种形状下成立：整批都是
+        `parallel_safe`（也就是只读）且不止一条。任何一个不能并行的调用都会把整批
+        按老路逐条跑 —— 也就是今天的行为逐字节不变。
+
+        为什么是"整批"而不是"把能并行的挑出来并行"：一个批次里的调用隐含了顺序
+        语义。最常见的形状是 `[read_file(a), write_file(a), read_file(a)]`（读、改、
+        读回验证 —— 提示词里明确要求写完之后读回来确认）。把两个读挑出来并发、把写
+        留在串行，读回验证就可能发生在写之前：模型会读到旧内容，然后报告"已确认改好
+        了"。**那是静默错误，而且它伪装成验证通过。** 整批一起退回去，这个偏序问题
+        就不存在了。
+        """
+        if len(batch) >= 2 and all(self._parallel_safe(call) for call in batch):
+            return self._run_parallel(batch, session, run_id, step)
+        return self._run_serial(batch, session, run_id, step)
+
+    def _report_tool_call(self, call: dict, session: Session, run_id: str, step: int) -> None:
+        """两条路径共用的"模型要调什么"那一句（debug + 审计）。"""
+        # 惰性：write_file 的 content 可以很长，而 _preview 要把它扫一遍。
+        self._debug_lazy(
+            lambda: f"   → 工具调用 {call['name']}"
+                    f"({self._preview(call['arguments'], 120)})"
+        )
+        self._emit(
+            "tool_call", session, run_id, step,
+            tool=call["name"],
+            arguments=self._preview(call["arguments"], AUDIT_PREVIEW_LIMIT),
+        )
+
+    def _report_tool_result(
+        self, call: dict, outcome: _Outcome, session: Session, run_id: str, step: int,
+        parallel: bool = False,
+    ) -> None:
+        """两条路径共用的"这条调用结果如何"那一句（审计 + debug）。"""
+        self._emit(
+            "tool_result", session, run_id, step,
+            tool=call["name"],
+            status=outcome.status,      # ok / denied / invalid_args / error
+            chars=len(outcome.text),    # 只记长度，不记全文 —— 全文已经在会话文件里了
+            duration_ms=outcome.duration_ms,
+            # 只有真并发了才写这个键：没有它，事后从日志里分不出这一批是并发还是逐条，
+            # 而"这一批为什么快/慢"正是拿着日志要回答的问题。
+            **({"parallel": True} if parallel else {}),
+        )
+        # 惰性 —— 这一行是那笔白工的主项：工具结果动辄几十万字符（read_file 不分页），
+        # 而 _preview 会把整段扫一遍。见 _debug_lazy。
+        self._debug_lazy(
+            lambda: f"   ← 工具结果 ({len(outcome.text)} 字符): {self._preview(outcome.text)}"
+        )
+
+    def _run_serial(
+        self, batch: list[dict], session: Session, run_id: str, step: int
+    ) -> list[_Outcome]:
+        """逐条：报调用 → 裁决 → 执行 → 报结果。这就是原来那个 for 循环。
+
+        **裁决和执行在同一条调用上相邻，这一点不能改**：人是在看到上一条的结果之后
+        才被问到下一条的，而上一条的结果正是他判断"这条该不该放行"的依据之一。
+        """
+        outcomes: list[_Outcome] = []
+        for call in batch:
+            self._report_tool_call(call, session, run_id, step)
+            outcome = self._run(self._prepare(call, session, run_id, step))
+            self._report_tool_bug(outcome)
+            self._report_tool_result(call, outcome, session, run_id, step)
+            outcomes.append(outcome)
+        return outcomes
+
+    def _run_parallel(
+        self, batch: list[dict], session: Session, run_id: str, step: int
+    ) -> list[_Outcome]:
+        """整批只读工具：先把裁决做完，再并发执行。
+
+        **事件一律由这里（主线程）发**，顺序和串行路径完全一样 —— 先按原顺序报完
+        整批 tool_call，再按原顺序报 tool_result。所以 on_event 不需要是线程安全的：
+        那是注入进来的实现，"它必须自己加锁"会是一条没人想得到的隐式契约。
+
+        代价是这一批的事件在整批跑完之后才出现。对只读批次来说可以接受（它们本来就
+        是秒级以下的活），换来的确定性更值钱 —— 按完成顺序发事件的话，同一个会话
+        两次跑出来的审计顺序会不一样。
+        """
+        for call in batch:
+            self._report_tool_call(call, session, run_id, step)
+
+        # 裁决（含问人）仍在主线程、仍按原顺序。这里比串行路径多了一点：整批先问完
+        # 再执行。只读工具在默认策略下不会问人（LOW 自动放行），所以这个差别平时看
+        # 不见；真问到人时（.tudouni.json 里把 auto_approve 写成了 []），它也是可以
+        # 接受的 —— 这一批都是只读的，人的判断不依赖前一条的结果。
+        prepared = [self._prepare(call, session, run_id, step) for call in batch]
+
+        started = self.clock()
+        with ThreadPoolExecutor(
+            max_workers=min(len(prepared), MAX_PARALLEL),
+            thread_name_prefix="tool",
+        ) as pool:
+            # map 按**输入顺序**返回，所以调度不影响 messages 里 tool 结果的顺序，
+            # 也不影响事件的顺序：同一个会话跑两次，历史是一样的。
+            outcomes = list(pool.map(self._run, prepared))
+        wall_ms = int((self.clock() - started) * 1000)
+
+        for call, outcome in zip(batch, outcomes):
+            self._report_tool_bug(outcome)
+            self._report_tool_result(call, outcome, session, run_id, step, parallel=True)
+
+        # 这一批实际占了多长墙上时间。**必须单独记一笔**：并发时逐条 duration_ms
+        # 相加大于墙上时间（两个 5 秒的工具并行，和是 10 秒），而 cli.py 那个
+        # "未归因 = 回合总 - 各项之和"依赖的是互不重叠的几段 —— 不记它，那几项一
+        # 相加就会超过回合总，差值被 max(0, ...) 悄悄吞掉，报出一行恒为 0 的"未归因"。
+        self._emit(
+            "tool_batch", session, run_id, step,
+            calls=len(outcomes),
+            wall_ms=wall_ms,
+            tools=",".join(call["name"] for call in batch),
+        )
+        return outcomes
+
+    def _prepare(self, call: dict, session: Session, run_id: str, step: int) -> _Prepared:
+        """一条调用的前半段：认工具、解析参数、过权限关。
+
+        这是原来 `_execute_tool` 的前半段，异常映射一个字都没改（工具名不认识是
+        KeyError、参数不是 JSON 是 JSONDecodeError，都变成"工具执行失败"）。
+
+        ValidationError **不在这里**：参数校验发生在 `tool.execute()` 里面，也就是
+        `_run` 那一段 —— 见那里的注释。
         """
         started = self.clock()
 
@@ -477,41 +663,81 @@ class Agent:
             # 地方（它内部才调到 handler），所以这是天然的收口点。
             denial = self._check_permission(tool, arguments, session, run_id, step)
             if denial is not None:
-                text, status = denial, "denied"
-            else:
-                started = self.clock()          # ← 从这里才算"执行"
-                result = tool.execute(arguments)
-                text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-                status = "ok"
+                # denied 那一支什么都没执行：记 0 而不是"从函数入口算起的耗时"，否则
+                # 这个数字会变成审批开销的同义词（它属于 permission 事件）。
+                return _Prepared(call, None, None, False, _Outcome(denial, "denied", 0))
+
+            return _Prepared(call, tool, arguments, tool.parallel_safe, None)
+
+        except Exception as exc:
+            return _Prepared(
+                call, None, None, False,
+                _Outcome(
+                    f"工具执行失败：{type(exc).__name__}: {exc}",
+                    "error",
+                    int((self.clock() - started) * 1000),
+                    self._bug_report(exc),
+                ),
+            )
+
+    def _run(self, prepared: _Prepared) -> _Outcome:
+        """一条调用的后半段：真的执行它。**能并发的只有这一段。**
+
+        四条出口都收敛成一个 _Outcome，事件交给调用方（主线程）发 —— 状态分类只有
+        这里知道（校验失败、被拒、还是运行出错），但"事件长什么样"只写一遍。
+        """
+        if prepared.settled is not None:
+            return prepared.settled
+
+        tool, arguments = prepared.tool, prepared.arguments
+        assert tool is not None and arguments is not None, "settled 为空时 tool/arguments 必然有值"
+
+        started = self.clock()          # ← 从这里才算"执行"
+        try:
+            result = tool.execute(arguments)
+            text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            return _Outcome(text, "ok", int((self.clock() - started) * 1000))
 
         except ValidationError as exc:
             # 这一支必须放在 except Exception 之前，否则永远不会命中。
             # 参数校验失败是「模型可以自己改对」的错误，所以要明确告诉它
             # 哪个字段、什么毛病；这跟「工具运行出错」是两回事。
-            text, status = f"参数校验失败：{self._format_args_error(exc)}", "invalid_args"
+            return _Outcome(
+                f"参数校验失败：{self._format_args_error(exc)}", "invalid_args",
+                int((self.clock() - started) * 1000),
+            )
 
         except Exception as exc:
-            text, status = f"工具执行失败：{type(exc).__name__}: {exc}", "error"
-            if not isinstance(exc, _TOOL_LEVEL_ERRORS):
-                # 工具自己抛的（文件不存在、路径越界、JSON 坏）都是预期内的，模型拿到
-                # 一句话就够了。其余异常很可能是**我们自己的 bug** —— 把它伪装成
-                # 「工具执行失败」喂给模型，模型会老老实实去改参数，于是你在调试一个
-                # 根本不存在的问题。所以这里在 stderr 留下完整 traceback。
-                self._warn("工具抛出未预期的异常，完整栈如下（给模型的文本已简化）：")
-                traceback.print_exc()
+            return _Outcome(
+                f"工具执行失败：{type(exc).__name__}: {exc}", "error",
+                int((self.clock() - started) * 1000),
+                self._bug_report(exc),
+            )
 
-        # denied 那一支什么都没执行：记 0 而不是"从函数入口算起的耗时"，否则这个数字
-        # 会变成审批开销的同义词（它属于 permission 事件）。
-        duration_ms = 0 if status == "denied" else int((self.clock() - started) * 1000)
+    @staticmethod
+    def _bug_report(exc: BaseException) -> str | None:
+        """非预期异常才要完整栈；工具自己抛的是预期内的，带回来也没人打。
 
-        self._emit(
-            "tool_result", session, run_id, step,
-            tool=call["name"],
-            status=status,      # ok / denied / invalid_args / error
-            chars=len(text),    # 只记长度，不记全文 —— 全文已经在会话文件里了
-            duration_ms=duration_ms,
-        )
-        return text
+        工具自己抛的（文件不存在、路径越界、JSON 坏）都是预期内的，模型拿到一句话
+        就够了。其余异常很可能是**我们自己的 bug** —— 把它伪装成「工具执行失败」喂给
+        模型，模型会老老实实去改参数，于是你在调试一个根本不存在的问题。所以这些要
+        在 stderr 留下完整 traceback。
+        """
+        if isinstance(exc, _TOOL_LEVEL_ERRORS):
+            return None
+        return "".join(traceback.format_exception(exc))
+
+    def _report_tool_bug(self, outcome: _Outcome) -> None:
+        """把 _bug_report 攒下的栈打出来。**只在主线程调用。**
+
+        traceback.print_exc() 是一行一次写，而 print 本身只保证"一次调用"是原子的 ——
+        两个工作线程同时打，栈就会交错成一段读不懂的东西。所以栈是带回主线程打的。
+        """
+        if outcome.traceback is None:
+            return
+        self._warn("工具抛出未预期的异常，完整栈如下（给模型的文本已简化）：")
+        print(outcome.traceback, file=sys.stderr, end="")
+
 
     def _check_permission(
         self,

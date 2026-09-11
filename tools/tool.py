@@ -57,6 +57,23 @@ class Tool:
     args_model: type[ToolArgs]
     handler: ToolHandler
 
+    # 这个工具能不能和其他工具**同时**执行。声明在工具自己身上，而不是在
+    # agent.py 里按名字写一张白名单 —— 理由和 risk 一样：知道"它有没有副作用"的
+    # 人在注册处，不在循环里。
+    #
+    # 和 risk 不同，这里**带默认值**，而且那个不对称是有理由的：risk 缺省成 LOW
+    # 是 fail-open（静默放行），而 parallel_safe 缺省成 False 是 fail-closed ——
+    # 漏声明的后果只是"这条没并行"，慢一点，不会错。所以不需要强制每个工具都写它。
+    #
+    # 判定标准只有一条：**这个 handler 有没有副作用。** 有副作用（写文件、执行命令、
+    # 改任何共享状态）就不能并行，因为同批调用之间没有任何隔离 —— 见 agent.py 里
+    # 那段"为什么整批才能并行"。
+    #
+    # 另有一条注册期硬约束（见 ToolRegistry.register）：parallel_safe 的工具必须
+    # 是 LOW。要并行就不能在批内弹审批 —— asker 走的是 stdin，两条审批同时问会
+    # 互相抢输入，而"谁批准了哪一条"也没法回答了。
+    parallel_safe: bool = False
+
     @property
     def parameters(self) -> JsonSchema:
         """参数 schema 从 args_model 推导，不再手写第二份。
@@ -100,6 +117,25 @@ class ToolRegistry:
     def register(self, tool: Tool):
         if tool.name in self._tools:
             raise ValueError(f"Tool already exists: {tool.name}")
+
+        # 并行的前提之一是"这一批不弹审批"（asker 走 stdin，两条审批同时问会互相抢
+        # 输入，而"谁批准了哪一条"也就没法回答了）。LOW 是"默认不用问人"的那一档，
+        # 所以把这条约束钉在注册处：坏组合在**启动时**就炸，而不是任务跑到一半才
+        # 出怪事 —— 入口本来就会把注册表打印一遍，报错的位置正好是看得见的地方。
+        #
+        # 它是**必要条件，不是充分条件**：LOW 说的是"不用问人"，不是"没有副作用"。
+        # 真正保证安全的是写这个工具的人读过 handler、确认它只读 —— 那件事没有
+        # 任何类型能表达，只能靠声明。所以这条校验挡的是"标了并行却要弹审批"，
+        # 挡不住"把一个会写的工具标成 LOW 又标成 parallel_safe"。
+        #
+        # 用 != 而不是 is not：RiskLevel 混了 str，所以配置里读进来的普通字符串
+        # "low" 和 RiskLevel.LOW 相等（见上面那个枚举的注释）。
+        if tool.parallel_safe and tool.risk != RiskLevel.LOW:
+            raise ValueError(
+                f"{tool.name} 声明了 parallel_safe，但风险等级是 {tool.risk.value}："
+                f"能并行执行的工具必须是 low。\n"
+                f"  并行的前提是批内不弹审批（审批走 stdin，两条同时问会互相抢输入）。"
+            )
 
         self._tools[tool.name] = tool
 
