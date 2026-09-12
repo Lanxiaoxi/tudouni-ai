@@ -147,6 +147,17 @@ class Tool:
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
+        # 注册之后**仍然需要被别处读**的协作方（目前只有技能那一块状态）。
+        #
+        # 它为什么不能像 questioner / web_search 那样只活在 handler 里：技能的"写"和"读"
+        # 是两条独立装配的路 —— 写由 SkillBoard（工具调用）负责，读由载荷尾部那段渲染
+        # （每轮拼一次）负责，而两边必须看到**同一个** board。让调用方（main.py）自己
+        # 再造一个的话，那个副本会带着另一个 loader，于是"技能加载成功了、却永远不出现在
+        # 载荷里"——一个既没有异常、也没有审计痕迹的状态（tests/test_skills.py 里那条
+        # test_the_note_never_enters_session_messages 就是盯着它的）。
+        #
+        # 所以谁造的谁留着：注册表拿着它，调用方从注册表上取回同一个对象。
+        self.skills = None
 
     def register(self, tool: Tool):
         if tool.name in self._tools:

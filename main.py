@@ -30,6 +30,7 @@ from agent_runtime.cli import (
     print_banner,
     print_history,
     print_sessions,
+    print_skills,
     resolve_session,
     run_repl,
 )
@@ -45,6 +46,14 @@ from agent_runtime.config import (
 from agent_runtime.models import OpenAICompatibleModel
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, cli_asker
 from agent_runtime.security.commands import format_rule
+from agent_runtime.skills import (
+    SkillCatalog,
+    SkillLoader,
+    active_line,
+    catalog_entries,
+    catalog_part,
+    skill_note,
+)
 from agent_runtime.state import JsonSessionStore
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.ask import cli_questioner, unavailable_questioner
@@ -91,6 +100,31 @@ def report_todos(session) -> None:
         print(f"[任务] {line}", file=sys.stderr)
 
 
+def report_skills(catalog: SkillCatalog, session=None) -> None:
+    """把这次启动扫到的技能说一遍。
+
+    和 `[权限]` / `[任务]` 那几行同一类东西（关于这次运行的既有状态），走 stderr。
+
+    **坏技能和被遮住的同名技能必须逐条报出来，这是这个函数存在的主要理由。** 两者的
+    症状一模一样：磁盘上那份文件明明在，却完全不起作用。一份写错 frontmatter 的
+    SKILL.md 从启动到会话结束都不会有任何异常；而一份被个人级技能遮住的项目级技能更
+    隐蔽 —— 人改它、改了很多遍，改的却是一份不算数的文件。取向和
+    `PermissionConfig.unknown_tools` 完全一样：不该拦启动，但绝不能不说。
+
+    已加载的技能也报一遍（恢复会话时 `session.metadata` 里可能就有）：技能正文比进程
+    活得久，而"它现在按哪份说明在做"是接着聊之前唯一该先看一眼的事实。
+    """
+    if catalog.skills:
+        print(f"[技能] 可用 {len(catalog.skills)} 个："
+              f"{'、'.join(skill.name for skill in catalog.skills)}", file=sys.stderr)
+    for item in catalog.shadowed:
+        print(f"[技能] 同名遮蔽：{item}", file=sys.stderr)
+    for problem in catalog.problems:
+        print(f"[技能] {problem}", file=sys.stderr)
+    if session is not None and (line := active_line(session.metadata)):
+        print(f"[技能] {line}", file=sys.stderr)
+
+
 def _check_session_id(session_id: str | None) -> str | None:
     """`--session` 是用户直接敲进来的字符串，写错了要能照着改。
 
@@ -126,9 +160,23 @@ def main() -> int:
     store = JsonSessionStore(SESSIONS_DIR)
     logs = JsonlSink(LOGS_DIR)
 
+    # 技能是硬盘上的文件，所以扫它不需要模型 —— 和 --list 同一档，排在配置检查之前。
+    # 造在这个位置还有第二个理由：后面装配工具和注 session_notes 都要用到这一份
+    # （`--skills` 只需要读它，别的子命令连碰都不碰）。
+    #
+    # 扫的是**六个约定目录**（用户级三个、项目级三个，见 skills/loader.py 的
+    # default_roots）：用户级那三个在工作区外面，而这条路径是硬编码的 —— SkillLoader
+    # 不接受模型给的路径，所以"技能只有人能改"在用户级目录上是操作系统帮着保证的。
+    skill_loader = SkillLoader(PROJECT_DIR)
+    skill_catalog = skill_loader.reload()
+
     # ---- 不需要模型的子命令：先处理掉，这样没配密钥也能查历史/审计 ----
     if args.list:
         print_sessions(store)
+        return 0
+
+    if args.skills:
+        print_skills(skill_loader)
         return 0
 
     if args.audit or args.history:
@@ -212,6 +260,25 @@ def main() -> int:
                 if web.tavily_api_key
                 else None
             ),
+            # 技能。和 todos 一样是**按会话的状态**（加载了哪个技能存在 session.metadata
+            # 里），所以只能在这里造 —— 但造出来的那个 SkillBoard 留在注册表的
+            # `tools.skills` 上，载荷尾部那段渲染从那里取回**同一个**对象。
+            #
+            # 自己再 new 一个的后果很隐蔽：那个副本会带着另一个重扫口，于是"技能加载
+            # 成功了、却永远不出现在载荷里"—— 没有异常、没有审计痕迹（tools/tool.py 里
+            # 那段写了为什么；tests 里那条 test_the_note_never_enters_session_messages
+            # 就是盯着它的）。
+            #
+            # loader 一起传进去，board 每次读清单都重扫技能目录：会话开着的时候新加的
+            # 技能下一轮就能加载（只给一次快照的话，模型会看得见一个加载不了的技能）。
+            #
+            # 一个技能都没有时传 None，create_tool_registry 因此**不注册** load_skill
+            # —— 和缺 TAVILY_API_KEY 不注册 web_search 同一条路。代价说明白：这种情况下
+            # 中途新建技能要重开会话才用得上（"连工具都还不在"，和"工具有了、技能换了"
+            # 是两件事，后者由重扫兜住）。
+            skills=skill_catalog if skill_catalog.skills else None,
+            skill_metadata=session.metadata,
+            skill_loader=skill_loader,
         )
     except Exception:
         http.close()
@@ -245,6 +312,7 @@ def main() -> int:
     )
     report_permissions(policy, memory)
     report_todos(session)
+    report_skills(skill_catalog, session)
 
     # autopilot 要在启动时大声说一次：它意味着接下来所有需要审批的工具都会**直接执行**，
     # 而这件事一旦忘了自己开着，事后看日志只会觉得"这个项目怎么什么都没问"。
@@ -255,6 +323,29 @@ def main() -> int:
               "并被告知自己决定、把假设说出来（拒绝名单、工作区边界、控制面写入仍然生效）",
               file=sys.stderr)
 
+    # 载荷尾部那段会话状态：技能目录 + 已加载技能的正文 + 任务列表，合成**一条**临时
+    # 消息（Agent 里 _status_note 负责合成，这里只负责"这一段说什么"）。
+    #
+    # 顺序是刻意的，而且它只在这一个地方定：先目录（有哪些能用），再正文（现在该按哪份
+    # 做），最后任务列表（做到哪了）。倒过来的话，模型会先读到一份"还剩什么活"的清单，
+    # 再读到"该怎么做" —— 而它做决策的瞬间需要的是后者。
+    #
+    # 读的必须是 `tools.skills.catalog`（注册表上那个 board）而不是上面那份启动快照：
+    # board 每次读都会重扫目录 —— 所以中途新加的技能下一轮就会出现在清单里，而且和"能不能
+    # 加载"读到的是同一份事实。重扫在这个函数里**只做一次**（读到局部变量再分别渲染两段）：
+    # 它每次读盘都会把每个技能文件读一遍，而这个函数每一步都会被调一次。
+    #
+    # 三段都**不进 session.messages**（逐轮变化的东西不持久化，见 agent._status_note），
+    # 所以它必须只读 metadata + 技能目录，不做别的事。
+    def session_notes(metadata):
+        board = tools.skills
+        catalog = board.catalog if board is not None else skill_catalog
+        return "\n\n".join(filter(None, (
+            catalog_part(metadata, catalog),
+            skill_note(metadata, catalog),
+            todo_note(metadata),
+        )))
+
     # 四个注入点，同一个原则：判定留在 Agent 内部，执行交给注入的实现。
     # （提问通道是第五个，但它在上面装配工具时就注入了 —— 它不属于 Agent：Agent 只看见
     # 一次普通的工具调用，ask_user 会不会阻塞在人的输入上，它不知道也不需要知道。）
@@ -264,9 +355,10 @@ def main() -> int:
         memory=memory,
         on_checkpoint=store.save,
         on_event=logs,
-        # 任务列表每轮都要重新贴在请求末尾（当前状态，不是让模型去翻历史找最近那一版）。
-        # 注入的是一段"怎么说"的实现：Agent 自己不知道任务列表长什么样。
-        session_notes=todo_note,
+        # 会话状态每轮都要重新贴在请求末尾（当前状态，不是让模型去翻历史找最近那一版）。
+        # 注入的是一段"怎么说"的实现：Agent 自己不知道技能和任务列表长什么样 ——
+        # 它只知道"每次请求末尾要把当前会话状态贴上"（见 agent.py 的 SessionNotes）。
+        session_notes=session_notes,
         debug=args.debug,
         # autopilot 只管审批那一关：工作区边界、控制面写入、拒绝名单都在它管不着的地方，
         # 所以它不是"关掉权限"，只是"这一轮没人可问"。

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from agent_runtime.agents import StepLimitExceeded
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
+from agent_runtime.skills import SkillLoader
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.tools.todo import progress_line
 
@@ -71,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="打印 --session 指定会话的审计轨迹（token、权限裁决、耗时），不调用模型",
     )
     parser.add_argument("--list", action="store_true", help="列出已保存的会话")
+    parser.add_argument(
+        "--skills", action="store_true",
+        help="列出工作区里的技能（.tudouni/skills/<名字>/SKILL.md），不调用模型",
+    )
     parser.add_argument(
         "--autopilot", action="store_true",
         help="不询问任何审批：需要审批的工具直接执行。拒绝名单、工作区边界、控制面写入"
@@ -348,6 +353,46 @@ def print_sessions(store: JsonSessionStore) -> None:
         todo = progress_line(session.metadata)
         print(f"  {session_id:22} {len(session.messages):3} 条消息、{session.step_count()} 步"
               + (f"；任务 {todo}" if todo else ""))
+
+
+def print_skills(loader: SkillLoader) -> None:
+    """`--skills`：列出工作区里的技能，不调用模型。
+
+    和 `--list` 同档 —— 它读的是硬盘上的文件，不需要密钥，所以也排在配置检查之前
+    （见 main.py 里那段子命令分两段的说明）：没配密钥的人照样该能查自己写了什么技能。
+
+    它打印两样东西，正好对应人在这台机器上能做的两件事：
+
+      * **认出来的技能** —— 名字、正文长度、声明的工具、以及那句 description（它是模型
+        判断"什么时候该用"的唯一依据，所以写得好不好在这里一眼能看出来）；
+      * **被跳过的技能** —— 每一条都带着文件名和具体毛病。这是 `--skills` 最要紧的
+        输出：一份写错 frontmatter 的文件从启动到会话结束都没有任何症状，它只是**不在**
+        模型看到的清单里，不在这里报出来就没人知道该去改哪。
+
+    正文长度值得显示，是因为它直接决定此后每一轮请求的成本（正文会拼进每一次请求）——
+    "这个技能值不值 3000 字符"是写技能的人真会问的问题。
+    """
+    catalog = loader.reload()
+
+    print("技能目录（优先级从低到高，个人级压项目级）：")
+    for path in loader.directories:
+        print(f"  {'✓' if path in catalog.roots else ' '} {path}")
+
+    if not catalog.skills:
+        print("\n没有技能。要加一个就建 <目录>/<名字>/SKILL.md，"
+              "开头写上 name 和 description（格式见 README 的「技能」一节）。")
+    else:
+        print(f"\n可用技能 {len(catalog.skills)} 个：")
+        for skill in catalog.skills:
+            tools = "、".join(skill.allowed_tools) or "（未声明）"
+            print(f"  {skill.name:20} 正文 {skill.body_chars:>6} 字符  声明的工具：{tools}")
+            print(f"  {'':20} {skill.description}")
+            print(f"  {'':20} 来自 {skill.path}")
+
+    for item in catalog.shadowed:
+        print(f"  [遮蔽] {item}")
+    for problem in catalog.problems:
+        print(f"  [跳过] {problem}")
 
 
 def print_history(session: Session) -> None:

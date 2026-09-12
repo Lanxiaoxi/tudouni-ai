@@ -20,6 +20,11 @@
 .tudouni.json
 # 写入走临时文件 + os.replace，崩溃可能留下半份；它同样不该进版本库。
 .tudouni.json.tmp
+# 但技能目录**要提交**（所以这里不写 .tudouni/、.agents/、.skills/）：技能住在
+# .tudouni/skills/、.agents/skills/、.skills/ 里，而它是给人写、给人 review、要被 diff
+# 的内容 —— 和上面那条权限策略正好相反。配套的是：agent 不许写这些目录（项目级那三个在
+# tools/filesystem.py 的控制面表里，用户级那三个在工作区外、文件工具本来就够不着），
+# 所以"只有人能改它"和"它进版本库"这两件事是一致的。
 
 # ---- 虚拟环境与缓存 ----
 .venv/
