@@ -25,6 +25,7 @@
 
 import platform
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -130,10 +131,28 @@ class Session:
 
         同样地，**恢复已有会话不会重算这条消息**：改 prompts/system.zh.md 只影响
         此后新建的会话，已经落盘的会话保留它创建时的那一份。
+
+        ## 为什么记一个 `created_at`
+
+        `metadata` 里那一条是**建这个会话的时刻**（epoch 秒），它服务的唯一一件事是
+        "把会话按创建时间排出来"（`--list` 和 TUI 的选会话面板）。
+
+        为什么不靠别的东西推：
+
+          * **`session_id` 不总是一个时间戳。** 自动分配的 id 是，但 `--session demo`
+            这种自己起的名字不是 —— 按 id 排序会把 `demo` 排到 `20250101-…` 后面，
+            而它可能是昨天建的；
+          * **会话文件的 mtime 不是创建时间。** 它每次 checkpoint 都会变，所以那个
+            时间说的是"最后一次聊"，不是"什么时候建的"。用 mtime 排的话，切回一个
+            老会话说一句话，它就会跳到列表最上面。
+
+        它**不进 session.messages**（那是发给模型的东西）—— 这一条只是本地的书签。
+        老会话文件里没有这个键，`composition._created_key` 对它们有另一条退路。
         """
         return cls(
             session_id=session_id,
             messages=[{"role": "system", "content": build_system_message()}],
+            metadata={"created_at": time.time()},
         )
 
     def step_count(self) -> int:

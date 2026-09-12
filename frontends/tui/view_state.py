@@ -932,14 +932,22 @@ class Command:
 # **`/list` 在第二期被去掉了**（设计决策，见 doc/TUI-design.md 13.3）：它和
 # "`/resume` 不带参数"说的是同一件事，而两条命令指向同一个出口时，人会先猜哪一条
 # 才是对的。留 `/resume` 一条，它自己负责列出候选。
+#
+# ## `hint` 是一句短语，不是说明书
+#
+# 它是面板里跟在命令名后面的那一列、也是 `/help` 那一列 —— **一行的宽度就是它的
+# 预算**。所以：不带参数会怎样（`/resume` 不带参数就列清单）、有几套配色
+# （14 套）、"立刻生效不用退出"这类**消失之后就不必再说的话**，一律不写在这里。
+# 这些要么在那一行里读得出来（按一下就知道），要么属于单条命令的详细说明
+# （`/help` 末尾那几行、`doc/TUI-design.md`）。
 COMMANDS: tuple[Command, ...] = (
-    Command("/new", "换一个新会话（立刻生效，不用退出）"),
-    Command("/resume", "换一个会话：不带参数从列表里挑，带 id 直接切", True),
+    Command("/new", "开一个新会话"),
+    Command("/resume", "换一个会话", True),
     Command("/audit", "审计日志在哪"),
     Command("/exit", "退出"),
-    Command("/help", "命令列表"),
-    Command("/theme", "换配色（14 套，不带参数就看清单）", True),
-    Command("/skills", "看全部技能（可用的 + 已加载的）"),
+    Command("/help", "命令与键位"),
+    Command("/theme", "换配色", True),
+    Command("/skills", "看全部技能"),
 )
 
 

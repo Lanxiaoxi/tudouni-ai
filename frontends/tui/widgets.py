@@ -1329,7 +1329,7 @@ class SessionPicker(ModalScreen):
         self._index = self._default_index()
 
     def _default_index(self) -> int:
-        """默认选中**最新那个会话**（清单是从新到旧给的）。
+        """默认选中**最新建的那个会话**（清单是按创建时间、最新的在前给的）。
 
         为什么不是"当前那一个"：打开这个面板的人几乎总是想换一个 —— 默认停在当前
         会话上会让人按一下 `Enter` 之后什么都没发生，而那是这个面板最坏的失败形态
@@ -1346,13 +1346,12 @@ class SessionPicker(ModalScreen):
                 classes="modal-head",
             )
             if not self.sessions:
-                yield Static(Text("还没有保存过任何会话 —— 说出第一句话之后才会有。",
+                yield Static(Text("还没有保存过会话 —— 说过第一句话才会有。",
                                   style=self.palette.ink4), classes="modal-hint")
             else:
                 yield Vertical(id="session-options")
             yield Static(Text(
-                "↑↓ 选择  ·  Enter 切过去  ·  Esc 取消   "
-                "（● = 你现在所在的会话；切换会收掉当前会话的 runtime）",
+                "↑↓ 选择  ·  Enter 切过去  ·  Esc 取消  ·  ● = 当前会话",
                 style=self.palette.ink4), classes="modal-foot")
 
     def on_mount(self) -> None:

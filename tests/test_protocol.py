@@ -471,13 +471,18 @@ def test_a_bad_session_id_is_answered_with_a_notice_and_the_session_survives(fak
 def test_session_list_answers_with_the_saved_sessions(fake_openai):
     """`session_list` → `sessions`：清单里的东西由 runtime 读盘算好。
 
-    三道检查各有各的理由：
+    两条检查，各自都有理由：
 
-      * **从新到旧**（TUI 的选择面板默认选第一条 = 最近那个会话）；
       * 每一条都带 `session_id` / `messages` / `steps` / `preview` / `todos` ——
         界面直接照着渲染，**不该自己去读会话文件**；
-      * 它是**只读**的：问一次清单不换会话、不改会话（所以这条测试跑完之后，
+      * 它是**只读**的：问一次清单不换会话、不改会话（所以那条断言问完之后，
         当前会话还是进来时那一个）。
+
+    **这里不验排序。** 排序（按创建时间、最新在前）在这条路上测不了：这个进程读的是
+    真工作区的 `.tudouni/sessions/`，里面是跑测试攒下来的会话文件 —— 而且是**老文件**
+    居多（没有 `created_at`，退到 mtime），排出来的顺序取决于这台机器上那些文件的
+    时间戳。那是在测设备，不是测代码。排序有它自己的确定性测试：
+    `tests/test_session_list.py`（自己造会话、自己定创建时间）。
     """
     import uuid
 
@@ -491,15 +496,10 @@ def test_session_list_answers_with_the_saved_sessions(fake_openai):
     assert listed["t"] == "sessions"
 
     items = listed["items"]
-    # **不断言"空"**：这个进程读的是真工作区的 `.tudouni/sessions/`，而跑过几轮
-    # 测试的机器上一定有会话（实测：那条断言第一次跑就红了，而它红的原因是别人的
-    # 数据 —— 那种断言测的是设备，不是代码）。
+    # **不断言"空"**：同上 —— 跑过几轮测试的机器上一定有会话。
     for item in items:
         assert set(item) == {"session_id", "messages", "steps", "preview", "todos"}
         assert isinstance(item["messages"], int) and isinstance(item["steps"], int)
-    # 排序：自动分配的 id 就是时间戳，所以"从新到旧"= id 降序。
-    ids = [item["session_id"] for item in items]
-    assert ids == sorted(ids, reverse=True), "清单必须从新到旧"
 
     # 只读：问一次清单之后，**当前会话没有变**。
     send({"v": 1, "t": "session_switch", "session_id": "list-b"})

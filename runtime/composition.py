@@ -218,44 +218,92 @@ PREVIEW_CHARS = 40
 
 # 会话清单最多回多少条。**必须有个上限**：`session_list` 是前端在交互中发的，
 # 而 `.tudouni/sessions/` 攒到几百个文件时，一次列全部会让面板的渲染和键盘响应都
-# 变钝。从新到旧取这些条 —— 要接着聊的几乎总是最近那几个。
+# 变钝。取**最新**的这些条 —— 要接着聊的几乎总是最近那几个。
 SESSION_LIST_LIMIT = 50
+
+
+def _created_key(session: Session, path: Path | None) -> tuple[float, str]:
+    """一份会话的**创建时间**排序键：`(epoch 秒, session_id)`。
+
+    三条来源，优先级从高到低，各自都有具体的理由：
+
+      1. `metadata["created_at"]` —— 真话。新建会话时写进去（`Session.new`），
+         跟着会话文件一起落盘，所以它跨进程、跨"说没说过话"都成立；
+      2. **会话文件的 mtime** —— 退路，只服务于**老会话文件**（这个键落地之前写的）。
+         它其实说的是"最后一次聊"，所以对老会话来说这个排序是近似的；用它而不是
+         直接给 0，是因为老文件的 mtime 至少是**同一台机器上真实的先后顺序**，
+         而全给 0 会把它们一起丢给 id 那个兜底；
+      3. `0.0` —— 连文件都读不到时（`path is None`）。那时候 id 说了算。
+
+    **id 是每一个分支的第二个分量**，不是可选的美化：两个会话的秒级时间戳相同时
+    （同一秒里建了两个、或者两个老文件的 mtime 精度只到秒）必须还有一个确定的
+    次序，否则列表的顺序会随 `sorted` 的实现细节变。
+    """
+    created = session.metadata.get("created_at") if session.metadata else None
+    if not isinstance(created, (int, float)) or isinstance(created, bool):
+        created = None
+    if created is None and path is not None:
+        try:
+            created = path.stat().st_mtime
+        except OSError:
+            created = None
+    return (float(created) if created is not None else 0.0, session.session_id)
 
 
 def session_summaries(
     store: JsonSessionStore, *, limit: int = SESSION_LIST_LIMIT
 ) -> list[dict[str, Any]]:
-    """已保存会话的清单（**从新到旧**），每条一句话说清"这是哪个会话、聊到哪了"。
+    """已保存会话的清单（**按创建时间，最新在前**），每条一句话说清"这是哪个会话"。
 
     它是 `sessions` 那条协议消息的内容，也是 `--list` 与 TUI 选会话面板**共同的**
     事实来源：让两个前端各自去读会话文件、各自决定怎么截预览，就是同一份事实的
     第二、第三个来源，而它们漂掉的症状是"同一个会话在两处看起来不一样"。
 
-    **一条读失败不拖垮整份清单。** 会话文件可能被截断、也可能是更新版本写的
+    ## 排序为什么不是"id 倒序"（那是它以前的样子）
+
+    自动分配的 id 就是时间戳，所以"按 id 排"和"按创建时间排"在那批会话上恰好一致
+    —— 于是这个 bug 一直看不出来。但 `--session demo` 这种自己起的名字不是时间戳，
+    按 id 排会把 `demo` 排到 `20250101-…` 后面，而它可能是昨天才建的。
+    判据是**数据**（`created_at`），不是"文件名的写法恰好长得像时间戳"。
+
+    一条读失败不拖垮整份清单：会话文件可能被截断、也可能是更新版本写的
     （`store.load` 会为此抛 ValueError）—— 那种文件在列表里显示成"读不出来"比让整个
     面板打不开好得多，而"打不开"的症状是**用户根本不知道有一个坏文件**。
 
-    读了哪些键都是**为了少读一次盘**：一次 `store.load` 就把消息条数、步数、任务
-    进度、预览全拿到了（会话文件本来就不大）。
+    ## 为什么只对**读得出来**的那些排序
+
+    坏文件没有 `created_at` 可读，把它和最老的会话混在一排会让"哪个才是刚才那个"
+    变模糊。所以它们统一排在最后（时间键 0），而它们本来也不该出现在选择面板的
+    前几条里。
     """
-    items: list[dict[str, Any]] = []
-    for session_id in reversed(store.list_ids()[-limit:]):
+    loaded: list[tuple[tuple[float, str], dict[str, Any]]] = []
+    for session_id in store.list_ids():
+        # `store._path` 是"一个 id 对应哪个文件"的**唯一**说法（它同时兜住 id 的
+        # 合法性校验）。自己拼 `directory / f"{id}.json"` 就是同一件事的第二个说法，
+        # 而它漂掉的那天，症状是"列表里的时间和实际文件对不上"——没人查得出来。
+        path = store._path(session_id)
         try:
             session = store.load(session_id)
         except Exception as exc:  # noqa: BLE001 - 坏文件只影响它自己那一行
-            items.append({
+            item = {
                 "session_id": session_id, "messages": 0, "steps": 0,
                 "todos": "", "preview": f"（读不出来：{type(exc).__name__}）",
-            })
+            }
+            loaded.append(((0.0, session_id), item))
             continue
-        items.append({
+        item = {
             "session_id": session_id,
             "messages": len(session.messages),
             "steps": session.step_count(),
             "todos": progress_line(session.metadata),
             "preview": _first_user_message(session),
-        })
-    return items
+        }
+        loaded.append((_created_key(session, path), item))
+
+    # **先排完再截断**：截断要的是"最新的 N 个"，而那只有排完之后才知道。
+    # （`store.list_ids()` 是按 id 升序的，直接切尾巴拿到的只是"id 最大的 N 个"。）
+    loaded.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _key, item in loaded[:limit]]
 
 
 def _first_user_message(session: Session) -> str:

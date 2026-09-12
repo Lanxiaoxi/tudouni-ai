@@ -823,7 +823,7 @@ class TuiApp(App[None]):
         elif command == "/theme":
             self._command_theme(rest)
         else:
-            self._say(f"没有这个命令：{command}（/help 看有哪些）")
+            self._say(f"没有这个命令：{command}（/help）")
 
     def _command_resume(self, rest: str) -> None:
         """`/resume [id]`。带 id 直接切，不带就从列表里挑。
@@ -838,7 +838,7 @@ class TuiApp(App[None]):
             return
         if self._client is None:
             return
-        self._say("正在列已保存的会话…")
+        self._say("正在取会话列表…")
         self._client.list_sessions()
 
     def switch_session(self, session_id: str | None) -> None:
@@ -851,8 +851,7 @@ class TuiApp(App[None]):
         """
         if self._client is None:
             return
-        target = f"会话 {session_id}" if session_id else "一个新会话"
-        self._say(f"正在切到{target}…（当前会话的 runtime 会在这里收掉）")
+        self._say(f"正在切到{'会话 ' + session_id if session_id else '新会话'}…")
         self._client.switch_session(session_id)
 
     def _show_session_picker(self, sessions: list[dict[str, Any]]) -> None:
@@ -879,19 +878,19 @@ class TuiApp(App[None]):
                 view_state.Line("14 套：", view_state.ROLE_RULE),
                 *[view_state.Line("  " + part, view_state.ROLE_PROCESS)
                   for part in theme_mod.listing().split(" · ")],
-                view_state.Line("换一套：/theme 靛夜  或  /theme p7  或  /theme 7",
+                view_state.Line("换一套：/theme 靛夜  ·  /theme p7  ·  /theme 7",
                                 view_state.ROLE_RULE),
             ])
             return
         key = theme_mod.resolve(rest)
         if key is None:
-            self._say(f"没有这套配色：{rest}（/theme 看清单）")
+            self._say(f"没有这套配色：{rest}（/theme）")
             return
         self._set_theme(key)
         self._say_lines([view_state.seg(
             ("配色换成 ", view_state.ROLE_RULE),
             (f"{key} {self.palette.name}", view_state.ROLE_WAITING),
-            ("（只影响这一次运行）", view_state.ROLE_RULE),
+            ("（只影响这次运行）", view_state.ROLE_RULE),
         )])
 
     def _help_lines(self) -> list[view_state.Line]:
