@@ -41,6 +41,23 @@
     },
     "required": ["v", "t"]
   },
+  "set_autopilot": {
+    "summary": "**运行中开关 autopilot**（TUI 的 `/autopilot`）。开了之后需要审批的工具直接执行（审计里每次放行记 outcome=autopilot），关掉就恢复逐条询问。工作区边界、控制面写入、拒绝名单不受它影响。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "set_autopilot"},
+      "on": {
+        "type": "boolean",
+        "doc": [
+          "true = 开（不再问审批），false = 关。**它是绝对状态，不是开关动作** ——",
+          "重发同一条是幂等的，而界面不需要知道 runtime 现在是什么状态。",
+          "runtime 处理后回一条 `ui` / `kind=state` 快照（带 autopilot 字段），",
+          "界面以那条为准 —— 不许自己在发出去的时候就改显示。"
+        ]
+      }
+    },
+    "required": ["v", "t", "on"]
+  },
   "shutdown": {
     "summary": "收摊。**当前这一轮会跑完**，不是打断它。",
     "fields": {

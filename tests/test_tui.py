@@ -130,6 +130,35 @@ def test_an_empty_answer_draws_nothing():
     assert view_state.answer_body(state, {"run_id": "r", "answer": ""}) is None
 
 
+def test_the_autopilot_badge_always_says_which_state_it_is_in():
+    """两个状态都写在那一格里，**不做成"开着才显示"**。
+
+    只显示"开"的话，"这一格空着"既可能是关掉了、也可能是没画出来 —— 而这一格的
+    语义是"接下来还会不会问你"，它不允许有歧义。
+
+    窄屏换短词：状态栏右边是 `width: auto`，多出来的每一列都是从**左段**身上扣的，
+    而左段被裁成半句正是 F5 那次踩过的坑。
+    """
+    state = view_state.ViewState()
+    assert str(state.autopilot_badge()) == "自动放行 关"
+    state.autopilot = True
+    assert str(state.autopilot_badge()) == "自动放行 开"
+    assert str(state.autopilot_badge(compact=True)) == "放行 开"
+
+
+def test_apply_state_only_believes_a_real_true_for_autopilot():
+    """`ui state` 里那个 `autopilot` 也只认真正的 `true`（和 runtime 收请求时一致）。
+
+    两边同一条规矩，因为猜错的方向是"不问就执行"。
+    """
+    state = view_state.ViewState()
+    view_state.apply_state(state, {"kind": "state", "autopilot": "true"})
+    assert state.autopilot is False
+
+    view_state.apply_state(state, {"kind": "state", "autopilot": True})
+    assert state.autopilot is True
+
+
 def test_status_bar_left_is_a_projection_not_a_second_truth():
     """状态栏左边完全由 `agent.state` + 会话规模推出来。
 
@@ -1117,6 +1146,11 @@ class FakeClient:
     def list_sessions(self) -> None:
         self.sent.append({"t": "session_list"})
 
+    def set_autopilot(self, on: bool) -> None:
+        # 界面发的是**绝对状态**，所以这里也照原样记下来 —— "按一下切一次"和
+        # "把状态设成 X"在下一条断言里长得很不一样。
+        self.sent.append({"t": "set_autopilot", "on": on})
+
     def send(self, message: dict) -> None:
         """真客户端那一层的出口。**这里只记账**：替身不该去编信封（`v` 那一段）。"""
         self.sent.append({k: v for k, v in message.items() if k != "v"})
@@ -1645,6 +1679,55 @@ async def test_the_answer_is_rendered_as_markdown(monkeypatch):
         app._set_theme("P3")
         await _settle(app, pilot)
         assert app.theme == "P3"
+
+
+@pytest.mark.anyio
+async def test_the_autopilot_command_waits_for_the_runtime_before_showing_it_as_on(monkeypatch):
+    """`/autopilot` 只**发请求**，指示灯等 runtime 那条快照 —— 不许乐观更新。
+
+    反面的做法在这里格外危险：灯亮着、其实还在逐条问你，于是真的审批面板会被当成
+    误报点掉。所以这条测试钉三件事：默认是关的、发出去的是绝对状态、以及"说了开"
+    必须发生在收到 `ui state` 之后。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        app._inbox.put(("message", _init_message("s")))
+        await _settle(app, pilot)
+        assert app.state.autopilot is False, "默认是关的"
+
+        bar = app.query_one("#status", widgets_module.StatusBar)
+        _left, right = bar.render_parts(app.state, app.palette, (time.time(), 120))
+        text = str(right)
+        assert "自动放行 关" in text
+        assert text.index("自动放行 关") < text.index("上下文"), \
+            "它要挨着「上下文」的左边（输入框上面那一行的右段开头）"
+
+        app.submit("/autopilot")
+        await _settle(app, pilot)
+        assert [m for m in app._client.sent if m["t"] == "set_autopilot"] \
+            == [{"t": "set_autopilot", "on": True}], "发出去的是绝对状态"
+        assert app.state.autopilot is False, "还没收到 runtime 的确认，界面不许先改"
+        assert "自动放行：开" not in _log_text(app), "也不许先说出来"
+
+        # runtime 的确认（真跑时就是那条 `ui state` 快照）。
+        app._inbox.put(("message", {"v": 1, "t": "ui", "kind": "state",
+                                    "autopilot": True}))
+        await _settle(app, pilot)
+        assert app.state.autopilot is True
+        assert "自动放行：开" in _log_text(app)
+
+        # 再执行一次 → 关，而且这一次的措辞说的是"恢复逐条询问"。
+        app.submit("/autopilot")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_autopilot", "on": False}
+        app._inbox.put(("message", {"v": 1, "t": "ui", "kind": "state",
+                                    "autopilot": False}))
+        await _settle(app, pilot)
+        assert app.state.autopilot is False
+        assert "自动放行：关" in _log_text(app)
 
 
 @pytest.mark.anyio

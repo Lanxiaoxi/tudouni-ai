@@ -761,6 +761,105 @@ def test_approval_goes_over_the_protocol(fake_openai):
           if m.get("t") == "ui" and m.get("kind") == "run_finished"]
     assert ui and ui[0]["answer"] == "跑完了"
 
+
+# --- autopilot：运行中开关（TUI 的 `/autopilot`）--------------------------------
+
+def _state_snapshots(lines: list[str]) -> list[dict]:
+    return [m for m in parse(lines)
+            if m.get("t") == "ui" and m.get("kind") == "state"]
+
+
+def test_set_autopilot_flips_it_and_replies_with_a_state_snapshot():
+    """改完**立刻回一条 state 快照** —— 界面按它显示（不许自己乐观更新）。
+
+    没有这条回执，界面上那盏灯就只能靠猜，而这一格说的是"接下来还会不会问你"：
+    "写着开、其实还在问"会让人把真的审批面板当成误报点掉。
+    """
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_autopilot", "on": True},
+         {"v": 1, "t": "shutdown"}],
+        session="autopilot-toggle",
+    )
+    assert code == 0, err
+    assert [m.get("autopilot") for m in _state_snapshots(lines)] == [False, True], \
+        "开场那条是关的，切过之后那条必须是开的"
+
+
+def test_only_a_real_true_turns_autopilot_on():
+    """`on` **只认真正的 `true`**：猜错的方向必须是"照旧问你"。
+
+    这一档的后果是"需要审批的工具直接执行"，所以 `"false"` / `1` 这类东西不许被
+    当成开 —— 猜错的两个方向代价不对称：该开没开只是维持现状，不该开却开了是
+    "没有人在上面点过头就执行了"。
+    """
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_autopilot", "on": "false"},
+         {"v": 1, "t": "set_autopilot", "on": 1},
+         {"v": 1, "t": "shutdown"}],
+        session="autopilot-strict",
+    )
+    assert code == 0, err
+    assert all(m.get("autopilot") is False for m in _state_snapshots(lines))
+
+
+def test_autopilot_survives_a_session_switch():
+    """开着 autopilot 再换会话，新模式要**跟着过去**。
+
+    换会话是新装一个 runtime（`serve.make_session_opener`），它照 `bootstrap.autopilot`
+    装 —— 所以那个开关不能只改 Agent 那一份。漏了它的症状是"界面上灯还亮着，
+    工具却开始逐条问你"，而这两件事分居两处、谁也不知道对方不一致。
+    """
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_autopilot", "on": True},
+         {"v": 1, "t": "session_switch", "session_id": None},
+         {"v": 1, "t": "shutdown"}],
+        session="autopilot-switch",
+    )
+    assert code == 0, err
+    got = parse(lines)
+    states = [m for m in got if m.get("t") == "ui" and m.get("kind") == "state"]
+    assert states[-1].get("autopilot") is True, "换过去的那个会话又变成要审批了"
+
+    # 顺带证明"真的换了会话" —— 不然这条测试可能只是"什么都没发生"。
+    inits = [m for m in got if m.get("t") == "init"]
+    assert len(inits) == 2 and inits[0]["session_id"] != inits[1]["session_id"]
+
+
+def test_autopilot_turned_on_mid_session_stops_the_asking(fake_openai):
+    """端到端：开了之后 HIGH 风险的 shell **不再要审批**，而那一轮照样跑完。
+
+    它比"那个字段被改成 True 了"强得多：`Agent.autopilot` 是**每次调用时**读的
+    （见 `agents/agent.py` 里 gate 那一处），只有真的跑一轮才验证得了"这一改走到了
+    关卡"。这也是 `--autopilot` 和 `/autopilot` 共用的那一条路。
+    """
+    base, scripts, _ = fake_openai
+    scripts[:] = [
+        {"content": None, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "shell", "arguments": json.dumps({"command": "echo hi"})},
+        }]},
+        {"content": "跑完了"},
+    ]
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_autopilot", "on": True},
+         {"v": 1, "t": "user_message", "text": "跑一下 echo"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session="autopilot-e2e",
+    )
+    assert code == 0, err
+    got = parse(lines)
+    assert not [m for m in got if m.get("t") == "permission_request"], \
+        "开着 autopilot 还在要审批 —— 说明那个开关没走到 gate"
+
+    ui = [m for m in kinds(got, "ui") if m.get("kind") == "run_finished"]
+    assert ui and ui[0]["answer"] == "跑完了", "不问归不问，这一轮还是要跑完"
+
+    # 放行记成 `autopilot` 而不是 `approved` —— 这正是"这一轮有没有人看着"的答案，
+    # 也是 `/autopilot` 能存在而不算审计谎报的理由。
+    outcomes = [e.get("outcome") for e in kinds(got, "event")
+                if e.get("kind") == "permission"]
+    assert outcomes == ["autopilot"]
+
 def test_the_client_layer_finds_the_runtime_entrypoint():
     """`protocol/client.py` 算出来的 `main.py` 路径必须真的存在。
 

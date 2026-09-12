@@ -401,6 +401,11 @@ class TuiApp(App[None]):
         self._sessions_requested = False
         # 那份还没回来的清单是**欢迎屏**要的吗（回了之后要区分它和 `/resume` 要的）。
         self._welcome_request_pending = False
+        # `/autopilot` 请求的那个状态，还没等到 runtime 确认时记在这儿（None = 没在等）。
+        # **它记的是"我们要的那个值"而不是"按过一下"**：回合收尾时也会来一条
+        # `ui state`（`_run_turn` 的 finally），而它可能排在我们那条回应前面 ——
+        # 只认"值对上了"才不会把中间那条当成回应（见 `_report_autopilot`）。
+        self._autopilot_wanted: bool | None = None
         self._register_themes()
         self.theme = theme_key if theme_key in theme_mod.THEMES \
             else theme_mod.DEFAULT_THEME
@@ -784,6 +789,28 @@ class TuiApp(App[None]):
             # 面板数据。**它不进对话流**：任务列表每更新一次就在流里插一段，会把
             # "你问的 + 它答的"冲稀。左栏就是它的位置。
             view_state.apply_state(self.state, message)
+            self._report_autopilot()
+
+    def _report_autopilot(self) -> None:
+        """`/autopilot` 的回声：**说的是 runtime 确认之后的那个值**。
+
+        两条规矩，都是"不许乐观更新"那条的推论：
+
+          * **只有我们在等这个值时才说话。** 开场那条快照也带 `autopilot`（`--autopilot`
+            起来时是 true），而那种情况下 runtime 自己已经发过一条 notice 说过这件事，
+            界面再复述一遍只是噪声；
+          * **说实际值，不说希望值。** 值没对上来就什么都不说（`_autopilot_wanted`
+            留着）—— 请求没被受理时（老 runtime 会忽略不认识的 `t`）报一句"已开启"
+            是**假话**，而这一格恰恰是"接下来还会不会问你"。
+        """
+        if self._autopilot_wanted is None or self.state.autopilot != self._autopilot_wanted:
+            return
+        self._autopilot_wanted = None
+        if self.state.autopilot:
+            self._say("自动放行：开（需要审批的工具直接执行，审计里记 autopilot；"
+                      "再执行一次 /autopilot 关闭）", view_state.ROLE_WARN)
+        else:
+            self._say("自动放行：关（恢复逐条询问）", view_state.ROLE_RULE)
 
     def _on_sessions(self, message: dict[str, Any]) -> None:
         """会话清单到了：**欢迎屏要的那一份就喂给它，否则弹选择面板**。
@@ -1010,8 +1037,37 @@ class TuiApp(App[None]):
                                                  id="skills"))
         elif command == "/theme":
             self._command_theme(rest)
+        elif command == "/autopilot":
+            self._command_autopilot()
         else:
             self._say(f"没有这个命令：{command}（/help）")
+
+    def _command_autopilot(self) -> None:
+        """`/autopilot`：切换"不再逐条问审批"那个模式。**开关在 runtime 手里。**
+
+        ## 它和 `--autopilot` 是同一个模式，但语义变了一半
+
+        设计稿第 15 条决策明确写过"**不给 `/autopilot`**"，理由是它是"这一次没有人
+        可问"，而在一个有人看着的界面里按它语义矛盾。现在它回来了，因为那句话的
+        前提可以拆开：**人在不在** 和 **要不要每一条都看** 是两件事。`--autopilot`
+        说的是前者（无人值守），`/autopilot` 说的是后者（有人看着，但他选择不看）。
+        审计里两者仍然分得开 —— 放行记的是 `outcome=autopilot`，而它和 `approved`
+        （人按过 y）不是一回事。
+
+        ## 界面只发请求，不先改显示
+
+        真正生效的证据是 runtime 回来的那条 `ui state`（里面带 `autopilot`），
+        而回声由 `_report_autopilot` 按那个值说。这和 `/new` 不许乐观清屏是同一条
+        规矩 —— 在这一格上尤其要紧："灯亮着、其实还在逐条问你"会让人把真的审批
+        面板当成误报点掉。
+
+        发的是**绝对状态**（`not 现在这个值`），那个"现在这个值"来自 runtime 上一次
+        的快照：重发同一条是幂等的，所以不存在"两条消息各切一次"的竞态。
+        """
+        if self._client is None:
+            return
+        self._autopilot_wanted = not self.state.autopilot
+        self._client.set_autopilot(self._autopilot_wanted)
 
     def _command_resume(self, rest: str) -> None:
         """`/resume [id]`。带 id 直接切，不带就从列表里挑。
@@ -1090,7 +1146,10 @@ class TuiApp(App[None]):
                                  view_state.ROLE_RULE)]
         for command in view_state.COMMANDS:
             lines.append(view_state.seg(
-                (f"  {command.name:<9}", view_state.ROLE_WAITING),
+                # 那一列的宽度和命令面板共用同一个数（`COMMAND_NAME_WIDTH`）：
+                # 两处各写一个的话，改了一处、另一处的间距就悄悄变了。
+                (f"  {command.name:<{view_state.COMMAND_NAME_WIDTH}}",
+                 view_state.ROLE_WAITING),
                 (command.hint, view_state.ROLE_PROCESS),
             ))
         lines.append(view_state.Line("键位：", view_state.ROLE_RULE))

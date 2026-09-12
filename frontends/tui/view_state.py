@@ -359,6 +359,13 @@ class ViewState:
     granted_tools: list[str] = field(default_factory=list)
     granted_prefixes: list[str] = field(default_factory=list)
     denied_tools: list[str] = field(default_factory=list)
+    # 现在是不是 autopilot（`--autopilot` 或 `/autopilot`）。**它只有 `ui state`
+    # 一个来源** —— 界面按 runtime 说显示，不在自己发请求的时候就改：那会让"写着开、
+    # 其实还在逐条问你"变成可能，而这一格的意思恰恰是"接下来会不会问你"。
+    #
+    # 它**不属于某一个会话**（它是整个进程的模式，换会话时 bootstrap 带着它走），
+    # 所以 `reset_for_session()` 不清它。
+    autopilot: bool = False
     # 用户刚发出去的那句话。**回显要用它而不是事件里那份预览** ——
     # `run_started.user_input` 是审计的 200 字符预览，而用户敲的字界面本来就有。
     pending_input: str = ""
@@ -383,6 +390,10 @@ class ViewState:
 
         **rail_open / rail_pinned 不清**：那是"我要不要看左栏"，和聊的是哪个会话无关
         —— 换一次会话就把用户手动收起的栏顶开，是最容易被当成 bug 的那种"贴心"。
+
+        **`autopilot` 也不清**（同样在上面那段之外）：它是整个进程的模式，而且
+        runtime 那边换会话时是**带着它**装的（`bootstrap.autopilot`）—— 这里清成
+        False 会和 runtime 分家，症状是"换了个会话，灯灭了但工具照样不问"。
         """
         self.agent = agent_state.initial()
         self.answers.clear()
@@ -517,6 +528,26 @@ class ViewState:
         else:
             span = "会话  —"
         return "  ·  ".join([context, hit, span, f"审计 {self.audit_dir_short()}"])
+
+    def autopilot_badge(self, compact: bool = False) -> Line:
+        """状态栏左边那枚 autopilot 指示灯：`自动放行 开` / `自动放行 关`。
+
+        **两个状态都要显示**，不做成"开着才显示"：那样"这一格空着"既可能是关掉了、
+        也可能是没画出来，而这一格的语义恰恰是"接下来还会不会问你" —— 它不允许有
+        歧义。用词跟着 `OUTCOME_TEXT` 里那条（`autopilot` → 「自动放行」），
+        所以它和审批结果里那个说法是同一句话。
+
+        颜色：开着是 `warn`（它意味着工具会在没有人点头的情况下执行），关着是
+        最暗那档 —— 常态不该抢眼。
+
+        `compact=True`（窄屏）把词缩成两个字：状态栏右边是 `width: auto`，多出来的
+        每一列都从**左段**身上扣，而左段被裁成半句正是 F5 那次踩过的坑
+        （实测：显示成 `● 要调用 edit_file（第`，那句话的意思整个没了）。
+        """
+        word = "放行" if compact else "自动放行"
+        if self.autopilot:
+            return Line(f"{word} 开", ROLE_WARN)
+        return Line(f"{word} 关", ROLE_RULE)
 
     def audit_short(self) -> str:
         """审计路径的短写法：**能省掉工作区前缀就省掉**。
@@ -874,6 +905,11 @@ def apply_state(state: ViewState, message: dict[str, Any]) -> None:
     # 要保住已经拿到的那一份 —— 直接覆盖会让"全部技能"那个弹层过一会儿就空了。
     if "skill_catalog" in message:
         state.skill_catalog = [dict(item) for item in message["skill_catalog"] or []]
+    # autopilot 是**布尔**，并不进上面那两条（它们各自按列表形状复制）。判据用
+    # `is True` 而不是真假值：和 `protocol/channels.py` 收到的那个方向一致 ——
+    # 这一格决定"接下来会不会问你"，猜错的方向必须是"照旧问你"。
+    if "autopilot" in message:
+        state.autopilot = message["autopilot"] is True
 
 
 # --- 上下文栏（左栏） ----------------------------------------------------------
@@ -1075,7 +1111,23 @@ COMMANDS: tuple[Command, ...] = (
     Command("/help", "命令与键位"),
     Command("/theme", "换配色", True),
     Command("/skills", "看全部技能"),
+    # **这一条推翻了决策 15 的一部分**（那一版明确不给 `/autopilot`，理由是"它是
+    # 一次没有人可问，在有人看着的界面里语义矛盾"）。现在它是"**有人在看着，但他
+    # 选择不看每一条**"—— 语义变了所以结论才改，理由留在 app.py 的
+    # `_command_autopilot` 和 doc/TUI-design.md 那一节里。
+    Command("/autopilot", "自动放行开关"),
 )
+
+# 命令名那一列的宽度。**从最长的那条算出来，不手写数字。**
+#
+# 手写过一次（`f"{name:<9}"`），而 `/autopilot` 是 **10 个字符** —— 它一加进来就把
+# 那一列顶穿了，于是"命令名"和"后面那句文案"之间**一个空格都不剩**，两段粘成一条
+# 读（实测：`/autopilot自动放行开关`）。这不是"有点挤"：那个面板的全部价值就是
+# "名字一列、说明一列"，粘在一起就只剩一列了。
+#
+# 从表里算出来之后，下一个更长的命令只会让整列一起右移，不会再出现同一类事故。
+# `+ 3` 是两列之间那个间隙（最短的命令名因此有 9 格，最长的那条有 3 格）。
+COMMAND_NAME_WIDTH = max(len(command.name) for command in COMMANDS) + 3
 
 
 def session_row(item: dict[str, Any], *, conflict: bool = False) -> Line:

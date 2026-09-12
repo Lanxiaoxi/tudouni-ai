@@ -624,6 +624,11 @@ class Runtime:
                 format_rule(rule) for rule in sorted(self.memory.prefixes())
             ],
             "denied_tools": sorted(self.policy.deny_tools),
+            # autopilot 是**活的那个**（`/autopilot` 能中途改它），所以读 Agent 上那份
+            # 而不是 `self.autopilot`：后者是字段，而 `Runtime` 是 frozen 的
+            # （见类 docstring：装配完就不再改）。界面按这条显示，于是"界面上写着开、
+            # 其实没开"不可能发生 —— 那份事实只有这个来源。
+            "autopilot": bool(self.agent.autopilot),
         }
         if with_catalog:
             state["skill_catalog"] = [

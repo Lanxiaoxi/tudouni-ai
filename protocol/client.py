@@ -211,6 +211,19 @@ class ProtocolClient:
         """请 runtime 回一份会话清单（出站 `sessions`）。**同样是发一条就走。**"""
         self.send({"t": messages.IN_SESSION_LIST})
 
+    def set_autopilot(self, on: bool) -> None:
+        """运行中开关 autopilot（TUI 的 `/autopilot`）。
+
+        **发的是绝对状态，不是"切一下"**：重发同一条是幂等的，界面也不需要先知道
+        runtime 现在是什么状态 —— 所以不存在"两条消息各切一次"的竞态。
+
+        和 `switch_session` / `interrupt` 一样**非阻塞、也不许乐观更新**：真正生效的
+        证据是 runtime 回来的那条 `ui` / `kind=state` 快照（里面带 `autopilot`）。
+        界面在这之前就改显示的话，"点了没生效"会以"灯亮着但还在问我"的形式出现 ——
+        而那件事在 autopilot 上格外要紧：它意味着"我以为它不问，其实它还在问"。
+        """
+        self.send({"t": messages.IN_SET_AUTOPILOT, "on": bool(on)})
+
     def shutdown(self) -> None:
         self.send({"t": messages.IN_SHUTDOWN})
 

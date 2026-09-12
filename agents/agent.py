@@ -900,7 +900,9 @@ class Agent:
 
         _DEBUG_BY_OUTCOME = {
             "auto_allowed": "   ✓ 自动放行",
-            "autopilot": "   ✓ 自动放行（autopilot：这一轮没人在看）",
+            # 文案不写"这一轮没人在看"：`/autopilot`（决策 25）让这个模式也能在有人
+            # 看着的时候打开 —— 它说的是"不问审批"，不是"没有人在"。
+            "autopilot": "   ✓ 自动放行（autopilot：不问审批）",
             "rule_allowed": "   ✓ 自动放行（你之前按过 t）",
             "command_allowed": "   ✓ 自动放行（命中命令规则）",
             "approved": "   ✓ 用户批准",

@@ -231,18 +231,19 @@ class SessionBar(TwoPart):
 
 
 class StatusBar(TwoPart):
-    """底部那一行：**agent 在干什么**（左）+ **这一轮的成本**（右）。
+    """底部那一行：**agent 在干什么**（左）+ **autopilot 开关 + 这一轮的成本**（右）。
 
-    它是**投影**（见 `view_state.ViewState.status_left / status_right`），
-    不是第二份事实。`payload` 是界面的 wall clock —— "本轮 1.4s"要随秒走动，
-    而那个数只能由界面自己数（纯函数里不取时间）。
+    它是**投影**（见 `view_state.ViewState.status_left / status_right /
+    autopilot_badge`），不是第二份事实。`payload` 是界面的 wall clock ——
+    "本轮 1.4s"要随秒走动，而那个数只能由界面自己数（纯函数里不取时间）。
 
     右边那一段**以两个空格开头**：左段是 `1fr`，内容长的时候会被裁到边界上，
-    于是"第 3 / 30 步"和"上下文"会挤在一起（实测：看不出这两段是两件事）。
+    于是"第 3 / 30 步"和"自动放行 关"会挤在一起（实测：看不出这两段是两件事）。
     两个空格是这块画布上唯一的"栏间距"。
 
     **窄屏降级**：审计路径在 80 列上和左边撞车，所以窄屏只留前三个数
-    （F5 那张图里状态栏右边就只剩用量）。
+    （F5 那张图里状态栏右边就只剩用量）；autopilot 那一格**保留但缩成两个字** ——
+    它不是"成本"，而是"接下来还会不会问你"，窄屏也不该把它丢掉。
     """
 
     def render_parts(self, state, palette, payload=None):
@@ -255,8 +256,15 @@ class StatusBar(TwoPart):
         mark, _, rest = state.status_left().partition(" ")
         left.append(mark, style=_phase_color(palette, state.agent.phase))
         left.append(f" {rest}", style=palette.ink2)
-        return (left, Text("  " + state.status_right(now, compact=narrow),
-                           style=palette.ink4))
+
+        # autopilot 那一格**自己一档色**（开着是 `warn`），所以它不能并进下面那条
+        # 单色的字符串里 —— 走 `paint()` 这个"行 → Text"的唯一出口，别在这里
+        # 手写第二份角色到颜色的映射。
+        right = Text("  ")
+        right.append_text(paint(palette, state.autopilot_badge(narrow)))
+        right.append("  ·  " + state.status_right(now, compact=narrow),
+                     style=palette.ink4)
+        return (left, right)
 
     def repaint(self, palette: theme_mod.Theme) -> None:
         # 秒数在变，所以重画之前得重算一次（`render_parts` 会读 payload）。
@@ -1428,7 +1436,9 @@ class CommandPalette(Vertical):
         self._title.update(title)
         self._options.remove_children()
         for position, command in enumerate(self.commands):
-            text = Text(f"{command.name:<9}", style=(
+            # 宽度从 `COMMANDS` 里算出来（见 `view_state.COMMAND_NAME_WIDTH`）——
+            # 手写过一次，然后 `/autopilot` 把这个 `<9` 顶穿了。
+            text = Text(f"{command.name:<{view_state.COMMAND_NAME_WIDTH}}", style=(
                 palette.accent if position == self._index else palette.ink2))
             text.append(command.hint, style=palette.ink4)
             self._options.mount(Static(text, classes=(

@@ -513,6 +513,14 @@ class ProtocolServer:
             self._send_session_list()
             return True
 
+        if kind == messages.IN_SET_AUTOPILOT:
+            # **只认真正的 `true`。** 这一档的后果是"需要审批的工具直接执行"，所以
+            # `"false"` / `1` 这类东西**不许**被猜成 true —— 猜错的两个方向代价不对称：
+            # 该开没开只是维持现状，不该开却开了是"没人在上面点过头就执行了"。
+            # schema 里 `on` 是 boolean，这条不信任是留给"手写的客户端"的。
+            self._set_autopilot(message.get("on") is True)
+            return True
+
         if kind == messages.IN_USER_MESSAGE:
             # 上一轮还没走完就先等它 —— 两条回合叠着跑会让事件顺序错乱，
             # 而"顺序"是这条协议唯一的同步手段。
@@ -560,6 +568,33 @@ class ProtocolServer:
             "t": messages.OUT_SESSIONS,
             "items": lister(self.bootstrap.booted.store) if lister else [],
         })
+
+    def _set_autopilot(self, on: bool) -> None:
+        """运行中开关 autopilot（`/autopilot`）。**两处都要改，少一处就是半开半关。**
+
+          * `self.bootstrap.autopilot` —— 换会话时新 runtime 照 bootstrap 装
+            （`serve.make_session_opener`）。不改它，"开着 autopilot 再 `/new`"
+            会得到一个又开始逐条问的会话，而界面上的指示灯还亮着；
+          * `self.runtime.agent.autopilot` —— **当前这个会话真正生效的那份**：
+            gate 每次都读它（`agents/agent.py`），改它下一步就生效。
+
+        `Runtime.autopilot` 那个字段**不动**：`Runtime` 是 frozen 的，而类 docstring
+        明令"运行中换策略该再 open_runtime 一个，不许就地改"。这里能就地改的是
+        Agent 上那个开关，理由是**审计分得开**：每一条放行都记着当时那一次决定
+        （`outcome=autopilot` 还是 `approved`），所以同一个回合里前后两种策略在
+        jsonl 里一眼能分。而"就地换掉权限策略"（比如改 auto_approve）不留这种痕迹
+        —— 那才是那条 docstring 真正防的东西。顺带：`Runtime.autopilot` 只用来渲染
+        启动时那条警告，那本来就是"启动时是什么样"的事实，留着旧值是对的。
+
+        **改完立刻回一条 state 快照**：界面按它显示、不许自己乐观更新，于是
+        "现在开着没有"只有一个来源（`runtime.ui_state()` 读的是 Agent 那份）。
+        """
+        if self.bootstrap is not None:
+            self.bootstrap = self.bootstrap._replace(autopilot=on)
+        runtime = self.runtime
+        if runtime is not None:
+            runtime.agent.autopilot = on
+        self.send(self._state_message())
 
     def _session_switch(self, session_id: Any) -> None:
         """收掉当前 runtime、按新会话装配、重发开场三连。**失败时保留旧会话。**

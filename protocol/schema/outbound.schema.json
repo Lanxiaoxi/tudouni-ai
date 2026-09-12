@@ -125,6 +125,10 @@
         "type": "array",
         "doc": "**只有 kind=state 有**。风险等级 → 处置：`[{\"risk\": \"low\", \"disposition\": \"auto|ask\"}]`。**处置由 runtime 算**（三档里哪几档自动放行是 PermissionPolicy 的判断），界面照着渲染 —— 它不该知道\"默认只有 low\"。"
       },
+      "autopilot": {
+        "type": "boolean",
+        "doc": "**只有 kind=state 有**。现在是不是 autopilot（`--autopilot` 或 `/autopilot`）。**以 runtime 为准**：界面按它显示，不在自己发请求的时候就改 —— 那条路会让\"界面上写着开、其实没开\"变成可能。"
+      },
       "granted_tools": {
         "type": "array",
         "items": {"type": "string"},

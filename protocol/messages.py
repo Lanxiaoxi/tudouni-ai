@@ -52,10 +52,19 @@ IN_SESSION_LIST = "session_list"
 # 紧跟一条 shutdown，那一轮会在第一个安全点被砍掉，界面永远拿不到答案）。
 # 想停下正在跑的这一轮，只能走这条。
 IN_INTERRUPT = "interrupt"
+# **运行中开关 autopilot**（TUI 的 `/autopilot`）。它和 `--autopilot` 是同一个模式，
+# 区别只在"什么时候决定"：那个在启动时定死，这个让界面在会话中途改。
+#
+# 为什么值得单独一条消息（而不是让前端自己"假装放行"）：放行这件事只有 runtime 能做
+# —— gate 是它调的，审计也是它写的。前端自己把 `permission_request` 回成 allow，审计
+# 里记的就是 `approved`（"人按了同意"），而那一刻其实没有人按过任何键 ——
+# 那是**审计谎报**，比多一条消息贵得多。
+IN_SET_AUTOPILOT = "set_autopilot"
 IN_SHUTDOWN = "shutdown"
 
 INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
-           IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SHUTDOWN)
+           IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SET_AUTOPILOT,
+           IN_SHUTDOWN)
 
 # 出站（runtime → 前端）九种。
 OUT_INIT = "init"
