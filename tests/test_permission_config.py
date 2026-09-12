@@ -1,4 +1,4 @@
-"""`.tudouni.json`：读法、报错，以及按 t 之后写回去的那一半。
+"""权限文件（`.tudouni/permissions.json`）：读法、报错，以及按 t 之后写回去的那一半。
 
 这个文件是**唯一由人写给权限系统看的东西**，所以两种失败都不能容忍：
 
@@ -6,21 +6,33 @@
   2. 写回去时把还没被人看见的设置一起删掉 —— 按一次 t 丢掉别的配置。
 
 前者靠"不认识就报错"，后者靠"只动那一个键 + 读不懂就不覆盖"。
+
+文件住在 `.tudouni/` 里面（运行期的私有目录），而那个目录**可能还不存在** —— 全新
+工作区就是这样。所以写之前建目录是这条路径自己的责任，不是测试的：按一次 `t` 而
+程序崩在"我自己的目录还没建"上，是这里最荒唐的失败形态。
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
 from agent_runtime.config import (
     ConfigError,
+    PERMISSION_FILE,
     PermissionConfig,
     save_approvals,
 )
 
 
+def permission_path(workdir) -> Path:
+    return workdir / ".tudouni" / "permissions.json"
+
+
 def write(workdir, text: str):
-    path = workdir / ".tudouni.json"
+    """把内容写进权限文件；**父目录按生产的写法建出来**（save_approvals 也会建）。"""
+    path = permission_path(workdir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -33,10 +45,32 @@ def write_json(workdir, payload) -> object:
 
 def test_missing_file_is_not_an_error(workdir):
     """和 .env 一样：没有就是没有，不算配置错误。"""
-    cfg = PermissionConfig.from_file(workdir / ".tudouni.json")
+    cfg = PermissionConfig.from_file(permission_path(workdir))
 
     assert cfg.auto_approve_tools == frozenset()
     assert cfg.deny_tools == frozenset()
+
+
+def test_the_permission_file_lives_in_the_runtime_dir():
+    """路径本身也钉一下：它是"运行期私有数据都在一个目录里"这条约定的入口。
+
+    配套的是控制面（`tools/filesystem.py` 的 CONTROL_PLANE 守着 `.tudouni/`），
+    所以这个文件天生就是"agent 不许写"的 —— 不需要再单独点名它。
+    """
+    from agent_runtime.skills import RUNTIME_DIR_NAME
+
+    assert PERMISSION_FILE.parent.name == RUNTIME_DIR_NAME
+    assert PERMISSION_FILE.name == "permissions.json"
+
+
+def test_save_creates_the_runtime_dir_when_missing(workdir):
+    """全新工作区里按一次 `t`：目录不存在也要能写成。"""
+    path = permission_path(workdir)
+
+    save_approvals(path, tools={"shell"}, prefixes=())
+
+    assert path.is_file()
+    assert json.loads(path.read_text(encoding="utf-8"))["auto_approve_tools"] == ["shell"]
 
 
 def test_default_auto_approve_matches_the_builtin_policy(workdir):
@@ -71,7 +105,8 @@ def test_reads_all_three_keys(workdir):
 def test_accepts_a_utf8_bom(workdir):
     """Windows 上"另存为 UTF-8"常常带 BOM，而带 BOM 的 JSON 会让 json.loads 在第一行
     就报 Expecting value —— 一个看不见的字符引起的失败，没人猜得到。"""
-    path = workdir / ".tudouni.json"
+    path = permission_path(workdir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"deny_tools": ["shell"]}), encoding="utf-8-sig")
 
     assert PermissionConfig.from_file(path).deny_tools == frozenset({"shell"})
@@ -125,7 +160,7 @@ def test_broken_json_reports_where(workdir):
 
     message = str(exc.value)
     assert "第 1 行" in message
-    assert ".tudouni.json" in message
+    assert "permissions.json" in message
 
 
 def test_non_object_root_is_an_error(workdir):
@@ -148,7 +183,7 @@ def test_unknown_tools_flags_typos_but_does_not_fail(workdir):
 # --- 按 t 之后写回去 ----------------------------------------------------
 
 def test_save_creates_the_file_and_survives_a_round_trip(workdir):
-    path = workdir / ".tudouni.json"
+    path = permission_path(workdir)
     save_approvals(path, tools={"shell"}, prefixes=())
 
     cfg = PermissionConfig.from_file(path)          # 写出来的必须自己能读回去
@@ -171,7 +206,7 @@ def test_save_keeps_the_other_keys_and_their_order(workdir):
 
 
 def test_save_is_sorted_and_idempotent(workdir):
-    path = workdir / ".tudouni.json"
+    path = permission_path(workdir)
     save_approvals(path, tools={"shell", "write_file"}, prefixes=())
     first = path.read_text(encoding="utf-8")
     save_approvals(path, tools={"write_file", "shell"}, prefixes=())
@@ -182,10 +217,10 @@ def test_save_is_sorted_and_idempotent(workdir):
 
 def test_save_leaves_no_temp_file_behind(workdir):
     """先写临时文件再 os.replace —— 但临时文件不能留在工作区里。"""
-    path = workdir / ".tudouni.json"
+    path = permission_path(workdir)
     save_approvals(path, tools={"shell"}, prefixes=())
 
-    assert sorted(p.name for p in workdir.iterdir()) == [".tudouni.json"]
+    assert sorted(p.name for p in (workdir / ".tudouni").iterdir()) == ["permissions.json"]
 
 
 def test_save_refuses_to_overwrite_a_file_it_cannot_read(workdir):
@@ -224,7 +259,7 @@ def test_a_rule_with_a_redirect_is_an_error(workdir):
 
 def test_save_writes_both_kinds_of_grant_and_round_trips(workdir):
     """两类记忆共用一次落盘：工具名和命令前缀，写出来的必须自己能读回去。"""
-    path = workdir / ".tudouni.json"
+    path = permission_path(workdir)
     save_approvals(path, tools={"write_file"}, prefixes={("git", "add"), ("ls",)})
 
     cfg = PermissionConfig.from_file(path)
@@ -236,7 +271,7 @@ def test_save_writes_both_kinds_of_grant_and_round_trips(workdir):
 def test_save_re_quotes_tokens_that_contain_spaces(workdir):
     """含空格的 token 要重新加引号，否则写回去再读出来就变成两个 token ——
     配置被自己的写回步骤改坏是最难查的一类 bug。"""
-    path = workdir / ".tudouni.json"
+    path = permission_path(workdir)
     rule = ("git", "commit", "-m", "wip wip")
     save_approvals(path, tools=(), prefixes={rule})
 

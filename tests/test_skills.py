@@ -1,4 +1,4 @@
-"""技能：发现（skills/ 包）+ 装载（tools/skills.py）。
+﻿"""技能：发现（skills/ 包）+ 装载（tools/skills.py）。
 
 这一组测试盯的是五件容易被无声破坏的事：
 
@@ -745,15 +745,15 @@ def test_the_skills_directory_is_control_plane(workdir):
     fs.safe_path(".tudouni/skills/evil/SKILL.md")
 
 
-def test_the_control_plane_uses_the_skills_package_constant():
+def test_the_control_plane_uses_the_runtime_dir_constant():
     """这条盯着"技能住哪"这个事实只有一个来源。
 
     抄第二份字面量的话，哪天目录改名就会变成"技能还在加载、agent 却已经能写它了" ——
     一个不会有任何报错的组合。
     """
-    from agent_runtime.skills import TUDOUNI_DIR_NAME
+    from agent_runtime.skills import RUNTIME_DIR_NAME
 
-    assert TUDOUNI_DIR_NAME in CONTROL_PLANE
+    assert RUNTIME_DIR_NAME in CONTROL_PLANE
 
 
 def test_a_symlinked_skill_directory_cannot_escape(workdir):

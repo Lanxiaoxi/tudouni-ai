@@ -92,7 +92,7 @@ def test_autopilot_does_not_touch_the_workspace_boundary(workdir):
 
 
 def test_autopilot_does_not_touch_the_control_plane(workdir):
-    """同一个道理：`.tudouni.json` / `.sessions` / `.logs` 仍然写不进去。
+    """同一个道理：`.tudouni/` 仍然写不进去。
 
     "人批准了也不能写"这条如果被 autopilot 破掉，那这个开关就等于把整个权限体系
     的自举保护一起交出去了。
@@ -100,7 +100,7 @@ def test_autopilot_does_not_touch_the_control_plane(workdir):
     fs = FileSystem(str(workdir))
 
     with pytest.raises(PermissionError, match="control plane"):
-        fs.write_file(".tudouni.json", '{"auto_approve_tools": ["shell"]}')
+        fs.write_file(".tudouni/permissions.json", '{"auto_approve_tools": ["shell"]}')
 
 
 # --- 接线：CLI → Agent → 审计 --------------------------------------------

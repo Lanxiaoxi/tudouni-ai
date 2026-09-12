@@ -30,6 +30,7 @@ from typing import Any
 from dotenv import dotenv_values
 
 from agent_runtime.security.commands import Rule, format_rule, parse_rule
+from agent_runtime.skills import RUNTIME_DIR_NAME
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -130,9 +131,19 @@ class ModelConfig:
         return CONTEXT_WINDOWS.get(self.model)
 
 
-# --- 权限设置：工作区根目录的 .tudouni.json -------------------------------
+# --- 权限设置：`<工作区>/.tudouni/permissions.json` -----------------------
+#
+# 它原来是工作区根的 `.tudouni.json`，现在住进运行期的私有目录。挪进来的收益是具体的：
+# 控制面只需要守一个 `.tudouni/`（它下面的东西**天生**就是"agent 不许写"），工作区根上
+# 也少一个点文件。
+#
+# 旧位置的数据**有意不再读**（`.tudouni.json` / `.sessions/` / `.logs/` 一起放弃）。
+# 留一条"新文件没有就去看旧文件"的分支，等于让这份配置解析永远背着一次历史迁移，而
+# 那是一次性的事。旧文件留在磁盘上不影响任何行为；想彻底清掉就删了它，程序不会碰它。
 
-PERMISSION_FILE = PROJECT_ROOT / ".tudouni.json"
+RUNTIME_DIR = PROJECT_ROOT / RUNTIME_DIR_NAME
+
+PERMISSION_FILE = RUNTIME_DIR / "permissions.json"
 
 PERMISSION_FILE_NAME = PERMISSION_FILE.name
 
@@ -321,7 +332,7 @@ def save_approvals(
     tools: Iterable[str],
     prefixes: Iterable[Rule],
 ) -> None:
-    """把"人说过别再问"的东西写回 `.tudouni.json`。
+    """把"人说过别再问"的东西写回权限文件（`permissions.json`）。
 
     两类分别进 `auto_approve_tools`（工具名）和 `shell_allow`（命令前缀）—— 它们是
     同一件事的两种粒度，所以共用这一个落盘口，也就不会出现"只写了一半"的状态。
@@ -333,12 +344,17 @@ def save_approvals(
     完整版，要么是新的完整版，不存在"写了一半"的形态。这个文件最需要它的时候，正是
     它不能毁掉自己的时候。
 
+    **父目录要自己建。** 这个文件住在 `.tudouni/` 里面，而那个目录可能还不存在
+    （全新工作区、或者人手动删过它）—— 按一次 `t` 就 FileNotFoundError 是这里最荒唐的
+    失败形态：用户做了一个正确的操作，程序崩在"我自己的目录还没建"上。
+
     读不懂就抛 ConfigError，**绝不覆盖** —— 那会把文件里还没被人看见的设置一起删掉。
     """
     raw = _read_json_object(path) if path.is_file() else {}
     raw["auto_approve_tools"] = sorted(set(tools))
     raw["shell_allow"] = sorted({format_rule(rule) for rule in prefixes})
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)

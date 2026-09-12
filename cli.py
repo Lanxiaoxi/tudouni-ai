@@ -374,12 +374,14 @@ def print_skills(loader: SkillLoader) -> None:
     """
     catalog = loader.reload()
 
-    print("技能目录（优先级从低到高，个人级压项目级）：")
+    # 目录按优先级从低到高列出来，并标出**真的存在的那些**：用户级目录在工作区外面，
+    # 不列出来人根本想不到去那儿找技能；而"哪些还不存在"正好是"要新建一个该放哪"的答案。
+    print("技能目录（优先级从低到高，个人级压项目级；✓ = 存在）：")
     for path in loader.directories:
         print(f"  {'✓' if path in catalog.roots else ' '} {path}")
 
     if not catalog.skills:
-        print("\n没有技能。要加一个就建 <目录>/<名字>/SKILL.md，"
+        print("\n没有技能。要加一个就在上面任一目录下建 <名字>/SKILL.md，"
               "开头写上 name 和 description（格式见 README 的「技能」一节）。")
     else:
         print(f"\n可用技能 {len(catalog.skills)} 个：")

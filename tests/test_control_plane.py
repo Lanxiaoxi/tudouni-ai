@@ -1,8 +1,9 @@
-"""控制面：agent 能写工作区里的任何东西，**除了这三样**。
+"""控制面：agent 能写工作区里的任何东西，**除了 `.tudouni/`**。
 
 这条边界和 safe_path 那条是方向相反的两个问题：safe_path 防它出去，这里防它进来。
-之所以值得单独钉住，是因为 write_file 的边界正好是整个工作区，而 .tudouni.json
-就住在工作区根部 —— 能写它，就等于能给自己发权限。
+之所以值得单独钉住，是因为 write_file 的边界正好是整个工作区，而运行期的私有目录
+就住在工作区根部 —— 能写它，就等于能给自己发权限、伪造批准记录、抹掉审计证据，
+或者给自己换一套行为指令（技能）。
 
 所以这里的断言都盯在**文件有没有真的被建出来**，而不是只看抛没抛异常：一个"先写入
 再报错"的实现也能让异常看起来正确。
@@ -26,18 +27,19 @@ def fs(workdir):
 def test_write_file_refuses_the_permission_file(fs, workdir):
     """能写它就能把 shell 加进免审批名单 —— 那就不叫权限策略了。"""
     with pytest.raises(PermissionError, match="control plane"):
-        fs.write_file(".tudouni.json", '{"auto_approve_tools": ["shell"]}')
+        fs.write_file(".tudouni/permissions.json", '{"auto_approve_tools": ["shell"]}')
 
-    assert not (workdir / ".tudouni.json").exists()
+    assert not (workdir / ".tudouni" / "permissions.json").exists()
 
 
 @pytest.mark.parametrize("path", [
-    ".sessions/20250101-000000.json",   # 能写它就能伪造"用户批准过"
-    ".logs/20250101-000000.jsonl",      # 能写它就能抹掉"谁批准了什么"
-    ".sessions",                        # 目录本身也不行
-    ".logs",
+    ".tudouni/sessions/20250101-000000.json",   # 能写它就能伪造"用户批准过"
+    ".tudouni/logs/20250101-000000.jsonl",      # 能写它就能抹掉"谁批准了什么"
+    ".tudouni/skills/evil/SKILL.md",            # 能写它就能给自己换一套行为指令
+    ".tudouni/permissions.json",
+    ".tudouni",                                 # 目录本身也不行
 ])
-def test_write_file_refuses_session_and_log_paths(fs, workdir, path):
+def test_write_file_refuses_the_runtime_dir(fs, workdir, path):
     with pytest.raises(PermissionError, match="control plane"):
         fs.write_file(path, "x")
 
@@ -56,11 +58,11 @@ def test_every_entry_in_the_table_is_actually_enforced(fs):
 
 
 def test_the_check_does_not_depend_on_case(fs, workdir):
-    """Windows 的文件系统不区分大小写，`.TUDOUNI.JSON` 写下去就是同一个文件。"""
+    """Windows 的文件系统不区分大小写，`.TUDOUNI/` 写下去就是同一个目录。"""
     with pytest.raises(PermissionError):
-        fs.write_file(".TUDOUNI.JSON", "x")
+        fs.write_file(".TUDOUNI/permissions.json", "x")
 
-    assert not (workdir / ".tudouni.json").exists()
+    assert not (workdir / ".tudouni").exists()
 
 
 def test_escaping_the_workspace_is_still_refused(fs):
@@ -72,9 +74,9 @@ def test_escaping_the_workspace_is_still_refused(fs):
 # --- edit_file 走的是同一条检查 ------------------------------------------
 
 @pytest.mark.parametrize("path", [
-    ".tudouni.json",
-    ".sessions/20250101-000000.json",
-    ".logs/20250101-000000.jsonl",
+    ".tudouni/permissions.json",
+    ".tudouni/sessions/20250101-000000.json",
+    ".tudouni/logs/20250101-000000.jsonl",
 ])
 def test_edit_file_also_refuses_the_control_plane(fs, workdir, path):
     """edit_file 是另一个能改文件的工具，控制面必须同样挡住它。
@@ -100,11 +102,17 @@ def test_edit_file_still_refuses_escaping_the_workspace(fs):
 # --- 放行 ---------------------------------------------------------------
 
 def test_reading_the_control_plane_is_still_allowed(fs, workdir):
-    """只挡写。读没有破坏性，而 agent 看不见自己项目的策略只会反复重试。"""
-    (workdir / ".tudouni.json").write_text('{"auto_approve": ["low"]}', encoding="utf-8")
+    """只挡写。读没有破坏性，而 agent 看不见自己项目的策略只会反复重试。
 
-    assert "auto_approve" in fs.read_file(".tudouni.json")
-    assert ".tudouni.json" in fs.list_files(".")
+    技能正文更是必须读得到（它连同目录的附件一起被 read_file 读）。
+    """
+    (workdir / ".tudouni").mkdir(parents=True, exist_ok=True)
+    (workdir / ".tudouni" / "permissions.json").write_text(
+        '{"auto_approve": ["low"]}', encoding="utf-8"
+    )
+
+    assert "auto_approve" in fs.read_file(".tudouni/permissions.json")
+    assert ".tudouni" in fs.list_files(".")
 
 
 def test_normal_writes_still_work(fs, workdir):
@@ -113,13 +121,12 @@ def test_normal_writes_still_work(fs, workdir):
 
 
 def test_a_nested_copy_of_the_name_is_not_the_control_plane(fs, workdir):
-    """控制面是"根目录那个文件"，不是"叫这个名字的任何东西"。
+    """控制面是"根目录那个目录"，不是"叫这个名字的任何东西"。
 
-    挡住 sub/.tudouni.json 只会让模型读不懂为什么被拒 —— 而那不是策略文件，
-    没有任何东西会去读它。
+    挡住 sub/.tudouni/ 只会让模型读不懂为什么被拒 —— 而那不是运行期目录。
     """
-    fs.write_file("sub/.tudouni.json", "{}")
-    fs.write_file("tudouni.json", "{}")          # 少一个点也不是
-    fs.write_file("sessions/notes.md", "x")      # 少一个点也不是
+    fs.write_file("sub/.tudouni/permissions.json", "{}")
+    fs.write_file("sub/sessions/notes.md", "x")   # 少一层也不是
+    fs.write_file("tudouni.json", "{}")           # 少一个点也不是
 
-    assert (workdir / "sub" / ".tudouni.json").exists()
+    assert (workdir / "sub" / ".tudouni" / "permissions.json").exists()

@@ -60,12 +60,20 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# 技能目录的**目录名**。`.tudouni` 是**本工具的私有位置**（和权限策略 .tudouni.json
-# 同一个家）；`.agents` / `.skills` 是**通用兜底**（生态里部分工具用它们）。
+# 这个运行时的**私有目录名**（每个工作区一个）。技能住它下面的 skills/，会话住 sessions/，
+# 审计日志住 logs/，权限策略是 permissions.json。
 #
-# 注意两者形状不同：`.agents` 下面还隔一层 `skills/`，而 `.skills` **本身就是技能目录**
-# （再拼一层会变成 `.skills/skills/`，那是没人约定过的路径）。
-TUDOUNI_DIR_NAME = ".tudouni"
+# 常量住在 skills/ 包而不是 config.py，是**依赖方向**逼出来的：config → security →
+# tools → skills，所以 config 反过来给 skills 提供常量就会成环。而 skills 谁也不依赖，
+# 是这条链上唯一能安全承载"布局常量"的地方 —— 它描述的也确实是文件系统的布局，不是
+# 技能专属的知识。
+RUNTIME_DIR_NAME = ".tudouni"
+# 旧名字（单目录时代留下的），保留是因为它在测试和文档里被引用得太多，而这个常量的
+# 含义一个字都没变。
+TUDOUNI_DIR_NAME = RUNTIME_DIR_NAME
+
+# 通用兜底目录（生态里部分工具用它们）。它们**不在**运行期目录里面 —— 认它们是为了吃下
+# 别人的技能包，而别人的布局我们无权改。
 AGENTS_DIR_NAME = ".agents"
 GENERIC_DIR_NAME = ".skills"
 SKILLS_DIR_NAME = "skills"

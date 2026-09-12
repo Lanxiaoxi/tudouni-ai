@@ -47,6 +47,7 @@ from agent_runtime.models import OpenAICompatibleModel
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, cli_asker
 from agent_runtime.security.commands import format_rule
 from agent_runtime.skills import (
+    RUNTIME_DIR_NAME,
     SkillCatalog,
     SkillLoader,
     active_line,
@@ -62,8 +63,8 @@ from agent_runtime.tools.todo import TodoBoard, progress_line, todo_note
 from agent_runtime.tools.webfetch import USER_AGENT, WebFetch
 from agent_runtime.tools.websearch import TavilySearch, WebSearch
 
-SESSIONS_DIR = PROJECT_DIR / ".sessions"
-LOGS_DIR = PROJECT_DIR / ".logs"
+SESSIONS_DIR = PROJECT_DIR / RUNTIME_DIR_NAME / "sessions"
+LOGS_DIR = PROJECT_DIR / RUNTIME_DIR_NAME / "logs"
 
 
 def report_permissions(policy: PermissionPolicy, memory: ApprovalMemory) -> None:
@@ -141,7 +142,8 @@ def _check_session_id(session_id: str | None) -> str | None:
     return (
         f"非法的 --session：{session_id!r}\n"
         f"  会话 id 只能由字母、数字、下划线、连字符组成，长度 1~64 ——\n"
-        f"  因为它会被拿去拼文件名（.sessions/<id>.json 和 .logs/<id>.jsonl）。\n"
+        f"  因为它会被拿去拼文件名（{RUNTIME_DIR_NAME}/sessions/<id>.json 和"
+        f" {RUNTIME_DIR_NAME}/logs/<id>.jsonl）。\n"
         f"  用 --list 看一下有哪些现成的 id。"
     )
 

@@ -20,7 +20,7 @@ class JsonlSink:
 
     它是可调用的，所以能直接当 Agent 的 on_event 传进去：
 
-        agent = Agent(..., on_event=JsonlSink(PROJECT_DIR / ".logs"))
+        agent = Agent(..., on_event=JsonlSink(PROJECT_DIR / ".tudouni" / "logs"))
     """
 
     def __init__(self, directory: str | Path):
@@ -49,6 +49,9 @@ class JsonlSink:
         不是查看器，是对偶的读取 API（验证和将来做分析都要用）。它会跳过解析
         失败的行 —— 那些是进程在写入中途被杀留下的半截记录，属于设计内的情形，
         不该让整份日志不可读。
+
+        和 JsonSessionStore 一样，**只有一个目录，不看旧位置**：那些日志是合并之前
+        的产物，有意放弃读。
         """
         path = self._path(session_id)
         if not path.exists():
