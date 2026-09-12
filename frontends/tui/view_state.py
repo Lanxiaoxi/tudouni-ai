@@ -34,8 +34,14 @@
     为 None 表示"整行一个 role"，这也是绝大多数行。
 """
 
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+
+# `cell_len` 是**这个文件里唯一的"宽度"口径**：它数的是终端列数（一个汉字两列），
+# 而 `len()` 数字符。欢迎屏上"把一行字居中"这件事只有按列数算才是对的。
+from rich.cells import cell_len
 
 from agent_runtime.protocol import state as agent_state
 
@@ -194,6 +200,87 @@ def indent(text: str, prefix: str = "  │ ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
+# --- 欢迎屏（空态）的那几段文字 ------------------------------------------------
+
+def center_text(text: str, width: int) -> str:
+    """把一段文字在 `width` 列里居中。放不下就**原样返回**（让调用方/边框去裁）。
+
+    **按显示列数算，不按 `len()`**：`center()` 用的是 `len`，而它数的是字符 ——
+    一个汉字占两列，于是"欢迎回来 Meaghan"这种中英混排的居中会歪一格（实测：
+    方块标看着比它下面那行字偏了半格，而那种歪法很难说清是哪里不对）。
+    宽度用 `rich.cells.cell_len` 量，那是这套代码里唯一的"列数"口径。
+    """
+    if width <= 0:
+        return text
+    span = cell_len(text)
+    if span >= width:
+        return text
+    left = (width - span) // 2
+    return " " * left + text
+
+
+def time_ago(seconds: float) -> str:
+    """`刚刚` / `12分钟前` / `3小时前` / `2天前` / `2026-09-01`。
+
+    **两级单位就够**：欢迎屏那一行要说的是"这是不是刚才那个"，而"3小时前"
+    和"3小时12分前"在判断这件事上没有区别 —— 多出来的两个字只是把会话 id 挤掉。
+
+    超过一周换成**日期**：那时候"多少天前"已经不再让人想起是哪一次对话了，日期才行。
+    """
+    if seconds < 0:
+        # 时钟回拨（或文件的 mtime 来自另一台机器）→ 当成"刚刚"，别显示"-3分钟前"。
+        seconds = 0
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}分钟前"
+    if seconds < 86_400:
+        return f"{int(seconds // 3600)}小时前"
+    if seconds < 7 * 86_400:
+        return f"{int(seconds // 86_400)}天前"
+    # 一周以前用**日期**。`time_ago` 拿到的是一个时长，所以这里要回推一个时刻 ——
+    # 这一档说的是"哪天"（相对时间到这儿已经不说明问题了），那几个小时的时区/夏令时
+    # 误差看不出来。
+    return datetime.fromtimestamp(time.time() - seconds).strftime("%Y-%m-%d")
+
+
+# 箴言。**它是欢迎屏右侧那一小块的全部内容**（设计上对应别家 CLI 的"What's new"）：
+# 一个每 15 天就有内容过期的区块，在天天用的工具里只会变成噪声，而一句读得进去的
+# 话至少每天说一次"这一屏是给人看的"。
+#
+# 规矩：**一句话，别超一行**（窄屏会折成两行，那也还行）。不要写项目自夸，也不要
+# 写需要上下文才懂的话 —— 它是开机问候，不是公告。
+MOTTOS: tuple[str, ...] = (
+    "先想清楚要什么，再动手。",
+    "能写下判据的，才算想明白了。",
+    "改一处，就只改那一处。",
+    "看不懂的代码，先别改。",
+    "小步走，常回头。",
+    "把话说给下一个读它的人听。",
+    "失败要响，别悄悄吞掉。",
+    "重复第三遍的时候，就该抽出来了。",
+    "先让它对，再让它快。",
+    "名字错了，代码就跟着错。",
+    "留下的注释要解释为什么，不是是什么。",
+    "没跑过的东西，不算做完。",
+    "接口比实现活得久。",
+    "删掉一行代码，和写一行一样值钱。",
+    "今天的决定，明天的默认值。",
+)
+
+
+def motto_of_day(day: int | None = None) -> str:
+    """今天的箴言：**按日期轮换**（同一天进来看到的是同一句）。
+
+    `day` 是"从 epoch 起第几天"（`day=None` 就现取本地日期），做成参数是为了让它
+    能在单测里被钉住 —— 这个函数里唯一会变的东西就是"今天几号"，而它恰好是最不
+    该混进断言的那一样。
+    """
+    if day is None:
+        day = int(time.time() // 86_400)
+    return MOTTOS[day % len(MOTTOS)]
+
+
 # --- 回合 ----------------------------------------------------------------------
 
 @dataclass
@@ -239,6 +326,12 @@ class ViewState:
     resumed: bool = False
     # 非默认权限那一行（决策 14：runtime 发什么显示什么）。
     permissions: dict[str, Any] = field(default_factory=dict)
+    # 已保存的会话清单（`sessions` 那条消息的 `items`，最新在前）。
+    #
+    # **它是欢迎屏右栏那一段的数据，而且它属于界面而不是会话** —— 所以
+    # `reset_for_session()` 不清它（换会话不改变"硬盘上有哪些会话"）。启动时
+    # 向 runtime 要一次（`TuiApp._ask_for_recent_sessions`），到了就重画欢迎屏。
+    recent_sessions: list[dict[str, Any]] = field(default_factory=list)
     # 工具名 → 风险，来自 `init.tools`。审批面板要显示风险，工具行要按它上色。
     tool_risks: dict[str, str] = field(default_factory=dict)
     # 工具名 → `init.tools` 里那一整条（risk / parallel_safe / interactive）。
@@ -728,22 +821,38 @@ def waiting_line(request: dict[str, Any]) -> Line:
     return Line(text, ROLE_WAITING, list(parts))
 
 
-def render_ui_answer(state: ViewState, message: dict[str, Any]) -> list[Line]:
-    """`t:"ui"` 那条 `run_finished` → 要画的行。**答案在这里。**
+@dataclass(frozen=True)
+class Answer:
+    """agent 的正文 —— **原文，不拆成行**。
+
+    它是这个模块里唯一"不变成行"的东西，理由和 `Line` 存在的理由正好相反：
+    过程行、工具行是"一行一个说法"的排版，而正文**有自己的语法**（标题、列表、
+    表格、代码块）。把它压成一行一段 `str` 就等于把那份语法丢掉 —— 界面于是只能
+    原样显示原始 MD（"回复没被渲染"的根因就在这里）。所以这一层只把原文交出去，
+    解析交给控件那一侧（`widgets.AnswerBlock`，即 Textual 的 `Markdown`）。
+
+    代价是**它的渲染结果在这一层不可断言**：能测的只有"给什么还什么"和"空答案
+    返回 None"。这是刻意的取舍 —— 渲染质量由控件保证，而这一层继续不做 Textual
+    的梦（`tests/test_imports.py` 有一条测试盯着这条边界）。
+    """
+
+    text: str
+
+
+def answer_body(state: ViewState, message: dict[str, Any]) -> Answer | None:
+    """`t:"ui"` 那条 `run_finished` → 答案正文。**纯函数。**
 
     审计里没有正文（`Agent.run` 的返回值只交给调用方），所以非流式模式下这是界面
     拿到答案的唯一途径。按 `run_id` 记下来 —— 它和 `event` 那条 `run_finished` 是
     两条消息，**顺序不保证**，所以不许靠到达顺序配对。
+
+    空答案（模型失败）返回 `None`：那时候不该画一个空的答案块。判据留在这里而不是
+    留给控件，是因为"要不要画"是判断、"画成什么样"才是渲染 —— 前者这一层能测。
     """
     run_id = message.get("run_id", "")
     answer = message.get("answer") or ""
     state.answers[run_id] = answer
-    if not answer:
-        return []
-    lines = answer.splitlines() or [answer]
-    out = [seg(("  ● ", ROLE_ANSWER), (lines[0], ROLE_ANSWER))]
-    out.extend(Line(f"    {line}", ROLE_ANSWER) for line in lines[1:])
-    return out
+    return Answer(answer) if answer else None
 
 
 def apply_state(state: ViewState, message: dict[str, Any]) -> None:
@@ -789,8 +898,8 @@ def rail_blocks(state: ViewState) -> list[tuple[str, str, list[Line]]]:
 def _todo_block(state: ViewState) -> tuple[str, str, list[Line]]:
     todos = state.todos
     if not todos:
-        return ("任务", "", [Line("还没有任务", ROLE_RULE),
-                             Line("agent 调用 todo_write 后出现在这里", ROLE_RULE)])
+        return ("任务", "", [Line("当前还没有任务", ROLE_RULE),
+                             Line("agent 创建的任务会在这里", ROLE_RULE)])
     done = sum(1 for item in todos if item.get("status") == "completed")
     lines = [_bar(done, len(todos))]
     for item in todos:
@@ -817,6 +926,24 @@ def _bar(done: int, total: int, width: int = 20) -> Line:
 
 
 def _skill_block(state: ViewState) -> tuple[str, str, list[Line]]:
+    """已加载技能：**这个会话按哪几份说明在做**。
+
+    ## 它和 `Ctrl+S` 那个面板看的不是同一个东西（这一条很容易被当成 bug）
+
+    | | 数据 | 回答的问题 |
+    |---|---|---|
+    | 这一块 | `session.metadata` 里 `load_skill` 写下的指针（`state.skills`） | **这次会话已经读了哪几份步骤** |
+    | `Ctrl+S` | 工作区里扫出来的全部技能（`state.skill_catalog`） | **有哪些技能可以读** |
+
+    所以"左栏 0 个、`Ctrl+S` 里列着好几个"是**正常的**：那说明模型还没读过任何一份，
+    而工作区里确实有货。项目里同一对区分还有一处（`--skills` 打的是可用清单，
+    `active_line` 说的是已加载）—— 这不是实现走岔了，是两个真的不同的事实。
+
+    **空态不写"可用有几个"**（曾经写过一版，去掉了）：那一块的标题就是"**已**加载"，
+    计数写的是已加载的个数，而"可用几个"是另一个事实、另一份清单（`Ctrl+S` 那份）。
+    把它塞进这里，读起来像在替那一块解释自己为什么是 0 —— 而这个栏里每一行都该说
+    自己那一块的事。要看可用清单，`Ctrl+S` 就是那个出口。
+    """
     if not state.skills:
         return ("已加载技能", "0", [Line("还没有加载技能", ROLE_RULE),
                                     Line("load_skill 读过的会一直生效", ROLE_RULE)])

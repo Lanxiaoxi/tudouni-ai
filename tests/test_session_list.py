@@ -136,7 +136,7 @@ def test_a_broken_file_does_not_take_the_whole_list_down(workdir):
 
 
 def test_the_summary_carries_what_a_picker_needs(workdir):
-    """每一条都带面板要的那五样，而且**预览是第一句用户说的话**。
+    """每一条都带面板要的那几样，而且**预览是第一句用户说的话**。
 
     预览取第一句而不是最后一句：选会话时人要认的是"这是哪一次对话"，而开头那句话
     就是它的标题（最后一句通常是"继续"、"嗯"这种认不出来的东西）。
@@ -146,11 +146,44 @@ def test_the_summary_carries_what_a_picker_needs(workdir):
           todos=[{"content": "改协议", "status": "completed"}])
 
     item, = session_summaries(store)
-    assert set(item) == {"session_id", "messages", "steps", "preview", "todos"}
+    assert set(item) == {"session_id", "messages", "steps", "preview", "todos",
+                         "modified_at"}
     assert item["preview"].startswith("帮我把 TUI 的换会话做掉")
     assert item["messages"] == 3, "system + 用户那句 + 助手那句"
     assert item["steps"] == 1, "一步 = 一条 assistant"
     assert item["todos"], "任务进度跟在这一行最后（哪个会话还剩着活）"
+
+
+def test_modified_at_is_the_file_time_not_the_creation_time(workdir):
+    """`modified_at` 说的是**最后一次聊**，它和排序用的 `created_at` 是两件事。
+
+    这条挡的是一种很自然的偷懒实现：拿 `created_at` 当 `modified_at` 发出去。那样
+    TUI 欢迎屏右上那栏（"最近动过哪几个会话"）会把一个昨天建、今天还在聊的会话排到
+    昨天去 —— 而列表看起来完全正常。
+    """
+    import os
+
+    store = JsonSessionStore(workdir)
+    _save(store, "s", created_at=1_700_000_000.0, says="昨天建的")
+    os.utime(store._path("s"), (1_700_900_000.0, 1_700_900_000.0))
+
+    item, = session_summaries(store)
+    assert item["modified_at"] == 1_700_900_000.0
+    assert item["modified_at"] != 1_700_000_000.0, "不许拿 created_at 顶替"
+
+
+def test_a_broken_file_still_reports_its_file_time(workdir):
+    """坏文件的那一条**也有 `modified_at`**（它的 mtime 是好的）。
+
+    它读不出来，但"这个文件什么时候被动过"仍然是文件系统的事实 —— 而"最近活动"
+    那一栏正需要它（`store.load` 失败和"文件不存在"是两件事）。
+    """
+    store = JsonSessionStore(workdir)
+    store._path("broken").write_text("{ 这不是 JSON", encoding="utf-8")
+
+    item, = session_summaries(store)
+    assert "读不出来" in item["preview"]
+    assert isinstance(item["modified_at"], float)
 
 
 def test_a_new_session_records_when_it_was_created(workdir):

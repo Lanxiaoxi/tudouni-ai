@@ -166,7 +166,137 @@ class TuiApp(App[None]):
         padding: 0 1;
         margin-bottom: 1;
     }
-    .welcome { height: auto; }
+
+    /* --- agent 正文：唯一按 Markdown 渲染的一块 ---------------------------- */
+    /* 它是 `Markdown` 控件 —— 里面是**一棵子控件树**（`MarkdownParagraph` /
+       `MarkdownH1` / `MarkdownFence` / `MarkdownTable` …），所以下面几条挑的是
+       "树里的哪一类"，而不是"第几行"。配色仍然只从 `$td-*` 来：换配色时 Textual
+       自己重算这些变量，正文不需要 `repaint()`。
+
+       `padding` 必须显式写：`Markdown` 自带 `padding: 0 2 0 2`（那是它给"一整篇
+       文档"的版式，左右各留两列）。这里收成一列 —— 那一列是给左边那条竖线的呼吸，
+       再多正文就和工具行的缩进对不上了。 */
+    .answer {
+        height: auto;
+        padding: 0 1;
+        margin: 0 0 1 0;
+        color: $td-ink2;
+        background: transparent;
+        /* **左边一条 accent 竖线 = 正文的视觉锚点。** 正文不再是行，没法像以前那样在
+           行首拼一个 `●`（那个标记之所以能存在，是因为整段都被压成了 `str`）——
+           而"这一段是它答的"需要一个形状来承担，否则答案和上面那几行工具输出连成
+           一片，只能靠读字号去猜分界在哪。
+           颜色取 `accent`，和输入框上下线、欢迎屏三个框、回合分隔线同一个 token：
+           这一屏上"结构线"是一套颜色。`border` 占控件自己的一格，所以正文会比工具行
+           往右挪一格（`padding` 再一格），正好和工具行文字的缩进对齐。 */
+        border-left: solid $td-accent;
+    }
+    /* 标题：**左对齐、用最亮那档 ink**。`Markdown` 自带的 H1 是居中的（同样是
+       "整篇文档"的版式），而这里是一段回复 —— 居中的标题看起来像另一块标题栏，
+       和上面的回合头抢层级。 */
+    .answer MarkdownH1, .answer MarkdownH2, .answer MarkdownH3,
+    .answer MarkdownH4, .answer MarkdownH5, .answer MarkdownH6 {
+        color: $td-ink;
+        background: transparent;
+        text-style: bold;
+    }
+    .answer MarkdownH1 { content-align: left middle; }
+    /* 列表的记号压到最暗那档：它是标点，不该和正文抢注意力。 */
+    .answer MarkdownBullet { color: $td-ink4; }
+    /* 引用块复用思考块的那套语法（`sunk` 底 + 一条竖线），但竖线用主题的描边色：
+       它是"别人的话"，和 agent 自己的话要分得开。 */
+    .answer MarkdownBlockQuote {
+        background: $td-sunk;
+        border-left: outer $td-line;
+    }
+    .answer MarkdownHorizontalRule { border-bottom: solid $td-hairline; }
+    /* 代码：**块和行内两种都要上 `sunk` 底**。行内那个是**组件类**（`.code_inline`，
+       挂在 `MarkdownBlock` 上），所以选择器得写成"后代 + 类"—— 和 Textual 自带
+       DEFAULT_CSS 里的写法一致。Textual 默认给行内代码染的是 `$warning` 底
+       （这是它自己的主题语汇），换成 `sunk` 才和这套配色是一家人。 */
+    .answer MarkdownFence { background: $td-sunk; color: $td-ink; }
+    .answer MarkdownBlock > .code_inline { background: $td-sunk; color: $td-ink; }
+    /* 表格：**按内容宽，不铺满整行**。Textual 默认是 `width: 1fr`，一个两列的
+       小表也会被拉成整屏宽（两列各占半屏，看起来像排版坏了）；`auto` 在放得下时
+       收到内容宽、放不下时照样压缩到可用宽度（实测 60 列下的宽表两种写法一致）。 */
+    .answer MarkdownTable { width: auto; background: transparent; }
+
+    /* --- 欢迎屏：上面两个方框并排，下面一个通栏的「提示」 ------------------ */
+    /* **框的宽度和高度都写在这里，常数在 `widgets.py` 里**（`WELCOME_BOX_HEIGHT` /
+       `WELCOME_RIGHT_WIDTH` / `WELCOME_HINT_WIDTH` / `WELCOME_STACK_COLUMNS` /
+       `WelcomeBlock.BOX_LINES`），所以那几处要一起改 —— 有一条测试盯着它们对不对得上。
+       分开的理由是它们服务的东西不同：宽度和摆法只受"这一屏有多宽"影响，而高度是
+       "框里固定有那么几行内容"。
+
+       三个框加起来 75 列宽（32 + 1 间距 + 42，提示框横跨这三个数），再加 `#log` 自己
+       那两列 padding = 77 —— 在 200 列的终端上**不铺满整行**：三条又长又空的横条比
+       留白难看得多。 */
+    /* `min-height: 0` 是必须的：容器默认带一个按内容算的最小高度，几个框那么高时
+       它会把"按内容长"撑成"填满整屏"（实测：不写这一行的症状是顶上的框线被顶出屏幕
+       之外，而看起来像"这一屏是从中间开始画的"）。 */
+    WelcomeBlock { height: auto; min-height: 0; }
+    /* **外层是纵向的**：一行（两个框）+ 提示框。提示框那一行间距用 `margin-bottom`
+       放在 `#welcome-row` 上 —— 它是纵向容器里唯一一个"子控件之间要留白"的地方。 */
+    #welcome-body {
+        layout: vertical;
+        height: auto;
+        min-height: 0;
+        padding: 0 0 1 0;
+        align: left top;
+    }
+    /* **这一行是 `Horizontal`，换版式靠 `layout: vertical`**（见 `_sync_layout`）：
+       两个框是同一批控件、只是摆放方向变了，不需要拆了重挂（拆的过程中新容器会和
+       还没摘掉的旧容器撞在同一个 id 上）。 */
+    #welcome-row {
+        layout: horizontal;
+        height: auto;
+        min-height: 0;
+        margin-bottom: 1;
+        align: left top;
+    }
+    /* 窄屏（< `WELCOME_STACK_COLUMNS`）：上面两个框各占满整行、上下摞起来；总高度超了
+       就滚动（不然输入行会被顶出屏幕）。 */
+    WelcomeBlock.stacked { height: 1fr; }
+    WelcomeBlock.stacked #welcome-body { height: 1fr; overflow-y: auto; }
+    WelcomeBlock.stacked #welcome-row { layout: vertical; }
+
+    .welcome-box {
+        /* **高度要比"内容行数 + 上下 padding"多两行**：Textual 算边框时会从 `height`
+           里再扣掉两行，不够的话就在框底裁掉内容 —— 而画面上看起来只是"框里少了两行
+           字"。两个方框的内容行数本来就定死（`BOX_LINES` 行），所以这个数也是确定的：
+           `WELCOME_BOX_HEIGHT` 记的就是它，有一条测试盯着两处一致。 */
+        height: 12;
+        background: $td-surface;
+        /* **边框用交互色，和输入框那两条线同色**（`#input-box` 的 `border-top/bottom`）：
+           这一屏上"有边框的东西"是同一类（欢迎屏的三个框、输入框），用同一个颜色才像
+           一套。原先用的是 `hairline`（描边的弱化版），那几个框在 `surface` 底上几乎
+           看不见边，看着像三块没有形状的色块。 */
+        border: round $td-accent;
+        padding: 1 1;
+        color: $td-ink2;
+    }
+    /* **两个方框的宽度写在各自类上，不靠 `1fr`**：`1fr` 会让它们各占一半，而右边那个
+       要装"多久以前 + 标题"两列，宽一点才不至于把标题全吃掉；左边只要放得下方块标和
+       身份那一行。 */
+    .start-box { width: 32; margin-right: 1; }
+    .recent-box { width: 42; }
+    /* 提示框横跨上面两个框（32 + 1 + 42 = 75）。高度 = 2 行键位 —— **这个框没有上下
+       `padding`**（不像上面那两个）：那两行键位自己就是全部内容，再垫两行空白会让它比
+       里面装的东西高出一截。Textual 还会从 `height` 里扣掉边框占的那两行，所以写 4
+       正好画得出 2 行正文（实测）。 */
+    .hint-box { width: 75; height: 4; padding: 0 1; }
+    /* 叠起来时三个框都占满整行（那时候 `#welcome-row` 的 `layout` 是 vertical）。 */
+    WelcomeBlock.stacked .start-box,
+    WelcomeBlock.stacked .recent-box,
+    WelcomeBlock.stacked .hint-box { width: 1fr; }
+    /* 标题画在边框那一行上（`BorderedPanel` 用 `border_title`），所以它和正文不是
+       同一档颜色：标题是"这一块叫什么"，正文才是内容。 */
+    .welcome-box > .border_title { color: $td-ink4; background: $td-surface; }
+    .welcome-line { width: 1fr; height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    .start-line { text-align: center; }
+    /* 提示框里的那两行键位：**它们可以折行**（放不下就换到下一行），所以是
+       `height: auto` —— 和方框里其它"一行就是一行"的行不一样。 */
+    .hint-line { width: 1fr; height: auto; }
 
     /* --- 命令面板 --------------------------------------------------------- */
     #palette {
@@ -203,8 +333,6 @@ class TuiApp(App[None]):
         color: $td-ink;
         scrollbar-size-vertical: 0;
     }
-
-    #keys { height: 1; background: $td-chrome; padding: 0 1; }
 
     /* --- 弹层 ------------------------------------------------------------- */
     PermissionPanel, QuestionPanel, SkillsPanel, SessionPicker { align: center middle; }
@@ -269,6 +397,10 @@ class TuiApp(App[None]):
         # `TypeError: 'bool' object is not callable`，从栈上看完全指不到这里（实测踩过）。
         self._palette_visible = False
         self._version = _version()
+        # 启动时向 runtime 要过一次会话清单了吗（欢迎屏右栏要它，只要一次）。
+        self._sessions_requested = False
+        # 那份还没回来的清单是**欢迎屏**要的吗（回了之后要区分它和 `/resume` 要的）。
+        self._welcome_request_pending = False
         self._register_themes()
         self.theme = theme_key if theme_key in theme_mod.THEMES \
             else theme_mod.DEFAULT_THEME
@@ -318,7 +450,7 @@ class TuiApp(App[None]):
 
     def _repaint_all(self) -> None:
         palette = self.palette
-        for selector in ("#rail", "#top", "#session", "#status", "#keys", "#log"):
+        for selector in ("#rail", "#top", "#session", "#status", "#log"):
             found = self.query(selector)
             if found:
                 widget = found.first()
@@ -346,7 +478,8 @@ class TuiApp(App[None]):
                     placeholder="说点什么，回车发送（/ 看命令，/resume 换会话，Shift+Enter 换行）",
                     id="input", highlight_cursor_line=False,
                 )
-        yield widgets.KeyHintBar(id="keys")
+        # 键位提示**不在这里**：它住在欢迎屏底下那个「提示」框里（`widgets.HintPanel`）
+        # —— 说过第一句话之后这一屏就收了，而 `/help` 仍然列着完整的键位表。
 
     def on_mount(self) -> None:
         # `/` 打开的命令面板和输入行是同一个东西的两面：面板默认藏着。
@@ -463,9 +596,6 @@ class TuiApp(App[None]):
         status = self._widget("#status", widgets.StatusBar)
         if status is not None:
             status.show(state, palette, (time.monotonic(), width))
-        keys = self._widget("#keys", widgets.KeyHintBar)
-        if keys is not None:
-            keys.show(state, palette, width)
 
     def _say(self, text: str, role: str = view_state.ROLE_RULE) -> None:
         """往会话里说一句界面自己的话（命令回显、提示）。
@@ -481,6 +611,18 @@ class TuiApp(App[None]):
         log = self._log()
         if log is not None:
             log.add_lines(lines, self.palette)
+
+    def _say_answer(self, text: str) -> None:
+        """agent 的正文：**和 `_say_lines` 不是同一条路** —— 它按 Markdown 渲染。
+
+        分开的判据是"这段字有没有自己的语法"，而不是"它重不重要"：正文有标题/列表/
+        代码块，得整段交给 `AnswerBlock`（Textual 的 `Markdown`）；而过程行、工具行、
+        提示是"一行一个说法"，继续走 `Line`。硬把两者塞进同一个入口的话，早晚会有人
+        往正文里掺一行工具行 —— 那一行的 `[` `*` 会被 Markdown 当成语法吃掉。
+        """
+        log = self._log()
+        if log is not None:
+            log.add_answer(text, self.palette)
 
     # -- 协议消息 --------------------------------------------------------------
 
@@ -536,6 +678,10 @@ class TuiApp(App[None]):
             # 空态：**新会话还没说第一句话时那一屏**。它不是装饰，见
             # `widgets.WelcomeBlock` 的 docstring。
             log.show_welcome(state, self.palette, self._version)
+            # 欢迎屏右栏要"最近动过哪几个会话"，而那份清单是异步来的（发一条
+            # `session_list`，runtime 回一条 `sessions`）。**只在空态要它**：恢复会话
+            # 时那一屏根本不会画，列一次几百个会话文件是白跑。
+            self._ask_for_recent_sessions()
         resumed = "（继续）" if state.resumed else "（新的）"
         lines = [view_state.Line(f"（会话 {state.session_id}{resumed}）",
                                  view_state.ROLE_RULE)]
@@ -558,6 +704,12 @@ class TuiApp(App[None]):
                 "想回到这个会话：/resume（在列表里挑，● 标着当前这个）",
                 view_state.ROLE_RULE))
         log.add_lines(lines, self.palette)
+        if not state.resumed:
+            # **最后再归位一次。** `show_welcome` 里那次滚动发生在欢迎屏刚摆好、
+            # 上面这几行还没加进去的时候，而 Textual 把滚动位置留在了那一刻算出的
+            # 最大值上（内容一变高，位置不会自己回到 0）—— 差的那一格正好把顶上那条
+            # 框线推出屏幕，看起来像"这一屏从中间开始画的"。
+            log.scroll_home(animate=False)
 
     def _on_session_load(self, message: dict[str, Any]) -> None:
         """恢复会话时重建画面。
@@ -621,7 +773,12 @@ class TuiApp(App[None]):
     def _on_ui(self, message: dict[str, Any]) -> None:
         if message.get("kind") == messages.UI_RUN_FINISHED:
             self.state.agent = agent_state.reduce(self.state.agent, message)
-            self._say_lines(view_state.render_ui_answer(self.state, message))
+            # **正文走 Markdown，不走行。** `answer_body` 仍然负责两件事：把答案按
+            # `run_id` 记账（`scripts/verify_tui.py` 和 `/history` 那类东西看它），
+            # 以及"空答案不画"这个判据（模型失败时 `answer` 是空串）。
+            answer = view_state.answer_body(self.state, message)
+            if answer is not None:
+                self._say_answer(answer.text)
             return
         if message.get("kind") == messages.UI_STATE:
             # 面板数据。**它不进对话流**：任务列表每更新一次就在流里插一段，会把
@@ -629,13 +786,44 @@ class TuiApp(App[None]):
             view_state.apply_state(self.state, message)
 
     def _on_sessions(self, message: dict[str, Any]) -> None:
-        """会话清单到了：弹选择面板（`/resume` 不带参数）。**它只弹，不切。**
+        """会话清单到了：**欢迎屏要的那一份就喂给它，否则弹选择面板**。
 
-        清单是**异步**来的（发一条 `session_list`，runtime 回一条 `sessions`），
-        所以"请求"和"收到"分在两处。这样即使列清单慢（几百个会话文件），界面也不会
-        卡在按键上 —— 菜单盘的开合是界面的操作，读盘是 runtime 的操作。
+        两条路用的是同一份清单、同一个请求，所以判据只能是"现在是谁在等它"：
+
+          * **空态那一屏要它**（右栏"最近活动"）。启动时就发了一次，而那时候用户
+            根本没按过任何键 —— 那份回包要是顺手弹出一个选择面板，界面一起就盖着
+            一张没人要的浮层；
+          * **`/resume` 要它** → 弹面板。这条**不能只看"欢迎屏在不在"**：欢迎屏会
+            一直留到第一句话为止，而"开着欢迎屏就把上次那个会话接回来"是完全正常的
+            用法，所以这里认的是"这次请求是谁发的"那个记号。
+
+        清单是**异步**来的（发一条 `session_list`，runtime 回一条 `sessions`），所以
+        "请求"和"收到"分在两处。这样即使列清单慢（几百个会话文件），界面也不会卡在
+        按键上 —— 菜单盘的开合是界面的操作，读盘是 runtime 的操作。
         """
-        self._show_session_picker(list(message.get("items") or []))
+        items = list(message.get("items") or [])
+        self.state.recent_sessions = items
+        if self._welcome_request_pending:
+            # 只认**第一次**回包：欢迎屏只问一次，那之后发出的都是 `/resume` 要的。
+            self._welcome_request_pending = False
+            log = self._log()
+            welcome = None if log is None else log.welcome_visible()
+            if welcome is not None:
+                welcome.show(self.state, self.palette, self._version, now=time.time())
+                return
+        self._show_session_picker(items)
+
+    def _ask_for_recent_sessions(self) -> None:
+        """向 runtime 要一次会话清单，**只要一次**。
+
+        第二条 `init`（`/new` 之后）会再画一次欢迎屏，而清单没变 —— 每换一次会话就
+        读一遍几百个会话文件是白跑，所以这里记一个"这次运行里已经问过了"。
+        """
+        if self._client is None or self._sessions_requested:
+            return
+        self._sessions_requested = True
+        self._welcome_request_pending = True
+        self._client.list_sessions()
 
     # -- 人机交互（非阻塞：塞回给子进程，而不是在这里等） ----------------------
 
@@ -838,6 +1026,10 @@ class TuiApp(App[None]):
             return
         if self._client is None:
             return
+        # **先撤掉欢迎屏那个记号再发。** 这次要的清单是给选择面板的：不撤的话，
+        # 启动时发出的那一条还没回来，它回来的那一份就会被欢迎屏吃掉，而面板永远
+        # 不弹 —— 屏幕上一个变化都没有，看起来像 `/resume` 坏了（实测踩过）。
+        self._welcome_request_pending = False
         self._say("正在取会话列表…")
         self._client.list_sessions()
 
@@ -902,7 +1094,9 @@ class TuiApp(App[None]):
                 (command.hint, view_state.ROLE_PROCESS),
             ))
         lines.append(view_state.Line("键位：", view_state.ROLE_RULE))
-        for key, what in [*widgets.KeyHintBar.FULL, *widgets.KeyHintBar.EXTRA]:
+        # **和欢迎屏底下那个「提示」框读的是同一份表**（`widgets.HINT_KEYS_*`）：
+        # 两处各写一遍的话，"改了键位、忘了改提示"早晚会发生。
+        for key, what in [*widgets.HINT_KEYS_FULL, *widgets.HINT_KEYS_EXTRA]:
             lines.append(view_state.seg(
                 (f"  {key:<12}", view_state.ROLE_WAITING),
                 (what, view_state.ROLE_PROCESS),

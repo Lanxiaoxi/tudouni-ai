@@ -160,11 +160,14 @@
         "type": "array",
         "doc": [
           "**按创建时间、最新的在前**。每一条的字段：",
-          "session_id / messages / steps / todos / preview。",
+          "session_id / messages / steps / todos / preview / modified_at。",
           "`todos` 是那一行现成的进度文字（空串 = 没有任务），`preview` 是第一条用户",
           "消息的截断预览（空串 = 还没说过话）—— **两样都由 runtime 算好**：让每个",
           "前端各自去读会话文件、各自决定怎么截断，就是同一份事实的第二、第三个来源。",
-          "读不出来的会话文件也在里面，preview 写着「读不出来：…」。"
+          "读不出来的会话文件也在里面，preview 写着「读不出来：…」。",
+          "`modified_at` 是**会话文件最后一次被写**的时间（epoch 秒，读不到时是 null）：",
+          "它和排序用的 `created_at` 不是一回事 —— TUI 欢迎屏右上那栏要的是「最后",
+          "一次聊」，而那是 mtime，不是创建时间。"
         ]
       }
     },

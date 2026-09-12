@@ -25,12 +25,13 @@
 
 from typing import Any
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static, TextArea
+from textual.widgets import Button, Markdown, Static, TextArea
 
 from agent_runtime.frontends.tui import theme as theme_mod
 from agent_runtime.frontends.tui import view_state
@@ -262,53 +263,28 @@ class StatusBar(TwoPart):
         super().repaint(palette)
 
 
-class KeyHintBar(Panel):
-    """键位提示行：**设计稿 F6「交互键位」那张表的界面形态**。
-
-    它按**当前列数**决定说几条：从左边开始放，放不下就**从右边少说一条**。理由是
-    这一行紧贴着输入行，多出来的一行会把输入行顶走 —— 而终端里"少说一条键位"的
-    代价远小于"输入行跑到屏幕外"（实测：122 列时最后那条 `Esc 中断本轮` 正好被裁掉，
-    看起来像没实现这个键）。
-
-    所以**顺序本身就是优先级**：`Esc` 排在 `Ctrl+S` 前面，因为前一个是"有东西要停下来"，
-    后一个是可以另找入口的（输入 `/skills`）。
-
-    窄屏（< 120 列）另外用一套更短的措辞：那几列连"思考过程"四个字都嫌长。
-    """
-
-    FULL = [
-        ("Enter", "发送"), ("/", "命令面板"),
-        ("Ctrl+T", "思考过程"), ("Ctrl+B", "上下文栏"), ("Esc", "中断本轮"),
-        ("Ctrl+S", "全部技能"),
-    ]
-    NARROW = [
-        ("Enter", "发送"), ("/", "命令"), ("Ctrl+T", "思考"), ("Esc", "中断"),
-    ]
-    # 上面两条是**这一行**的候选（放不下就从右边少一条）。这两条不进那一行，
-    # 但 `/help` 要列出来：`Shift+Enter` 只在输入框里有意义（而输入框的占位符已经
-    # 写着它），`Ctrl+K` 写在顶栏那一句里。**键位表要全，提示行要短。**
-    EXTRA = [
-        ("Shift+Enter", "输入框里换行（回车是发送）"),
-        ("Ctrl+K", "命令面板"),
-        ("↑ ↓", "面板选候选 / 光标移动 / 翻会话流"),
-    ]
-
-    def render_state(self, state, palette, payload=None):
-        narrow = bool(payload) and payload < view_state.NARROW_COLUMNS
-        pairs = self.NARROW if narrow else self.FULL
-        # 一列的余量留给光标/边框：文本宽度按"中文算两列"估，宁可少说一条。
-        budget = (payload or 0) - 2 if payload else None
-        text = Text()
-        for index, (key, what) in enumerate(pairs):
-            piece = Text()
-            if index:
-                piece.append("  ·  ", style=palette.ink4)
-            piece.append(key, style=palette.ink3)
-            piece.append(f" {what}", style=palette.ink4)
-            if budget is not None and text.cell_len + piece.cell_len > budget:
-                break
-            text.append_text(piece)
-        return text
+# 键位提示：**这是设计稿 F6「交互键位」那张表里最常用的几条**。它现在画在欢迎屏
+# 下面那个「提示」框里（`HintPanel`），而 `/help` 列的是同一份数据 —— 两处各写一遍
+# 的话，"改了键位表、忘了改提示"就是必然。
+#
+# **顺序本身就是优先级**：`Esc` 排在 `Ctrl+S` 前面，因为前一个是"有东西要停下来"，
+# 后一个是可以另找入口的（输入 `/skills`）。
+HINT_KEYS_FULL: tuple[tuple[str, str], ...] = (
+    ("Enter", "发送"), ("/", "命令面板"), ("Ctrl+T", "思考过程"), ("Ctrl+B", "上下文栏"),
+    ("Esc", "中断本轮"), ("Ctrl+S", "全部技能"), ("Ctrl+K", "命令面板"),
+)
+# 窄屏那一版用更短的措辞：那几列连"思考过程"四个字都嫌长。
+HINT_KEYS_NARROW: tuple[tuple[str, str], ...] = (
+    ("Enter", "发送"), ("/", "命令"), ("Ctrl+T", "思考"), ("Ctrl+B", "上下文"),
+    ("Esc", "中断"), ("Ctrl+S", "技能"), ("Ctrl+K", "面板"),
+)
+# 这两条**不进那个框**（框里只放得下最常用的几条），但 `/help` 要列出来：
+# `Shift+Enter` 只在输入框里有意义（而输入框的占位符已经写着它），`↑ ↓` 是面板里的
+# 操作。**键位表要全，提示要短。**
+HINT_KEYS_EXTRA: tuple[tuple[str, str], ...] = (
+    ("Shift+Enter", "输入框里换行（回车是发送）"),
+    ("↑ ↓", "面板选候选 / 光标移动 / 翻会话流"),
+)
 
 
 class LineBlock(Static):
@@ -335,6 +311,41 @@ class LineBlock(Static):
     def repaint(self, palette: theme_mod.Theme) -> None:
         self._palette = palette
         self.refresh_text()
+
+
+class AnswerBlock(Markdown):
+    """agent 的正文。**它是这一屏上唯一"有语法"的东西**，所以不走 `Line` 那条路。
+
+    `LineBlock` 把每一行交给 `rich.text.Text`，而 `Text` 只认样式不认语法 —— 标题、
+    列表、表格、代码块于是全都原样显示（"回复还是原始 MD"就是这么来的）。Textual 的
+    `Markdown` 反过来：它把正文解析成**一棵子控件树**（`MarkdownParagraph` /
+    `MarkdownH1` / `MarkdownFence` / `MarkdownTable` …），于是配色从"逐行猜角色"
+    变成 CSS —— `app.py` 里那几条 `.answer Markdown*` 用的还是同一套 `$td-*` 变量，
+    所以 `/theme` 换配色时它跟着变，**不需要** `repaint()` 那一套重画。代码块的语法
+    高亮也是它自己做的（`MarkdownFence` 调 `textual.highlight`，并在主题变化时
+    重高亮）。
+
+    为什么**可以**这样用而不用担心代价：这一版没有流式（决策 1），一条答案只会解析
+    一次；而解析出来的子控件数只和正文的块数有关，和字符数无关。真要做流式时该换的
+    是 `Markdown.get_stream()`（Textual 自带），而不是把这里退回去逐行 `Text`。
+
+    `open_links=False`：**模型输出里的链接不许自己拉起浏览器**。那是模型能直接触发的
+    一个外部动作，而"点一下就把浏览器打开"这个后果不该由模型写的一行字决定。链接的
+    文本在画面里是完整的，要看内容就复制走。
+    """
+
+    def __init__(self, text: str, palette: theme_mod.Theme, **kwargs: Any):
+        self._palette = palette
+        super().__init__(text, open_links=False, **kwargs)
+
+    def repaint(self, palette: theme_mod.Theme) -> None:
+        """`ConversationLog.repaint` 会挨个调过来，而这里**只需要记个账**。
+
+        正文的配色全在 CSS 里（`$td-*` 由 Textual 的主题变量算出来），换主题时
+        Textual 自己会重算；不像 `LineBlock` 那样要拿新配色再画一遍。它存在的唯一
+        理由是"块协议要一致"—— 少了它，`/theme` 会在正文这一块上抛 `AttributeError`。
+        """
+        self._palette = palette
 
 
 class TurnBlock(Vertical):
@@ -377,6 +388,11 @@ class TurnBlock(Vertical):
         宽度取自控件自己的 `size.width`（= 会话流的正文宽），所以重新布局时要重画
         —— `on_resize` 干的就是这件事。算错一格也不会把行撑成两行：头上的
         `text-wrap: nowrap` 会让它裁掉而不是折行。
+
+        **横线用 `accent`**（输入框上下那两条线、欢迎屏三个框的边框也是它）：这一屏上
+        "结构线"是同一类东西，同一个颜色才像一套。原先用 `hairline`，它在底色上几乎
+        看不出是条线 —— 于是回合之间只剩一个空行，而空行分不出"上一轮结束了"和
+        "这里碰巧多了一行"。
         """
         left, right, right_role = view_state.turn_head_parts(self.head_line)
         palette = self._palette
@@ -385,7 +401,7 @@ class TurnBlock(Vertical):
         text = Text()
         text.append(left, style=style_of(palette, self.head_line.role))
         text.append(" ")
-        text.append("─" * gap, style=palette.hairline)
+        text.append("─" * gap, style=palette.accent)
         if right:
             text.append(" ")
             text.append(right, style=style_of(palette, right_role))
@@ -413,6 +429,18 @@ class TurnBlock(Vertical):
                 pending.append(line)
         if pending:
             self._append("plain", pending)
+
+    def add_answer(self, text: str) -> None:
+        """agent 正文：**整块交给 `AnswerBlock`**，不拆成行、也不和后一块合并。
+
+        `_append` 那条"同类相邻就并进最后一块"的规则在这里**刻意不适用**：Markdown
+        是整篇一次解析的，两条答案塞进同一个控件就会连成一段（前一条的列表会被后一条
+        的标题接管，而画面看起来只是"排版有点怪"）。一次 `run_finished` 一条答案，
+        所以一块一条正好。
+        """
+        block = AnswerBlock(text, self._palette, classes="answer")
+        self.chunks.append({"kind": "answer", "block": block})
+        self._mount_chunks()
 
     def _append(self, kind: str, lines: list[view_state.Line]) -> None:
         """同一类连续的行并进最后一块，否则开一块新的。
@@ -465,6 +493,11 @@ class TurnBlock(Vertical):
         占着"没有底色"的那一块，而它该有自己的 `sunk` 底。
         """
         for position, chunk in enumerate(self.chunks):
+            if chunk["kind"] == "answer":
+                # 正文块**不是 `LineBlock`**（它没有 `.lines`），也不是折叠的对象 ——
+                # 少了这一句，按 `Ctrl+T` 会在这里抛 AttributeError，而界面看起来只是
+                # "思考没展开"。
+                continue
             block: LineBlock = chunk["block"]
             if chunk["kind"] == "think":
                 # 展开着的思考正文：整块收掉，换成一行折叠提示。
@@ -511,10 +544,14 @@ class TurnBlock(Vertical):
             self._mount_chunks()
 
     def has_thinking(self) -> bool:
-        """这一回合里有没有思考过程（折叠着的算，展开着的也算）。"""
+        """这一回合里有没有思考过程（折叠着的算，展开着的也算）。
+
+        **正文块要跳过**：它没有 `.lines`（见 `toggle_thinking` 里同一条判据）。
+        """
         return any(
             line.role == view_state.ROLE_THINK_HEAD or chunk["kind"] == "think"
-            for chunk in self.chunks for line in chunk["block"].lines
+            for chunk in self.chunks if chunk["kind"] != "answer"
+            for line in chunk["block"].lines
         )
 
     def repaint(self, palette: theme_mod.Theme) -> None:
@@ -535,6 +572,10 @@ class MessageBlock(Vertical):
         super().__init__(*args, **kwargs)
         self._palette = palette
         self._chunks: list[LineBlock] = []
+        # 正文块和行块**分开记**：重画时要区别对待（行要重画、正文不用），而
+        # "这一块是什么"只有这里知道 —— 靠类型去 `self.children` 里筛会在挂载
+        # 还没排完的时候漏掉刚加的那一块。
+        self._answers: list[AnswerBlock] = []
 
     def add(self, lines: list[view_state.Line]) -> None:
         if not lines:
@@ -546,62 +587,460 @@ class MessageBlock(Vertical):
         self._chunks.append(block)
         self.mount(block)
 
+    def add_answer(self, text: str) -> None:
+        """没有回合可归的正文（少见，但不留一条会掉内容的缝）。"""
+        block = AnswerBlock(text, self._palette, classes="answer")
+        self._answers.append(block)
+        self.mount(block)
+
     def repaint(self, palette: theme_mod.Theme) -> None:
         self._palette = palette
         for block in self._chunks:
             block.repaint(palette)
+        for answer in self._answers:
+            answer.repaint(palette)
 
     @property
     def empty(self) -> bool:
-        return not self._chunks
+        return not self._chunks and not self._answers
 
 
-class WelcomeBlock(Panel):
-    """空态：**新会话还没说第一句话时那一屏**（设计稿 F2 的右半）。
+class BorderedPanel(Static):
+    """一个**带标题的方框**：`╭─ 标题 ─────────╮`。
+
+    标题走 Textual 的 `border_title`，不自己在正文里拼一行 `── 标题 ──`。区别是
+    具体的：`border_title` 画在**边框那一行**上，所以"这个框叫什么"不占内容行；
+    而自己拼一行的话，字和线各画一遍，框里框外两套线宽，早晚对不齐。
+
+    `render_parts()` 回 `(标题, 正文)`，正文里的每一行是一个独立 `Static` ——
+    这样每一行可以有自己的对齐方式（方块标居中、最近活动那两列左右分开），而不是
+    在同一个 `Text` 里靠空格凑（数空格在宽字符上必错）。
+
+    **它继承 `Static` 而不是 `Panel`**：`Panel.show()` 是把整份内容塞进一次
+    `update()`，而这里要的是"若干个子行"。重复用 `update()` 还会把刚挂上去的子控件
+    挤掉。
+    """
+
+    def __init__(self, palette: theme_mod.Theme, *args: Any, **kwargs: Any):
+        # 配色是**显式参数**（和这个文件里别的控件一样，见模块 docstring）：
+        # 谁都不去 `self.app.palette`。
+        super().__init__(*args, **kwargs)
+        self._palette = palette
+        # 上一次画的时候这个框有多宽（`HintPanel` 要按它决定提示怎么折行）。
+        self._width = 0
+
+    def show_children(self, state: view_state.ViewState, palette: theme_mod.Theme,
+                      payload: Any = None, *, now: float | None = None,
+                      width: int = 0) -> None:
+        self._state = state
+        self._payload = payload
+        self._now = now
+        self._width = width
+        # 重画（换主题 / 窗口宽度变了）也要用当前这套配色，所以它得留一份。
+        self._palette = palette
+        title, rows = self.render_parts(state, palette, payload, width)
+        self.border_title = title
+        self.remove_children()
+        self.mount(*rows)
+
+    def render_parts(self, state: view_state.ViewState, palette: theme_mod.Theme,
+                     payload: Any = None, width: int = 0) -> tuple[Text, list[Static]]:
+        raise NotImplementedError
+
+    def repaint(self, palette: theme_mod.Theme) -> None:
+        if getattr(self, "_state", None) is not None:
+            self.show_children(self._state, palette, self._payload, now=self._now,
+                               width=self._width)
+
+    def on_resize(self) -> None:
+        """宽度变了就重画 —— 这几行的省略号位置是按当前列数算的。"""
+        self.repaint(self._palette)
+
+
+# 两个方框的几何。**数字必须和 `app.py` 的 CSS 对上**（`.start-box` / `.recent-box`
+# 的 `width`、`.welcome-box` 的 `height`），所以它值得一条测试：对不上的症状只是
+# "框里多/少一条空行"，没有任何报错，也没人会去查是哪儿错了。
+#
+# 两个框的**内容都是 `WelcomeBlock.BOX_LINES` 行**，框高 = 那些行 + 上下 padding 各 1
+# + Textual 给边框留的 2 行 = 12。`height` 写虚一行就会在框底裁掉一行，而画面上看起来
+# 只是"框里少了一行字"。
+WELCOME_BOX_HEIGHT = 12
+# 右栏那个方框的内容宽（列）：`42(框宽) - 2(边框) - 2(padding)`。`_recent_row` 靠它
+# 把"多久以前"和"标题"分成两列，所以它和 CSS 里那个 42 是一对。
+WELCOME_RIGHT_WIDTH = 38
+# 窄于这么多列就**把两个框叠起来**（并排时每一半只剩二十几列，标题就全被省略号吃掉
+# 了）。两个框并排要 `32 + 1 + 42 + 1 + #log 自己的左右 padding` = 78 列，取 86 是留了
+# 一点余量。**并排是常态**：叠起来那一版只是"终端实在放不下"时的退路。
+WELCOME_STACK_COLUMNS = 86
+# 底下那个「提示」框的宽度（列）：**上面两个框加起来**（`32 + 1 间距 + 42`）。它和
+# CSS 里 `.hint-box` 的宽度是一对，有一条测试盯着。
+WELCOME_HINT_WIDTH = 75
+# 提示框里的**文字宽**（`75 - 2(边框) - 2(padding)`）：`HintPanel` 按它决定一行放
+# 几条键位。
+WELCOME_HINT_TEXT = WELCOME_HINT_WIDTH - 4
+
+
+class WelcomeBlock(Vertical):
+    """空态：**新会话还没说第一句话时那一屏**。
 
     它不是装饰。一个空白的会话区会让人以为程序没起来，而这里说的三件事
-    （这个程序是什么、当前工作区/模型/预算、接下来能做什么）恰好是"第一次打开它"
+    （这是哪个程序、在哪个工作区/用什么模型、最近动过什么）恰好是"第一次打开它"
     时唯一需要知道的。
 
-    `payload` 是版本号。**左边那个方块标是自绘的**：终端里没有图片，而一屏空态
-    没有任何视觉重量时，"这是哪个程序"这句话就得靠一个三行的标记来承担 ——
-    它也顺带把 `tudouni` 和版本号、标语在左边对齐成一条线。
+    ## 形状：**上面两个方框并排，下面一个通栏的「提示」**
+
+    `╭─ 开始 ──╮ ╭─ 最近 ──╮`：左边是身份（方块标 + 名字与版本 + 模型与工作区），
+    右边是"最近动过哪几个会话"和一句箴言；底下那个「提示」横跨上面两个框的宽度，
+    里面是键位提示（它原先画在输入行下面那一行，挪进来的理由见 `HintPanel`）。
+    **并排是常态**，只有终端窄到 `WELCOME_STACK_COLUMNS` 以下才把上面两个框叠起来。
+
+    **右栏那两块的位置是固定的，不管有没有内容**：没有会话时那里写着"（还没有会话）"。
+    这是刻意的 —— 一个"有内容才出现"的区块会让每次启动的版式都不一样，而"今天这里
+    为什么少了一块"是没人愿意去查的问题。
+
+    `payload` 是版本号。左边那个方块标是自绘的：终端里没有图片，而一屏空态没有
+    任何视觉重量时，"这是哪个程序"这句话就得靠这几行实心块来承担。
     """
 
     # 三行的小标记。**只用半块和全块字符**（▄▀█）：它们在等宽字体里都是"一个字符
     # 宽"的实心格，不会像有些图形字符那样在 CJK 字体下变成双宽而把版式顶歪。
     # 形状是个上窄下窄、中间鼓的方块（像一坨土豆泥），三行等宽，右边的字才对得齐。
-    LOGO = (" ▄▄▄▄▄▄", "██▀▀██ ", " ▀▀▀▀▀▀")
+    LOGO = (" ▄▄▄▄▄▄", "██▀▀██ ", " ▄▄▄▄▄▄")
+    # 左栏里那个方块标的内容宽（列）：方块标 8 列 + 两侧各留 1 列呼吸 = 10。
+    BOX_WIDTH = 10
+    # 右栏一次列几条会话。
+    RECENT_LIMIT = 4
+    # 右栏那个方框的内容宽（列）。**它就是 `WELCOME_RIGHT_WIDTH`**（那里记着它和
+    # CSS 里那个 42 的关系）：`_recent_row` 靠它把"多久以前"和"标题"分成两列。
+    RIGHT_WIDTH = WELCOME_RIGHT_WIDTH
+    # 每个方框正文的行数（**两个框一样多**，这是它们等高、里面不出现空档的全部理由）：
+    #   右 = "最近活动" 1 + 4 条会话 + 空行 1 + "箴言" 1 + 箴言 1 = 8
+    #   左 = 方块标 3 + 空行 1 + 问候 1 + 空行 1 + `tudouni 版本` 1 + 模型与工作区 1
+    #        + 空行 1 + 提示 1 = 10
+    # 两边对不齐时**用空行补齐**（那条"框里必须正好这么多行"的规矩见 `StartPanel` 和
+    # `RecentPanel` 的 `render_parts`）—— 差一行的症状只是"框里多一条或少一条空行"，
+    # 没有任何报错。
+    BOX_LINES = 10
 
-    def render_state(self, state, palette, payload=None):
-        text = Text()
-        for index, row in enumerate(self.LOGO):
-            if index:
-                text.append("\n")
-            text.append(row, style=palette.accent)
-            if index == 1:
-                text.append("    tudouni", style=palette.ink + " bold")
-            elif index == 2:
-                text.append(f"    {payload or ''}  ·  agent_runtime",
-                            style=palette.ink4)
-        text.append("\n\n")
-        text.append("极小实现 · 由 DeepSeek 驱动的 agent 运行时", style=palette.ink2)
-        text.append("\n")
-        text.append(
-            f"工作区 {state.workspace or '—'}  ·  模型 {state.model or '—'}"
-            f"  ·  最多 {state.max_steps or '—'} 步",
-            style=palette.ink3,
-        )
-        text.append("\n\n")
-        text.append("快速上手", style=palette.ink3 + " bold")
-        for line in (
-            "直接说你要做什么，回车发送",
-            "有风险的工具会先问你：shell 是 HIGH，write_file / edit_file 是 MEDIUM",
-            "输入 / 打开命令面板；Ctrl+T 展开思考，Ctrl+B 收起上下文栏",
-        ):
-            text.append("\n  · ", style=palette.ink4)
-            text.append(line, style=palette.ink3)
+    def __init__(self, palette: theme_mod.Theme, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._palette = palette
+        self._state: view_state.ViewState | None = None
+        self._payload: Any = None
+        self._now: float | None = None
+        # `None` = 还没排过版；`True`/`False` = 上面那两个框是叠着的还是并排的。
+        self._stacked: bool | None = None
+
+    def compose(self):
+        """**三个盒子和它们的容器在这一次全部声明出来。**
+
+        为什么要走 `compose()` 而不是在 `show()` 里 `mount()`：`mount()` 是排队的，
+        而给一个**还没挂上**的容器挂子控件会当场抛
+        `MountError: Can't mount widget(s) before ... is mounted`（实测）。`compose()`
+        由 Textual 自己按顺序把整棵子树挂完，没有这个先来后到的问题。
+
+        **配色走关键字**：Textual 的 `Widget.__init__(*children)` 会把位置参数当成子
+        控件，于是 `StartPanel(palette, ...)` 里那个 `Theme` 成了它的内容，报的是
+        `unable to display 'Theme' type`（看起来完全指不到这儿）。
+
+        版式：外层纵向（上面一行 + 下面那个通栏的提示框）；`#welcome-row` 是横向的 ——
+        **写成 `Vertical` 的话两个框就是上下排的**，而 CSS 的 `align` 只管交叉轴，
+        "并排"怎么调都调不出来（实测：屏幕上就是"开始框在上、最近框在下"）。窄屏那一版
+        把 `#welcome-row` 的 `layout` 改成 `vertical`（见 `_sync_layout`）。
+        """
+        with Vertical(id="welcome-body"):
+            with Horizontal(id="welcome-row"):
+                yield StartPanel(palette=self._palette,
+                                 classes="welcome-box start-box")
+                yield RecentPanel(palette=self._palette,
+                                  classes="welcome-box recent-box")
+            yield HintPanel(self._palette, classes="welcome-box hint-box")
+
+    @property
+    def body(self) -> Vertical:
+        return self.query_one("#welcome-body", Vertical)
+
+    @property
+    def row(self) -> Horizontal:
+        return self.query_one("#welcome-row", Horizontal)
+
+    @property
+    def hint(self) -> "HintPanel":
+        return self.query_one(HintPanel)
+
+    def show(self, state: view_state.ViewState, palette: theme_mod.Theme,
+             payload: Any = None, *, now: float | None = None) -> None:
+        self._state = state
+        self._palette = palette
+        self._payload = payload
+        self._now = now
+        if self.body.is_mounted:
+            self._sync_layout()
+
+    def on_mount(self) -> None:
+        """**挂好之后再画。**
+
+        盒子在 `compose()` 里声明（Textual 会把这棵子树挂完），所以"我现在有多宽、
+        该并排还是叠起来"只有到这一次回调才算得出来。`ConversationLog` 也刻意**不在**
+        挂载前调 `show()`（那时宽度是 0，画出来的是"并排"那一版，窄终端上会溢出屏幕）。
+        """
+        self._sync_layout()
+
+    def _sync_layout(self) -> None:
+        """按当前宽度决定"并排"还是"上下"，然后重画三个方框。
+
+        两件事绑在一起做，是因为**重画要用新的宽度**：先画再换版式的话，那一次画的
+        内容是按旧宽度算的（症状是窗口一拖，右栏那两列就错开）。
+        """
+        if self._state is None:
+            return
+        if not self.size.width:
+            # **宽度还是 0 = Textual 还没排过版**（控件刚挂上去就是这个状态）。这时候
+            # 算出来的 `stacked` 一定是"并排"，而窗口其实可能很窄 —— 于是那一版会按
+            # 并排画出去、横向溢出屏幕（实测：70 列的终端上两个框各被切掉一截）。
+            # 现在什么都不做，等布局定下来那一次 `on_resize` 再画。
+            return
+        stacked = self.size.width < WELCOME_STACK_COLUMNS
+        if stacked != self._stacked:
+            # **只在版式真的变了时动一次**：`on_resize` 会被拖动的每一帧调到。
+            #
+            # 换的是**容器的 `layout`**（横向 ↔ 纵向），不是重建容器、也不是靠 CSS 让
+            # 两个定宽的框"折行"：一行里放不下时 Textual 会把子控件压窄（实测：70 列
+            # 上两个框各 33 列，而不是各占满整行）。控件一个都不动，所以这里没有
+            # "新容器和还没摘掉的旧容器撞在同一个 id 上"那种坑。
+            self._stacked = stacked
+            self.row.styles.layout = "vertical" if stacked else "horizontal"
+            # `stacked` 这个类只给 CSS 用（它管的是"这一版要不要滚动、框宽要不要放开"）。
+            # **不能用 `toggle_class`**：它是"翻转"不是"设置"（每次调用都切反）。
+            if stacked:
+                self.add_class("stacked")
+            else:
+                self.remove_class("stacked")
+        # 提示框按**自己那一行的宽度**决定说几条键位（窄屏另有一套更短的措辞）。叠起来
+        # 那一版三个框各占满整行，提示框跟着它们一起变宽。
+        hint_width = self.row.size.width if stacked else WELCOME_HINT_WIDTH
+        for panel in [*self.row.query(BorderedPanel), self.hint]:
+            panel.show_children(self._state, self._palette, self._payload,
+                                now=self._now, width=hint_width)
+
+    def repaint(self, palette: theme_mod.Theme) -> None:
+        self._palette = palette
+        self._sync_layout()
+
+    def on_resize(self) -> None:
+        self._sync_layout()
+
+
+class StartPanel(BorderedPanel):
+    """左栏：**这是哪个程序、用什么模型、在哪个工作区**。
+
+    方块标和"tudouni + 版本"照旧：它是这一屏上唯一"一眼认出这是 tudouni"的东西。
+    """
+
+    # 方块标从 `WelcomeBlock` 那里取（它才是这个标记的定义处，这里只是画它的地方）。
+    LOGO = WelcomeBlock.LOGO
+
+    def render_parts(self, state, palette, payload=None, width=0):
+        # **这 8 行是定死的**（见 `WELCOME_BOX_HEIGHT`）：两个框一样高、里面不留
+        # 会随内容变形的空档，靠的就是这里的条数和 `RecentPanel` 那边一致。
+        rows: list[Text] = []
+        for line in self.LOGO:
+            rows.append(Text(line, style=palette.accent))
+        rows.append(Text(""))
+        rows.append(Text(f"欢迎回来 {user_name()}", style=palette.ink + " bold"))
+        rows.append(Text(""))
+        rows.append(Text(f"tudouni {payload or ''}".strip(), style=palette.ink2))
+        rows.append(Text(model_and_workspace(state), style=palette.ink3))
+        rows.append(Text("", style=palette.ink4))
+        rows.append(Text("命令面板：/", style=palette.ink4))
+        return Text("开始", style=palette.ink3), [
+            _centered_row(row) for row in rows
+        ]
+
+
+class RecentPanel(BorderedPanel):
+    """右栏：**最近动过哪几个会话** + 一句箴言。
+
+    "最近"用的是会话文件的 mtime（`modified_at`，runtime 读盘时算好）—— 它说的是
+    "最后一次聊"，而那正是"我上次干到哪儿了"要看的东西。**读不出来或者没有那个
+    字段就不显示时间**，不猜一个。
+
+    箴言那一块的形状是从别家 CLI 的"What's new"借来的，内容换成了**一句每天轮换
+    的话**：一个每 15 天就有内容过期的新特性区块，在这种天天开的工具里只会变成噪声。
+    """
+
+    def render_parts(self, state, palette, payload=None, width=0):
+        # **正好 `BOX_LINES` 行**（和 `StartPanel` 那边一样多，这是两个框等高的全部
+        # 理由）：标题 1 + 会话 4 + 空行 1 + 箴言标题 1 + 箴言 1 = 8，末尾再补 2 个空行。
+        rows: list[Text] = [Text("最近活动", style=palette.ink3)]
+        items = _most_recent(state.recent_sessions, WelcomeBlock.RECENT_LIMIT)
+        for item in items:
+            rows.append(_recent_row(item, palette, self._now))
+        for index in range(WelcomeBlock.RECENT_LIMIT - len(items)):
+            # **空位也要占住**（见 `WelcomeBlock` 的 docstring）：没有会话时第一格
+            # 写"（还没有会话）"，其余空格 —— 这样框的高度不随硬盘上有几个会话变。
+            blank = "（还没有会话）" if not items and index == 0 else ""
+            rows.append(Text(blank, style=palette.ink4))
+        rows.append(Text(""))
+        rows.append(Text("箴言", style=palette.ink3))
+        rows.append(Text(view_state.motto_of_day(), style=palette.line))
+        rows.extend(Text("") for _ in range(WelcomeBlock.BOX_LINES - len(rows)))
+        return Text("最近", style=palette.ink3), [
+            Static(row, classes="welcome-line") for row in rows
+        ]
+
+
+class HintPanel(BorderedPanel):
+    """底下那个通栏的「提示」：**键位**。
+
+    它原来是输入行下面那一条常驻的一行字（`#keys`）。挪到欢迎屏里之后有两个变化：
+
+      1. **它有地方了**，所以不再"放不下就从右边少说一条"（那一行原来紧贴输入行，
+         多一行就会把输入行顶出屏幕）—— 现在按"每行几条"排，一行放不下就换行；
+      2. **它只在欢迎屏上**。说过第一句话之后这一屏就收了，键位提示跟着一起收 ——
+         那时候 `/help` 仍然列着完整的键位表，输入框的占位符也还写着最基本的用法。
+
+    窄屏（`width < WELCOME_HINT_WIDTH`）换一套更短的措辞：那几列连"思考过程"四个字
+    都嫌长。**宽度由调用方传进来**（`WelcomeBlock` 量的是这一行自己的宽度），因为这个
+    框在并排和叠起来两版里的宽度不一样。
+    """
+
+    # 一行放几条：4 条 × 约 17 列 ≈ 68 列，正好塞进 71 列的文字宽（见
+    # `WELCOME_HINT_TEXT`）。
+    PER_ROW = 4
+
+    def render_parts(self, state, palette, payload=None, width=0):
+        pairs = HINT_KEYS_NARROW if width < WELCOME_HINT_WIDTH else HINT_KEYS_FULL
+        rows: list[Static] = []
+        for start in range(0, len(pairs), self.PER_ROW):
+            row = Text()
+            for key, what in pairs[start:start + self.PER_ROW]:
+                if row.cell_len:
+                    row.append("   ")
+                row.append(key, style=palette.ink3)
+                row.append(f" {what}", style=palette.ink4)
+            # `hint-line` 而不是 `welcome-line`：提示那一行的**换行由它自己决定**
+            # （`height: auto` + 软换行），而方框里其它行都是"一行就是一行"。
+            rows.append(Static(row, classes="hint-line"))
+        return Text("提示", style=palette.ink3), rows
+
+
+def _most_recent(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """会话清单 → 最近动过的 `limit` 条。
+
+    **清单本身是按创建时间排的**（那是选会话面板要的顺序，见
+    `composition.session_summaries`），而这一栏要的是"最后一次聊" —— 两者不是同一个
+    顺序：一个昨天建、今天还在聊的会话在创建时间上是旧的，在"我上次干到哪儿了"
+    上却是最新的。所以这里按 `modified_at` 重排。
+
+    没有 `modified_at` 的那些（坏文件、老 runtime 给的载荷）排在最后：它们没有
+    "最近"可言，而按 0 排也一样。
+    """
+    def key(item: dict[str, Any]) -> float:
+        when = item.get("modified_at")
+        if isinstance(when, (int, float)) and not isinstance(when, bool):
+            return float(when)
+        return 0.0
+
+    return sorted(items, key=key, reverse=True)[:limit]
+
+
+def _centered_row(text: Text) -> Static:
+    """左栏的一行：**整个控件居中**，不是在前面补空格。
+
+    补空格那条路要求调用方知道控件的宽度，而布局是下一帧的事 —— 刚挂上去时宽度还是
+    0，于是那一行会贴在左边直到下一次重画（症状：窗口一拖，方块标就歪一下）。
+    `text-align: center` 由 CSS 给，宽度由控件自己决定，两边都不需要知道对方的数字。
+    """
+    return Static(text, classes="welcome-line start-line")
+
+
+def _recent_row(item: dict[str, Any], palette: theme_mod.Theme,
+                now: float | None) -> Text:
+    """最近活动的一行：`12分钟前  把欢迎屏改成两个框`。
+
+    右边那一列是**这次对话的标题**，不是会话 id：id 是时间戳（`20260912-101530`），
+    人对着它认不出"这是哪一次"。标题直接用 runtime 算好的 `preview` —— 它就是第一条
+    用户消息的开头几个字（`composition._first_user_message`），选会话面板用的也是它。
+    **界面不自己去读会话文件、也不自己截断**：同一份事实两个来源，早晚会漂。
+
+    左边那一列的宽度按"最长的那个时间说法" `12分钟前` 算（`STAMP_WIDTH`），所以四行
+    的时间是右对齐的、标题都在同一条竖线上 —— 那点空白就是这一行的列分隔，不用
+    `f"{stamp:<8}"`（一个汉字两列，`len` 数不出来）。
+    """
+    when = item.get("modified_at")
+    if isinstance(when, (int, float)) and not isinstance(when, bool) and now:
+        stamp = view_state.time_ago(now - float(when))
+    else:
+        # 没有那个字段（老 runtime / 手工构造的载荷）→ 宁可不说时间，也不猜一个。
+        stamp = ""
+    # 还没说过话的会话（preview 是空串）在面板里也写"（还没说过话）"，这里照抄那个
+    # 口径：**一行完全空白看起来像渲染坏了**。
+    title = str(item.get("preview") or "") or "（还没说过话）"
+    room = WelcomeBlock.RIGHT_WIDTH - STAMP_WIDTH - 2
+    row = Text(stamp, style=palette.ink4)
+    row.append(" " * max(1, STAMP_WIDTH - row.cell_len + 2))
+    row.append(_clip_cells(title, room), style=palette.ink2)
+    return row
+
+
+# "12分钟前" 的显示宽（列）：7 个汉字/数字混排 = 3 + 2 + 2 + 2 ≈ 11，留一位余量。
+# 它是右栏第一列的固定宽 —— 四行的时间因此右对齐、标题因此对齐成一条竖线。
+STAMP_WIDTH = 12
+
+
+def _clip_cells(text: str, width: int) -> str:
+    """按**显示列数**截断，截了就补一个 `…`。
+
+    不用 `view_state.clip`（它按 `len` 数）：标题是"用户说的第一句话"，中英混排是常态，
+    而一个汉字占两列 —— 按字符数截出来的标题长短会随内容飘，右边那条竖线就歪了。
+    """
+    if width <= 1 or cell_len(text) <= width:
         return text
+    kept: list[str] = []
+    used = 0
+    for char in text:
+        size = cell_len(char)
+        if used + size > width - 1:
+            break
+        kept.append(char)
+        used += size
+    return "".join(kept) + "…"
+
+
+def user_name() -> str:
+    """当前用户名（问候那一行用）。**认不出来就空着**。
+
+    `getpass.getuser()` 会依次看 `LOGNAME` / `USER` / `LNAME` / `USERNAME`，最后退到
+    pwd 数据库 —— 这几样在一个裁剪过的容器里都可能没有，那时候它抛 KeyError。
+    问候语少一个名字不是错误，界面因此起不来才是。
+    """
+    try:
+        import getpass
+
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - 见 docstring：这不是错误路径
+        return ""
+
+
+def workspace_name(state: view_state.ViewState) -> str:
+    """工作区的**最后一段目录名** —— 完整路径在顶栏那一行写着。
+
+    左栏那个方框只有二十几列，而完整路径的前 30 列在任何机器上都是常量
+    （`C:\\Users\\<名字>\\repo\\`）：把常量抄第二遍买不到任何信息。
+    """
+    path = (state.workspace or "").replace("\\", "/").rstrip("/")
+    return path.rsplit("/", 1)[-1] if path else "—"
+
+
+def model_and_workspace(state: view_state.ViewState) -> str:
+    """左栏那一行身份：`deepseek-chat · agent_runtime`。
+
+    **步数预算不在这里**：它在会话头那一行（`最多 80 步`），而这一格要说的是
+    "我在哪儿、用的什么模型"——把三个数挤在一行里，宽屏能看、窄屏全都被省略号吃掉。
+    """
+    return f"{state.model or '—'}  ·  {workspace_name(state)}"
+
 
 
 class RailBlock(Vertical):
@@ -695,15 +1134,29 @@ class ConversationLog(VerticalScroll):
     # -- 空态 ------------------------------------------------------------------
 
     def show_welcome(self, state: view_state.ViewState, palette: theme_mod.Theme,
-                     version: str) -> None:
+                     version: str, now: float | None = None) -> None:
         self._palette = palette
         if self._welcome is None:
-            block = WelcomeBlock(classes="welcome")
-            block.show(state, palette, version)
+            # **只挂上去、不塞内容。** 盒子在 `WelcomeBlock.compose()` 里声明（见那里的
+            # 说明：给一个还没挂上的容器挂子控件会抛 `MountError`），所以内容要等这一次
+            # 挂载走完 —— 由 `_sync_layout` 在拿到宽度之后再画。
+            block = WelcomeBlock(palette, classes="welcome")
             self.mount(block)
             self._welcome = block
         else:
-            self._welcome.show(state, palette, version)
+            self._welcome.show(state, palette, version, now=now)
+        # **把会话流拉回顶部**：欢迎屏比别的内容高一截，而 `#log` 自己会滚到底
+        # （追加行之后的那次 `scroll_end` 留下的位置）—— 不归位的话顶上两个框的边框
+        # 会被滚出屏幕，看起来像"这一屏是从中间开始画的"。
+        self.scroll_home(animate=False)
+
+    def welcome_visible(self) -> WelcomeBlock | None:
+        """空态那一屏**现在**在不在（在就把它还回来）。
+
+        它是 `_on_sessions` 的判据：同一份会话清单，欢迎屏要它和 `/resume` 要它
+        是两件事 —— 见 `TuiApp._on_sessions`。
+        """
+        return self._welcome
 
     def hide_welcome(self) -> None:
         if self._welcome is not None:
@@ -723,7 +1176,14 @@ class ConversationLog(VerticalScroll):
         return block
 
     def add_lines(self, lines: list[view_state.Line], palette: theme_mod.Theme) -> None:
-        """往**当前回合**里加行；还没有回合就加到一个无回合块里。"""
+        """往**当前回合**里加行；还没有回合就加到一个无回合块里。
+
+        **空态那一屏还在时不滚到底。** `init` 那条消息是分两步画的：先摆欢迎屏
+        （`show_welcome` 会把流拉回顶部），紧接着把这一屏的几行说明追加进去
+        （`add_lines` 会滚到底）。后一步在欢迎屏比说明高的时候会把**上面那两行框线
+        滚出屏幕** —— 症状是"这一屏从中间开始画"，而它看起来完全像是我把版式算错了。
+        欢迎屏还在 = 用户还没说过第一句话，所以这一屏停在顶部才是对的。
+        """
         if not lines:
             return
         self._palette = palette
@@ -735,7 +1195,30 @@ class ConversationLog(VerticalScroll):
                 self._current = MessageBlock(palette, classes="turn")
                 self.mount(self._current)
             self._current.add(lines)
-        self._scroll_end()
+        if self._welcome is None:
+            self._scroll_end()
+
+    def add_answer(self, text: str, palette: theme_mod.Theme) -> None:
+        """agent 正文 —— **这个前端里唯一走 `AnswerBlock` 的东西**（其余仍是行）。
+
+        滚动那两条理由和 `add_lines` 一样（欢迎屏还挂着就不滚），但这里**还要多排
+        一次**：`Markdown` 是分批挂子控件的，挂上去的那一刻它的高度还没算出来，所以
+        第一次 `_scroll_end()` 会把底停在"还没长开"的位置 —— 症状是"答完了，但最后
+        几行在屏幕外"，而且它只在答案比一屏长的时候出现。刷新之后再排一次才落在真的
+        底上。
+        """
+        self._palette = palette
+        current = self.current_turn_block
+        if current is not None:
+            current.add_answer(text)
+        else:
+            if self._current is None:
+                self._current = MessageBlock(palette, classes="turn")
+                self.mount(self._current)
+            self._current.add_answer(text)
+        if self._welcome is None:
+            self._scroll_end()
+            self.call_after_refresh(self._scroll_end)
 
     def _scroll_end(self) -> None:
         if self.is_mounted:
@@ -1424,9 +1907,13 @@ class SessionPicker(ModalScreen):
 
 
 __all__ = [
-    "CommandPalette", "ContextRail", "ConversationLog", "KeyHintBar",
-    "LineBlock", "MessageBlock", "Panel", "PermissionPanel", "QuestionPanel",
-    "SessionBar", "SessionPicker", "SkillsPanel", "StatusBar", "TopBar",
-    "TurnBlock", "TwoPart", "WelcomeBlock", "color_of", "paint", "paint_lines",
-    "style_of",
+    "BorderedPanel", "CommandPalette", "ContextRail", "ConversationLog",
+    "HINT_KEYS_EXTRA", "HINT_KEYS_FULL", "HINT_KEYS_NARROW", "HintPanel",
+    "LineBlock", "MessageBlock", "Panel", "PermissionPanel",
+    "QuestionPanel", "RecentPanel", "SessionBar", "SessionPicker", "SkillsPanel",
+    "StartPanel", "StatusBar", "TopBar", "TurnBlock", "TwoPart",
+    "WELCOME_BOX_HEIGHT", "WELCOME_HINT_TEXT", "WELCOME_HINT_WIDTH",
+    "WELCOME_RIGHT_WIDTH", "WELCOME_STACK_COLUMNS",
+    "WelcomeBlock", "color_of", "paint", "paint_lines", "style_of", "user_name",
+    "workspace_name",
 ]

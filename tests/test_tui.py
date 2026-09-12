@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -109,21 +110,24 @@ def test_the_answer_is_recorded_by_run_id_not_by_arrival_order():
     所以配对只能靠 `run_id`。靠到达顺序的话，一旦两条消息的次序变了（这在
     工作线程 + 主循环之间是可能的），界面会把答案贴到错误的一轮上 ——
     而那看起来完全正常。
+
+    **它交出去的是原文，不是行**（`Answer`）：正文要按 Markdown 渲染，拆成行就等于
+    把语法丢掉。所以这里能钉的只有"给什么还什么"和下面那条"空答案不画"。
     """
     state = view_state.ViewState()
-    lines = view_state.render_ui_answer(state, {"run_id": "r9", "answer": "答案"})
-    assert any("答案" in line for line in lines)
-    assert state.answers["r9"] == "答案"
+    answer = view_state.answer_body(state, {"run_id": "r9", "answer": "# 答案"})
+    assert answer is not None and answer.text == "# 答案"
+    assert state.answers["r9"] == "# 答案"
 
     # 第二次同 run_id（重放）覆盖，而不是追加出第二条。
-    view_state.render_ui_answer(state, {"run_id": "r9", "answer": "答案2"})
+    view_state.answer_body(state, {"run_id": "r9", "answer": "答案2"})
     assert state.answers["r9"] == "答案2"
 
 
 def test_an_empty_answer_draws_nothing():
     """模型失败时 `answer` 是空串 —— 那时**不该**画一个空的 `[agent]` 气泡。"""
     state = view_state.ViewState()
-    assert view_state.render_ui_answer(state, {"run_id": "r", "answer": ""}) == []
+    assert view_state.answer_body(state, {"run_id": "r", "answer": ""}) is None
 
 
 def test_status_bar_left_is_a_projection_not_a_second_truth():
@@ -217,6 +221,80 @@ def test_the_permission_block_says_only_what_the_runtime_sent():
     roles = {role for line in blocks["权限范围"] for _text, role in line.segments}
     assert view_state.ROLE_RISK_MEDIUM in roles and view_state.ROLE_RISK_HIGH in roles
     assert len(blocks["权限范围"]) == 3
+
+
+def test_the_skill_block_counts_loaded_skills_only():
+    """左栏那块说的是**已加载**（这个会话读过哪几份），不是**可用**（工作区里有几个）。
+
+    这一对区分被当成 bug 报过一次，原话是"左栏写着 0，而 `Ctrl+S` 里明明列着技能"。
+    两处的数据根本不是同一个：
+
+      * `state.skills` ← `session.metadata`（`load_skill` 写下的指针，按会话）；
+      * `state.skill_catalog` ← 工作区扫出来的全部技能（每次启动扫一遍）。
+
+    所以"已加载 0 / 可用 1"是**正常的一个状态**（有货但还没读）。这条测试钉两件事：
+    计数只数已加载、而且**空态不去解释"可用有几个"** —— 那一块每一行都该说自己那一块
+    的事，可用清单的出口是 `Ctrl+S`（曾经在这里加过一句"工作区里有 N 个可用"，去掉了）。
+    """
+    # 工作区里有货、但还没读过任何一份：计数仍然是 0，而空态不提"可用"。
+    state = view_state.ViewState(session_id="s",
+                                 skill_catalog=[{"name": "frontend-design"}])
+    title, count, lines = view_state.rail_blocks(state)[1]
+    assert (title, count) == ("已加载技能", "0"), "计数数的是已加载，不是可用"
+    assert [str(line) for line in lines] == [
+        "还没有加载技能", "load_skill 读过的会一直生效"]
+
+    # 工作区里也一个技能都没有 —— 空态**一模一样**（这就是"不解释可用"的直接后果）。
+    empty = view_state.ViewState(session_id="s")
+    _title, count, lines = view_state.rail_blocks(empty)[1]
+    assert count == "0"
+    assert [str(line) for line in lines] == [
+        "还没有加载技能", "load_skill 读过的会一直生效"]
+
+    # 读过之后：列名字、计数跟着走，可用清单里有几个无关。
+    loaded = view_state.ViewState(
+        session_id="s", skills=[{"name": "frontend-design"}],
+        skill_catalog=[{"name": "frontend-design"}, {"name": "pdf"}])
+    title, count, lines = view_state.rail_blocks(loaded)[1]
+    assert (title, count) == ("已加载技能", "1")
+    assert [str(line) for line in lines] == ["frontend-design"]
+
+
+def test_the_empty_rail_blocks_do_not_name_internal_tools():
+    """空态的两句话**不点名内部工具**，也不替运行时解释自己为什么是空的。
+
+    "agent 调用 todo_write 后出现在这里"曾经在左栏里挂了很久 —— 它把实现细节
+    （任务是哪个工具写的）写进了界面，而用户要的只是"这里会出现什么"。同一条规矩
+    也用在那句"load_skill 读过的会一直生效"上：它说的是**效果**（读过的会留着），
+    不是"哪个工具会调用它"。名字会变、工具会合并，而效果那句话不会。
+    """
+    state = view_state.ViewState(session_id="s")
+    blocks = {title: [str(line) for line in lines]
+              for title, _count, lines in view_state.rail_blocks(state)}
+    assert blocks["任务"] == ["当前还没有任务", "agent 创建的任务会在这里"]
+    assert blocks["已加载技能"] == ["还没有加载技能",
+                                    "load_skill 读过的会一直生效"]
+    assert "todo_write" not in "\n".join(blocks["任务"])
+
+
+def test_the_rail_summary_only_mentions_skills_once_they_are_loaded():
+    """收起那一行只说**已加载**了几个技能；一个没加载就完全不提技能。
+
+    摘要那一行的职责是"说清收起之后少了什么"。没加载时说"可用 N 个"是在说另一块
+    的事（而且它和左栏那一块的口径就对不上了）—— 见 `_skill_block` 的 docstring。
+    """
+    state = view_state.ViewState(session_id="s",
+                                 skill_catalog=[{"name": "a"}, {"name": "b"}])
+    assert "技能" not in view_state.rail_summary(state)
+
+    state.skills = [{"name": "a"}]
+    assert "1 个技能" in view_state.rail_summary(state)
+
+    # 一个技能都没有：这一行不提技能，但别的那几段照旧。
+    bare = view_state.ViewState(session_id="s", todos=[{"content": "x",
+                                                        "status": "pending"}])
+    summary = view_state.rail_summary(bare)
+    assert "技能" not in summary and "0/1 个任务" in summary
 
 
 # --- 工具行的语法（设计稿的核心改动 2） ---------------------------------------
@@ -488,45 +566,55 @@ async def test_startup_notices_are_quiet_and_do_not_repeat_the_rail(monkeypatch)
 
 
 @pytest.mark.anyio
-async def test_the_key_hint_row_never_overflows(monkeypatch):
-    """键位提示行**按列数决定说几条**，放不下就从右边少说一条。
+async def test_the_hint_box_holds_the_key_row(monkeypatch):
+    """键位提示**在欢迎屏底下那个「提示」框里**，不再挂在输入行下面。
 
-    它紧贴输入行，多出来的一行会把输入行顶走；而"少说一条键位"的代价小得多。
+    两件事一起钉，因为它们是同一次改动：
 
-    ## 两级降级，别把它们当成一件事
+      * 那个框的宽度 = 上面两个框加起来（32 + 1 间距 + 42 = 75），三条框线对得上；
+      * 界面里**没有** `#keys` 那一条了 —— 挪走了却留着控件的话，它会白占一行把
+        输入行往上顶（而画面上只是"下面空了一行"，看不出是哪儿多出来的）。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
 
-      1. **< 120 列**换成一套更短的措辞（`NARROW`）—— 这是常态那条路；
-      2. **还放不下就截断**（`render_state` 里那个 `break`）—— 这是保险。
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s")))
+        await _settle(app, pilot)
 
-    **第 2 条在真界面里几乎永远不触发**（宽屏那套正文 102 列，而它只在 ≥120 列时
-    才出现），所以它只能直接对着那个纯函数测 —— 装一个 119 列的界面去测，测到的
-    其实是第 1 条。这里两个宽度各钉一次：90 列走第 1 条，60 列连第 1 条都放不下。
+        assert not app.query("#keys"), "键位提示行已经搬进欢迎屏了"
+        hint = app.query_one(widgets_module.HintPanel)
+        start = app.query_one(widgets_module.StartPanel)
+        recent = app.query_one(widgets_module.RecentPanel)
+        assert hint.region.width == widgets_module.WELCOME_HINT_WIDTH
+        assert hint.region.width == start.region.width + 1 + recent.region.width, \
+            "提示框要横跨上面那两个框"
+        assert hint.region.y > recent.region.y
+        # 两行键位，每行四条。
+        assert len(hint.children) == 2
+        assert "发送" in _welcome_text(app) and "中断本轮" in _welcome_text(app)
+
+
+def test_the_hint_box_switches_to_shorter_words_when_narrow():
+    """窄屏（比 `WELCOME_HINT_WIDTH` 还窄）换一套更短的措辞。
+
+    它是那个框"放得下"的唯一保证：一整条 `Ctrl+T 思考过程` 在三十几列里会折成两行，
+    把框底撑破（框高是写死的）。
     """
     from agent_runtime.frontends.tui import theme as theme_mod
     from agent_runtime.frontends.tui import widgets as widgets_module
 
     palette = theme_mod.get(theme_mod.DEFAULT_THEME)
-    bar = widgets_module.KeyHintBar()
+    panel = widgets_module.HintPanel(palette)
 
-    # 宽屏那套：122 列放得下全部六条。
-    wide = str(bar.render_state(view_state.ViewState(), palette, 122))
-    assert "中断本轮" in wide and "全部技能" in wide
+    wide = panel.render_parts(view_state.ViewState(), palette, None,
+                              widgets_module.WELCOME_HINT_WIDTH)[1]
+    assert any("思考过程" in str(row.render()) for row in wide)
 
-    # 窄屏那套：说四条，而它是短的。
-    narrow = str(bar.render_state(view_state.ViewState(), palette, 90))
-    assert "中断" in narrow and "全部技能" not in narrow
-
-    # 连短的都放不下时按顺序截断 —— 而**第一个永远留着**（它最要紧）。
-    tiny = str(bar.render_state(view_state.ViewState(), palette, 60))
-    assert tiny.startswith("Enter")
-    assert len(tiny) <= 60, f"提示行撑破了列宽：{tiny!r}"
-
-    app = _build_app(monkeypatch)
-    async with app.run_test(size=(80, 24)) as pilot:
-        app._pump()
-        await pilot.pause()
-        keys = app.query_one("#keys", widgets_module.KeyHintBar)
-        assert keys.region.width <= 80
+    narrow = panel.render_parts(view_state.ViewState(), palette, None,
+                                widgets_module.WELCOME_HINT_WIDTH - 1)[1]
+    assert any("思考" in str(row.render()) for row in narrow)
+    assert not any("思考过程" in str(row.render()) for row in narrow)
 
 
 def test_the_thinking_block_is_a_quote():
@@ -549,12 +637,28 @@ def test_the_thinking_block_is_a_quote():
     assert [str(line) for line in body] == ["  │ 甲", "  │ 乙"]
 
 
-@pytest.mark.anyio
-async def test_the_welcome_screen_has_a_logo(monkeypatch):
-    """空态那一屏左边有个三行的方块标记。
+def _welcome_text(app) -> str:
+    """空态那一屏上**所有画出来的字**（两个框的标题也在里面）。
 
-    终端里没有图片，而一屏空态没有任何视觉重量时，"这是哪个程序"就得靠它承担 ——
-    **只用半块/全块字符**（▄▀█）：它们在等宽字体里都是一个字符宽的实心格，
+    标题走的是 `border_title`，而它**不是** `Static.render()` 那一份内容 —— 只读
+    `render()` 的话"开始 / 最近"两个标题永远断言不到，而那正是这一屏的骨架。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    parts = [str(app.query_one(widgets_module.WelcomeBlock).render())]
+    for panel in app.query(widgets_module.BorderedPanel):
+        if panel.border_title is not None:
+            parts.append(str(panel.border_title))
+        parts.extend(str(child.render()) for child in panel.children)
+    return "\n".join(parts)
+
+
+@pytest.mark.anyio
+async def test_the_welcome_screen_is_two_titled_boxes(monkeypatch):
+    """空态那一屏 = **两个带标题的方框**：左边身份（方块标 + 版本 + 模型与工作区），
+    右边"最近活动" + 一句箴言。
+
+    方块标**只用半块/全块字符**（▄▀█）：它们在等宽字体里都是一个字符宽的实心格，
     不会像某些图形字符那样在 CJK 字体下变双宽而把右边的字顶歪。
     """
     from agent_runtime.frontends.tui import widgets as widgets_module
@@ -564,18 +668,138 @@ async def test_the_welcome_screen_has_a_logo(monkeypatch):
         app._inbox.put(("message", {
             "v": 1, "t": "init", "protocol": 1,
             "session_id": "s", "resumed": False, "model": "m",
-            "workspace": "C:/w", "max_steps": 80, "context_tokens": None,
-            "tools": [], "permissions": {}, "audit_path": "C:/w/a.jsonl",
-            "notices": [],
+            "workspace": "C:/w/agent_runtime", "max_steps": 80,
+            "context_tokens": None, "tools": [], "permissions": {},
+            "audit_path": "C:/w/a.jsonl", "notices": [],
         }))
         await _settle(app, pilot)
-        rendered = str(app.query_one(widgets_module.WelcomeBlock).render())
+        rendered = _welcome_text(app)
         assert "██▀▀██" in rendered
         assert "tudouni" in rendered and app._version in rendered
+        assert "开始" in rendered and "最近" in rendered
+        # 身份那一行给的是**最后一段目录名**（完整路径在顶栏那一行）。
+        assert "agent_runtime" in rendered and "C:/w" not in rendered
+        # 箴言那一格**总是有字**（它每天轮换，所以这里不钉具体哪一句）。
+        assert view_state.motto_of_day() in rendered
         # 三行等宽：右边的字才对得齐（这是它能当标志用的前提）。
         rows = widgets_module.WelcomeBlock.LOGO
         assert len({len(row) for row in rows}) == 1
         assert all(set(row) <= set(" ▄▀█") for row in rows)
+        # 两个框的正文一样多行 —— 等高、里面不留会随内容变形的空档靠的就是这一条。
+        assert len(app.query_one(widgets_module.StartPanel).children) \
+            == widgets_module.WelcomeBlock.BOX_LINES
+        assert len(app.query_one(widgets_module.RecentPanel).children) \
+            == widgets_module.WelcomeBlock.BOX_LINES
+
+
+@pytest.mark.anyio
+async def test_the_boxes_stay_inside_their_height(monkeypatch):
+    """**框高和框里的行数是一对**（CSS 里那个高度和 `BOX_LINES`）。
+
+    实测踩过：`height` 少两行时 Textual 会把框底两行内容**裁掉**，而画面上看起来只是
+    "框里少了两行字"—— 没有报错、没有滚动条，谁也不会往版式上想。所以这里量的是几何：
+    框高必须容得下"正文 + padding"，而正文必须真的画在自己的框里。
+
+    提示框不在这一条里：它没有上下 `padding`、高度也不是按 `BOX_LINES` 定的（它只装
+    两行键位），见 `.hint-box` 那条 CSS。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+    from agent_runtime.frontends.tui import app as app_module
+
+    css_height = int(app_module.TuiApp.CSS.split(".welcome-box {")[1]
+                     .split("height:")[1].split(";")[0].strip())
+    assert css_height == widgets_module.WELCOME_BOX_HEIGHT, \
+        "CSS 里那个高度和这条常数是一对，改一处就要改另一处"
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(140, 30)) as pilot:
+        app._inbox.put(("message", _init_message("s")))
+        await _settle(app, pilot)
+        panels = [*app.query(widgets_module.StartPanel),
+                  *app.query(widgets_module.RecentPanel)]
+        assert len(panels) == 2
+        for panel in panels:
+            assert panel.region.height == css_height
+            # 内容区（去掉边框和 padding）装得下全部正文行。
+            assert panel.content_size.height >= widgets_module.WelcomeBlock.BOX_LINES
+            inside = panel.region.shrink(panel.styles.gutter)
+            for child in panel.children:
+                assert child.region.height == 1
+                assert inside.contains_region(child.region), \
+                    f"{child.region} 画到框外去了（框在 {panel.region}）"
+
+
+@pytest.mark.anyio
+async def test_the_welcome_screen_shows_recent_titles_not_ids(monkeypatch):
+    """右栏"最近活动"两列：左边**多久以前**（清单的 `modified_at`），右边**标题**。
+
+    三条一起测，因为它们是同一件事的三面：
+
+      * 清单到了 → 欢迎屏重画（**不弹选择面板** —— 用户还没按过任何键）；
+      * 右列是**第一条用户消息的开头**（`preview`，runtime 算好的），**不是会话 id**
+        —— id 是时间戳，人对着它认不出这是哪一次对话；
+      * 顺序按"最后一次聊"排，而不是清单本来的创建时间顺序。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+    now = time.time()
+    async with app.run_test(size=(140, 30)) as pilot:
+        app._inbox.put(("message", _init_message("s")))
+        await _settle(app, pilot)
+        assert "（还没有会话）" in _welcome_text(app), "空着也要占住那一格"
+
+        app._inbox.put(("message", {
+            "v": 1, "t": "sessions",
+            "items": [
+                # 清单按创建时间排（这个最老），但它刚刚才被动过 —— 所以它该排第一。
+                {"session_id": "20260101-000000", "messages": 9, "steps": 4,
+                 "todos": "", "preview": "把欢迎屏改成左右两个框",
+                 "modified_at": now - 30},
+                {"session_id": "20260901-000000", "messages": 3, "steps": 1,
+                 "todos": "", "preview": "看看协议", "modified_at": now - 5 * 86400},
+            ],
+        }))
+        await _settle(app, pilot)
+
+        assert not isinstance(app.screen, widgets_module.SessionPicker), \
+            "启动时那份清单不该弹出选择面板"
+        rendered = _welcome_text(app)
+        assert "刚刚" in rendered and "5天前" in rendered
+        assert "把欢迎屏改成左右两个框" in rendered and "看看协议" in rendered
+        assert "20260101-000000" not in rendered and "20260901-000000" not in rendered, \
+            "会话 id 是时间戳，认不出是哪次对话 —— 这一列要的是标题"
+        assert rendered.index("把欢迎屏改成左右两个框") < rendered.index("看看协议")
+
+
+def test_a_long_title_is_cut_by_columns_not_by_characters():
+    """标题按**显示列数**截断（一个汉字两列），不是一个字符一列。
+
+    截断的那几行要能对齐，靠的就是"每一行右边那条竖线在同一个位置"。用 `len` 数的话，
+    中文标题会被多留一倍宽度，而画面上看起来只是"这一行比上面那行长一截"。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    stamp = " " * widgets_module.STAMP_WIDTH
+    short = widgets_module._recent_row(
+        {"preview": "短标题"}, _palette(), now=None)
+    long_cn = widgets_module._recent_row(
+        {"preview": "一" * 40}, _palette(), now=None)
+    long_en = widgets_module._recent_row(
+        {"preview": "a" * 40}, _palette(), now=None)
+
+    assert short.cell_len <= widgets_module.WelcomeBlock.RIGHT_WIDTH
+    assert long_cn.cell_len == widgets_module.WelcomeBlock.RIGHT_WIDTH
+    assert long_en.cell_len == widgets_module.WelcomeBlock.RIGHT_WIDTH
+    assert str(long_cn).endswith("…") and str(long_en).endswith("…")
+    # 没有时间戳时那一列**照样占着** —— 否则标题会贴到最左边，四行对不齐。
+    assert str(short).startswith(stamp)
+
+
+def _palette():
+    from agent_runtime.frontends.tui import theme as theme_mod
+
+    return theme_mod.get(theme_mod.DEFAULT_THEME)
 
 
 def _hex_of(color) -> str:
@@ -1183,10 +1407,12 @@ async def test_slash_new_asks_the_runtime_to_switch_and_keeps_the_screen(monkeyp
         app._inbox.put(("message", _init_message("old-one")))
         await _settle(app, pilot)
         assert app.state.session_id == "old-one"
-        assert app._client.sent == [], "开场消息是收进来的，不是发出去的"
+        # 空态那一屏会主动问一次会话清单（右栏"最近活动"要它）—— **这是开场唯一
+        # 一条界面自己发出去的消息**，而它之后不该再有别的。
+        assert app._client.sent == [{"t": "session_list"}]
 
         app.submit("/new")
-        assert app._client.sent == [{"t": "session_switch", "session_id": None}]
+        assert app._client.sent[-1] == {"t": "session_switch", "session_id": None}
         # **还没换成功** —— 所以会话还是老的、流里的话还在。
         assert app.state.session_id == "old-one"
         assert "old-one" in _log_text(app)
@@ -1343,12 +1569,82 @@ def _events(app, *messages) -> None:
 
 
 def _log_text(app) -> str:
+    """会话流里**行**的文本。
+
+    **它看不见 agent 正文** —— 正文是 `AnswerBlock`（一棵 Markdown 子控件树），
+    不是 `LineBlock`。要断言正文就得直接查控件（见下面那条渲染测试）。
+    """
     from agent_runtime.frontends.tui import widgets
 
     parts = []
     for block in app.query(widgets.LineBlock):
         parts.extend(str(line) for line in block.lines)
     return "\n".join(parts)
+
+
+@pytest.mark.anyio
+async def test_the_answer_is_rendered_as_markdown(monkeypatch):
+    """agent 正文走 `AnswerBlock`：它解析成**一棵子控件树**，而不是一串行。
+
+    这条钉的是"渲染"本身。只断言"有个块在"是不够的 —— 把正文塞进一个 `Static`
+    也能过。所以看的是**解析出来的子控件**（`MarkdownH1` / `MarkdownParagraph` /
+    `MarkdownFence`）：它们出现，才说明 `#`、`**`、三个反引号真的被当成语法了，
+    而不是原样画出来。
+
+    顺带钉住"两条通路是分开的"：正文不进 `LineBlock`（`_log_text` 里看不到它），
+    否则工具行那类 `[` `*` 会混进 Markdown 的解析范围。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "举个例子"})
+        app._inbox.put(("message", {
+            "v": 1, "t": "ui", "kind": "run_finished", "run_id": "r1",
+            "answer": "# 标题\n\n正文**加粗**。\n\n```python\nprint(1)\n```\n",
+        }))
+        await _settle(app, pilot)
+
+        blocks = list(app.query(widgets_module.AnswerBlock))
+        assert len(blocks) == 1, "一次 run_finished 只该有一个正文块"
+        block = blocks[0]
+
+        # `Markdown` 的子控件是**分批异步挂**的（`update()` 走 executor +
+        # `mount_all`），所以这里等它长出来再断言 —— 不等就是偶发红。
+        for _ in range(20):
+            if len(block.children) >= 3:
+                break
+            await pilot.pause()
+        kinds = [type(child).__name__ for child in block.children]
+        assert "MarkdownH1" in kinds, f"标题没被解析成 H1：{kinds}"
+        assert "MarkdownParagraph" in kinds, f"段落没被解析：{kinds}"
+        assert "MarkdownFence" in kinds, f"代码块没被解析成 Fence：{kinds}"
+
+        # **模型写一行链接不该能拉起浏览器**：`open_links` 是这道闸的唯一开关，
+        # 而 Textual 没给它公开的读法（它只是个内部字段），所以只能这样钉。
+        assert block._open_links is False, "链接自动打开会让模型的输出直接触发外部动作"
+
+        assert app.state.answers["r1"].startswith("# 标题"), "答案照样要按 run_id 记账"
+        assert "# 标题" not in _log_text(app), "正文不该同时掉进行那条通路"
+
+        # --- 正文块插进回合块之后，两条老路径不能被它绊倒 ---------------------
+        turn = app.query_one(widgets_module.ConversationLog).current_turn_block
+        assert turn is not None
+        assert [chunk["kind"] for chunk in turn.chunks] == ["plain", "answer"], \
+            "正文是独立的块类型，不并进前面那些行里"
+
+        # `has_thinking()` 会**遍历所有块**。正文块没有 `.lines` —— 少了那条跳过，
+        # 这一句就抛 AttributeError，而界面上只是"没有思考过程"这一块画不出来。
+        assert turn.has_thinking() is False
+
+        # `/theme` 换配色会走 `ConversationLog.repaint → TurnBlock.repaint →
+        # 每个块`：正文块只记账、不重画（配色在 CSS 里，Textual 自己会重算）。
+        # 少了那个方法，换配色会在正文这一块上抛 AttributeError。
+        app._set_theme("P3")
+        await _settle(app, pilot)
+        assert app.theme == "P3"
 
 
 @pytest.mark.anyio

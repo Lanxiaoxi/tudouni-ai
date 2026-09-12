@@ -250,6 +250,24 @@ def _created_key(session: Session, path: Path | None) -> tuple[float, str]:
     return (float(created) if created is not None else 0.0, session.session_id)
 
 
+def _modified_at(path: Path | None) -> float | None:
+    """会话文件最后一次被写的时间（epoch 秒）。**读不到就是 None。**
+
+    它是"最后一次聊这个会话"，和 `created_at` 是**两件事**：选会话面板按创建时间排
+    （"这是哪一次对话"），而 TUI 欢迎屏右上那栏按这个排（"我上次干到哪儿了"）。
+    后者不能拿 `created_at` 顶替 —— 一个昨天建、今天还在聊的会话会被排到"昨天"。
+
+    **它不是 `metadata` 里的字段**：mtime 是文件系统的属性，不该再抄一份进会话
+    文件（抄了就有两份，而 `save` 每次整份重写时它们会对不上）。
+    """
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def session_summaries(
     store: JsonSessionStore, *, limit: int = SESSION_LIST_LIMIT
 ) -> list[dict[str, Any]]:
@@ -288,6 +306,7 @@ def session_summaries(
             item = {
                 "session_id": session_id, "messages": 0, "steps": 0,
                 "todos": "", "preview": f"（读不出来：{type(exc).__name__}）",
+                "modified_at": _modified_at(path),
             }
             loaded.append(((0.0, session_id), item))
             continue
@@ -297,6 +316,8 @@ def session_summaries(
             "steps": session.step_count(),
             "todos": progress_line(session.metadata),
             "preview": _first_user_message(session),
+            # "最后一次聊"（文件 mtime）。欢迎屏右上那栏按它排，见 `_modified_at`。
+            "modified_at": _modified_at(path),
         }
         loaded.append((_created_key(session, path), item))
 

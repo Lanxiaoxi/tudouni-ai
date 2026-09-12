@@ -473,8 +473,8 @@ def test_session_list_answers_with_the_saved_sessions(fake_openai):
 
     两条检查，各自都有理由：
 
-      * 每一条都带 `session_id` / `messages` / `steps` / `preview` / `todos` ——
-        界面直接照着渲染，**不该自己去读会话文件**；
+      * 每一条都带 `session_id` / `messages` / `steps` / `preview` / `todos` /
+        `modified_at` —— 界面直接照着渲染，**不该自己去读会话文件**；
       * 它是**只读**的：问一次清单不换会话、不改会话（所以那条断言问完之后，
         当前会话还是进来时那一个）。
 
@@ -498,8 +498,13 @@ def test_session_list_answers_with_the_saved_sessions(fake_openai):
     items = listed["items"]
     # **不断言"空"**：同上 —— 跑过几轮测试的机器上一定有会话。
     for item in items:
-        assert set(item) == {"session_id", "messages", "steps", "preview", "todos"}
+        assert set(item) == {"session_id", "messages", "steps", "preview", "todos",
+                             "modified_at"}
         assert isinstance(item["messages"], int) and isinstance(item["steps"], int)
+        # `modified_at` 是"会话文件最后被写"的时刻，TUI 欢迎屏右栏按它排；读不到文件
+        # 时是 null（不猜一个）。**它是 mtime，不是 `created_at`** —— 那一个只在
+        # runtime 内部用来排序，不上这条协议。
+        assert item["modified_at"] is None or isinstance(item["modified_at"], float)
 
     # 只读：问一次清单之后，**当前会话没有变**。
     send({"v": 1, "t": "session_switch", "session_id": "list-b"})
