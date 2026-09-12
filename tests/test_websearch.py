@@ -8,9 +8,15 @@
 Tavily 长什么样子的地方**，所以"字段名漂移"这类事只能在这里被抓住。
 """
 
+import threading
+
 import httpx
 import pytest
 
+from agent_runtime.agents import Agent
+from agent_runtime.models.types import ModelResponse
+from agent_runtime.security import PermissionPolicy
+from agent_runtime.state import Session
 from agent_runtime.tools.builtin import WebSearchArgs, create_tool_registry
 from agent_runtime.tools.tool import RiskLevel, ToolResult
 from agent_runtime.tools.websearch import (
@@ -23,6 +29,8 @@ from agent_runtime.tools.websearch import (
     TavilySearch,
     WebSearch,
 )
+
+from fakes import Collector, ScriptedModel, tool_call, usage
 
 SECRET = "tvly-dev-SECRETSECRET"
 
@@ -83,6 +91,11 @@ def text_of(backend, query: str = "q", max_results: int = 5) -> str:
     一样），而大部分断言关心的是模型看到了什么 —— 审计那半边另有专门的一条。
     """
     return run(backend, query, max_results).text
+
+
+def tool_texts(session) -> list[str]:
+    """会话里所有 tool 结果的正文（按 messages 的顺序）。"""
+    return [m["content"] for m in session.messages if m["role"] == "tool"]
 
 
 # --- 渲染 ---------------------------------------------------------------
@@ -240,19 +253,65 @@ def test_a_missing_search_tool_is_not_registered_at_all():
     assert "web_search" not in {tool.name for tool in create_tool_registry(".").all()}
 
 
-def test_web_search_is_low_risk_and_not_parallel():
+def test_web_search_is_low_risk_and_parallel_safe():
     """风险 LOW 是刻意的：一次研究任务是 5~15 次搜索，每次都弹审批只会让人一路按 y ——
     审批变成仪式的那一刻，它就不再保护任何东西了。
 
-    代价写在描述里：query 会被原样发给第三方。而"不能并行"是注册期校验的结果
-    （parallel_safe 必须是 LOW，这里没声明），所以整批退回串行、行为可预期。
+    代价写在描述里：query 会被原样发给第三方。
+
+    **parallel_safe=True 也是刻意的**，而且它和 LOW 是同一件事的两面：判定标准只有一条
+    —— handler 有没有副作用，而它只是"发一个请求、等回来"，既不写本地也不碰共享状态。
+    收益则比 read_file 那条路径大得多：搜索天然要发很多次、每次都阻塞在网络上（见
+    README「一批里的并发」最后那张对照表量的就是这个形状）。注册期校验反过来也保证了
+    这件事是安全的：能并行的必须是 LOW，而 LOW 意味着批内不会有人被问审批。
     """
     tool = create_tool_registry(".", web_search=WebSearch(FakeBackend())).get("web_search")
 
     assert tool.risk is RiskLevel.LOW
-    assert tool.parallel_safe is False
+    assert tool.parallel_safe is True
     assert "第三方" in tool.description       # 出口要写在模型看得见的地方
     assert "fetch_web" in tool.description    # 分工也要
+
+
+def test_two_searches_in_one_batch_really_run_concurrently():
+    """上一条只钉住了标志位，这一条盯**后果**：一批两条搜索真的同时跑。
+
+    形状照 tests/test_parallel.py 里那条（第一个调用一直等第二个跑起来才放行）—— 串行
+    执行的话它会直接卡到超时，所以这条不可能"假通过"。
+
+    走真的 Agent 而不是手搭的循环：标志位声明对了、但 Agent 那条并行路径没走到（比如
+    装配处漏了什么），只有在真会话里才暴露得出来。
+    """
+    second_ran = threading.Event()
+
+    def backend(query: str, max_results: int) -> Findings:
+        if query == "慢":
+            assert second_ran.wait(5), "第二个搜索没有在第一个结束之前跑起来 —— 没有并发"
+        else:
+            second_ran.set()
+        return Findings(hits=[hit(title=query)])
+
+    registry = create_tool_registry(".", web_search=WebSearch(backend))
+    model = ScriptedModel([
+        ModelResponse(content=None, tool_calls=[
+            tool_call("web_search", {"query": "慢"}, "c0"),
+            tool_call("web_search", {"query": "快"}, "c1"),
+        ], usage=usage()),
+        ModelResponse(content="完成", usage=usage()),
+    ])
+    collector = Collector()
+    session = Session.new("s")
+    Agent(model, registry, PermissionPolicy({RiskLevel.LOW}),
+          on_event=collector).run(session, "搜两件事")
+
+    # 结果按**模型给的顺序**回到 messages 里，哪怕完成的时间是反过来的
+    # （顺序只由模型决定：同一个会话跑两次，历史必须一样）
+    assert [m["tool_call_id"] for m in session.messages if m["role"] == "tool"] == ["c0", "c1"]
+    assert "慢" in tool_texts(session)[0] and "快" in tool_texts(session)[1]
+    # 审计里能看出这一批是并发的 —— 没有它，"这一批为什么快"就无从回答
+    batch = collector.of("tool_batch")
+    assert len(batch) == 1 and batch[0]["tools"] == "web_search,web_search"
+    assert [e.get("parallel") for e in collector.of("tool_result")] == [True, True]
 
 
 def test_arguments_actually_reach_the_handler():

