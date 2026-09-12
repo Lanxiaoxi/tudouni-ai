@@ -33,13 +33,19 @@ SCHEMA_DIR = Path(__file__).resolve().parent / "schema"
 # 的情况下演进语义是可能的 —— 而那是迟早的事。
 VERSION = 1
 
-# 入站（前端 → runtime）四种。
+# 入站（前端 → runtime）五种。
 IN_USER_MESSAGE = "user_message"
 IN_PERMISSION_RESPONSE = "permission_response"
 IN_QUESTION_RESPONSE = "question_response"
+# **中断当前这一轮**（Esc）。它和 `shutdown` 是两件事，这一点是实测踩出来的：
+# `shutdown` 的语义是"收摊"，而它**不取消**当前回合（否则客户端发完 user_message
+# 紧跟一条 shutdown，那一轮会在第一个安全点被砍掉，界面永远拿不到答案）。
+# 想停下正在跑的这一轮，只能走这条。
+IN_INTERRUPT = "interrupt"
 IN_SHUTDOWN = "shutdown"
 
-INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE, IN_SHUTDOWN)
+INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
+           IN_INTERRUPT, IN_SHUTDOWN)
 
 # 出站（runtime → 前端）八种。
 OUT_INIT = "init"
@@ -67,6 +73,18 @@ ALWAYS = "always"
 ALWAYS_GROUP = "always_group"
 
 DECISIONS = (ALLOW, DENY, ALWAYS, ALWAYS_GROUP)
+
+# `t:"ui"` 的两种 `kind`。**它和 `t:"event"` 是两条通道**：event 是审计的原样转发
+# （进 jsonl），ui 只给界面、不进审计。
+#
+#   * `run_finished` —— 这一轮的最终答案（审计里没有正文，所以它是界面唯一的来源）；
+#   * `state` —— 面板数据快照（任务列表 / 已加载技能 / 会话规模）。
+#     它同样**不进审计**：任务列表的变化在审计里已经有 `tool_call` 那条参数了，
+#     再写一份就是同一份事实的第二个来源。
+UI_RUN_FINISHED = "run_finished"
+UI_STATE = "state"
+
+UI_KINDS = (UI_RUN_FINISHED, UI_STATE)
 
 
 def load_schema(name: str) -> dict[str, Any]:

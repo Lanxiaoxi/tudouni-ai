@@ -60,9 +60,13 @@ class AnsiFrontend:
         elif kind == messages.OUT_EVENT:
             self._print_event(message)
         elif kind == messages.OUT_UI:
-            self._out("")
-            self._out(f"agent> {message.get('answer', '')}")
-            self._answering.set()
+            # **只有 `run_finished` 那条有正文。** `kind:"state"` 是面板数据快照
+            # （任务列表 / 已加载技能），这个 ANSI 渲染器刻意不做面板 —— 它要是也
+            # 打进正文，会把"用户问 + agent 答"那条流冲稀（它的 stdout 是要能重定向的）。
+            if message.get("kind") == messages.UI_RUN_FINISHED:
+                self._out("")
+                self._out(f"agent> {message.get('answer', '')}")
+                self._answering.set()
         elif kind == messages.OUT_NOTICE:
             level = message.get("level", "info")
             self._err(f"[{level}] {message.get('text', '')}")

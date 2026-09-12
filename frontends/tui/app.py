@@ -1,6 +1,6 @@
 """Textual 客户端：**跑在父进程里**，通过 stdio 协议驱动一个 runtime 子进程。
 
-## 三件事必须说清楚，否则读这段代码会以为哪里写错了
+## 四件事必须说清楚，否则读这段代码会以为哪里写错了
 
 ### 1. 协议回调和 Textual 的界面更新**不在同一个线程**
 
@@ -20,7 +20,8 @@
 没有流式（决策 1），所以模型往返和工具执行期间**界面上不会有任何新东西**。
 一次往返是秒级 —— 一个完全静止的界面会被当成卡死。所以状态栏那一行在
 `working` 时会显示模型/工具**正在做什么**（`protocol/state.py` 的 `activity`），
-而这需要界面自己随事件更新。这是 v1 的验收项（R6 第 1 条），不是打磨。
+而且它还数着这一轮已经跑了多久（"本轮 1.4s"随秒走动）。这是 v1 的验收项
+（R6 第 1 条），不是打磨。
 
 ### 3. 审批是**非阻塞**的（对读线程而言）
 
@@ -28,38 +29,235 @@
 卡在人身上了。真正的回答由界面在用户点按钮之后调 `client.answer_permission(...)`。
 子进程那一侧本来就会一直等（`ProtocolServer.wait`），所以"等"发生在**它**那儿，
 而不是在我们的读线程上。
+
+### 4. 配色是运行时可换的（`/theme`）
+
+14 套主题在 `theme.py` 里是纯数据，`_register_themes()` 把它们注册成 Textual 主题
+（每个 token 变成一个 `$td-*` CSS 变量），而**自定义颜色的那些零件**（会话流、
+左栏、状态栏）在换主题时要重画自己 —— `_repaint_all()` 就是那一步。CSS 变量那部分
+由 Textual 自己重算，所以只有"用 Rich 手绘颜色的地方"需要这一趟。
 """
 
 import queue
 import sys
+import time
 from typing import Any
 
 from textual.app import App
-from textual.widgets import Footer, Input, RichLog, Static
+from textual.containers import Horizontal, Vertical
+from textual.theme import Theme as TextualTheme
+from textual.widgets import Static
 
+from agent_runtime.frontends.tui import theme as theme_mod
 from agent_runtime.frontends.tui import view_state, widgets
 from agent_runtime.protocol import messages
 from agent_runtime.protocol import state as agent_state
 from agent_runtime.protocol.client import ProtocolClient
+
+# 每条上下栏的高度。**它们写在这里而不是 CSS 里**，因为"一共几行"是这个布局的
+# 结构事实（顶栏 1 + 会话头 1 + 状态 1 + 输入 1 + 键位 1）—— 加上会话区至少 3 行，
+# 这个界面最小要 8 行才不至于把会话区挤没。F5 那张 80×45 的图是它的正常形态。
+_BAR = 1
+
+
+def _version() -> str:
+    """`pyproject.toml` 里的版本号，读不到就返回空串。
+
+    **不在这里抄一个 `"0.1.0"`**：一个数字两处写，迟早会漂，而漂掉的那一处
+    （欢迎屏）没人会去核对。读文件失败不算错误 —— 它只影响欢迎屏的一行字，
+    所以失败时安静地不显示（比让界面起不来好得多）。
+
+    **往上找而不是数层数**：这个仓库的布局是"包目录就是仓库根"（`package = false`，
+    见 pyproject 里那段），而 `frontends/tui/app.py` 到 `pyproject.toml` 正好是三层 ——
+    但"正好三层"是个会随目录调整而失效的假设（第一版写成 `parents[3]`，实测拿到
+    空串，而症状只是欢迎屏少一行字，没人会注意）。所以改成往上找那个文件。
+    """
+    try:
+        import tomllib
+        from pathlib import Path
+
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "pyproject.toml"
+            if candidate.is_file():
+                data = tomllib.loads(candidate.read_text(encoding="utf-8"))
+                return str(data.get("project", {}).get("version", ""))
+        return ""
+    except Exception:  # pragma: no cover - 只在打包/裁剪过的环境里走到
+        return ""
 
 
 class TuiApp(App[None]):
     """那个界面。实现 `ClientHooks`（四个回调）。"""
 
     CSS = """
-    #header { dock: top; height: 1; background: $panel; }
-    #status { dock: bottom; height: 1; background: $panel; }
-    #input  { dock: bottom; }
-    #log    { height: 1fr; }
+    Screen { background: $td-bg; color: $td-ink3; }
+
+    /* --- 三条上下栏：顶栏 / 会话头 / 状态栏 ------------------------------- */
+    #top, #session, #status {
+        height: 1;
+        background: $td-chrome;
+        padding: 0 1;
+    }
+    /* **上下栏一律不换行**：它们是"一行一条"的东西，而 `activity` 的长短由事件决定
+       （"要调用 edit_file（第 1 个）"就比"模型在想"长一倍）。允许换行的话，行数会
+       随时变 —— 多出来的一行会把输入行顶走，而屏幕上看起来只是"状态栏偶尔少半句"
+       （实测：`第 1 / 30` 后面的"步"被折到了第二行，而那一行在栏外）。 */
+    .bar-left, .bar-right { text-wrap: nowrap; text-overflow: clip; }
+    /* **两条栏的宽度都必须显式写。** 只给 `bar-right` 写 `1fr` 是不够的：
+       `bar-left` 会按 `Static` 的默认宽度（`1fr`）把整行吃掉，`bar-right` 被挤成
+       1 列 —— 于是顶栏右半（工作区 + `Ctrl+K`）**一个字都看不见**，而画面上看起来
+       只是"右边空着"，像设计就是这么留白的（实测：这条是用户看截图时发现的，
+       我自己的版式探针当时也打印了空行，但我没看出来）。 */
+    #top .bar-left { width: 1fr; }
+    #top .bar-right { width: auto; text-align: right; }
+    #session .bar-left { width: 1fr; }
+    #session .bar-right { width: auto; text-align: right; }
+    #status .bar-left { width: 1fr; }
+    #status .bar-right { width: auto; text-align: right; }
+
+    #rail-summary { height: 1; background: $td-chrome; color: $td-ink4; padding: 0 1; }
+
+    /* --- 主体：左栏 + 会话流 ---------------------------------------------- */
+    #body { height: 1fr; }
+    #rail {
+        width: 32;
+        background: $td-rail;
+        border-right: solid $td-hairline;
+        padding: 1 1;
+    }
+    #log { background: $td-bg; padding: 0 1; }
+
+    /* 上下文栏的一块：**左边一条色条当视觉锚点**。
+       它是主题的 `line` 色（那正是这一套配色的"描边"角色）—— 四块共用一条竖线，
+       眼睛顺着它就能看出"这一栏有四段"，而不是靠空白去猜。 */
+    .rail-block {
+        margin-bottom: 1;
+        height: auto;
+        border-left: solid $td-rail-bar;
+        padding-left: 1;
+    }
+    .rail-head { height: 1; }
+    .rail-title { width: 1fr; }
+    .rail-count { width: auto; text-align: right; }
+    .rail-lines { color: $td-ink3; }
+
+    /* --- 回合块 ----------------------------------------------------------- */
+    /* **每一个容器都要显式写 `height: auto`。** Textual 的 `Vertical` 默认是
+       `height: 1fr`，而它嵌在一个 `height: auto` 的父块里时，`1fr` 会去撑满整个
+       视口 —— 于是"一个回合块高 35 行"（里面只有 13 行内容），日志的虚拟高度
+       虚高，`scroll_end()` 把回合头整个顶出可视区（实测：屏幕上只剩回合头那一条
+       描边，看起来像"分隔线画出来了但标题没画"）。 */
+    .turn { height: auto; margin-bottom: 1; }
+    .turn-body { height: auto; }
+    /* 回合头 = **一行**：标题 + 一串画出来的横线 + 状态（F1 的形态）。
+       `nowrap` 是保险：横线长度是按宽度算的，万一算多一格，这里裁掉而不是折成两行。 */
+    .turn-head {
+        height: 1;
+        text-wrap: nowrap;
+        text-overflow: clip;
+        margin-bottom: 1;
+    }
+    .turn-text { height: auto; }
+    /* 思考正文 = **引用块**：底下压一层 `sunk`，左边那条 `│` 由行内容带
+       （`view_state.QUOTE_BAR`）—— 底色划范围、竖线定边界，两根一起才像一个块。 */
+    .think-body {
+        height: auto;
+        background: $td-sunk;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    .welcome { height: auto; }
+
+    /* --- 命令面板 --------------------------------------------------------- */
+    #palette {
+        height: auto;
+        max-height: 12;
+        background: $td-elevated;
+        border: round $td-hairline;
+        padding: 0 1;
+    }
+    #palette-options { height: auto; }
+    .palette-title { height: 1; }
+    .palette-option { height: 1; }
+    .palette-option.selected { background: $td-accent-soft; }
+
+    /* --- 输入行（两行 + 上下高亮边框） ------------------------------------ */
+    /* **这是这一屏唯一有高亮边框的东西**：上下两条 accent 线夹住两行输入。
+       高度写 4 = 上边框 1 + 内容 2 + 下边框 1（Textual 的边框占控件自己的行）。
+       `scrollbar-size-vertical: 0`：两行的框里塞一条滚动条会挤掉两个字符，
+       而 TextArea 本来就会自动滚动让光标可见 —— 那条条什么也没多告诉他。 */
+    #input-box {
+        height: 4;
+        background: $td-chrome;
+        border-top: solid $td-accent;
+        border-bottom: solid $td-accent;
+    }
+    #input-row { height: 2; }
+    #prompt { width: 2; color: $td-accent; }
+    #input {
+        border: none;
+        padding: 0 1;
+        height: 2;
+        width: 1fr;
+        background: $td-chrome;
+        color: $td-ink;
+        scrollbar-size-vertical: 0;
+    }
+
+    #keys { height: 1; background: $td-chrome; padding: 0 1; }
+
+    /* --- 弹层 ------------------------------------------------------------- */
+    PermissionPanel, QuestionPanel, SkillsPanel { align: center middle; }
+    #permission-body, #question-body, #skills-body {
+        width: 76;
+        max-width: 96%;
+        height: auto;
+        background: $td-elevated;
+        border: round $td-hairline;
+        padding: 1 2;
+    }
+    .modal-head { height: 1; }
+    .modal-head Static { width: 1fr; }
+    .modal-badge { width: auto; text-align: right; }
+    /* 风险芯片（F3 右上角那一枚）：终端里没有圆角，所以它是**一块底** + 内边距 ——
+       这是这块画布上唯一能表达"这是一个标签"的做法。 */
+    .badge-danger { background: $td-danger-soft; padding: 0 1; }
+    .modal-title { height: auto; margin-bottom: 1; }
+    .modal-hint { height: auto; color: $td-ink4; }
+    .modal-foot { height: auto; color: $td-ink4; }
+    #permission-args, #question-options, #skill-list {
+        background: $td-sunk;
+        padding: 0 1;
+        margin: 1 0;
+        height: auto;
+    }
+    #permission-buttons, #question-buttons { height: auto; margin-top: 1; }
+    /* 选项和技能行**没有行内样式**（除了未选中那些的灰阶）：选中那一条的反白靠
+       这里的 `background` + `color`，而 `width: 1fr` 是让那块底**铺满整行**的关键
+       —— 控件不占满宽度的话，反白只有文字那么长。 */
+    .option, .skill-row { height: auto; padding: 0 1; width: 1fr; }
+    .option.selected {
+        background: $td-accent;
+        color: $td-bg;
+        text-style: bold;
+    }
+    Button { margin-right: 2; min-width: 10; }
     """
 
     BINDINGS = [
         ("ctrl+c", "quit_app", "退出"),
-        ("ctrl+t", "toggle_thinking", "展开/折叠思考"),
+        ("ctrl+t", "toggle_thinking", "思考"),
+        ("ctrl+b", "toggle_rail", "上下文栏"),
+        ("ctrl+k", "command_palette", "命令面板"),
+        ("ctrl+s", "skills", "全部技能"),
         ("ctrl+r", "resume_last", "重开会话"),
+        ("escape", "escape_key", "中断/关闭"),
+        ("up", "palette_up", "上一条"),
+        ("down", "palette_down", "下一条"),
     ]
 
-    def __init__(self, session: str | None = None, *, autopilot: bool = False):
+    def __init__(self, session: str | None = None, *, autopilot: bool = False,
+                 theme_key: str = theme_mod.DEFAULT_THEME):
         super().__init__()
         self._session = session
         self._autopilot = autopilot
@@ -67,26 +265,100 @@ class TuiApp(App[None]):
         # 协议回调往这里放（**任何线程都能放**），界面定时排空它。
         self._inbox: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._client: ProtocolClient | None = None
-        # **名字不能叫 `_ready`**：`App` 自己有一个 `_ready()` 方法，而 `run_test()`
-        # 会去调它 —— 被一个 bool 盖住之后报的是 `TypeError: 'bool' object is not
-        # callable`，从栈上看完全指不到这里。实测踩过。
-        self._greeted = False
+        # 界面自己的开关。**这里不要出现叫 `_ready` 的属性**：`App` 自己有一个
+        # `_ready()` 方法，而 `run_test()` 会去调它 —— 被一个 bool 盖住之后报的是
+        # `TypeError: 'bool' object is not callable`，从栈上看完全指不到这里（实测踩过）。
+        self._palette_visible = False
+        self._version = _version()
+        self._register_themes()
+        self.theme = theme_key if theme_key in theme_mod.THEMES \
+            else theme_mod.DEFAULT_THEME
+
+    # -- 主题 ------------------------------------------------------------------
+
+    @property
+    def palette(self) -> theme_mod.Theme:
+        """当前配色。**取的是 Textual 主题名对应的那一套**（`theme` 是它的键）。"""
+        return theme_mod.get(self.theme)
+
+    def _register_themes(self) -> None:
+        """14 套设计稿配色 → 14 个 Textual 主题。
+
+        每个 token 同时出现在两个地方，而且**都是必要的**：
+
+          * `Theme.variables`（`$td-*`）—— 给 CSS 用（底、边框、内边距那些静态部分）；
+          * `Theme` 自身的 `primary` / `warning` / `error` / `success` / `surface`
+            等字段 —— 给 Textual 自带控件（`Button`、`Input` 的内建样式）用。
+
+        漏掉后者会得到一个"自己的行是对的、按钮还是默认蓝"的界面 —— 而那种不一致
+        在暗色主题上尤其脏。
+        """
+        for key in theme_mod.ORDER:
+            palette = theme_mod.THEMES[key]
+            p = palette.palette
+            self.register_theme(TextualTheme(
+                name=key,
+                primary=p.accent,
+                secondary=palette.skill,
+                warning=p.warn,
+                error=p.danger,
+                success=p.ok,
+                accent=p.accent,
+                foreground=p.ink,
+                background=p.bg,
+                surface=p.surface,
+                panel=p.chrome,
+                dark=p.dark,
+                variables=palette.variables(),
+            ))
+
+    def _set_theme(self, key: str) -> None:
+        """换配色：先让 Textual 重算 CSS，再让手绘颜色的零件重画一遍。"""
+        self.theme = key
+        self._repaint_all()
+
+    def _repaint_all(self) -> None:
+        palette = self.palette
+        for selector in ("#rail", "#top", "#session", "#status", "#keys", "#log"):
+            found = self.query(selector)
+            if found:
+                widget = found.first()
+                repaint = getattr(widget, "repaint", None)
+                if repaint is not None:
+                    repaint(palette)
 
     # -- 组装 ------------------------------------------------------------------
 
     def compose(self):
-        yield widgets.SessionHeader(id="header")
-        yield widgets.ConversationLog(id="log")
+        yield widgets.TopBar(id="top")
+        yield widgets.SessionBar(id="session")
+        yield Static("", id="rail-summary")
+        with Horizontal(id="body"):
+            yield widgets.ContextRail(self.palette, id="rail")
+            yield widgets.ConversationLog(self.palette, id="log")
+        yield widgets.CommandPalette(self.palette, id="palette")
         yield widgets.StatusBar(id="status")
-        yield Input(placeholder="说点什么，回车发送（/help 看命令）", id="input")
+        # 输入框 = **一个框**：上面一条 accent 色的线、下面一条，中间两行可输入。
+        # 那两条线是这一屏唯一的"高亮边框"，因为它就是我现在要你操作的地方。
+        with Vertical(id="input-box"):
+            with Horizontal(id="input-row"):
+                yield Static(">", id="prompt")
+                yield widgets.PromptArea(
+                    placeholder="说点什么，回车发送（/help 看命令，Shift+Enter 换行）",
+                    id="input", highlight_cursor_line=False,
+                )
+        yield widgets.KeyHintBar(id="keys")
 
     def on_mount(self) -> None:
+        # `/` 打开的命令面板和输入行是同一个东西的两面：面板默认藏着。
+        self.query_one("#palette", widgets.CommandPalette).display = False
         self._client = ProtocolClient(self, session=self._session,
                                       autopilot=self._autopilot)
         self._client.start()
         # 消息泵。见模块 docstring 第 1 条：**不用 call_from_thread**。
         self.set_interval(0.05, self._pump)
-        self.query_one("#input", Input).focus()
+        self.query_one("#input", widgets.PromptArea).focus()
+        self._refresh_chrome()
 
     # -- ClientHooks（**在读线程里被调用，只许入队**） -------------------------
 
@@ -140,10 +412,7 @@ class TuiApp(App[None]):
                 self._ask_permission(payload)
             elif kind == "question":
                 self._ask_question(payload)
-
-        status = self._widget("#status", widgets.StatusBar)
-        if status is not None:
-            status.show(self.state)
+        self._refresh_chrome()
 
     def _widget(self, selector: str, expect: type):
         """拿一个控件；**现在还没有就返回 None**（而不是抛 `NoMatches`）。
@@ -156,10 +425,50 @@ class TuiApp(App[None]):
         widget = found.first()
         return widget if isinstance(widget, expect) else None
 
-    def _log(self):
-        return self._widget("#log", RichLog)
+    def _log(self) -> widgets.ConversationLog | None:
+        return self._widget("#log", widgets.ConversationLog)
 
-    def _say(self, text: str, *, style: str | None = None) -> None:
+    # -- 上下栏（每次 pump 都刷一遍：状态栏要随秒走动） -----------------------
+
+    def _refresh_chrome(self) -> None:
+        palette = self.palette
+        # 上下文栏开合：**默认收起**，而"检测到有任务/技能时自动展开"按窗口宽度算
+        # （决策 1）。用户按过 Ctrl+B 之后不再自动开合（`rail_pinned`）。
+        state = self.state
+        want = view_state.should_auto_open(state, self.size.width)
+        if want != state.rail_open:
+            state.rail_open = want
+        rail = self._widget("#rail", widgets.ContextRail)
+        if rail is not None:
+            rail.display = state.rail_open
+            if state.rail_open:
+                rail.show(state, palette)
+        narrow = self.size.width < view_state.NARROW_COLUMNS
+        summary = self._widget("#rail-summary", Static)
+        if summary is not None:
+            # 摘要**只在窄屏出现**（F5 的形态）：宽屏收起时，会话头右边那句
+            # `Ctrl+B 上下文栏` 已经说明了怎么打开它，再来一行就是重复。
+            show_summary = narrow and not state.rail_open
+            summary.display = show_summary
+            if show_summary:
+                summary.update(view_state.rail_summary(state))
+
+        # 宽度要传下去：三条栏在窄屏上各有各的降级（F5），而"现在多少列"只有
+        # 这里知道（控件不该去问 App）。
+        width = self.size.width
+        for selector, widget_type in (("#top", widgets.TopBar),
+                                      ("#session", widgets.SessionBar)):
+            widget = self._widget(selector, widget_type)
+            if widget is not None:
+                widget.show(state, palette, width)
+        status = self._widget("#status", widgets.StatusBar)
+        if status is not None:
+            status.show(state, palette, (time.monotonic(), width))
+        keys = self._widget("#keys", widgets.KeyHintBar)
+        if keys is not None:
+            keys.show(state, palette, width)
+
+    def _say(self, text: str, role: str = view_state.ROLE_RULE) -> None:
         """往会话里说一句界面自己的话（命令回显、提示）。
 
         **不抛**：拿不到控件就当没说 —— 它只可能在界面还没挂载完或正在拆的时候发生，
@@ -167,60 +476,72 @@ class TuiApp(App[None]):
         """
         log = self._log()
         if log is not None:
-            log.write_line(text, style=style)
+            log.add_lines([view_state.Line(text, role)], self.palette)
+
+    def _say_lines(self, lines: list[view_state.Line]) -> None:
+        log = self._log()
+        if log is not None:
+            log.add_lines(lines, self.palette)
+
+    # -- 协议消息 --------------------------------------------------------------
 
     def _on_protocol_message(self, message: dict[str, Any]) -> None:
         kind = message.get("t")
-        log = self._log()
-        if log is None:
-            return
-
         if kind == messages.OUT_INIT:
             self._on_init(message)
         elif kind == messages.OUT_SESSION_LOAD:
             self._on_session_load(message)
         elif kind == messages.OUT_EVENT:
-            self.state.agent = agent_state.reduce(self.state.agent, message)
-            log.write_lines(view_state.render_event(self.state, message))
+            self._on_event(message)
         elif kind == messages.OUT_UI:
-            self.state.agent = agent_state.reduce(self.state.agent, message)
-            log.write_lines(view_state.render_ui_answer(self.state, message))
+            self._on_ui(message)
         elif kind == messages.OUT_NOTICE:
             level = message.get("level", "info")
-            log.write_line(
-                f"[{level}] {message.get('text', '')}",
-                style="yellow" if level == "warn" else None,
-            )
+            self._say(f"[{level}] {message.get('text', '')}",
+                      view_state.ROLE_WARN if level == "warn" else view_state.ROLE_NOTICE)
 
     def _on_init(self, message: dict[str, Any]) -> None:
-        self.state.session_id = message.get("session_id", "")
-        self.state.model = message.get("model", "")
-        self.state.max_steps = message.get("max_steps", 0)
-        self.state.workspace = message.get("workspace", "")
-        self.state.audit_path = message.get("audit_path", "")
-        self.state.permissions = dict(message.get("permissions") or {})
-        self.state.tool_risks = {
-            tool["name"]: tool["risk"] for tool in message.get("tools") or []
-        }
-        header = self._widget("#header", widgets.SessionHeader)
-        if header is not None:
-            header.show(self.state)
+        state = self.state
+        state.session_id = message.get("session_id", "")
+        state.model = message.get("model", "")
+        state.max_steps = message.get("max_steps", 0)
+        state.workspace = message.get("workspace", "")
+        state.audit_path = message.get("audit_path", "")
+        state.context_tokens = message.get("context_tokens")
+        state.resumed = bool(message.get("resumed"))
+        state.permissions = dict(message.get("permissions") or {})
+        tools = message.get("tools") or []
+        state.tool_risks = {tool["name"]: tool["risk"] for tool in tools}
+        state.tool_info = {tool["name"]: dict(tool) for tool in tools}
 
         log = self._log()
-        assert log is not None, "init 到达时 #log 必然已经挂载（调用方刚查过）"
-        resumed = "（继续）" if message.get("resumed") else "（新的）"
-        log.write_line(f"会话 {self.state.session_id}{resumed}")
+        if log is None:
+            return
+        if not state.resumed:
+            # 空态：**新会话还没说第一句话时那一屏**。它不是装饰，见
+            # `widgets.WelcomeBlock` 的 docstring。
+            log.show_welcome(state, self.palette, self._version)
+        resumed = "（继续）" if state.resumed else "（新的）"
+        lines = [view_state.Line(f"（会话 {state.session_id}{resumed}）",
+                                 view_state.ROLE_RULE)]
         for notice in message.get("notices") or []:
-            log.write_line(
-                f"[{notice.get('code')}] {notice.get('text')}",
-                style="yellow" if notice.get("level") == "warn" else None,
-            )
+            code = notice.get("code", "")
+            if view_state.notice_is_redundant(code):
+                # 左栏常驻显示着同一件事（权限范围 / 已加载技能 / 任务），不再抄一遍。
+                continue
+            # **文字原样，不自己拼 `[code]` 前缀**：runtime 给的那句话开头已经写着
+            # `[权限]` / `[技能]` 了，再加一个 `[permissions]` 就是同一件事说两遍
+            # （实测：用户截图里那一行读起来像 debug 输出）。
+            role = (view_state.ROLE_WARN if notice.get("level") == "warn"
+                    else view_state.ROLE_RULE)
+            lines.append(view_state.Line(notice.get("text", ""), role))
         # **把续聊的办法说出来**：新会话在 CLI 那边是靠启动那行提示的，
         # 而 TUI 里没有那一行 —— 不说的话用户不知道怎么回来。
-        if not message.get("resumed"):
-            log.write_line(f"想回来继续它：main.py --tui --session {self.state.session_id}")
-        log.write_line("")
-        self._greeted = True
+        if not state.resumed:
+            lines.append(view_state.Line(
+                f"想回来继续它：main.py --tui --session {state.session_id}",
+                view_state.ROLE_RULE))
+        log.add_lines(lines, self.palette)
 
     def _on_session_load(self, message: dict[str, Any]) -> None:
         """恢复会话时重建画面。
@@ -228,25 +549,77 @@ class TuiApp(App[None]):
         **它只画用户和 agent 说过的话，不画工具卡片**（决策 3：v1 不渲染工具卡片）。
         工具结果在 `messages` 里是全文（`role=="tool"`），想看就 `/history`。
         """
-        log = self._log()
-        assert log is not None
         restored = [
             m for m in (message.get("messages") or [])
             if m.get("role") in ("user", "assistant") and m.get("content")
         ]
         if not restored:
             return
-        log.write_line(f"（恢复 {len(message.get('messages') or [])} 条历史，"
-                       f"下面是你说过的和 agent 答过的）")
+        lines = [view_state.Line(
+            f"（恢复 {len(message.get('messages') or [])} 条历史，"
+            f"下面是你说过的和 agent 答过的）", view_state.ROLE_RULE)]
         for msg in restored:
-            who = "你" if msg["role"] == "user" else "agent"
-            log.write_line(f"[{who}] {msg['content']}")
-            log.write_line("")
+            role = view_state.ROLE_USER if msg["role"] == "user" else view_state.ROLE_ANSWER
+            lines.append(view_state.Line(str(msg["content"]), role))
+        self._say_lines(lines)
+
+    def _on_event(self, message: dict[str, Any]) -> None:
+        """一条审计事件 → 回合流里的行。
+
+        **回合的边界在这里判**（`run_started` 开块、`run_finished` 回头改标题），
+        而"事件怎么变成字"仍然是 `view_state.render_event` 那个纯函数的事。
+        分开的好处很实在：块结构（布局）和行内容（判断）各自能单独测。
+        """
+        kind = message.get("kind")
+        self.state.agent = agent_state.reduce(self.state.agent, message)
+        lines = view_state.render_event(self.state, message)
+        log = self._log()
+        if log is None:
+            return
+
+        block: widgets.TurnBlock | None = None
+        if kind == "run_started":
+            turn = self.state.current_turn
+            if turn is not None:
+                # 界面自己数秒（"本轮 1.4s"）—— 纯函数里不取时间，所以起点在这儿记。
+                turn.started_at = time.monotonic()
+                block = log.start_turn(turn, self.palette)
+
+        body: list[view_state.Line] = []
+        for line in lines:
+            if line.role == view_state.ROLE_TURN_START:
+                # 回合头由 TurnBlock 自己放（它要能被回填成最终形态），但**内容要用
+                # `render_event` 那一条** —— 它写着"进行中 · 第 1 步"。丢掉它的话，
+                # 进行中的回合头上只剩一个"回合 2"（实测：一眼看不出它在跑第几步）。
+                if block is not None:
+                    block.set_head(line)
+                continue
+            if line.role == view_state.ROLE_TURN_END:
+                target = block or log.current_turn_block
+                if target is not None:
+                    target.set_head(line)
+                continue
+            body.append(line)
+        log.add_lines(body, self.palette)
+
+    def _on_ui(self, message: dict[str, Any]) -> None:
+        if message.get("kind") == messages.UI_RUN_FINISHED:
+            self.state.agent = agent_state.reduce(self.state.agent, message)
+            self._say_lines(view_state.render_ui_answer(self.state, message))
+            return
+        if message.get("kind") == messages.UI_STATE:
+            # 面板数据。**它不进对话流**：任务列表每更新一次就在流里插一段，会把
+            # "你问的 + 它答的"冲稀。左栏就是它的位置。
+            view_state.apply_state(self.state, message)
 
     # -- 人机交互（非阻塞：塞回给子进程，而不是在这里等） ----------------------
 
     def _ask_permission(self, request: dict[str, Any]) -> None:
-        panel = widgets.PermissionPanel(request, id="permission")
+        # **先在会话流里留一行**，再弹面板：面板是盖住的，而"这一轮为什么停在这儿"
+        # 要看记录的时候只有会话流能回答。
+        self._say_lines([view_state.waiting_line(request)])
+        panel = widgets.PermissionPanel(request, self.state.tool_info, self.palette,
+                                        id="permission")
 
         def answered(decision: str | None) -> None:
             if self._client is None:
@@ -254,13 +627,12 @@ class TuiApp(App[None]):
             # `dismiss(None)`（Esc / 关掉）按**拒绝**处理：fail-closed，
             # 和 `cli_asker` 读不到输入那一支同一个方向。
             self._client.answer_permission(
-                request.get("id", ""), decision or messages.DENY
-            )
+                request.get("id", ""), decision or messages.DENY)
 
         self.push_screen(panel, answered)
 
     def _ask_question(self, request: dict[str, Any]) -> None:
-        panel = widgets.QuestionPanel(request, id="question")
+        panel = widgets.QuestionPanel(request, self.palette, id="question")
 
         def answered(result: Any) -> None:
             if self._client is None:
@@ -270,11 +642,96 @@ class TuiApp(App[None]):
 
         self.push_screen(panel, answered)
 
+    # -- 命令面板 --------------------------------------------------------------
+
+    def on_text_area_changed(self, event: Any) -> None:
+        """输入以 `/` 开头就打开面板（设计稿改动 6）。
+
+        **不劫持普通输入**：面板只在 `/` 那一支出现，而它出现时输入行仍然是普通的
+        输入行（面板只是把候选列出来）—— 所以"我想打一句以 / 开头的话"这件事
+        不会因为面板的存在而变得不可能（回车执行的是选中的命令，而 Esc 关掉面板
+        之后那句话还能接着打）。
+        """
+        palette = self._widget("#palette", widgets.CommandPalette)
+        if palette is None:
+            return
+        value = event.text_area.text
+        if value.startswith("/"):
+            palette.show(value, self.palette)
+            palette.display = True
+            self._palette_visible = True
+        else:
+            palette.display = False
+            self._palette_visible = False
+
+    def _hide_palette(self) -> None:
+        palette = self._widget("#palette", widgets.CommandPalette)
+        if palette is not None:
+            palette.display = False
+        self._palette_visible = False
+
+    def action_palette_up(self) -> None:
+        """`↑`：面板开着就移动选择，否则滚会话流。
+
+        **一个键两种用途是刻意的**：面板是浮层、它开着的时候用户的注意力在候选上，
+        而面板关着时 `↑↓` 唯一合理的意思是"往回翻"。两个都做，比让 `↑↓` 在面板
+        关着时变成死键好 —— 死键会让人以为界面卡了。
+        """
+        palette = self._widget("#palette", widgets.CommandPalette)
+        if self._palette_visible and palette is not None:
+            palette.move(-1)
+            return
+        self.scroll_log(-1)
+
+    def action_palette_down(self) -> None:
+        palette = self._widget("#palette", widgets.CommandPalette)
+        if self._palette_visible and palette is not None:
+            palette.move(1)
+            return
+        self.scroll_log(1)
+
+    def scroll_log(self, delta: int) -> None:
+        """翻会话流。`PromptArea` 在"光标已经到头"时也调它（见那里 `↓` 的说明）。"""
+        log = self._log()
+        if log is None:
+            return
+        (log.scroll_up if delta < 0 else log.scroll_down)(animate=False)
+
+    def action_command_palette(self) -> None:
+        """`Ctrl+K`：打开命令面板。**它不动你正在写的那句话。**
+
+        输入框空着就插一个 `/`（面板自己就出来了，光标天然落在它后面）；已经有草稿
+        就直接把面板盖上去 —— 草稿原样留着，`Esc` 关掉面板接着写。
+
+        第一版是无条件 `field.text = "/"`，两个毛病叠在一起：**吃掉草稿**，而且
+        `text` 设完之后光标落在 **0**（`cursor_position = 1` 也救不回来，被那次设置
+        的重排冲掉）—— 接着打的字会插到 `/` 前面，面板立刻又关了。实测：`Ctrl+K`
+        再按 `t` 得到 `t/`。用 `insert` 就没有这两个毛病（它插在光标处并推进光标）。
+        """
+        palette = self._widget("#palette", widgets.CommandPalette)
+        field = self._widget("#input", widgets.PromptArea)
+        if palette is None or field is None:
+            return
+        if not field.text:
+            field.insert("/")
+        palette.show(field.text or "/", self.palette)
+        palette.display = True
+        self._palette_visible = True
+        field.focus()
+
     # -- 输入 ------------------------------------------------------------------
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        event.input.value = ""
-        self.submit(event.value)
+    def on_prompt_area_submitted(self, event: widgets.PromptArea.Submitted) -> None:
+        """回车（或命令面板里选中一条）之后走这里。**先把输入框清空再处理。**
+
+        先清空的理由：`submit()` 里可能开面板、也可能抛提示，而那些都要以
+        "输入框现在是空的"为前提 —— 反过来（处理完再清）会让 `/theme` 那种
+        "执行完还留着一行命令"的状态出现在两个地方。
+        """
+        field = self._widget("#input", widgets.PromptArea)
+        if field is not None:
+            field.text = ""
+        self.submit(event.text)
 
     def submit(self, text: str) -> None:
         """处理一句用户输入。**不碰 Textual 的消息对象** —— 所以它能被直接单测。
@@ -288,67 +745,164 @@ class TuiApp(App[None]):
         text = text.strip()
         if not text:
             return
+        if text.startswith("/") and self._palette_visible:
+            palette = self._widget("#palette", widgets.CommandPalette)
+            selected = palette.selected if palette is not None else None
+            if selected is not None:
+                # 面板里回车 = "执行选中的那条"（F2 的键位说明）。参数从打进去的
+                # 那行里取 —— 面板只是候选，它不该替用户编参数。
+                _name, _, rest = text.partition(" ")
+                self._hide_palette()
+                self._run_command(selected.name, rest.strip())
+                return
         if self._handle_slash(text):
             return
+        self.state.pending_input = text
         if self._client is not None:
             self._client.user_message(text)
 
     def _handle_slash(self, text: str) -> bool:
-        """`/` 命令。v1 只有这几条（决策 15）。
+        """`/` 命令。**面板没开着时的兜底路径**（比如整行一次打完）。"""
+        if not text.startswith("/"):
+            return False
+        command, _, rest = text.partition(" ")
+        self._run_command(command.lower(), rest.strip())
+        return True
+
+    def _run_command(self, command: str, rest: str) -> None:
+        """**所有 `/` 命令的唯一执行处**（面板和整行输入都走这里）。
 
         `/new` 和 `/resume` 都是**重开进程**：`TodoBoard` / `SkillBoard` 绑在
         `session.metadata` 上，同进程换会话要重新装配整张注册表。所以它们在这里
         只是"告诉用户怎么做"，而不是假装能做到 —— 一个按了没反应的服务比没有更坏。
         """
-        if not text.startswith("/"):
-            return False
-        command, _, rest = text.partition(" ")
-        command = command.lower()
-
         if command in ("/exit", "/quit"):
             self.exit()
         elif command == "/help":
-            log = self._log()
-            if log is None:
-                return True
-            log.write_line("命令：")
-            log.write_line("  /exit            退出")
-            log.write_line("  /audit           审计日志在哪")
-            log.write_line("  /new             换一个新会话（重开后加 --session）")
-            log.write_line("  /resume <id>     接着某个会话（重开：--tui --session <id>）")
-            log.write_line("  /list            列会话要另开一个终端：main.py --list")
-            log.write_line("  Ctrl+T           展开/折叠思考过程")
+            self._say_lines(self._help_lines())
         elif command == "/audit":
             self._say(f"审计日志：{self.state.audit_path}")
         elif command == "/new":
             self._say("换会话要重开：main.py --tui")
         elif command == "/resume":
-            self._say(f"接着聊要重开：main.py --tui --session {rest.strip() or '<id>'}")
+            self._say(f"接着聊要重开：main.py --tui --session {rest or '<id>'}")
         elif command == "/list":
             self._say("会话列表要另开一个终端看：main.py --list")
+        elif command == "/skills":
+            self.push_screen(widgets.SkillsPanel(self.state, self.palette,
+                                                 id="skills"))
+        elif command == "/theme":
+            self._command_theme(rest)
         else:
             self._say(f"没有这个命令：{command}（/help 看有哪些）")
-        return True
+
+    def _command_theme(self, rest: str) -> None:
+        """`/theme [名字]`。**不带参数就只列清单**（不做"轮换到下一套"）。
+
+        轮换听起来方便，但它把"我现在是哪一套"变成了一个必须靠记忆的状态 ——
+        而列一次清单的成本是零。
+        """
+        if not rest:
+            self._say_lines([
+                view_state.Line(f"当前配色：{self.theme} {self.palette.name}",
+                                view_state.ROLE_WAITING),
+                view_state.Line("14 套：", view_state.ROLE_RULE),
+                *[view_state.Line("  " + part, view_state.ROLE_PROCESS)
+                  for part in theme_mod.listing().split(" · ")],
+                view_state.Line("换一套：/theme 靛夜  或  /theme p7  或  /theme 7",
+                                view_state.ROLE_RULE),
+            ])
+            return
+        key = theme_mod.resolve(rest)
+        if key is None:
+            self._say(f"没有这套配色：{rest}（/theme 看清单）")
+            return
+        self._set_theme(key)
+        self._say_lines([view_state.seg(
+            ("配色换成 ", view_state.ROLE_RULE),
+            (f"{key} {self.palette.name}", view_state.ROLE_WAITING),
+            ("（只影响这一次运行）", view_state.ROLE_RULE),
+        )])
+
+    def _help_lines(self) -> list[view_state.Line]:
+        lines = [view_state.Line("命令（输入 / 会打开面板，↑↓ 选、Enter 执行）：",
+                                 view_state.ROLE_RULE)]
+        for command in view_state.COMMANDS:
+            lines.append(view_state.seg(
+                (f"  {command.name:<9}", view_state.ROLE_WAITING),
+                (command.hint, view_state.ROLE_PROCESS),
+            ))
+        lines.append(view_state.Line("键位：", view_state.ROLE_RULE))
+        for key, what in [*widgets.KeyHintBar.FULL, *widgets.KeyHintBar.EXTRA]:
+            lines.append(view_state.seg(
+                (f"  {key:<12}", view_state.ROLE_WAITING),
+                (what, view_state.ROLE_PROCESS),
+            ))
+        return lines
 
     # -- 动作 ------------------------------------------------------------------
 
+    def action_toggle_rail(self) -> None:
+        """`Ctrl+B`：折叠/展开上下文栏。**纯界面操作**，不改变任何 agent 的事实。
+
+        按过一次之后 `rail_pinned` 置位：一次明确的操作不该被下一次状态更新推翻
+        （否则"有任务时自动展开"会在用户刚收起它之后立刻把它顶开）。
+        """
+        self.state.rail_open = not self.state.rail_open
+        self.state.rail_pinned = True
+        self._refresh_chrome()
+
     def action_toggle_thinking(self) -> None:
-        """展开/折叠最近一段思维链。**纯界面操作**，不改变任何 agent 的事实。"""
-        if not self.state.thinking:
-            self._say("（这一轮还没有思考过程）")
-            return
-        run_id = list(self.state.thinking)[-1]
-        text, expanded = self.state.thinking[run_id]
-        self.state.toggle_thinking(run_id)
+        """展开/折叠**光标所在回合**的思考过程。
+
+        v1 取的是 `list(state.thinking)[-1]`（最后一段），而那从第二回合起就会作用
+        到错的那一段上 —— 画面看起来完全正常，所以属于最难查的那类。现在的对象是
+        `turn_under_viewport()`：用户看到哪一块，就动哪一块。
+        """
         log = self._log()
         if log is None:
             return
-        if expanded:
-            log.write_line("  （已折叠）")
-        else:
-            log.write_line("  ┌ 思考过程")
-            log.write_line(view_state.indent(text, "  │ "))
-            log.write_line("  └")
+        block = log.turn_under_viewport()
+        if block is None:
+            self._say("（还没有回合）")
+            return
+        run_id = block.turn.run_id
+        text, _expanded = self.state.thinking.get(run_id, ("", False))
+        if not text:
+            self._say("（这一轮没有思考过程）")
+            return
+        self.state.toggle_thinking(run_id)
+        if not block.toggle_thinking(text):
+            self._say("（这一轮的思考已经不在画面上了）")
+
+    def action_skills(self) -> None:
+        """`Ctrl+S`：全部技能（可用的 + 已加载的）。"""
+        self.push_screen(widgets.SkillsPanel(self.state, self.palette, id="skills"))
+
+    def action_escape_key(self) -> None:
+        """`Esc`：**关闭面板，或者中断这一轮**（F6 的键位表）。
+
+        两个语义共用一键是有意的，而顺序也是：弹层开着时它属于弹层（在审批面板里
+        它是**拒绝**，fail-closed），没有弹层时它才是"停下这一轮"。
+
+        **中断不是打断**：runtime 在两步之间停下（`agents/agent.py` 那个检查点），
+        所以已经在跑的那一次模型往返或工具调用会跑完。这里只发请求，状态由
+        `run_finished(cancelled)` 那条事件改 —— 界面不自己宣布"已停止"（那会是
+        第二份事实）。
+        """
+        if self._palette_visible:
+            self._hide_palette()
+            field = self._widget("#input", widgets.PromptArea)
+            if field is not None:
+                field.text = ""
+            return
+        if self.state.agent.is_busy:
+            if self._client is not None:
+                self._client.interrupt()
+            self._say("已请求停下这一轮（会在当前这一步结束后停）",
+                      view_state.ROLE_WARN)
+            return
+        self._say("（这一轮没在跑 —— Esc 在弹层里是拒绝/跳过）")
 
     def action_resume_last(self) -> None:
         """`Ctrl+R`：把"怎么接着聊"再说一遍。
@@ -374,7 +928,8 @@ class TuiApp(App[None]):
             self._client = None
 
 
-def run_tui(session: str | None = None, *, autopilot: bool = False) -> int:
+def run_tui(session: str | None = None, *, autopilot: bool = False,
+            theme_key: str = theme_mod.DEFAULT_THEME) -> int:
     """`main.py --tui` 走这里。
 
     **配置错时子进程会以退出码 2 结束、并把原因打在 stderr 上。** 那一支由界面
@@ -382,7 +937,7 @@ def run_tui(session: str | None = None, *, autopilot: bool = False) -> int:
     处理"还没起来就失败"，因为它的表现是"界面闪一下就退"，而 stderr 上的原因是
     看得见的。
     """
-    app = TuiApp(session=session, autopilot=autopilot)
+    app = TuiApp(session=session, autopilot=autopilot, theme_key=theme_key)
     app.run()
     client = app._client
     return 0 if client is None or client.exit_code in (None, 0) else client.exit_code

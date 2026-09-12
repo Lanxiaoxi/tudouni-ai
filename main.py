@@ -86,8 +86,16 @@ def main() -> int:
     # import 放在函数里：`frontends/tui/__init__.py` 不许在顶层 import textual
     # （否则 `--list` 那种查询子命令也要加载一个 TUI 框架）。
     if args.tui:
+        from agent_runtime.frontends.tui import theme as tui_theme
         from agent_runtime.frontends.tui.app import run_tui
-        return run_tui(args.session, autopilot=args.autopilot)
+
+        # `--theme` 收的是"人能写出来的一段字"（`p7` / `靛夜` / `7`），而认它的是
+        # `theme.resolve` —— 同一个函数也是 `/theme` 用的那个，所以两条入口对
+        # "什么算一套配色"的判断不可能分家。认不出就**回默认**，不报错：
+        # 配色是个装饰性参数，为它让整个界面起不来是最坏的取舍。
+        key = tui_theme.resolve(args.theme) if args.theme else tui_theme.DEFAULT_THEME
+        return run_tui(args.session, autopilot=args.autopilot,
+                       theme_key=key or tui_theme.DEFAULT_THEME)
 
     # ---- `--runtime-stdio`：协议子进程 ----
     #

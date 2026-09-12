@@ -53,4 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--runtime-stdio", action="store_true",
         help="把 stdout 变成 JSONL 协议通道（由 --tui 拉起，一般不由人直接跑）",
     )
+    parser.add_argument(
+        "--theme", default=None,
+        help="TUI 的配色（14 套：p7 靛夜是默认；也能给名字，如 --theme 靛夜）。"
+             "运行中还能用 /theme 换",
+    )
     return parser

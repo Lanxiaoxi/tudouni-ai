@@ -19,6 +19,7 @@ import pytest
 def anyio_backend():
     return "asyncio"
 
+from agent_runtime.frontends.tui import theme as theme_mod
 from agent_runtime.frontends.tui import view_state
 from agent_runtime.protocol import state as agent_state
 
@@ -125,19 +126,19 @@ def test_an_empty_answer_draws_nothing():
     assert view_state.render_ui_answer(state, {"run_id": "r", "answer": ""}) == []
 
 
-def test_status_line_is_a_projection_not_a_second_truth():
-    """状态栏那一行完全由 `agent.state` + 会话规模推出来。
+def test_status_bar_left_is_a_projection_not_a_second_truth():
+    """状态栏左边完全由 `agent.state` + 会话规模推出来。
 
     这里只钉一件事：**`activity` 说的是"最近发生了什么"**，不是界面自己编的词。
     没有流式，"模型在想"和"工具在跑"分不出更细的粒度 —— 硬分只能用时间间隔去猜。
     """
     state = view_state.ViewState(session_id="s1", model="m", max_steps=80)
-    assert "空闲" in state.status_line()
+    assert "空闲" in state.status_left()
 
     state.agent = agent_state.reduce(
         agent_state.initial(), {"t": "event", "kind": "run_started", "step": 0}
     )
-    assert "准备中" in state.status_line()
+    assert "准备中" in state.status_left()
 
     # **`step` 只在 `run_started` 上更新**，后面的事件带的是同一个 step。
     # 而 step 的语义是"第几次模型往返"，`run_started` 那条是 **0** ——
@@ -150,23 +151,677 @@ def test_status_line_is_a_projection_not_a_second_truth():
         "t": "event", "kind": "tool_call", "step": 1, "tool": "read_file",
         "tool_index": 1,
     })
-    line = state.status_line()
+    line = state.status_left()
     assert "read_file" in line and "第 2 个" in line
-    assert "第 1/80 步" in line
-    assert "s1" in line and "m" in line
+    assert "第 1 / 80 步" in line
 
 
-def test_status_line_shows_permissions_only_when_runtime_sent_them():
-    """决策 14：**runtime 发什么显示什么**，界面不硬编码默认值。
+def test_status_bar_right_shows_context_cache_and_audit():
+    """右边那四个数**此前只有"回合结束时那一条统计"这一条出口** —— 也就是只有
+    跑完才看得见。放进常驻状态栏是设计稿的加法之一。
 
-    默认时 `permissions` 是空 dict，于是那一行什么都不加。
+    占比的分母来自 `init.context_tokens`（响应里没有这个字段，见那里的说明）。
+    """
+    state = view_state.ViewState(
+        context_tokens=1_000_000, audit_path=r"C:\w\.tudouni\logs\s.jsonl")
+    assert "上下文  —" in state.status_right()
+
+    state.prompt_tokens = 14_100
+    state.cached_tokens = 12_400
+    right = state.status_right()
+    assert "14.1k / 1M" in right, right
+    assert "1.4%" in right
+    assert "命中 88%" in right, right
+    # 左栏和状态栏报的是审计**目录**（F2 那一行写的就是 `.tudouni/logs`）：
+    # 文件名就是会话 id，而它已经在同一块的上一行写着，32 列的栏里再抄一遍会折成三行。
+    assert "审计 .tudouni/logs" in right, right
+
+    # 窄屏（`compact`）只留用量和命中率 —— 否则左段会被裁成半句。
+    narrow = state.status_right(compact=True)
+    assert "14.1k / 1M" in narrow and "命中 88%" in narrow
+    assert "审计" not in narrow and "本轮" not in narrow
+
+
+def test_no_denominator_when_the_model_is_not_in_the_table():
+    """**错的百分比比没有百分比更坏**（和 cli 那条口径一致）。
+
+    `init.context_tokens` 为 None 时只报用量 —— 不猜一个分母。
+    """
+    state = view_state.ViewState(prompt_tokens=2_000, context_tokens=None)
+    right = state.status_right()
+    assert "上下文 2k" in right
+    assert "%）" not in right
+    assert "/" not in right.split("·")[0]
+
+
+def test_the_permission_block_says_only_what_the_runtime_sent():
+    """决策 14：**runtime 发什么显示什么**，界面不硬编码一份默认值。
+
+    "哪几档自动放行"是 `PermissionPolicy` 的判断，由 runtime 算好放进
+    `risk_scope` —— 界面照着渲染，它不该知道"默认只有 low"这件事。
     """
     state = view_state.ViewState(session_id="s")
-    assert "权限：" not in state.status_line()
+    blocks = dict((title, lines) for title, _count, lines in view_state.rail_blocks(state))
+    assert any("没报范围" in str(line) for line in blocks["权限范围"])
 
-    state.permissions = {"auto_approve_tools": ["shell"]}
-    assert "权限：" in state.status_line()
-    assert "shell" in state.status_line()
+    state.risk_scope = [
+        {"risk": "low", "disposition": "auto"},
+        {"risk": "medium", "disposition": "ask"},
+        {"risk": "high", "disposition": "ask"},
+    ]
+    blocks = dict((title, lines) for title, _count, lines in view_state.rail_blocks(state))
+    text = "\n".join(str(line) for line in blocks["权限范围"])
+    assert "low" in text and "自动放行" in text
+    assert "medium" in text and "high" in text and "询问" in text
+    # 决策 3：**只给 MEDIUM / HIGH 上色**，LOW 不着色。
+    roles = {role for line in blocks["权限范围"] for _text, role in line.segments}
+    assert view_state.ROLE_RISK_MEDIUM in roles and view_state.ROLE_RISK_HIGH in roles
+    assert len(blocks["权限范围"]) == 3
+
+
+# --- 工具行的语法（设计稿的核心改动 2） ---------------------------------------
+
+def test_a_tool_line_carries_its_own_syntax_and_risk_colour():
+    """`→ [1] read_file(...)` + 风险**靠颜色不靠文字**。
+
+    LOW 不着色也**不写"低风险"**：`risk=low` 的工具占多数，写出来只是噪声。
+    """
+    state = view_state.ViewState()
+    state.tool_risks = {"read_file": "low", "edit_file": "medium", "shell": "high"}
+
+    low = view_state.render_event(state, {
+        "kind": "tool_call", "tool": "read_file", "tool_index": 0,
+        "arguments": "frontends/tui/view_state.py", "call_id": "c1"})
+    medium = view_state.render_event(state, {
+        "kind": "tool_call", "tool": "edit_file", "tool_index": 1,
+        "arguments": "a.py", "call_id": "c2"})
+    high = view_state.render_event(state, {
+        "kind": "tool_call", "tool": "shell", "tool_index": 2,
+        "arguments": "python -m pytest -q", "call_id": "c3"})
+
+    assert "[1] read_file(frontends/tui/view_state.py)" in str(low[0])
+    assert "风险" not in str(low[0]), "LOW 不许有文字标签"
+    assert "MEDIUM 风险" in str(medium[0])
+    assert "HIGH 风险" in str(high[0])
+
+    def roles(line):
+        return {role for _text, role in line.segments}
+
+    assert view_state.ROLE_RISK_MEDIUM in roles(medium[0])
+    assert view_state.ROLE_RISK_HIGH in roles(high[0])
+    assert view_state.ROLE_RISK_HIGH not in roles(low[0])
+
+
+def test_the_result_line_is_paired_by_call_id():
+    """决策 4：`←` 用 **`call_id`** 配对，不靠事件顺序。
+
+    并行批次里"顺序一致"是个实现细节而不是契约，一旦不对应就是"结果贴错调用"
+    —— 看起来完全正常、实际全错的展示。
+    """
+    state = view_state.ViewState()
+    view_state.render_event(state, {
+        "kind": "tool_call", "tool": "read_file", "tool_index": 0,
+        "arguments": "a.py", "call_id": "c1"})
+    view_state.render_event(state, {
+        "kind": "tool_call", "tool": "read_file", "tool_index": 1,
+        "arguments": "b.py", "call_id": "c2"})
+
+    # 结果**故意乱序**回来，而且事件里的 tool_index 是错的 —— 配对必须靠 call_id。
+    lines = view_state.render_event(state, {
+        "kind": "tool_result", "tool": "read_file", "call_id": "c2",
+        "tool_index": 0, "status": "ok", "chars": 312, "duration_ms": 12})
+    assert "[2]" in str(lines[0]), str(lines[0])
+    assert "312 字符" in str(lines[0])
+
+
+def test_a_turn_has_a_header_that_gets_a_final_form():
+    """回合分隔线：**开头说"进行中"，结束改成"3 步 · 4.2s · 已答"**。
+
+    设计稿的对话流是按回合分块的，而块与块之间必须有一条能一眼扫到的界。
+    """
+    state = view_state.ViewState()
+    start = view_state.render_event(state, {
+        "kind": "run_started", "run_id": "r1", "user_input": "你好"})
+    assert start[0].role == view_state.ROLE_TURN_START
+    assert "回合 1" in str(start[0]) and "进行中" in str(start[0])
+    assert any("你好" in str(line) for line in start)
+
+    for _ in range(3):
+        view_state.render_event(state, {
+            "kind": "model_call", "run_id": "r1", "status": "ok",
+            "duration_ms": 1200, "prompt_tokens": 12400})
+    end = view_state.render_event(state, {
+        "kind": "run_finished", "run_id": "r1", "stop_reason": "answered",
+        "duration_ms": 4200})
+    assert end[0].role == view_state.ROLE_TURN_END
+    assert "3 步" in str(end[0]) and "4.2s" in str(end[0]) and "已答" in str(end[0])
+
+
+def test_cancel_is_reported_as_its_own_outcome():
+    """被中断**必须**和"答完了"长得不一样 —— 和步数用尽同一个理由。"""
+    state = view_state.ViewState()
+    view_state.render_event(state, {"kind": "run_started", "run_id": "r1"})
+    lines = view_state.render_event(state, {
+        "kind": "run_finished", "run_id": "r1", "stop_reason": "cancelled",
+        "duration_ms": 900})
+    assert "已中断" in str(lines[0])
+    assert any("停下" in str(line) for line in lines[1:])
+
+
+# --- 上下文栏的开合（决策 1） -------------------------------------------------
+
+def test_the_rail_is_collapsed_until_there_is_something_to_show():
+    """决策 1：**默认收起**，检测到有任务/技能且宽屏时自动展开，窄屏一律不展开。"""
+    state = view_state.ViewState()
+    assert view_state.should_auto_open(state, 200) is False
+
+    state.todos = [{"content": "写测试", "status": "in_progress"}]
+    assert view_state.should_auto_open(state, 200) is True
+    assert view_state.should_auto_open(state, 80) is False, "窄屏一律不展开"
+
+    # 用户按过 Ctrl+B 之后**不再自动开合** —— 一次明确的操作不该被下一次更新推翻。
+    state.rail_pinned = True
+    state.rail_open = False
+    assert view_state.should_auto_open(state, 200) is False
+
+
+def test_the_rail_summary_says_what_collapsing_hides():
+    """窄屏降级那一行（F5）：收起之后少了什么必须说出来，否则"收起"就是"看不见"。"""
+    state = view_state.ViewState(risk_scope=[
+        {"risk": "low", "disposition": "auto"},
+        {"risk": "medium", "disposition": "ask"}])
+    state.todos = [{"content": "a", "status": "completed"},
+                   {"content": "b", "status": "pending"}]
+    state.skills = [{"name": "tui-design", "digest": "x"}]
+    summary = view_state.rail_summary(state)
+    assert "Ctrl+B" in summary
+    assert "1/2 个任务" in summary and "1 个技能" in summary and "medium 询问" in summary
+
+
+def test_the_todo_block_counts_and_marks_each_item():
+    state = view_state.ViewState(todos=[
+        {"content": "确认现状", "status": "completed"},
+        {"content": "写工具行语法", "status": "in_progress"},
+        {"content": "补文档", "status": "pending"},
+    ])
+    title, count, lines = view_state.rail_blocks(state)[0]
+    assert title == "任务" and count == "1 / 3"
+    text = "\n".join(str(line) for line in lines)
+    assert "✓ 确认现状" in text and "◐ 写工具行语法" in text and "○ 补文档" in text
+
+
+# --- 配色与命令面板（纯数据那一半） -------------------------------------------
+
+def test_there_are_fourteen_themes_and_the_default_one_is_indigo_night():
+    """用户的九套色卡（P1–P9）+ 设计稿 F7 的五套候选（A–E），默认 ⑦ 靛夜。"""
+    assert len(theme_mod.ORDER) == 14
+    assert theme_mod.DEFAULT_THEME == "P7"
+    palette = theme_mod.get("P7")
+    assert palette.name == "靛夜"
+    # accent **必须是提亮过的那个值**：原色 #463DE8 在 #161616 上只有 2.3:1。
+    assert palette.accent == "#7670EF"
+    assert palette.bg == "#161616"
+
+
+def test_every_theme_carries_all_roles():
+    """九个 token 齐全，而派生角色确实**落在两个端点之间**（不是随手写的字面量）。"""
+    for key in theme_mod.ORDER:
+        palette = theme_mod.get(key)
+        for attr in ("bg", "chrome", "surface", "line", "ink", "ink2", "ink3",
+                     "accent", "warn", "danger", "ok"):
+            value = getattr(palette, attr)
+            assert value.startswith("#") and len(value) == 7, (key, attr, value)
+        assert palette.rail != palette.bg
+        assert palette.hairline != palette.bg
+        # 变量表齐全（CSS 里用到的每一个 `$td-*` 都得在这儿）。
+        variables = palette.variables()
+        for name in ("td-bg", "td-chrome", "td-surface", "td-line", "td-ink",
+                     "td-ink2", "td-ink3", "td-accent", "td-warn", "td-danger",
+                     "td-ok", "td-rail", "td-elevated", "td-sunk", "td-hairline",
+                     "td-ink4", "td-accent-soft", "td-danger-soft", "td-skill",
+                     "td-rail-bar"):
+            assert variables[name].startswith("#"), (key, name)
+
+
+def test_theme_blend_is_linear_and_clamped():
+    assert theme_mod.blend("#000000", "#FFFFFF", 0) == "#000000"
+    assert theme_mod.blend("#000000", "#FFFFFF", 1) == "#FFFFFF"
+    assert theme_mod.blend("#000000", "#FFFFFF", 0.5) == "#808080"
+
+
+def test_theme_resolve_accepts_key_number_name_and_nothing_else():
+    """`/theme` 的全部交互设计：key / 展示序号 / 名字里的一段。"""
+    assert theme_mod.resolve("p7") == "P7"
+    assert theme_mod.resolve("P7") == "P7"
+    assert theme_mod.resolve("7") == "P7"
+    assert theme_mod.resolve("13") == "D"
+    assert theme_mod.resolve("靛") == "P7"
+    assert theme_mod.resolve("墨绿") == "C"
+    assert theme_mod.resolve("a") == "A"
+    assert theme_mod.resolve("zz") is None
+    assert theme_mod.resolve("") is None
+
+
+def test_the_palette_listing_covers_every_theme():
+    listing = theme_mod.listing()
+    for index, key in enumerate(theme_mod.ORDER, 1):
+        assert f"{index} {key} {theme_mod.get(key).name}" in listing
+
+
+def test_the_theme_flag_parses_and_resolves():
+    """`--theme` 收的是"人能写出来的一段字"，而认它的是 `theme.resolve` ——
+    和 `/theme` 用的是**同一个函数**，所以两条入口对"什么算一套配色"的判断不会分家
+    （分家的话，"启动时能用的名字"和"运行中能用的名字"会慢慢漂成两套）。
+    """
+    from agent_runtime.frontends.cli import build_parser
+
+    args = build_parser().parse_args(["--tui", "--theme", "墨绿仪器"])
+    assert args.tui is True and args.theme == "墨绿仪器"
+    assert theme_mod.resolve(args.theme) == "C"
+    assert build_parser().parse_args(["--tui"]).theme is None
+
+
+@pytest.mark.anyio
+async def test_the_top_bar_right_half_is_not_starved(monkeypatch):
+    """顶栏右半（工作区 + `Ctrl+K` 提示）**必须真的画出来**。
+
+    这条是**用户看截图时发现的 bug**：只给 `bar-right` 写 `1fr` 而 `bar-left`
+    不写宽度时，左边那个 `Static` 会按默认的 `1fr` 把整行吃掉，右边被挤成 1 列 ——
+    而画面上看起来只是"右边空着"，像设计就是这么留白的。所以这里量的不是字符串，
+    是**两个控件实际分到的列数**。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(122, 26)) as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "init", "protocol": 1,
+            "session_id": "s", "resumed": False, "model": "deepseek-flash",
+            "workspace": "C:/w", "max_steps": 80, "context_tokens": 1_000_000,
+            "tools": [], "permissions": {}, "audit_path": "C:/w/.tudouni/logs/s.jsonl",
+            "notices": [],
+        }))
+        await _settle(app, pilot)
+
+        right = app.query_one("#top .bar-right")
+        assert right.region.width > 10, f"顶栏右边被挤没了：{right.region}"
+        assert "Ctrl+K" in str(right.render())
+
+        top = app.query_one("#top")
+        left = app.query_one("#top .bar-left")
+        assert left.region.width + right.region.width <= top.region.width
+
+
+@pytest.mark.anyio
+async def test_startup_notices_are_quiet_and_do_not_repeat_the_rail(monkeypatch):
+    """启动那几行说明：**左栏已经常驻显示的不再抄一遍**，其余的原样说。
+
+    `permissions` / `skills` / `todos` 三个 code 说的正是上下文栏那三块（设计稿 F2
+    的空态里一条都没有）；而 `mcp` / `web` / `autopilot` 那些**没有别的出口** ——
+    丢掉它们就等于把"文件明明在却不起作用"这类话藏起来。
+    """
+    assert view_state.notice_is_redundant("permissions") is True
+    assert view_state.notice_is_redundant("skills") is True
+    assert view_state.notice_is_redundant("todos") is True
+    assert view_state.notice_is_redundant("mcp") is False
+    assert view_state.notice_is_redundant("web") is False
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(140, 30)) as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "init", "protocol": 1,
+            "session_id": "s", "resumed": False, "model": "m",
+            "workspace": "C:/w", "max_steps": 80, "context_tokens": None,
+            "tools": [], "permissions": {}, "audit_path": "C:/w/a.jsonl",
+            "notices": [
+                {"level": "err", "code": "permissions",
+                 "text": "[权限] 按等级自动放行 low；点名免问 fetch_web"},
+                {"level": "warn", "code": "mcp",
+                 "text": "[MCP] 忽略了工作区里那份 mcp.json"},
+            ],
+        }))
+        await _settle(app, pilot)
+        text = _log_text(app)
+        assert "[MCP] 忽略了工作区里那份 mcp.json" in text
+        assert "点名免问 fetch_web" not in text, "左栏已经显示着它"
+        # **不自己拼 `[code]` 前缀**：runtime 给的那句话开头已经写着 `[权限]`。
+        assert "[mcp]" not in text and "[permissions]" not in text
+
+
+@pytest.mark.anyio
+async def test_the_key_hint_row_never_overflows(monkeypatch):
+    """键位提示行**按列数决定说几条**，放不下就从右边少说一条。
+
+    它紧贴输入行，多出来的一行会把输入行顶走；而"少说一条键位"的代价小得多。
+    `Esc` 排在 `Ctrl+S` / `Ctrl+R` 前面，所以先掉的是后两个。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(122, 26)) as pilot:
+        app._pump()
+        await pilot.pause()
+        keys = app.query_one("#keys", widgets_module.KeyHintBar)
+        rendered = str(keys.render())
+        assert keys.region.width <= 122
+        assert "中断本轮" in rendered, "Esc 是最要紧的那条，不能被裁掉"
+        assert "重开会话" not in rendered, "放不下时先掉最不重要的"
+
+    app2 = _build_app(monkeypatch)
+    async with app2.run_test(size=(80, 24)) as pilot:
+        app2._pump()
+        await pilot.pause()
+        rendered = str(app2.query_one("#keys", widgets_module.KeyHintBar).render())
+        assert "思考" in rendered and "命令" in rendered
+
+
+def test_the_thinking_block_is_a_quote():
+    """思考正文 = **引用块**：底色划范围（控件给），`│` 定边界（行给）。
+
+    两根一起才像一个块。这条钉的是行那一半：竖线单独一档颜色（`ROLE_QUOTE` →
+    主题的 `line`），正文仍是 `ROLE_THINK_BODY`。**折叠/展开两条路径用的是同一个
+    构造函数**（`quote_line`）—— 各写一遍的话，反复按 `Ctrl+T` 会长出两种长相。
+    """
+    line = view_state.quote_line("先读 view_state。")
+    assert str(line).startswith(view_state.QUOTE_BAR)
+    assert line.segments[0] == (view_state.QUOTE_BAR, view_state.ROLE_QUOTE)
+    assert line.segments[1] == ("先读 view_state。", view_state.ROLE_THINK_BODY)
+
+    state = view_state.ViewState(thinking={"r1": ("甲\n乙", True)})
+    lines = view_state.render_event(state, {
+        "kind": "model_call", "run_id": "r1", "status": "ok",
+        "duration_ms": 5, "reasoning": "甲\n乙"})
+    body = [line for line in lines if line.role == view_state.ROLE_QUOTE]
+    assert [str(line) for line in body] == ["  │ 甲", "  │ 乙"]
+
+
+@pytest.mark.anyio
+async def test_the_welcome_screen_has_a_logo(monkeypatch):
+    """空态那一屏左边有个三行的方块标记。
+
+    终端里没有图片，而一屏空态没有任何视觉重量时，"这是哪个程序"就得靠它承担 ——
+    **只用半块/全块字符**（▄▀█）：它们在等宽字体里都是一个字符宽的实心格，
+    不会像某些图形字符那样在 CJK 字体下变双宽而把右边的字顶歪。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(140, 30)) as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "init", "protocol": 1,
+            "session_id": "s", "resumed": False, "model": "m",
+            "workspace": "C:/w", "max_steps": 80, "context_tokens": None,
+            "tools": [], "permissions": {}, "audit_path": "C:/w/a.jsonl",
+            "notices": [],
+        }))
+        await _settle(app, pilot)
+        rendered = str(app.query_one(widgets_module.WelcomeBlock).render())
+        assert "██▀▀██" in rendered
+        assert "tudouni" in rendered and app._version in rendered
+        # 三行等宽：右边的字才对得齐（这是它能当标志用的前提）。
+        rows = widgets_module.WelcomeBlock.LOGO
+        assert len({len(row) for row in rows}) == 1
+        assert all(set(row) <= set(" ▄▀█") for row in rows)
+
+
+def _hex_of(color) -> str:
+    """Textual 的 `Color` 打出来是 `Color(118, 112, 239)`，比较要用 `.hex`。"""
+    return str(getattr(color, "hex", color)).lstrip("#").upper()
+
+
+def _input(app):
+    from agent_runtime.frontends.tui import widgets
+
+    return app.query_one("#input", widgets.PromptArea)
+
+
+@pytest.mark.anyio
+async def test_the_input_is_a_two_row_box_with_highlighted_edges(monkeypatch):
+    """输入框 = **两行内容 + 上下两条 accent 线**。
+
+    为什么值得一条测试：它由三处数字凑出来的（`#input-box` 高度 4、`#input-row`
+    高度 2、`#input` 高度 2），**任何一处对不上都会静默地少一行或把线吃掉** ——
+    而画面上只是"看着有点挤"，不会报错。所以这里量的全是几何。
+    """
+    from agent_runtime.frontends.tui import widgets
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(100, 24)) as pilot:
+        app._pump()
+        await pilot.pause()
+
+        box = app.query_one("#input-box")
+        field = _input(app)
+        assert box.region.height == 4, "1 上边框 + 2 内容 + 1 下边框"
+        assert field.region.height == 2, "真的能看两行"
+        assert field.content_size.height == 2, "两行都得是内容区，别被 padding 吃掉"
+
+        accent = _hex_of(app.palette.accent)
+        for side in ("border_top", "border_bottom"):
+            style, color = getattr(box.styles, side)
+            assert style == "solid"
+            assert _hex_of(color) == accent, (side, _hex_of(color), accent)
+        # 左右不封边：设计稿里这是一条通栏的输入行，不是一张卡片。
+        assert box.styles.border_left[0] == ""
+        assert box.styles.border_right[0] == ""
+
+        # 两行内容：一句话长到超过一行时**软换行到第二行**，而不是横向滚走。
+        field.text = "很长的一句话" * 12
+        field.cursor_position = len(field.text)
+        await pilot.pause()
+        assert field.wrapped_document.height >= 2, "该换行"
+        assert field.region.height == 2, "再长也只占两行，多出来的靠滚动"
+
+
+@pytest.mark.anyio
+async def test_enter_sends_and_shift_enter_breaks_the_line(monkeypatch):
+    """`Enter` 发送、`Shift+Enter` 换行。
+
+    这条钉的是一个**踩过的坑**：`TextArea._on_key` 里硬编了 `enter -> "\\n"` 并当场
+    `stop()`，所以"回车发送"写在 `BINDINGS` 里是**没用的**（绑定表里查得到那条，
+    按下去还是换行）。只能在 `_on_key` 那一层拦 —— 而这里测的是行为，不是实现，
+    所以哪怕以后 Textual 改了内部做法，这条断言仍然是对的。
+    """
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(100, 24)) as pilot:
+        app._pump()
+        await pilot.pause()
+        field = _input(app)
+
+        await pilot.press("你", "好")
+        await pilot.pause()
+        await pilot.press("shift+enter")
+        await pilot.pause()
+        await pilot.press("再", "说", "一", "句")
+        await pilot.pause()
+        assert field.text == "你好\n再说一句", repr(field.text)
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._client.sent == [{"t": "user_message", "text": "你好\n再说一句"}]
+        assert field.text == "", "发完要清空"
+
+
+@pytest.mark.anyio
+async def test_ctrl_k_opens_the_palette_without_eating_the_draft(monkeypatch):
+    """`Ctrl+K` 打开面板，**但不动你正在写的那句话**。
+
+    两个坑都在这一条里：无条件把输入框替换成 `/` 会**吃掉草稿**；而且 `text` 设完之后
+    光标落在 0（`cursor_position` 也救不回来），接着打的字会插到 `/` 前面，面板立刻
+    又关上 —— 实测过 `Ctrl+K` 再按 `t` 得到 `t/`。
+    """
+    from agent_runtime.frontends.tui import widgets
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(100, 24)) as pilot:
+        app._pump()
+        await pilot.pause()
+        field = _input(app)
+        palette = app.query_one("#palette", widgets.CommandPalette)
+
+        await pilot.press("ctrl+k")
+        await pilot.pause()
+        assert field.text == "/"
+        assert field.cursor_location == (0, 1), "光标要在那个 / 后面"
+        assert palette.display is True
+
+        await pilot.press("t")
+        await pilot.pause()
+        assert field.text == "/t", "接着打的字要接在 / 后面"
+        assert palette.display is True, "面板不该被自己关掉"
+
+        # 有草稿时：面板盖上去，草稿一个字都不动。
+        field.text = ""
+        await pilot.pause()
+        await pilot.press("写", "草", "稿")
+        await pilot.pause()
+        await pilot.press("ctrl+k")
+        await pilot.pause()
+        assert field.text == "写草稿", "草稿不许被吃掉"
+        assert palette.display is True
+        assert app.query_one("#input").has_focus
+
+
+@pytest.mark.anyio
+async def test_arrows_move_the_cursor_then_fall_back_to_the_log(monkeypatch):
+    """`↑↓` 一个键三种用法：面板选候选 / 光标移动 / 翻会话流。
+
+    "到底了"不能靠行号看（软换行时一行占好几个可视行），所以 `↓` 的做法是
+    **先试一次光标下移、没动就让给会话流**。这条测试把三种情况都走一遍。
+    """
+    from agent_runtime.frontends.tui import widgets
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(100, 14)) as pilot:
+        app._pump()
+        await pilot.pause()
+        field = _input(app)
+
+        # 1) 两行内容时：下移光标，不翻会话流。
+        field.text = "甲\n乙"
+        field.cursor_position = 0
+        await pilot.pause()
+        before = app.query_one("#log", widgets.ConversationLog).scroll_offset.y
+        await pilot.press("down")
+        await pilot.pause()
+        assert field.cursor_location == (1, 0)
+        assert app.query_one("#log").scroll_offset.y == before
+
+        # 2) 已经在最后一个可视行：让给会话流（这里内容不够长，滚不动，
+        #    但**不能把光标挪到不存在的下一行**，也不能抛）。
+        await pilot.press("down")
+        await pilot.pause()
+        assert field.cursor_location == (1, 1)
+
+        # 3) 面板开着：选候选，光标不动。
+        field.text = ""
+        await pilot.press("ctrl+k")
+        await pilot.pause()
+        palette = app.query_one("#palette", widgets.CommandPalette)
+        assert palette.selected.name == "/new"
+        await pilot.press("down")
+        await pilot.pause()
+        assert palette.selected.name == "/resume"
+        await pilot.press("up")
+        await pilot.pause()
+        assert palette.selected.name == "/new"
+
+
+@pytest.mark.anyio
+async def test_each_rail_block_has_a_left_colour_bar(monkeypatch):
+    """左栏每块左边一条色条 —— 眼睛顺着它就能看出"这一栏有四段"。
+
+    颜色取**弱化过的主题描边色**（`rail_bar` = `line` 往底色压 30%）：四块各来一条
+    满血描边色会跟正文抢眼睛，而"锚点"该是安静的那一层。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(140, 40)) as pilot:
+        app.state.todos = [{"content": "写测试", "status": "pending"}]
+        app.state.rail_pinned = True
+        app.state.rail_open = True
+        app._refresh_chrome()
+        await pilot.pause()
+
+        blocks = list(app.query(widgets_module.RailBlock))
+        assert len(blocks) == 4, "四块（任务/技能/权限/会话）"
+        expected = _hex_of(app.palette.rail_bar)
+        for block in blocks:
+            style, color = block.styles.border_left
+            assert style == "solid"
+            assert _hex_of(color) == expected, (_hex_of(color), expected)
+        assert app.palette.rail_bar != app.palette.line, "锚点要比描边色安静"
+
+
+@pytest.mark.anyio
+async def test_the_selected_option_is_marked_and_reversed(monkeypatch):
+    """F4 的选中项：`▌` 标记 + **整行反白**（底色铺满，不是只有文字那一段）。
+
+    反白在每一套主题下都自带对比（它就是前景背景互换），而色块底要和 14 套主题的
+    正文色逐一对一遍。`▌` 是给单色终端的形状信号。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+    async with app.run_test(size=(110, 30)) as pilot:
+        app._inbox.put(("question", {
+            "v": 1, "t": "question_request", "id": "q1",
+            "question": "默认展开还是收起？", "header": "rail",
+            "options": ["默认展开", "默认收起", "只在有任务时展开"],
+            "multi_select": False,
+        }))
+        await _settle(app, pilot)
+
+        rows = list(app.screen.query(".option"))
+        assert len(rows) == 3
+        assert str(rows[0].render()).startswith("▌")
+        assert "▌" not in str(rows[1].render())
+        # 反白 = 控件整行的底色是交互色（铺满由 `width: 1fr` 保证）。
+        selected_bg = rows[0].styles.background
+        assert selected_bg is not None
+        assert _hex_of(selected_bg) == _hex_of(app.palette.accent)
+        assert rows[1].styles.background != selected_bg
+
+        # ↓ 之后标记跟着走（不是只有底色在动）。
+        await pilot.press("down")
+        await _settle(app, pilot)
+        rows = list(app.screen.query(".option"))
+        assert "▌" not in str(rows[0].render())
+        assert str(rows[1].render()).startswith("▌")
+
+
+def test_the_command_palette_filters_by_prefix_only():
+    """**只按前缀匹配**：命令一共八条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
+    assert [c.name for c in view_state.filter_commands("/")] == \
+        [c.name for c in view_state.COMMANDS]
+    assert [c.name for c in view_state.filter_commands("/re")] == ["/resume"]
+    assert view_state.filter_commands("/zz") == []
+    # 带了参数就选不出东西 —— 于是回车走的是"整行命令"那条路（`/resume abc`）。
+    assert view_state.filter_commands("/resume abc") == []
+    # 设计稿 F2 那六条还在原位，新增的三条排在末尾。
+    names = [c.name for c in view_state.COMMANDS]
+    assert names[:6] == ["/new", "/resume", "/list", "/audit", "/exit", "/help"]
+    assert "/theme" in names and "/skills" in names
+
+
+def test_the_waiting_line_lists_only_the_keys_the_backend_offered():
+    """审批请求到了之后，会话流里那一行**只列后端真的提供了的键**。
+
+    面板上的按钮是条件渲染的，这一行也必须是 —— 两边不一致的话，用户会照着一个
+    不存在的键去按（而按下去什么都不发生，看起来像卡了）。
+    """
+    bare = view_state.waiting_line({"remember_hint": None, "allow_trust_all": False})
+    assert "等待你的批准" in bare
+    assert "[y] 允许" in bare and "[n] 拒绝" in bare and "[Esc] 拒绝" in bare
+    assert "[t]" not in bare and "[a]" not in bare
+
+    full = view_state.waiting_line({"remember_hint": "以后别再问",
+                                    "allow_trust_all": True,
+                                    "trust_all_hint": "以后这一组都直接执行"})
+    assert "[t] 总是允许" in full and "[a] 都允许" in full
+    # 分段着色：整行的 role 是"在等人"，键位那几段是提示色。
+    assert full.role == view_state.ROLE_WAITING
+    assert any(role == view_state.ROLE_RULE for _text, role in full.segments)
 
 
 # --- 第二层：Textual 应用骨架 -------------------------------------------------
@@ -190,12 +845,18 @@ class FakeClient:
         self.sent: list[dict] = []
         self.started = False
         self.closed = False
+        self.interrupts = 0
 
     def start(self) -> None:
         self.started = True
 
     def user_message(self, text: str) -> None:
         self.sent.append({"t": "user_message", "text": text})
+
+    def interrupt(self) -> None:
+        # **它和 `shutdown` 是两件事**（见 `ProtocolClient.interrupt` 的 docstring），
+        # 所以这里也分开记 —— 否则"Esc 到底发了什么"这件事测不出来。
+        self.interrupts += 1
 
     def answer_permission(self, request_id: str, decision: str) -> None:
         self.sent.append({"t": "permission_response", "id": request_id,
@@ -248,11 +909,14 @@ async def test_the_app_mounts_and_draws_an_init(monkeypatch):
     """
     app = _build_app(monkeypatch)
 
-    async with app.run_test() as pilot:
+    # **宽屏跑**：会话头在 120 列以下会把模型名和步数预算收起来（F5 的降级），
+    # 而这条测试要看的是完整形态。
+    async with app.run_test(size=(140, 40)) as pilot:
         app._inbox.put(("message", {
             "v": 1, "t": "init", "protocol": 1,
             "session_id": "tui-test", "resumed": False,
             "model": "fake", "workspace": "C:/w", "max_steps": 80,
+            "context_tokens": 1_000_000,
             "tools": [{"name": "read_file", "risk": "low",
                        "parallel_safe": True, "interactive": False}],
             "permissions": {}, "audit_path": "C:/w/.tudouni/logs/tui-test.jsonl",
@@ -266,11 +930,14 @@ async def test_the_app_mounts_and_draws_an_init(monkeypatch):
         assert app.state.max_steps == 80
         assert app.state.audit_path.endswith(".jsonl")
         assert app.state.tool_risks == {"read_file": "low"}
+        assert app.state.tool_info["read_file"]["parallel_safe"] is True
 
-        # 顶栏确实被更新了。**`Static` 上没有 `.renderable`**（Textual 8 实测），
+        # 会话头确实被更新了。**`Static` 上没有 `.renderable`**（Textual 8 实测），
         # 要拿它现在的文本得走 `render()`。
-        header = app.query_one("#header")
-        assert "tui-test" in str(header.render())
+        session = app.query_one("#session")
+        rendered = " ".join(str(w.render()) for w in session.query("Static"))
+        assert "tui-test" in rendered
+        assert "fake" in rendered
 
 
 @pytest.mark.anyio
@@ -300,6 +967,11 @@ async def test_a_permission_request_opens_the_panel_with_exactly_the_buttons(mon
         ids = {b.id for b in app.screen.query(Button)}
         assert ids == {"allow", "deny"}, f"不该出现别的按钮，实际 {ids}"
 
+        # 会话流里也要留下"这里停过一次"的痕迹（面板是盖住的，回头看记录时
+        # 只有它能解释那一轮为什么断在那儿）。
+        assert "等待你的批准" in _log_text(app)
+        assert "[t]" not in _log_text(app), "后端没给 t，界面就不许提它"
+
 
 @pytest.mark.anyio
 async def test_a_trust_all_request_shows_the_fourth_button(monkeypatch):
@@ -324,6 +996,32 @@ async def test_a_trust_all_request_shows_the_fourth_button(monkeypatch):
         # `Static` 上没有 `.renderable`（Textual 8 实测），文本走 `render()`。
         rendered = " ".join(str(w.render()) for w in app.screen.query("Static"))
         assert hint in rendered
+
+
+@pytest.mark.anyio
+async def test_escape_in_the_approval_panel_denies(monkeypatch):
+    """决策 16：`Esc` = **拒绝**，不是"关掉再说"。
+
+    fail-closed 的方向和 `cli_asker` 读不到输入那一支一致（默认拒绝才是安全的失败
+    方向）。这条测的是**键位绑定**本身（上一条测的是按钮集合），因为绑定写错的话
+    症状是"按了没反应"，而面板看起来完全正常。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("permission", {
+            "v": 1, "t": "permission_request", "id": "p7", "call_id": "c7",
+            "tool": "shell", "risk": "high", "arguments": {"command": "rm -rf x"},
+            "remember": None, "remember_hint": None,
+            "allow_trust_all": False, "trust_all_hint": None,
+        }))
+        await _settle(app, pilot)
+        assert type(app.screen).__name__ == "PermissionPanel"
+
+        await pilot.press("escape")
+        await _settle(app, pilot)
+        assert {"t": "permission_response", "id": "p7",
+                "decision": "deny"} in app._client.sent
 
 
 @pytest.mark.anyio
@@ -402,3 +1100,197 @@ async def test_slash_commands_do_not_reach_the_runtime(monkeypatch):
 
         app.submit("  /exit  ")
         assert len(client.sent) == 1, "带空格的命令也要认得出来"
+
+
+# --- 第三层：设计稿新增的那几件交互 -------------------------------------------
+
+def _events(app, *messages) -> None:
+    """把几条协议消息塞进泵（**和真消息走同一条路**）。"""
+    for message in messages:
+        app._inbox.put(("message", {"v": 1, "t": "event", **message}))
+
+
+def _log_text(app) -> str:
+    from agent_runtime.frontends.tui import widgets
+
+    parts = []
+    for block in app.query(widgets.LineBlock):
+        parts.extend(str(line) for line in block.lines)
+    return "\n".join(parts)
+
+
+@pytest.mark.anyio
+async def test_the_command_palette_opens_on_slash_and_enter_runs_the_selection(monkeypatch):
+    """设计稿改动 6：`/` 打开面板、`↑↓` 选、**回车执行的是选中的那条**。
+
+    而命令本身照旧**不进 runtime** —— 面板改的是"怎么挑命令"，不是"命令由谁执行"。
+    """
+    from agent_runtime.frontends.tui import widgets
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        field = app.query_one("#input", widgets.PromptArea)
+        field.text = "/"
+        await _settle(app, pilot)
+
+        palette = app.query_one("#palette", widgets.CommandPalette)
+        assert palette.display is True
+        assert palette.selected is not None and palette.selected.name == "/new"
+
+        field.text = "/the"
+        await _settle(app, pilot)
+        assert palette.selected.name == "/theme"
+        assert [c.name for c in palette.commands] == ["/theme"]
+
+        app.submit("/the")
+        await _settle(app, pilot)
+        assert palette.display is False, "执行完要收起来"
+        assert app._client.sent == [], "命令不该进 runtime"
+
+
+@pytest.mark.anyio
+async def test_escape_interrupts_the_running_turn_instead_of_quitting(monkeypatch):
+    """F6 的键位表：`Esc` = **中断本轮**（没有弹层时）。
+
+    它发的是 `interrupt` 而不是 `shutdown`：收摊会让当前这一轮跑完，而"我改主意了"
+    要的恰恰是停下这一轮、会话留着。**界面不自己宣布"已停止"** —— 那由
+    `run_finished(cancelled)` 那条事件说（第二份事实是这里最容易犯的错）。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test():
+        app.action_escape_key()
+        assert app._client.interrupts == 0, "没在跑的时候不该发中断"
+
+        app.state.agent = agent_state.reduce(
+            agent_state.initial(), {"t": "event", "kind": "run_started", "step": 0})
+        app.action_escape_key()
+        assert app._client.interrupts == 1
+
+
+@pytest.mark.anyio
+async def test_the_rail_stays_collapsed_until_there_is_something_to_show(monkeypatch):
+    """决策 1 落到界面上：宽屏 + 有任务才自动展开，窄屏一律降级成一行摘要。"""
+    from textual.widgets import Static
+
+    from agent_runtime.frontends.tui import widgets
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        rail = app.query_one("#rail", widgets.ContextRail)
+        assert rail.display is False, "默认收起"
+
+        app.state.todos = [{"content": "写测试", "status": "in_progress"}]
+        app._refresh_chrome()
+        await pilot.pause()
+        assert rail.display is True, "有任务时自动展开"
+
+        app.action_toggle_rail()
+        assert rail.display is False
+        assert app.state.rail_pinned is True, "手动按过之后不再自动开合"
+        app._refresh_chrome()
+        assert rail.display is False
+
+    app2 = _build_app(monkeypatch)
+    async with app2.run_test(size=(80, 24)) as pilot:
+        app2.state.todos = [{"content": "写测试", "status": "in_progress"}]
+        app2._refresh_chrome()
+        await pilot.pause()
+        assert app2.query_one("#rail").display is False, "窄屏一律不展开"
+        summary = app2.query_one("#rail-summary", Static)
+        assert summary.display is True
+        assert "Ctrl+B" in str(summary.render())
+
+
+@pytest.mark.anyio
+async def test_ctrl_t_toggles_the_turn_you_are_looking_at(monkeypatch):
+    """设计稿改动 4：`Ctrl+T` 作用于**光标所在回合**，不再是"最后一段"。
+
+    v1 那个写法（`list(state.thinking)[-1]`）从第二回合起就会作用到错的那一段上，
+    而画面看起来完全正常 —— 所以这条测试用两个回合来钉它。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "第一轮"})
+        _events(app, {"kind": "model_call", "run_id": "r1", "step": 1,
+                      "status": "ok", "duration_ms": 5, "reasoning": "甲" * 300})
+        # **把第一回合撑到超过一屏**：不然"视口在第一回合"这件事根本不成立
+        # （内容全在屏幕上方，中心点落在空白处，那就退化成"最后一个回合"了）。
+        for index in range(30):
+            _events(app, {"kind": "tool_call", "run_id": "r1", "step": 1,
+                          "tool": "read_file", "call_id": f"c{index}",
+                          "tool_index": index, "arguments": f"a{index}.py"})
+        _events(app, {"kind": "run_finished", "run_id": "r1", "step": 1,
+                      "stop_reason": "answered", "duration_ms": 100})
+        _events(app, {"kind": "run_started", "run_id": "r2", "step": 0,
+                      "user_input": "第二轮"})
+        _events(app, {"kind": "model_call", "run_id": "r2", "step": 1,
+                      "status": "ok", "duration_ms": 5, "reasoning": "乙" * 300})
+        # 第二回合也要够长 —— 否则滚到底时视口中心仍然落在第一回合里（它占了
+        # 屏幕上大半），而那是**正确**的行为，不是 bug。
+        for index in range(30):
+            _events(app, {"kind": "tool_call", "run_id": "r2", "step": 1,
+                          "tool": "read_file", "call_id": f"d{index}",
+                          "tool_index": index, "arguments": f"b{index}.py"})
+        await _settle(app, pilot)
+
+        log = app.query_one("#log")
+        log.scroll_home(animate=False)
+        await pilot.pause()
+
+        app.action_toggle_thinking()
+        await pilot.pause()
+
+        expanded = {run_id: flag for run_id, (_text, flag) in app.state.thinking.items()}
+        assert expanded["r1"] is True, "视口在第一回合，动的就该是第一回合"
+        assert expanded["r2"] is False
+        assert "甲" * 300 in _log_text(app)
+        assert "乙" * 300 not in _log_text(app)
+
+        # 再按一次收回去：折叠行回来，正文消失。
+        app.action_toggle_thinking()
+        await pilot.pause()
+        assert app.state.thinking["r1"][1] is False
+        assert "甲" * 300 not in _log_text(app)
+        assert "思考过程" in _log_text(app)
+
+        # **滚到底之后，作用对象换成第二回合** —— 这就是 v1 那个写法做不到的事。
+        log.scroll_end(animate=False)
+        await pilot.pause()
+        app.action_toggle_thinking()
+        await pilot.pause()
+        assert app.state.thinking["r2"][1] is True
+        assert app.state.thinking["r1"][1] is False
+
+
+@pytest.mark.anyio
+async def test_theme_command_switches_all_fourteen_live(monkeypatch):
+    """`/theme`：14 套在运行中换，而且**换完立刻重画**（不是等下一次事件）。"""
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        assert app.theme == "P7" and app.palette.name == "靛夜"
+
+        app.submit("/theme 墨绿")
+        await _settle(app, pilot)
+        assert app.theme == "C"
+        assert "墨绿" in app.palette.name
+        # 状态栏那一行的颜色跟着换了（它是手绘颜色的那些零件之一）。
+        status = app.query_one("#status")
+        assert status.display is True
+
+        # 认不出的名字不改配色，只说话。
+        app.submit("/theme 不存在的颜色")
+        await _settle(app, pilot)
+        assert app.theme == "C"
+        assert "没有这套配色" in _log_text(app)
+
+        # 不带参数 = 列清单（14 套都在）。
+        app.submit("/theme")
+        await _settle(app, pilot)
+        assert "14 套" in _log_text(app)
+        assert "P7 靛夜" in _log_text(app)

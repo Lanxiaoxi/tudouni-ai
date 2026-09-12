@@ -9,6 +9,14 @@
     },
     "required": ["v", "t", "text"]
   },
+  "interrupt": {
+    "summary": "**中断当前这一轮。** 不是收摊，也不是取消已经发出去的那一步。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "interrupt"}
+    },
+    "required": ["v", "t"]
+  },
   "shutdown": {
     "summary": "收摊。**当前这一轮会跑完**，不是打断它。",
     "fields": {

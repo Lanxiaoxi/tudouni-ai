@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -45,6 +46,9 @@ class _Handler(BaseHTTPRequestHandler):
         type(self).calls.append(json.loads(self.rfile.read(length) or b"{}"))
         index = min(len(type(self).calls) - 1, len(type(self).scripts) - 1)
         step = type(self).scripts[index]
+        # `delay` 只有"验中断"那一条用得上：要有一个**正在跑**的回合才按得动 Esc。
+        if step.get("delay"):
+            time.sleep(step["delay"])
         payload = {
             "id": "x", "object": "chat.completion", "created": 0, "model": "fake",
             "choices": [{
@@ -79,6 +83,23 @@ async def _drive(app, pilot, predicate, *, tries: int = 100, delay: float = 0.05
         if predicate():
             return True
     return False
+
+
+def _log_text(app) -> str:
+    """会话流里现在所有的字。
+
+    **回合头也要算进来**：它是 `Static` 而不是 `LineBlock`（它要能被 `run_finished`
+    回填成最终形态），所以只读 `LineBlock` 会漏掉"已中断""步数用尽"这些**结局**
+    —— 而那正是这里要断言的东西（实测：漏了它，"界面说没说清"这条断言永远失败）。
+    """
+    from textual.widgets import Static
+
+    from agent_runtime.frontends.tui import widgets
+
+    parts = [str(widget.render()) for widget in app.query(".turn-head")]
+    for block in app.query(widgets.LineBlock):
+        parts.extend(str(line) for line in block.lines)
+    return "\n".join(parts)
 
 
 async def main() -> int:
@@ -126,8 +147,15 @@ async def main() -> int:
             before = len(app.state.answers)
 
             app.submit("跑一下 echo hi")
-            await _drive(app, pilot,
-                         lambda: type(app.screen).__name__ == "PermissionPanel")
+            panel = await _drive(app, pilot,
+                                 lambda: type(app.screen).__name__ == "PermissionPanel")
+            if panel:
+                # **面板挂上去和它里面的按钮挂上去不是同一刻**：`push_screen` 先把
+                # Screen 放好，里面的 Button 要等下一次布局才在 DOM 里。只等前者
+                # 就会偶发 `NoMatches: #allow`（实测：这条验收脚本因此红过一次，
+                # 而重跑又绿 —— 典型的时序依赖）。所以再等一次，等的是那个按钮。
+                await _drive(app, pilot,
+                             lambda: bool(app.screen.query("#allow")), tries=40)
             print("=== 审批 ===")
             print(f"  面板 {type(app.screen).__name__}  "
                   f"phase={app.state.agent.phase}  网关收到 {len(_Handler.calls)} 次请求")
@@ -152,6 +180,42 @@ async def main() -> int:
                 print(f"  工具结果：{str(tool_msgs[-1].get('content'))[:60]!r}")
                 assert "退出码 0" in str(tool_msgs[-1].get("content")), \
                     "审批放行之后命令应该真的执行了"
+
+            # --- 4. Esc 中断这一轮 ---
+            #
+            # **这是"协议里那条 interrupt 真的通到 Agent 的检查点"唯一的端到端证据。**
+            # 单测只能钉住"标志置了没有"，而这条链有四段：TUI 的 Esc → 协议一行 →
+            # `ProtocolServer.request_stop` → Agent 在**两步之间**停下并发出
+            # `run_finished(stop_reason=cancelled)` → 界面把它显示成"已中断"。
+            #
+            # 两件事是这条验收能成立的前提，都不是随手写的：
+            #
+            #   * 网关这一步要**慢 2 秒**，否则回合在按 Esc 之前就跑完了；
+            #   * 让模型**调一个工具**（而不是直接回答）。检查点在两步之间，而
+            #     "只有一步、模型直接回答"的回合里根本没有下一个检查点 —— 那时候
+            #     Esc 的正确行为就是**什么都不发生**（不打断正在进行的那一步，
+            #     也不丢掉已经拿到的答案）。
+            _Handler.scripts.append({
+                "content": None,
+                "delay": 2.0,
+                "tool_calls": [{
+                    "id": "call_2", "type": "function",
+                    "function": {"name": "read_file",
+                                 "arguments": json.dumps({"path": "main.py"})},
+                }],
+            })
+            _Handler.scripts.append({"content": "不该看到我"})
+            app.submit("这一轮请慢一点")
+            running = await _drive(app, pilot, lambda: app.state.agent.is_busy,
+                                   tries=60)
+            print("=== 中断 ===")
+            assert running, "这一轮没跑起来，Esc 就无从测起"
+            app.action_escape_key()
+            stopped = await _drive(
+                app, pilot, lambda: app.state.agent.phase == "cancelled", tries=200)
+            print(f"  phase={app.state.agent.phase}")
+            assert stopped, f"Esc 之后这一轮没有停下：{app.state.agent.phase}"
+            assert "已中断" in _log_text(app), "界面上没说清这一轮是被中断的"
             print("=== 通过 ===")
     except AssertionError as exc:
         print(f"=== 失败：{exc} ===")

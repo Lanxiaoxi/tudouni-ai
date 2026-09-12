@@ -434,6 +434,58 @@ class Runtime:
         """agent 的文件工具能碰的范围。派生值，不存字段 —— 它完全由"包在哪"决定。"""
         return project_dir()
 
+    def ui_state(self, *, with_catalog: bool = False) -> dict[str, Any]:
+        """**面板数据**：左栏（上下文栏）那四块里，会话状态那一半。
+
+        为什么它在装配层而不在协议层：任务列表和已加载技能住在
+        `session.metadata` 里，而"用什么键、结构长什么样"是 `tools/builtin/todo.py`
+        和 `skills/` 的知识。协议层只该转发形状，不该认识那两个键。
+
+        **只给指针，不给正文**：技能正文是 L2（模型调 `load_skill` 才拿得到），
+        任务正文本来就只有一行。所以这个 dict 很小，可以每次工具返回都发一份。
+
+        `with_catalog=True` 才会带上**可用**技能清单 —— 读它要重扫技能目录
+        （见 `SkillBoard.catalog`），而那个目录几乎不变，所以只有开场那一条带它。
+        界面上"全部技能"那个弹层要的就是这份清单；它和"已加载"是两件事。
+        """
+        from agent_runtime.skills.render import load_entries
+        from agent_runtime.tools.builtin.todo import load as load_todos
+        from agent_runtime.tools.tool import RiskLevel
+
+        state: dict[str, Any] = {
+            "todos": load_todos(self.session.metadata),
+            "skills": [dict(entry) for entry in load_entries(self.session.metadata)],
+            "messages": len(self.session.messages),
+            "steps": self.session.step_count(),
+            # 权限范围。**按等级给出"自动放行 / 询问"**，而不是把 auto_approve 集合
+            # 原样发给界面：三个等级里哪几个会自动放行是 `PermissionPolicy` 的判断，
+            # 界面照着渲染就行（它不该知道"默认只有 low"这件事 —— 那是 config 的
+            # 知识，界面自己硬编码一份就是第二份事实）。
+            "risk_scope": [
+                {
+                    "risk": level.value,
+                    "disposition": (
+                        "auto" if level in self.policy.auto_approve else "ask"
+                    ),
+                }
+                for level in RiskLevel
+            ],
+            # 「按过一次 t 就永久生效」是这套权限里最容易被忘掉的东西，而左栏的
+            # 全部价值就在"我现在放行了什么"常驻可见。所以这三样一并给它 ——
+            # 它们此前只有 `--audit` 那一条出口。
+            "granted_tools": sorted(self.memory.tools()),
+            "granted_prefixes": [
+                format_rule(rule) for rule in sorted(self.memory.prefixes())
+            ],
+            "denied_tools": sorted(self.policy.deny_tools),
+        }
+        if with_catalog:
+            state["skill_catalog"] = [
+                {"name": skill.name, "description": skill.description}
+                for skill in self.skill_catalog.skills
+            ]
+        return state
+
     def audit_log_line(self) -> str:
         """「审计日志写到哪」那一行。
 

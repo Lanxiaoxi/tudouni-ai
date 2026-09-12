@@ -360,6 +360,9 @@ class ProtocolServer:
             "t": messages.OUT_SESSION_LOAD,
             "messages": runtime.session.messages,
         })
+        # 面板开场数据。**带可用技能清单**（这一条要扫目录，整个会话只发这一次）；
+        # 之后的每一次快照都只有"已经在那儿"的那几个数。
+        self.send(self._state_message(with_catalog=True))
 
         try:
             for message in self.transport.recv():
@@ -406,6 +409,17 @@ class ProtocolServer:
             # **跑完**。想中断当前这一轮，用取消（`request_stop`），那是另一条路。
             return False
 
+        if kind == messages.IN_INTERRUPT:
+            # **中断这一轮，而不是收摊。** 它和 `shutdown` 必须分开：把这两件事
+            # 混在一起过（见下面 `IN_SHUTDOWN` 那段），后果是界面永远拿不到答案。
+            #
+            # 它只是**置位**：Agent 在下一个安全点退出（`agents/agent.py` 里那个
+            # 两步之间的检查点）。模型往返和工具执行都打断不了 —— 打断它们会留下
+            # 一条带 tool_calls 却没有对应结果的 assistant 消息，那种会话此后每一轮
+            # 都发不出去（API 直接 400）。所以 Esc 的语义是"停在这一步之后"。
+            self.request_stop()
+            return True
+
         if kind == messages.IN_PERMISSION_RESPONSE:
             # 不认识这个 id 就忽略（重复回应、或者上一轮遗留的）—— 不崩。
             self.pending.resolve(message.get("id", ""), message.get("decision"))
@@ -440,6 +454,10 @@ class ProtocolServer:
     def _run_turn(self, text: str) -> None:
         """跑一个回合（**在工作线程里**），并把该发的都发出去。"""
         runtime = self.runtime
+        # **先把上一轮的取消标志清掉。** 不清的话，被 Esc 中断过一次之后，
+        # 这个会话此后每一轮都会在第一个安全点被砍掉 —— 而症状是"发消息没反应"，
+        # 没有任何地方报错。标志是每轮一份的，不是每次会话一份。
+        self._stop.clear()
         try:
             answer = runtime.agent.run(runtime.session, text, max_steps=runtime.max_steps)
         except RunCancelled as exc:
@@ -454,6 +472,12 @@ class ProtocolServer:
             self._answer = ""
             self._notice("warn", "model", f"[本轮失败] {exc}")
             return
+        finally:
+            # 面板数据在回合收尾时补一份：`todo_write` / `load_skill` 的结果会让
+            # 左栏变样，而那条路（`on_event`）按事件推 —— 这里补的是"无论如何
+            # 都对得上当前会话"的那一份。**放在 finally**：取消和失败两条路上
+            # 左栏也该是刚才那一步之后的真相。
+            self.send(self._state_message())
 
         self._answer = answer
         # **答案在这里发，不在 `on_event` 里** —— 这是实测踩出来的：`on_event` 看到
@@ -463,10 +487,28 @@ class ProtocolServer:
         self.send({
             "v": messages.VERSION,
             "t": messages.OUT_UI,
-            "kind": "run_finished",
+            "kind": messages.UI_RUN_FINISHED,
             "run_id": self._last_run_id,
             "answer": answer,
         })
+
+    def _state_message(self, *, with_catalog: bool = False) -> dict[str, Any]:
+        """面板数据快照（`t:"ui", kind:"state"`）。
+
+        **它不进审计**：任务列表的变化在审计里已经有 `tool_call` 那条参数，技能加载
+        也一样。再往 jsonl 里写一份就是同一份事实的第二个来源。
+
+        `with_catalog` 只在开场那一条里为真：可用技能清单要扫一遍目录，而它几乎不变
+        —— 每次工具返回都重扫一遍是白付的代价（`SkillBoard.catalog` 每次读都会重扫）。
+        """
+        runtime = self.runtime
+        return {
+            "v": messages.VERSION,
+            "t": messages.OUT_UI,
+            "kind": messages.UI_STATE,
+            **runtime.ui_state(with_catalog=with_catalog),
+        }
+
 
     def _notice(self, level: str, code: str, text: str) -> None:
         self.send({
@@ -487,6 +529,10 @@ class ProtocolServer:
             "model": runtime.model_cfg.model,
             "workspace": str(runtime.workspace),
             "max_steps": runtime.max_steps,
+            # 上下文窗口（分母）。**它不是 runtime 猜的** —— 响应里没有这个字段，
+            # 所以它来自 config 那张按模型名的表；表里没有就是 None，而界面按
+            # "只报用量、不报占比"处理（错的百分比比没有百分比更坏）。
+            "context_tokens": runtime.context_tokens,
             "tools": [
                 {
                     "name": tool.name,
@@ -527,6 +573,13 @@ class ProtocolServer:
             self._last_run_id = record.get("run_id", "")
 
         self.send({"v": messages.VERSION, "t": messages.OUT_EVENT, **record})
+
+        # 一条工具返回之后补一份面板快照：**`todo_write` 和 `load_skill` 改的正是
+        # 左栏那两块**，而它们在事件流里没有自己的 kind（`tool_call` / `tool_result`
+        # 是全部）。不按工具名特判（那会让协议层认识具体工具），代价是每次工具返回
+        # 多发一个几百字节的 dict —— 换的是"左栏在回合进行中也是对的"。
+        if record.get("kind") == "tool_result":
+            self.send(self._state_message())
 
     # -- 取消 ------------------------------------------------------------------
 

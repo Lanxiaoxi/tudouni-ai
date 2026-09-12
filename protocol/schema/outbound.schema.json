@@ -14,6 +14,11 @@
       "model": {"type": "string"},
       "workspace": {"type": "string", "doc": "工作区绝对路径（agent 的文件工具能碰的范围）"},
       "max_steps": {"type": "integer"},
+      "context_tokens": {
+        "type": "integer",
+        "nullable": true,
+        "doc": "这个模型的上下文窗口（输入侧上限，token）。**它是给界面算占比用的分母**，而响应里没有这个字段，所以它来自 runtime/config.py 那张按模型名的表。表里没有这个名字时为 null —— 那时候界面**只报用量、不报占比**（错的百分比比没有百分比更坏，和 cli 那条口径一致）。"
+      },
       "tools": {
         "type": "array",
         "items": {
@@ -52,7 +57,8 @@
       }
     },
     "required": ["v", "t", "protocol", "session_id", "resumed", "model", "workspace",
-                 "max_steps", "tools", "permissions", "audit_path", "notices"]
+                 "max_steps", "context_tokens", "tools", "permissions", "audit_path",
+                 "notices"]
   },
   "session_load": {
     "summary": "会话恢复的画面数据。0 或 1 条，紧跟 init。",
@@ -86,18 +92,64 @@
     "required": ["v", "t", "kind", "session_id", "run_id", "step", "ts"]
   },
   "ui": {
-    "summary": "只给界面、不进审计的东西。目前只有一条。",
+    "summary": "只给界面、不进审计的东西。两种 kind，字段按 kind 取。",
     "fields": {
       "v": {"type": "integer", "const": 1},
       "t": {"type": "string", "const": "ui"},
-      "kind": {"type": "string", "const": "run_finished"},
+      "kind": {
+        "type": "string",
+        "enum": ["run_finished", "state"],
+        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/messages/steps）。两种都**不进审计**。"
+      },
       "answer": {
         "type": "string",
-        "doc": "这一轮的最终答案（Agent.run 的返回值）。**审计里没有正文**，所以非流式模式下这是界面拿到答案的唯一途径。"
+        "doc": "**只有 kind=run_finished 有**。这一轮的最终答案（Agent.run 的返回值）。**审计里没有正文**，所以非流式模式下这是界面拿到答案的唯一途径。"
       },
-      "run_id": {"type": "string"}
+      "run_id": {
+        "type": "string",
+        "doc": "**只有 kind=run_finished 有**。和 `t:\"event\"` 上那条 run_finished 配对 —— 两条消息的顺序不保证，所以配对只能靠它。"
+      },
+      "todos": {
+        "type": "array",
+        "doc": "**只有 kind=state 有**。`session.metadata['todos']` 的原样：`[{\"content\": \"...\", \"status\": \"pending|in_progress|completed\"}]`。"
+      },
+      "skills": {
+        "type": "array",
+        "doc": "**只有 kind=state 有**。已加载技能的指针：`[{\"name\": \"...\", \"digest\": \"...\"}]`（没有正文 —— 正文是 L2，只有模型调 load_skill 才拿得到）。"
+      },
+      "skill_catalog": {
+        "type": "array",
+        "doc": "**只有 kind=state 有**。这次启动时工作区里**可用**的技能清单：`[{\"name\": \"...\", \"description\": \"...\"}]`。它只在第一条快照里给（目录扫描有代价，而它几乎不变）。"
+      },
+      "risk_scope": {
+        "type": "array",
+        "doc": "**只有 kind=state 有**。风险等级 → 处置：`[{\"risk\": \"low\", \"disposition\": \"auto|ask\"}]`。**处置由 runtime 算**（三档里哪几档自动放行是 PermissionPolicy 的判断），界面照着渲染 —— 它不该知道\"默认只有 low\"。"
+      },
+      "granted_tools": {
+        "type": "array",
+        "items": {"type": "string"},
+        "doc": "**只有 kind=state 有**。被 `t` 点名免问的工具（`permissions.json` 里那份）。"
+      },
+      "granted_prefixes": {
+        "type": "array",
+        "items": {"type": "string"},
+        "doc": "**只有 kind=state 有**。按前缀放行的命令规则，形如 `git add`。"
+      },
+      "denied_tools": {
+        "type": "array",
+        "items": {"type": "string"},
+        "doc": "**只有 kind=state 有**。被直接拒绝的工具。"
+      },
+      "messages": {
+        "type": "integer",
+        "doc": "**只有 kind=state 有**。会话里现在有多少条消息 —— 左栏「本次会话」区块要那一行。"
+      },
+      "steps": {
+        "type": "integer",
+        "doc": "**只有 kind=state 有**。这个会话累计跑了多少步（`Session.step_count()`）。"
+      }
     },
-    "required": ["v", "t", "kind", "answer", "run_id"]
+    "required": ["v", "t", "kind"]
   },
   "notice": {
     "summary": "运行期的说明，不阻塞。",

@@ -227,6 +227,160 @@ def test_init_splits_permissions_into_default_and_not(fake_openai):
     }
 
 
+def test_init_carries_the_context_window(fake_openai):
+    """`init.context_tokens` 是状态栏那个百分比的分母。
+
+    **响应里没有这个字段**（OpenAI 兼容的形状里就没有"上下文窗口"），所以它来自
+    `config.CONTEXT_WINDOWS` 那张按模型名的表。界面拿它算占比；表里没有这个名字时
+    它是 null，界面就只报用量、不报占比（错的百分比比没有百分比更坏）。
+    """
+    from agent_runtime.runtime.config import CONTEXT_WINDOWS
+
+    base, _, _ = fake_openai
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        session=None,
+    )
+    assert code == 0, err
+    init = parse(lines)[0]
+    assert "context_tokens" in init
+    assert init["context_tokens"] == CONTEXT_WINDOWS.get(init["model"])
+
+
+def test_the_state_snapshot_carries_the_rail_data(fake_openai):
+    """`t:"ui", kind:"state"` 是**左栏那四块的唯一数据来源**。
+
+    任务列表和已加载技能住在子进程的 `session.metadata` 里，而 TUI 是另一个进程 ——
+    没有这条快照，设计稿里那块最值钱的加法就没有数据（它此前只有 `--skills` /
+    `--audit` / `--list` 三条"另开一个终端"的出口）。
+
+    开场那条**带可用技能清单**（要扫目录，所以只发一次），而且它排在 `init` /
+    `session_load` 之后。
+    """
+    base, _, _ = fake_openai
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        session=None,
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    states = [m for m in kinds(got, "ui") if m.get("kind") == "state"]
+    assert states, "开场就该有一条面板快照"
+    first = states[0]
+    for key in ("todos", "skills", "risk_scope", "messages", "steps",
+                "granted_tools", "granted_prefixes", "denied_tools",
+                "skill_catalog"):
+        assert key in first, f"快照少了 {key}"
+
+    # 三个风险等级都在，而且处置是 runtime 算的（界面不认识"默认只有 low"）。
+    assert {item["risk"] for item in first["risk_scope"]} == {"low", "medium", "high"}
+    assert all(item["disposition"] in ("auto", "ask")
+               for item in first["risk_scope"])
+    # 快照**排在握手之后**：界面先要知道会话是谁，再谈面板。
+    assert [m["t"] for m in got[:3]] == ["init", "session_load", "ui"]
+
+
+def test_interrupt_stops_the_turn_but_shutdown_does_not(fake_openai):
+    """`interrupt` 和 `shutdown` **必须分开**（这是实测踩出来的）。
+
+    `shutdown` 的语义是"收摊"，而它**不取消**当前回合 —— 否则客户端发完
+    user_message 紧跟一条 shutdown（"我该说的都说了"），那一轮会在第一个安全点被
+    砍掉，界面永远拿不到答案，而且任何地方都不报错。
+    想停下正在跑的这一轮只能走 `interrupt`。
+
+    这条在 `ProtocolServer` 这一层测（不起子进程）：它要钉的正是"这两个 `t` 各自
+    把哪个标志置起来"。
+    """
+    from agent_runtime.protocol.channels import ProtocolServer
+    from agent_runtime.protocol.transport_stdio import StdioTransport
+
+    class _Transport(StdioTransport):
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        def send(self, message: dict) -> None:
+            self.sent.append(message)
+
+        def recv(self):
+            return iter(())
+
+        def close(self) -> None:
+            pass
+
+    server = ProtocolServer(_Transport())
+    assert server.should_stop() is False
+
+    server._dispatch({"v": 1, "t": "interrupt"})
+    assert server.should_stop() is True, "interrupt 必须请求停下这一轮"
+
+    # 收摊**不置**这个标志 —— 它只让循环退出，当前这一轮会跑完。
+    server._stop.clear()
+    server._dispatch({"v": 1, "t": "shutdown"})
+    assert server.should_stop() is False
+
+
+def test_a_new_turn_clears_a_previous_interrupt():
+    """**被 Esc 中断过一次之后，下一轮必须还能正常跑。**
+
+    取消标志落在一个 `threading.Event` 上，而它是**每次会话一个**的。不清的话，
+    这个会话此后每一轮都会在第一个安全点被砍掉 —— 症状是"发消息没反应"，
+    没有任何地方报错。
+    """
+    from agent_runtime.protocol.channels import ProtocolServer
+    from agent_runtime.protocol.transport_stdio import StdioTransport
+
+    class _Transport(StdioTransport):
+        def __init__(self) -> None:      # 不碰真的 stdin/stdout
+            self.sent: list[dict] = []
+
+        def send(self, message: dict) -> None:
+            pass
+
+        def recv(self):
+            return iter(())
+
+        def close(self) -> None:
+            pass
+
+    server = ProtocolServer(_Transport())
+    server._dispatch({"v": 1, "t": "interrupt"})
+    assert server.should_stop() is True
+
+    class _Session:
+        messages: list = []
+        metadata: dict = {}
+
+        def step_count(self) -> int:
+            return 0
+
+    seen: dict[str, bool] = {}
+
+    class _Agent:
+        def run(self, session, text, max_steps=None):
+            # 这一轮**真正跑起来**时看到的标志：它必须是干净的。
+            seen["should_stop"] = server.should_stop()
+            return "跑完了"
+
+    class _Logs:
+        directory = "."
+
+    class _Runtime:
+        session = _Session()
+        agent = _Agent()
+        logs = _Logs()
+        context_tokens = None
+        max_steps = 1
+
+        def ui_state(self, *, with_catalog=False):
+            return {"todos": [], "skills": [], "messages": 0, "steps": 0}
+
+    server.attach(_Runtime())
+    server._run_turn("再试一次")
+    assert seen["should_stop"] is False, "被中断过一次之后，下一轮不该立刻又被砍掉"
+    assert server.should_stop() is False
+
+
 def test_one_turn_produces_the_answer_in_the_ui_message(fake_openai):
     """一轮跑完，**答案在 `run_finished` 那条 `t:"ui"` 里**。
 
@@ -244,9 +398,10 @@ def test_one_turn_produces_the_answer_in_the_ui_message(fake_openai):
     assert code == 0, err
     got = parse(lines)
 
-    ui = kinds(got, "ui")
+    # `t:"ui"` 现在有两种 kind（`run_finished` 的正文 + `state` 的面板快照），
+    # 所以这里**按 kind 取**，不能按 `t` 取第一条 —— 开场那条 `state` 排在前面。
+    ui = [m for m in kinds(got, "ui") if m.get("kind") == "run_finished"]
     assert len(ui) == 1
-    assert ui[0]["kind"] == "run_finished"
     assert ui[0]["answer"] == "我很好，谢谢。"
 
     # 同一轮的事件也在，而且 `run_finished` 的 stop_reason 是 answered。
@@ -342,8 +497,8 @@ def test_approval_goes_over_the_protocol(fake_openai):
                 answered.append(message)
                 send({"v": 1, "t": "permission_response",
                       "id": message["id"], "decision": "allow"})
-            elif message.get("t") == "ui":
-                break          # 拿到答案就收工
+            elif message.get("t") == "ui" and message.get("kind") == "run_finished":
+                break          # 拿到答案就收工（`kind:"state"` 那种快照不算）
         send({"v": 1, "t": "shutdown"})
     finally:
         try:
@@ -369,7 +524,8 @@ def test_approval_goes_over_the_protocol(fake_openai):
     assert "remember" in req and "remember_hint" in req
     assert req["allow_trust_all"] is False, "不是 MCP 工具，没有可信任的组"
     # **回了一句 allow 之后这一轮真的走完了** —— 这是"回应被读走了"的证据。
-    ui = [m for m in seen if m.get("t") == "ui"]
+    ui = [m for m in seen
+          if m.get("t") == "ui" and m.get("kind") == "run_finished"]
     assert ui and ui[0]["answer"] == "跑完了"
 
 def test_the_client_layer_finds_the_runtime_entrypoint():

@@ -66,12 +66,18 @@ uv run main.py --autopilot              # 这次运行没有人可问：不审�
 uv run main.py --debug                  # 把中间过程打到 stderr
 
 uv run main.py --tui                    # TUI 界面（它自己拉起一个 --runtime-stdio 子进程）
+uv run main.py --tui --theme 墨绿仪器    # 换配色。14 套：p7 靛夜是默认，也能给名字/序号
 uv run main.py --runtime-stdio          # 协议子进程：stdout 是 JSONL（一般不由人直接跑）
 ```
 
 **`--tui` 和 `--runtime-stdio` 是一对父子**，人只会用前者。后者留成显式开关是为了可测
 （喂几行 JSON 就能验协议，见 `doc/protocol.md`）。TUI 需要额外装一个依赖
 （`textual`，见「架构」里那条依赖说明）；老 CLI 和 `--runtime-stdio` **都不加载它**。
+
+TUI 的界面：顶上三条栏（程序 / 会话 / 状态），左边是**上下文栏**（任务、已加载技能、
+权限范围、本次会话 —— 它默认收起，`Ctrl+B` 展开，宽屏且有任务/技能时自动展开），
+右边是按回合分块的会话流。`/` 打开命令面板，配色能在运行中换（`/theme`）。
+键位和 14 套配色的来历见 `doc/TUI-design.md` 第十四节。
 
 不带 `--session` 时**每次都是新会话**，但**聊过之后就会落盘**（第一次写盘发生在你说出
 第一句话之后），所以开了不用不会留下空文件。
@@ -743,8 +749,9 @@ frontends/          界面：**各前端之间不共享代码**，只讲协议
   cli/               老 CLI（含四个"不需要模型"的子命令）+ 它的参数形状（args.py）
   tui/               Python + Textual
     app.py             App + 四个协议回调 + 50ms 消息泵（跨线程那个坑见它的注释）
-    widgets.py         会话正文 / 权限面板 / 提问面板 / 状态栏
-    view_state.py      **只放显示状态**：滚动、折叠、焦点 + 纯渲染函数（可单测）
+    widgets.py         三条上下栏 / 上下文栏 / 回合块 / 命令面板 / 三个弹层
+    view_state.py      **只放显示状态**：折叠、左栏开合 + 纯渲染函数（可单测）
+    theme.py           14 套配色（**纯数据，不 import textual**；派生角色按固定规则算）
   ansi/              200 行零依赖客户端 —— 协议的验收工具，**允许被扔掉**
 
 ── 内核：八个独立的领域（谁也不认识 runtime / protocol / frontends）──────────
@@ -870,7 +877,8 @@ import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也
     TUI widget 也能跑，只是从此 Web 那一侧依赖上了一个终端库；
   * `frontends/` 不许 import `runtime/`；
   * `textual` 只准出现在 `frontends/tui/app.py` 和 `widgets.py` 两个文件里 ——
-    这条保证老 CLI 和协议子进程都不加载一个 TUI 框架。
+    这条保证老 CLI 和协议子进程都不加载一个 TUI 框架。（`tui/theme.py` 是**纯数据**，
+    一个 textual 的 import 都没有，所以它不需要进那张白名单 —— 它要能被直接单测。）
 
 `runtime/config.py` 是第二条的**点名例外**：它要解析 `mcp.json` 的形状，而那份形状知识
 住在 `tools/mcp.py`（反向的 `tools → config` 是禁止的）。**例外写在测试的集合里，不是靠
@@ -1116,7 +1124,9 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 - **`doc/` 里的文件。** `guide.md` 是本项目最早那份分阶段设计文档；`summary.md` 是
   Agent 自己读 `guide.md` 之后写的摘要 —— 顺便当作"它真的能干活"的样例。
   `TUI.md` 是"给这个项目加一个 TUI"的**初步思路**（外部视角，不知道仓库长什么样），
-  `TUI-design.md` 是结合现有实现重做的那一份（逐条回应前者，并记下拍板的决策），
+  `TUI-design.md` 是结合现有实现重做的那一份（逐条回应前者，并记下拍板的决策）——
+  **第十四节是 v2 的界面改版**（九张界面稿 + 14 套配色的落地，以及三处和早先决策的
+  冲突按什么办），
   `protocol.md` 是**给写新前端的人看的契约**（讲语义；形状在
   `protocol/schema/*.json`）。
 - **`tools/builtin/filesystem.py` 里的 `safe_path`。** 它其实是一条安全策略，按职责该住在
@@ -1157,7 +1167,12 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
   直接决定它会不会被用上）。规范里有 `paths`（按文件 glob 门控）之类的扩展，但按关键词自动
   注入等于让**模型之外的规则**决定注入什么指令，收益和风险都要重新算一遍
 - 任务编排、子 Agent（`todo_write` 只是给模型看的进度草稿纸，**不是调度**：见上面
-  「任务列表」，以及它的 Web 版进度面板 —— 行式终端里没有面板这回事）
+  「任务列表」）。它的**进度面板**在 TUI 里有了一版：上下文栏那块"任务"读的就是
+  同一份 `session.metadata["todos"]`（协议上走 `ui(kind:"state")`，见 `doc/protocol.md`）；
+  Web 版要做的是同一个数据换个画法
+- **TUI 上明确没做的那几件**（免得被当成漏了，理由见 `doc/TUI-design.md` 第 14.5 节）：
+  工具结果卡片 / diff / 文件树 / 会话列表（决策 3 未变）、亮色主题的观感打磨
+  （14 套里的 `③ 粉紫` 能选、能跑，但没单独校过）
 - **写操作和 shell 的并发**：只读工具的整批并行已经做了（见「一批里的并发」），
   而 `write_file` / `edit_file` / `shell` 刻意没做 —— `edit_file` 是"读进来、改一段、
   整份写回去"，两个并发调用会互相盖掉对方（经典 lost update），而且两边都会报成功；

@@ -182,6 +182,18 @@ class ProtocolClient:
         self.send({"t": messages.IN_QUESTION_RESPONSE, "id": request_id,
                    "status": status, "text": text})
 
+    def interrupt(self) -> None:
+        """请 runtime **停下当前这一轮**（Esc）。
+
+        它和 `shutdown()` 是两件事，别合并：`shutdown` 只是收摊，当前这一轮会跑完
+        —— 而"我改主意了，别跑了"要的恰恰是停下这一轮、但会话留着。
+
+        非阻塞：它只写一行，runtime 在下一个**安全点**（两步之间）停下，然后照常
+        发 `run_finished(stop_reason=cancelled)`。所以界面不该在这里就把状态改成
+        "已停止" —— 那会是第二份事实（真正停下由那条事件说）。
+        """
+        self.send({"t": messages.IN_INTERRUPT})
+
     def shutdown(self) -> None:
         self.send({"t": messages.IN_SHUTDOWN})
 
