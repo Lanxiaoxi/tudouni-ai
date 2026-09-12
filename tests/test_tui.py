@@ -492,26 +492,41 @@ async def test_the_key_hint_row_never_overflows(monkeypatch):
     """键位提示行**按列数决定说几条**，放不下就从右边少说一条。
 
     它紧贴输入行，多出来的一行会把输入行顶走；而"少说一条键位"的代价小得多。
-    `Esc` 排在 `Ctrl+S` / `Ctrl+R` 前面，所以先掉的是后两个。
+
+    ## 两级降级，别把它们当成一件事
+
+      1. **< 120 列**换成一套更短的措辞（`NARROW`）—— 这是常态那条路；
+      2. **还放不下就截断**（`render_state` 里那个 `break`）—— 这是保险。
+
+    **第 2 条在真界面里几乎永远不触发**（宽屏那套正文 102 列，而它只在 ≥120 列时
+    才出现），所以它只能直接对着那个纯函数测 —— 装一个 119 列的界面去测，测到的
+    其实是第 1 条。这里两个宽度各钉一次：90 列走第 1 条，60 列连第 1 条都放不下。
     """
+    from agent_runtime.frontends.tui import theme as theme_mod
     from agent_runtime.frontends.tui import widgets as widgets_module
 
+    palette = theme_mod.get(theme_mod.DEFAULT_THEME)
+    bar = widgets_module.KeyHintBar()
+
+    # 宽屏那套：122 列放得下全部六条。
+    wide = str(bar.render_state(view_state.ViewState(), palette, 122))
+    assert "中断本轮" in wide and "全部技能" in wide
+
+    # 窄屏那套：说四条，而它是短的。
+    narrow = str(bar.render_state(view_state.ViewState(), palette, 90))
+    assert "中断" in narrow and "全部技能" not in narrow
+
+    # 连短的都放不下时按顺序截断 —— 而**第一个永远留着**（它最要紧）。
+    tiny = str(bar.render_state(view_state.ViewState(), palette, 60))
+    assert tiny.startswith("Enter")
+    assert len(tiny) <= 60, f"提示行撑破了列宽：{tiny!r}"
+
     app = _build_app(monkeypatch)
-    async with app.run_test(size=(122, 26)) as pilot:
+    async with app.run_test(size=(80, 24)) as pilot:
         app._pump()
         await pilot.pause()
         keys = app.query_one("#keys", widgets_module.KeyHintBar)
-        rendered = str(keys.render())
-        assert keys.region.width <= 122
-        assert "中断本轮" in rendered, "Esc 是最要紧的那条，不能被裁掉"
-        assert "重开会话" not in rendered, "放不下时先掉最不重要的"
-
-    app2 = _build_app(monkeypatch)
-    async with app2.run_test(size=(80, 24)) as pilot:
-        app2._pump()
-        await pilot.pause()
-        rendered = str(app2.query_one("#keys", widgets_module.KeyHintBar).render())
-        assert "思考" in rendered and "命令" in rendered
+        assert keys.region.width <= 80
 
 
 def test_the_thinking_block_is_a_quote():
@@ -791,17 +806,20 @@ async def test_the_selected_option_is_marked_and_reversed(monkeypatch):
 
 
 def test_the_command_palette_filters_by_prefix_only():
-    """**只按前缀匹配**：命令一共八条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
+    """**只按前缀匹配**：命令一共七条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
     assert [c.name for c in view_state.filter_commands("/")] == \
         [c.name for c in view_state.COMMANDS]
     assert [c.name for c in view_state.filter_commands("/re")] == ["/resume"]
     assert view_state.filter_commands("/zz") == []
     # 带了参数就选不出东西 —— 于是回车走的是"整行命令"那条路（`/resume abc`）。
     assert view_state.filter_commands("/resume abc") == []
-    # 设计稿 F2 那六条还在原位，新增的三条排在末尾。
+    # 设计稿 F2 那五条还在原位，新增的三条排在末尾。
     names = [c.name for c in view_state.COMMANDS]
-    assert names[:6] == ["/new", "/resume", "/list", "/audit", "/exit", "/help"]
+    assert names[:5] == ["/new", "/resume", "/audit", "/exit", "/help"]
     assert "/theme" in names and "/skills" in names
+    # **`/list` 在第二期被去掉了**：它和"`/resume` 不带参数"是同一个出口，而两条
+    # 命令指向同一件事时，人要先猜哪一条才对。这条断言钉的就是"别再把它加回来"。
+    assert "/list" not in names
 
 
 def test_the_waiting_line_lists_only_the_keys_the_backend_offered():
@@ -846,6 +864,7 @@ class FakeClient:
         self.started = False
         self.closed = False
         self.interrupts = 0
+        self.shutdowns = 0
 
     def start(self) -> None:
         self.started = True
@@ -865,6 +884,21 @@ class FakeClient:
     def answer_question(self, request_id: str, status: str, text: str) -> None:
         self.sent.append({"t": "question_response", "id": request_id,
                           "status": status, "text": text})
+
+    def switch_session(self, session_id: str | None = None) -> None:
+        # 和真客户端一样只发一条 —— **界面不许在这里自己清屏**（换会话可能失败），
+        # 所以"发了什么"和"界面变成什么样"是两件可分别断言的事。
+        self.sent.append({"t": "session_switch", "session_id": session_id})
+
+    def list_sessions(self) -> None:
+        self.sent.append({"t": "session_list"})
+
+    def send(self, message: dict) -> None:
+        """真客户端那一层的出口。**这里只记账**：替身不该去编信封（`v` 那一段）。"""
+        self.sent.append({k: v for k, v in message.items() if k != "v"})
+
+    def shutdown(self) -> None:
+        self.shutdowns += 1
 
     def close(self) -> None:
         self.closed = True
@@ -1100,6 +1134,204 @@ async def test_slash_commands_do_not_reach_the_runtime(monkeypatch):
 
         app.submit("  /exit  ")
         assert len(client.sent) == 1, "带空格的命令也要认得出来"
+
+
+# --- 换会话（`/new` `/resume`）-------------------------------------------------
+#
+# 这一组钉的是第二期改掉的那条设计决策（旧 9.2："`/new` / `/resume` 都是重开进程"）。
+# 关键在于**两件事要分开测**：
+#
+#   1. 命令发出去的是什么（`session_switch`，而且**界面此刻不许清屏**）；
+#   2. 换成功了界面变成什么样（由 `init` 那条消息决定）。
+#
+# 合起来测的话，"界面抢在 runtime 前面清屏"这个 bug 会藏过去 —— 而它的后果很具体：
+# 换会话失败（权限文件坏了）时，用户会看到一个空界面，而他的会话其实还在。
+
+def _init_message(session_id: str, **overrides) -> dict:
+    """一条 `init`。字段照 `protocol/schema/outbound.schema.json`。"""
+    return {
+        "v": 1, "t": "init", "protocol": 1,
+        "session_id": session_id, "resumed": False,
+        "model": "fake", "workspace": "C:/w", "max_steps": 80,
+        "context_tokens": 1_000_000, "tools": [], "permissions": {},
+        "audit_path": f"C:/w/.toudouni/logs/{session_id}.jsonl", "notices": [],
+        **overrides,
+    }
+
+
+def _sessions_payload(*session_ids: str) -> dict:
+    return {
+        "v": 1, "t": "sessions",
+        "items": [
+            {"session_id": name, "messages": 4, "steps": 2,
+             "todos": "", "preview": f"{name} 的第一句话"}
+            for name in session_ids
+        ],
+    }
+
+
+@pytest.mark.anyio
+async def test_slash_new_asks_the_runtime_to_switch_and_keeps_the_screen(monkeypatch):
+    """`/new` 发一条 `session_switch`（`session_id=None`），**并且不清屏**。
+
+    清屏的时机是这条测试的重点：它只能发生在 `init` 到达之后。在这里就清的话，
+    换会话失败时用户会失去当前会话的画面（而 runtime 那边其实原样保留着它）。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", _init_message("old-one")))
+        await _settle(app, pilot)
+        assert app.state.session_id == "old-one"
+        assert app._client.sent == [], "开场消息是收进来的，不是发出去的"
+
+        app.submit("/new")
+        assert app._client.sent == [{"t": "session_switch", "session_id": None}]
+        # **还没换成功** —— 所以会话还是老的、流里的话还在。
+        assert app.state.session_id == "old-one"
+        assert "old-one" in _log_text(app)
+
+
+@pytest.mark.anyio
+async def test_a_new_init_rebuilds_the_screen_for_the_new_session(monkeypatch):
+    """换成功之后：**旧回合、旧左栏、旧答案全清掉**，然后画新会话的空态。
+
+    这里的每一条断言都对应一个"漏了就很难看"的字段（见 `ViewState.reset_for_session`
+    的 docstring）：漏 `turns` 就会在新会话里看见旧回合，漏 `todos` 就会让左栏显示
+    上一个会话的任务列表 —— 而后者看起来完全正常。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", _init_message("old-one")))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "第一轮"})
+        app.state.todos = [{"content": "旧会话的任务", "status": "pending"}]
+        await _settle(app, pilot)
+        assert "第一轮" in _log_text(app)
+
+        app._inbox.put(("message", _init_message("new-two")))
+        await _settle(app, pilot)
+
+        assert app.state.session_id == "new-two"
+        assert app.state.turns == [] and app.state.todos == []
+        log = _log_text(app)
+        assert "第一轮" not in log, "上一个会话的回合必须从画面上消失"
+        assert "旧会话的任务" not in log
+        assert "new-two" in log, "新会话空态要说明自己是谁"
+
+
+@pytest.mark.anyio
+async def test_resume_without_an_id_asks_for_the_list_then_switch_on_choice(monkeypatch):
+    """`/resume` = 列清单 → 弹面板 → 选中那一条才切。`Esc` 什么都不做。
+
+    面板的默认选中项是**最新那个会话**（清单是从新到旧给的），所以"打开就回车"会
+    切到最近聊过的那个 —— 这也是这个面板最常见的用法。
+    """
+    from agent_runtime.frontends.tui import widgets
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", _init_message("old-one")))
+        await _settle(app, pilot)
+
+        # 先接住"请给我清单"那一条，直接喂回一份数据（不起子进程）。
+        def answer_with_list() -> None:
+            app._inbox.put(("message", _sessions_payload("old-one", "new-two")))
+
+        monkeypatch.setattr(app._client, "list_sessions", answer_with_list)
+        app.submit("/resume")
+        await _settle(app, pilot)
+
+        picker = app.screen
+        assert isinstance(picker, widgets.SessionPicker)
+        assert picker.selected() == "old-one", "清单从新到旧，默认选最新的那个"
+
+        await pilot.press("down")
+        await _settle(app, pilot)
+        assert picker.selected() == "new-two"
+
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent == [{"t": "session_switch", "session_id": "new-two"}]
+
+
+@pytest.mark.anyio
+async def test_resume_with_an_id_switches_straight_away(monkeypatch):
+    """`/resume <id>` 不发 `session_list`：id 已经在手里了，再列一次清单是白跑一趟。"""
+    app = _build_app(monkeypatch)
+
+    async with app.run_test():
+        app.submit("/resume 20250101-120000")
+        assert app._client.sent == [
+            {"t": "session_switch", "session_id": "20250101-120000"}]
+
+
+@pytest.mark.anyio
+async def test_escape_in_the_picker_switches_nothing(monkeypatch):
+    """`Esc` = **什么都不做**。换会话会把当前 runtime 收掉，误触的代价比"没换"大。"""
+    from agent_runtime.frontends.tui import widgets
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", _sessions_payload("a-one", "b-two")))
+        await _settle(app, pilot)
+        assert isinstance(app.screen, widgets.SessionPicker)
+
+        await pilot.press("escape")
+        await _settle(app, pilot)
+        assert app._client.sent == []
+        assert app.state.session_id == ""
+
+
+def test_the_fake_client_covers_the_real_one():
+    """替身必须覆盖真客户端的每一个方法 —— 否则测试测的是一个**不存在的**接口。
+
+    这一条很值：`TuiApp` 只通过 `self._client` 说话，而那个属性在测试里是替身。
+    真客户端加了一个方法、替身没跟上时，测试会绿着通过，而界面上那条路一跑就
+    `AttributeError`（只在用户按那个键时才炸）。
+    """
+    from agent_runtime.protocol.client import ProtocolClient
+
+    real = {name for name in dir(ProtocolClient) if not name.startswith("_")}
+    fake = {name for name in dir(FakeClient) if not name.startswith("_")}
+    missing = real - fake - {"hooks", "exit_code"}
+    assert not missing, f"FakeClient 少了真客户端的这些方法：{sorted(missing)}"
+
+
+@pytest.mark.anyio
+async def test_resetting_for_a_session_keeps_the_ui_switches(monkeypatch):
+    """换会话清掉一切**属于会话**的东西，但**不动界面自己的开关**（`Ctrl+B`）。
+
+    这条钉的是那个分寸：左栏开合是"我要不要看它"，和聊的是哪个会话无关 —— 换一次
+    会话就把用户手动收起的栏顶开，是最容易被当成 bug 的那种"贴心"。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", _init_message("old-one")))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "第一轮"})
+        app.state.todos = [{"content": "旧任务", "status": "pending"}]
+        app.state.skills = [{"name": "旧技能"}]
+        await _settle(app, pilot)
+
+        app.action_toggle_rail()          # 用户手动开了左栏
+        assert app.state.rail_pinned is True
+
+        app._inbox.put(("message", _init_message("new-two")))
+        await _settle(app, pilot)
+
+        assert app.state.rail_open is True, "左栏的开合是用户的选择，换会话不该动它"
+        assert app.state.rail_pinned is True
+        for field in ("turns", "answers", "thinking", "calls", "todos", "skills",
+                      "risk_scope", "granted_tools", "granted_prefixes",
+                      "denied_tools"):
+            value = getattr(app.state, field)
+            assert not value, f"{field} 里还留着上一个会话的东西：{value!r}"
+        assert app.state.steps == 0 and app.state.messages == 0
 
 
 # --- 第三层：设计稿新增的那几件交互 -------------------------------------------

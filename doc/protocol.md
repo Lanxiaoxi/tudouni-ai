@@ -86,6 +86,10 @@ subprocess.Popen(
 │  （等下一句 user_message）
 │
 │  ──── interrupt ───────────────────►  停下**这一轮**，会话留着（见第 5 节）
+│  ──── session_list ────────────────►
+│  ◄──── sessions ────────────────────  已保存会话的清单（选会话用）
+│  ──── session_switch ──────────────►  原地换一个会话（见 3.6）
+│  ◄──── init + session_load + ui ────  **重发开场三连**，进程没重启
 │  ──── shutdown ─────────────────────►  收摊：跑完当前这一轮再退出
 ```
 
@@ -184,6 +188,41 @@ subprocess.Popen(
 
 模型失败、协议层丢了一行、等等。`level` 是 `info` / `warn`，`code` 是机器认的类别。
 **`warn` 必须比其余的更显眼**（它是"出事了"和"就是提一句"的分界）。
+
+换会话失败也走它（见 3.6）：`code == "session"` 那条出现时，**当前会话一点都没变**，
+你什么都不用收拾。
+
+### 3.6 `session_switch` / `session_list` —— 换会话，不重启进程
+
+**这一节替换的是"杀掉子进程、带另一个 `--session` 重启"。** 那条路能用，但它让
+"换一个会话"变成了一件要退出界面的事 —— 而界面里最需要它的时刻（刚聊完一个话题）
+恰恰是最不该退出重来的时候。
+
+```json
+你 → {"v":1,"t":"session_switch","session_id":"20250101-120000"}
+你 → {"v":1,"t":"session_switch","session_id":null}      // 新会话，id 由 runtime 分配
+你 → {"v":1,"t":"session_list"}
+你 ← {"v":1,"t":"sessions","items":[{"session_id":"…","messages":12,"steps":7,
+                                     "todos":"","preview":"帮我把 TUI 的…"}]}
+```
+
+**它为什么不只是一条"前端自己刷新一下"的消息**：会话状态（任务列表、已加载技能）住在
+**子进程的 `session.metadata`** 里，而且绑在一个工具注册表上（`TodoBoard` /
+`SkillBoard` 是它的成员）。所以换会话 = runtime **重新装配一遍自己**（模型 client →
+工具注册表 → Agent → MCP 子进程），然后重发 `init` + `session_load` + `ui(state)`。
+
+四条要记住的：
+
+1. **判据是 `init.session_id` 变了，不是"我发过那条请求"。** 换会话**可能失败**
+   （配置坏了、id 非法），而失败时 runtime **原样保留旧会话**。所以界面**不许**在
+   发出请求时就把画面清掉 —— 那会让一次失败变成"我的会话没了"；
+2. **它是同步的，而且会先等当前这一轮跑完**（和 `shutdown` 同一条规矩）。理由和
+   第 5 节那句一样：中断会留下一条带 `tool_calls` 却没有结果的 assistant 消息；
+3. **`session_id` 不存在 = 新会话**（和 CLI 的 `--session` 同一条语义），**id 由 runtime
+   分配** —— 前端不许自己编：分配 id 要碰磁盘确认没撞名，那是 store 的知识；
+4. **`session_list` 是只读的**，而且**别自己去读 `.tudouni/sessions/`**：目录布局不是
+   协议的一部分（store 是留着换实现的余地的），而"每条会话长什么样、预览怎么截"
+   必须只有一份。清单**从新到旧**给（要接着聊的几乎总是最近那个）。
 
 ## 4. 人机交互：两条会阻塞的消息
 
@@ -310,6 +349,7 @@ gate 都进不去），你这一侧只要别把它显示成"已授权"就行。
 | 步数用尽 | `event(run_finished, stop_reason=max_steps)` | **必须和 `answered` 长得不一样**：不许让人分不清"答完了"和"被砍断了" |
 | 你发了一行坏 JSON | 跳过、计数，循环结束时报一句到 stderr | —— |
 | 你发了不认识的 `t` | 忽略、继续 | —— |
+| `session_switch` 的 id 非法 / 配置坏了 | 一条 `notice(code="session")`，**旧会话原样保留**，进程不退 | 把那条 notice 显示出来，**别清屏** —— 你现在还在原来的会话里 |
 | 版本对不上 | 说一句到 stderr，退出 | 自己也该停：继续下去没意义 |
 | 子进程自己崩了 | stdout 关闭 = 你读到 EOF | 用 `wait()` 拿退出码，报出来 |
 
@@ -317,25 +357,28 @@ gate 都进不去），你这一侧只要别把它显示成"已授权"就行。
 `model_error` / `model_fatal`。**认不出的取值不许崩** —— 当作 `failed` 显示，并原样
 把那个字符串打出来（那是唯一的线索）。
 
-## 7. 客户端不许自己决定的三件事
+## 7. 客户端不许自己决定的四件事
 
-这三条是**边界**，不是风格：
+这四条是**边界**，不是风格：
 
 1. **放行哪些工具**（4.1 第 4 条）—— 你只回一个枚举。
 2. **什么算"非默认权限"**（3.1）—— runtime 发什么你显示什么。
 3. **`remember_hint` / `trust_all_hint` 那句话**（4.1 第 2 条）—— 原样显示。
+4. **会话清单长什么样**（3.6）—— 别去读 `.tudouni/sessions/`，问 `session_list`。
 
-共同的理由是同一个：**它们是 runtime 的判定，客户端重做一遍就是第二份事实。**
-而第二份事实漂掉的症状永远是"看起来正常，其实不一样"。
+前三条共同的理由是同一个：**它们是 runtime 的判定，客户端重做一遍就是第二份事实。**
+而第二份事实漂掉的症状永远是"看起来正常，其实不一样"。第 4 条是同一个理由的另一个
+方向 —— 那份目录布局是 store 的实现细节，不是协议的一部分。
 
 ## 8. 写一个新客户端要做什么
 
-按 `protocol/client.py` 的 `ClientHooks` 实现三个回调：
+按 `protocol/client.py` 的 `ClientHooks` 实现那三个**需要回答**的回调：
 
 ```python
 class MyClient:
     def on_message(self, message) -> None: ...
-        # init / session_load / event / ui / notice —— 人机交互那两条不走这里
+        # init / session_load / event / ui / notice / sessions ——
+        # 不需要回答的都走这里
 
     def on_permission(self, request) -> str | None: ...
         # 返回 allow / deny / always / always_group；
@@ -344,6 +387,9 @@ class MyClient:
     def on_question(self, request) -> tuple[str, str] | None: ...
         # (answered|skipped, text)；同样可以返回 None
 ```
+
+**`sessions` 走 `on_message`**，不走单独的钩子：它**不需要回答** —— 那正是第 4 节
+那两条和其余所有出站消息的分界线。
 
 **那个 `None` 不是可选的便利，是必需的** —— 异步界面（TUI）没法在**读线程**上等人
 点按钮：那会把读线程钉住，而它还要负责收别的消息。返回 `None` 之后，答案由界面在
@@ -369,7 +415,7 @@ client.wait()
 **将来的 TS 类型应当由脚本从 schema 生成**，不是手抄 —— 手抄的话连"字段名对不上"
 都测不出来。
 
-## 9. 这一版**没有**的东西
+## 9. 这一版仍然**没有**的东西
 
 写在这里免得被当成 bug：
 
@@ -378,6 +424,8 @@ client.wait()
   **你必须自己转圈**：一次模型往返是秒级，一个完全静止的界面会被当成卡死。
   顺带说清 `interrupt` 的边界：它**停不下正在飞的那一次模型调用或工具执行**，
   只停"下一步"。
+- **换会话时的"随时打断"**（3.6）—— 换会话会**等**当前这一轮跑完再换。想快点过去，
+  先发 `interrupt`、等 `run_finished(cancelled)` 到了再发 `session_switch`。
 - **工具卡片 / diff** —— 事件里 `arguments` 只有预览。工具结果的全文在
   `session_load.messages` 里（`role=="tool"`），自己取。
 - **随时打断** —— 见第 5 节：只有两步之间那一个中断点。

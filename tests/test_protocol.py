@@ -281,6 +281,234 @@ def test_the_state_snapshot_carries_the_rail_data(fake_openai):
     assert [m["t"] for m in got[:3]] == ["init", "session_load", "ui"]
 
 
+# --- 换会话（`session_switch` / `session_list`）--------------------------------
+#
+# 这两条是第二期加的，而它们的存在理由是一个**具体的不方便**：`/new` 和 `/resume`
+# 原来是"前端杀掉子进程、带另一个 `--session` 重启"。这套测试钉的就是"进程不再重启"
+# —— 所以它必须真的起一个子进程、**不关 stdin**、来回发几条。用进程内的假传输测的话，
+# "进程还活着"这件事根本没被测到（那正是这一组要验的东西）。
+
+def _open_protocol(fake_openai, *, session: str | None = None):
+    """起一个 `--runtime-stdio` 子进程，把 stdin 留着。返回 (进程, 读函数, 发函数)。
+
+    **和 `run_protocol` 分开**：那个是一次性喂完就等的（一次性输入），而这里要
+    "发一条、读一条、再发一条" —— 换会话是**多轮**的事。
+
+    **读用一条线程 + 队列，不用 `select()`**：Windows 上 `select()` 只认套接字，
+    对管道会抛 `WinError 10038`（实测踩过）。线程 + `queue.get(timeout=...)` 在三个
+    平台上都是同一套行为，而且"超时"和"进程卡死"能分开报（见下面的读函数）。
+
+    stderr 和 stdout 都设成 utf-8：协议通道上是中文（`notice.text`），在 Windows 上
+    按默认编码读会解出乱码，而那些乱码只在断言失败时才看得见。
+    """
+    import queue
+    import threading
+
+    base, _, _ = fake_openai
+    env = dict(os.environ)
+    env["DEEPSEEK_API_KEY"] = "sk-test"
+    env["DEEPSEEK_BASE_URL"] = base
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    argv = [sys.executable, str(MAIN_PY), "--runtime-stdio"]
+    if session is not None:
+        argv += ["--session", session]
+
+    process = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        encoding="utf-8", errors="replace", env=env, cwd=str(REPO_ROOT),
+    )
+
+    # **不带类型注解**：`incoming: "queue.Queue[str]" = ...` 会被当成局部变量的注解，
+    # 而那个注解在闭包里解析时算一次赋值 —— 于是内层函数读它拿到的是"还没赋值"的
+    # `NameError`（实测踩过，报的是"free variable not associated with a value"）。
+    incoming = queue.Queue()
+
+    def pump() -> None:
+        for line in process.stdout:
+            incoming.put(line)
+        incoming.put("")            # EOF 也入队：读函数据此报"流结束了"
+
+    threading.Thread(target=pump, name="protocol-reader", daemon=True).start()
+
+    def next_line(timeout: float = 30.0) -> dict:
+        """阻塞等到下一行。**超时就是失败，不是空值** ——
+
+        在"进程其实已经卡死"和"这一条本来就不会发"之间，只有超时能分辨；而一个
+        静静返回 None 的读函数会让两类失败长得一模一样。
+        """
+        try:
+            line = incoming.get(timeout=timeout)
+        except queue.Empty:
+            raise AssertionError(
+                f"等协议消息超时了（{timeout}s）—— 子进程多半卡住了"
+            ) from None
+        assert line.strip(), "协议流结束了 —— 子进程不该在这里退出"
+        return json.loads(line)
+
+    def send(message: dict) -> None:
+        process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+
+    return process, next_line, send
+
+
+def test_session_switch_reassembles_without_restarting_the_process(fake_openai):
+    """**换会话不重启进程，而且重发整组开场消息。**
+
+    这条是第二期那两行"要重开：main.py --tui"的替代品，所以它要证明的正是那两行
+    说做不到的事：
+
+      * 同一个进程能换到另一个会话、再换回来（换完 `shutdown` 之后退出码仍然是 0）；
+      * 换过去之后 `init` / `session_load` / `ui state` **一样不少地重发**
+        （少发哪一条的症状是"切过去之后左栏或历史有一半是旧的"）；
+      * `resumed` 跟着新会话走（接着聊 = True，新会话 = False），而不是留着上一次的值；
+      * 换回来的那个会话**历史还在**（`session_load.messages` 里有那句用户消息）。
+
+    ## 为什么第一句要在 A 里说
+
+    会话文件是在**第一次 checkpoint**时写的（`resolve_session` 的 docstring：开了不用
+    不会留下空文件），所以"换回来是接着聊"这件事要求那个会话真的落过盘 ——
+    实测踩过：不先说一句话时换回来 `resumed` 是 False，而那不是 bug。
+
+    ## 为什么 id 每次现取
+
+    这个进程读的是真工作区的 `.tudouni/sessions/`，而会话文件**跑一次就留下了**。
+    写死两个 id 的话，第二次跑这条测试时 `resumed` 就是 True（实测踩过：第一次绿、
+    第二次红）—— 那种"第二次才红"的失败最难查。
+    """
+    import uuid
+
+    first = f"switch-a-{uuid.uuid4().hex[:8]}"
+    second = f"switch-b-{uuid.uuid4().hex[:8]}"
+    process, next_line, send = _open_protocol(fake_openai, session=first)
+
+    opening = [next_line()["t"] for _ in range(3)]
+    assert opening == ["init", "session_load", "ui"]
+
+    # 在 A 里说一句话，让它落盘。
+    send({"v": 1, "t": "user_message", "text": "在 A 里说的话"})
+    for _ in range(40):
+        message = next_line()
+        if message.get("t") == "ui" and message.get("kind") == "run_finished":
+            break
+    else:  # pragma: no cover - 走到这儿说明假模型那条路断了
+        raise AssertionError("A 里这一轮没跑完")
+
+    send({"v": 1, "t": "session_switch", "session_id": second})
+    fresh = [next_line() for _ in range(3)]
+    assert [m["t"] for m in fresh] == ["init", "session_load", "ui"]
+    assert fresh[0]["session_id"] == second
+    assert fresh[0]["resumed"] is False, "没落过盘的就是新会话 —— 这个值由 runtime 算"
+    assert fresh[1]["messages"], "新建的会话也有一条 system 消息"
+
+    # 换回 A：它落过盘了，所以是"接着聊"，而且历史要发回来。
+    send({"v": 1, "t": "session_switch", "session_id": first})
+    back = [next_line() for _ in range(3)]
+    assert [m["t"] for m in back] == ["init", "session_load", "ui"]
+    assert back[0]["session_id"] == first
+    assert back[0]["resumed"] is True, "有会话文件就是接着聊 —— resumed 由 runtime 算，不是界面猜"
+    assert any(m.get("role") == "user" and "在 A 里说的话" in str(m.get("content"))
+               for m in back[1]["messages"]), "换回来要把那个会话的历史发回来"
+
+    send({"v": 1, "t": "shutdown"})
+    assert process.wait(timeout=30) == 0
+
+
+def test_new_session_gets_a_fresh_id_from_the_runtime(fake_openai):
+    """`session_switch` 不带 id = **新会话**，id 由 runtime 分配（前端不许自己编）。
+
+    前端编 id 的话，"什么算一个没被占用的 id"就成了前端也要知道的事 —— 而那是
+    store 的知识（要碰磁盘确认没撞名）。
+    """
+    import uuid
+
+    current = f"switch-a-{uuid.uuid4().hex[:8]}"
+    process, next_line, send = _open_protocol(fake_openai, session=current)
+    for _ in range(3):
+        next_line()
+
+    send({"v": 1, "t": "session_switch", "session_id": None})
+    fresh = next_line()
+    assert fresh["t"] == "init"
+    assert fresh["session_id"] and fresh["session_id"] != current
+    assert fresh["resumed"] is False
+
+    send({"v": 1, "t": "shutdown"})
+    assert process.wait(timeout=30) == 0
+
+
+def test_a_bad_session_id_is_answered_with_a_notice_and_the_session_survives(fake_openai):
+    """id 非法：**一条 notice，进程不退，当前会话原样保留。**
+
+    非法 id 是最常见的手滑（带空格、粘进来一个路径），所以它**不能**是一条异常 ——
+    `store.exists()` 会从 `_path` 里抛 ValueError，那会打断读循环、把整个进程带走，
+    而用户只是打错了一个字。这里同时钉两件事：报错说清了能写什么，而且报错之后
+    这个会话还能接着用。
+    """
+    import uuid
+
+    process, next_line, send = _open_protocol(
+        fake_openai, session=f"switch-a-{uuid.uuid4().hex[:8]}")
+    for _ in range(3):
+        next_line()
+
+    send({"v": 1, "t": "session_switch", "session_id": "bad/../id"})
+    notice = next_line()
+    assert notice["t"] == "notice"
+    assert notice["code"] == "session"
+    assert "非法" in notice["text"]
+
+    # 会话还在：再换一次（这次合法）照样工作。
+    send({"v": 1, "t": "session_switch",
+          "session_id": f"switch-c-{uuid.uuid4().hex[:8]}"})
+    assert next_line()["t"] == "init"
+
+    send({"v": 1, "t": "shutdown"})
+    assert process.wait(timeout=30) == 0
+
+
+def test_session_list_answers_with_the_saved_sessions(fake_openai):
+    """`session_list` → `sessions`：清单里的东西由 runtime 读盘算好。
+
+    三道检查各有各的理由：
+
+      * **从新到旧**（TUI 的选择面板默认选第一条 = 最近那个会话）；
+      * 每一条都带 `session_id` / `messages` / `steps` / `preview` / `todos` ——
+        界面直接照着渲染，**不该自己去读会话文件**；
+      * 它是**只读**的：问一次清单不换会话、不改会话（所以这条测试跑完之后，
+        当前会话还是进来时那一个）。
+    """
+    import uuid
+
+    process, next_line, send = _open_protocol(
+        fake_openai, session=f"list-a-{uuid.uuid4().hex[:8]}")
+    for _ in range(3):
+        next_line()
+
+    send({"v": 1, "t": "session_list"})
+    listed = next_line()
+    assert listed["t"] == "sessions"
+
+    items = listed["items"]
+    # **不断言"空"**：这个进程读的是真工作区的 `.tudouni/sessions/`，而跑过几轮
+    # 测试的机器上一定有会话（实测：那条断言第一次跑就红了，而它红的原因是别人的
+    # 数据 —— 那种断言测的是设备，不是代码）。
+    for item in items:
+        assert set(item) == {"session_id", "messages", "steps", "preview", "todos"}
+        assert isinstance(item["messages"], int) and isinstance(item["steps"], int)
+    # 排序：自动分配的 id 就是时间戳，所以"从新到旧"= id 降序。
+    ids = [item["session_id"] for item in items]
+    assert ids == sorted(ids, reverse=True), "清单必须从新到旧"
+
+    # 只读：问一次清单之后，**当前会话没有变**。
+    send({"v": 1, "t": "session_switch", "session_id": "list-b"})
+    assert next_line()["session_id"] == "list-b"
+
+    send({"v": 1, "t": "shutdown"})
+    assert process.wait(timeout=30) == 0
+
+
 def test_interrupt_stops_the_turn_but_shutdown_does_not(fake_openai):
     """`interrupt` 和 `shutdown` **必须分开**（这是实测踩出来的）。
 

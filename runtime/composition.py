@@ -211,6 +211,83 @@ def resolve_session(
     return new_id, Session.new(new_id), False
 
 
+# 预览截断到多少字符。**它比 `--list` 那条路多一个数**：终端里 `--list` 打一行就够，
+# 而面板上每一行还要跟一段"这个会话是关于什么的" —— 那正是选会话时唯一有用的信息。
+# 40 个字符在 76 列的弹层里放得下，再长会把消息条数挤出去。
+PREVIEW_CHARS = 40
+
+# 会话清单最多回多少条。**必须有个上限**：`session_list` 是前端在交互中发的，
+# 而 `.tudouni/sessions/` 攒到几百个文件时，一次列全部会让面板的渲染和键盘响应都
+# 变钝。从新到旧取这些条 —— 要接着聊的几乎总是最近那几个。
+SESSION_LIST_LIMIT = 50
+
+
+def session_summaries(
+    store: JsonSessionStore, *, limit: int = SESSION_LIST_LIMIT
+) -> list[dict[str, Any]]:
+    """已保存会话的清单（**从新到旧**），每条一句话说清"这是哪个会话、聊到哪了"。
+
+    它是 `sessions` 那条协议消息的内容，也是 `--list` 与 TUI 选会话面板**共同的**
+    事实来源：让两个前端各自去读会话文件、各自决定怎么截预览，就是同一份事实的
+    第二、第三个来源，而它们漂掉的症状是"同一个会话在两处看起来不一样"。
+
+    **一条读失败不拖垮整份清单。** 会话文件可能被截断、也可能是更新版本写的
+    （`store.load` 会为此抛 ValueError）—— 那种文件在列表里显示成"读不出来"比让整个
+    面板打不开好得多，而"打不开"的症状是**用户根本不知道有一个坏文件**。
+
+    读了哪些键都是**为了少读一次盘**：一次 `store.load` 就把消息条数、步数、任务
+    进度、预览全拿到了（会话文件本来就不大）。
+    """
+    items: list[dict[str, Any]] = []
+    for session_id in reversed(store.list_ids()[-limit:]):
+        try:
+            session = store.load(session_id)
+        except Exception as exc:  # noqa: BLE001 - 坏文件只影响它自己那一行
+            items.append({
+                "session_id": session_id, "messages": 0, "steps": 0,
+                "todos": "", "preview": f"（读不出来：{type(exc).__name__}）",
+            })
+            continue
+        items.append({
+            "session_id": session_id,
+            "messages": len(session.messages),
+            "steps": session.step_count(),
+            "todos": progress_line(session.metadata),
+            "preview": _first_user_message(session),
+        })
+    return items
+
+
+def _first_user_message(session: Session) -> str:
+    """会话里第一句用户说的话，截断成一行。**没有就返回空串。**
+
+    为什么是第一句而不是最后一句：选会话的时候人要认的是"这是哪一次对话"，
+    而开头那句话是这份对话的标题。最后一句通常是"继续"、"嗯"这种认不出来的东西。
+
+    `preview_line` 里那句 note 说的就是这件事（**它是给人看的，不许当会话正文用**），
+    所以这里不再抄一遍详细理由。
+    """
+    for message in session.messages:
+        if message.get("role") == "user":
+            text = message.get("content") or ""
+            if not isinstance(text, str):
+                text = str(text)
+            return preview_line(text, PREVIEW_CHARS)
+    return ""
+
+
+def preview_line(text: str, limit: int = PREVIEW_CHARS) -> str:
+    """把一段多行文本压成**一行**给列表用。
+
+    **换行必须先换成空格，不能直接截断**：`read_file` 那种正文一进列表就是几十行，
+    面板会被撑开，而"每一行一条"是这个面板的版式（和上下栏同样的理由）。
+    """
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[:limit] + "…"
+
+
 # --- 第二段：需要模型和通道 -----------------------------------------------------
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -779,4 +856,5 @@ def _session_notes(tools: Any, skill_catalog: SkillCatalog) -> Callable[[Any], s
 __all__ = [
     "Booted", "Channels", "Notice", "Runtime",
     "boot", "check_session_id", "open_runtime", "project_dir", "resolve_session",
+    "session_summaries",
 ]

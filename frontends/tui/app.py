@@ -207,8 +207,8 @@ class TuiApp(App[None]):
     #keys { height: 1; background: $td-chrome; padding: 0 1; }
 
     /* --- 弹层 ------------------------------------------------------------- */
-    PermissionPanel, QuestionPanel, SkillsPanel { align: center middle; }
-    #permission-body, #question-body, #skills-body {
+    PermissionPanel, QuestionPanel, SkillsPanel, SessionPicker { align: center middle; }
+    #permission-body, #question-body, #skills-body, #session-body {
         width: 76;
         max-width: 96%;
         height: auto;
@@ -225,7 +225,7 @@ class TuiApp(App[None]):
     .modal-title { height: auto; margin-bottom: 1; }
     .modal-hint { height: auto; color: $td-ink4; }
     .modal-foot { height: auto; color: $td-ink4; }
-    #permission-args, #question-options, #skill-list {
+    #permission-args, #question-options, #skill-list, #session-options {
         background: $td-sunk;
         padding: 0 1;
         margin: 1 0;
@@ -250,7 +250,6 @@ class TuiApp(App[None]):
         ("ctrl+b", "toggle_rail", "上下文栏"),
         ("ctrl+k", "command_palette", "命令面板"),
         ("ctrl+s", "skills", "全部技能"),
-        ("ctrl+r", "resume_last", "重开会话"),
         ("escape", "escape_key", "中断/关闭"),
         ("up", "palette_up", "上一条"),
         ("down", "palette_down", "下一条"),
@@ -344,7 +343,7 @@ class TuiApp(App[None]):
             with Horizontal(id="input-row"):
                 yield Static(">", id="prompt")
                 yield widgets.PromptArea(
-                    placeholder="说点什么，回车发送（/help 看命令，Shift+Enter 换行）",
+                    placeholder="说点什么，回车发送（/ 看命令，/resume 换会话，Shift+Enter 换行）",
                     id="input", highlight_cursor_line=False,
                 )
         yield widgets.KeyHintBar(id="keys")
@@ -495,6 +494,8 @@ class TuiApp(App[None]):
             self._on_event(message)
         elif kind == messages.OUT_UI:
             self._on_ui(message)
+        elif kind == messages.OUT_SESSIONS:
+            self._on_sessions(message)
         elif kind == messages.OUT_NOTICE:
             level = message.get("level", "info")
             self._say(f"[{level}] {message.get('text', '')}",
@@ -502,7 +503,21 @@ class TuiApp(App[None]):
 
     def _on_init(self, message: dict[str, Any]) -> None:
         state = self.state
-        state.session_id = message.get("session_id", "")
+        new_session = message.get("session_id", "")
+        # **换会话 = 换一屏。** 判定放在这里、而不是在"用户敲了 `/new`"那一刻，是
+        # 有意的：换会话可能失败（权限文件坏了、MCP 起不来），而失败时 runtime 那
+        # 一侧**原样保留旧会话**。界面要是抢先清了屏，用户就会看到一个空界面配一条
+        # "换不过去"的提示 —— 而他的会话其实还在。
+        #
+        # 判据是 `init.session_id` 变了（第一条 init 时旧值是空串，天然成立）。
+        switched = bool(state.session_id) and new_session != state.session_id
+        if switched:
+            state.reset_for_session()
+            log = self._log()
+            if log is not None:
+                log.clear()
+
+        state.session_id = new_session
         state.model = message.get("model", "")
         state.max_steps = message.get("max_steps", 0)
         state.workspace = message.get("workspace", "")
@@ -535,11 +550,12 @@ class TuiApp(App[None]):
             role = (view_state.ROLE_WARN if notice.get("level") == "warn"
                     else view_state.ROLE_RULE)
             lines.append(view_state.Line(notice.get("text", ""), role))
-        # **把续聊的办法说出来**：新会话在 CLI 那边是靠启动那行提示的，
-        # 而 TUI 里没有那一行 —— 不说的话用户不知道怎么回来。
+        # **把回来的办法说出来**。v1 这里写的是 `main.py --tui --session <id>`
+        # （那时换会话只能重开进程）；现在它就是 `/resume <id>`，所以这句话也必须
+        # 跟着改 —— 界面里指一条做不到的路，比不说更坏。
         if not state.resumed:
             lines.append(view_state.Line(
-                f"想回来继续它：main.py --tui --session {state.session_id}",
+                "想回到这个会话：/resume（在列表里挑，● 标着当前这个）",
                 view_state.ROLE_RULE))
         log.add_lines(lines, self.palette)
 
@@ -611,6 +627,15 @@ class TuiApp(App[None]):
             # 面板数据。**它不进对话流**：任务列表每更新一次就在流里插一段，会把
             # "你问的 + 它答的"冲稀。左栏就是它的位置。
             view_state.apply_state(self.state, message)
+
+    def _on_sessions(self, message: dict[str, Any]) -> None:
+        """会话清单到了：弹选择面板（`/resume` 不带参数）。**它只弹，不切。**
+
+        清单是**异步**来的（发一条 `session_list`，runtime 回一条 `sessions`），
+        所以"请求"和"收到"分在两处。这样即使列清单慢（几百个会话文件），界面也不会
+        卡在按键上 —— 菜单盘的开合是界面的操作，读盘是 runtime 的操作。
+        """
+        self._show_session_picker(list(message.get("items") or []))
 
     # -- 人机交互（非阻塞：塞回给子进程，而不是在这里等） ----------------------
 
@@ -772,9 +797,15 @@ class TuiApp(App[None]):
     def _run_command(self, command: str, rest: str) -> None:
         """**所有 `/` 命令的唯一执行处**（面板和整行输入都走这里）。
 
-        `/new` 和 `/resume` 都是**重开进程**：`TodoBoard` / `SkillBoard` 绑在
-        `session.metadata` 上，同进程换会话要重新装配整张注册表。所以它们在这里
-        只是"告诉用户怎么做"，而不是假装能做到 —— 一个按了没反应的服务比没有更坏。
+        `/new` 和 `/resume` 从第二期起是**真的换会话**：它们发一条 `session_switch`
+        给子进程，由 runtime 收掉当前 runtime、按新会话重新装配，然后重发
+        `init` / `session_load` / `ui state`。**界面进程不动** —— 所以不需要退出重敲
+        任何命令。
+
+        这件事此前被明确列为"能做，但不该在第一版做"（设计稿 9.2）：它要求运行时
+        能重新装配整张工具注册表，因为 `TodoBoard` / `SkillBoard` 绑在
+        `session.metadata` 上。现在那份装配只有一处（`protocol/serve.py` 的
+        `make_session_opener`），所以两条入口不会各装出一套不一样的运行时。
         """
         if command in ("/exit", "/quit"):
             self.exit()
@@ -783,11 +814,9 @@ class TuiApp(App[None]):
         elif command == "/audit":
             self._say(f"审计日志：{self.state.audit_path}")
         elif command == "/new":
-            self._say("换会话要重开：main.py --tui")
+            self.switch_session(None)
         elif command == "/resume":
-            self._say(f"接着聊要重开：main.py --tui --session {rest or '<id>'}")
-        elif command == "/list":
-            self._say("会话列表要另开一个终端看：main.py --list")
+            self._command_resume(rest)
         elif command == "/skills":
             self.push_screen(widgets.SkillsPanel(self.state, self.palette,
                                                  id="skills"))
@@ -795,6 +824,47 @@ class TuiApp(App[None]):
             self._command_theme(rest)
         else:
             self._say(f"没有这个命令：{command}（/help 看有哪些）")
+
+    def _command_resume(self, rest: str) -> None:
+        """`/resume [id]`。带 id 直接切，不带就从列表里挑。
+
+        **带 id 时不校验那个会话存不存在**：runtime 那边把它当"新会话"处理（和
+        `--session` 同一条语义），而"我以为在接着聊、其实开了一个新的"这件事必须
+        在界面上看得见 —— 所以 `init.session_id` 变了就换屏，而 `resumed=False`
+        那行字会说明它是新的。在这里先查一次文件反而会多出第二份"什么算存在"的判断。
+        """
+        if rest:
+            self.switch_session(rest)
+            return
+        if self._client is None:
+            return
+        self._say("正在列已保存的会话…")
+        self._client.list_sessions()
+
+    def switch_session(self, session_id: str | None) -> None:
+        """请 runtime 换到某个会话（`None` = 新会话）。**界面先不做任何乐观更新。**
+
+        这条规矩值得写下来：换会话可能失败（配置坏了、id 非法），而 runtime 那边
+        失败时**保留旧会话**。界面要是在这里就把会话流清掉，失败之后用户看到的是
+        一个空界面加一条"换不过去"—— 而他的东西其实还在。所以清屏只发生在
+        `_on_init`（那条消息是"已经换好了"的唯一凭据）。
+        """
+        if self._client is None:
+            return
+        target = f"会话 {session_id}" if session_id else "一个新会话"
+        self._say(f"正在切到{target}…（当前会话的 runtime 会在这里收掉）")
+        self._client.switch_session(session_id)
+
+    def _show_session_picker(self, sessions: list[dict[str, Any]]) -> None:
+        """弹会话选择面板；选中的那个切过去，`Esc` 什么都不做。"""
+        panel = widgets.SessionPicker(sessions, self.state.session_id, self.palette,
+                                      id="session-picker")
+
+        def chosen(session_id: Any) -> None:
+            if isinstance(session_id, str) and session_id:
+                self.switch_session(session_id)
+
+        self.push_screen(panel, chosen)
 
     def _command_theme(self, rest: str) -> None:
         """`/theme [名字]`。**不带参数就只列清单**（不做"轮换到下一套"）。
@@ -903,14 +973,6 @@ class TuiApp(App[None]):
                       view_state.ROLE_WARN)
             return
         self._say("（这一轮没在跑 —— Esc 在弹层里是拒绝/跳过）")
-
-    def action_resume_last(self) -> None:
-        """`Ctrl+R`：把"怎么接着聊"再说一遍。
-
-        这里是**有意不做成"重启进程"**的：一次误触就把会话换掉，而用户以为只是
-        刷新了一下。所以它只提示。
-        """
-        self._say(f"接着聊要重开：main.py --tui --session {self.state.session_id}")
 
     def action_quit_app(self) -> None:
         self.exit()

@@ -79,6 +79,11 @@ TUI 的界面：顶上三条栏（程序 / 会话 / 状态），左边是**上�
 右边是按回合分块的会话流。`/` 打开命令面板，配色能在运行中换（`/theme`）。
 键位和 14 套配色的来历见 `doc/TUI-design.md` 第十四节。
 
+**换会话不用退出重来**：`/new` 直接开一个新会话，`/resume` 弹出会话列表面板
+（`↑↓` 选、`Enter` 切、`Esc` 取消），`/resume <id>` 直接切。这三条都是**原地换**——
+runtime 收掉当前会话的 runtime、按新会话重新装配，界面进程一直活着（协议见
+`doc/protocol.md` 的 3.6）。
+
 不带 `--session` 时**每次都是新会话**，但**聊过之后就会落盘**（第一次写盘发生在你说出
 第一句话之后），所以开了不用不会留下空文件。
 
@@ -739,7 +744,8 @@ protocol/           跨进程契约：runtime 的"远程 API"。**不认识任�
   state.py           事件 → 状态：那张推导表，纯函数（三个前端共用）
   channels.py        ProtocolServer：传输循环 + Runtime 持有者 + 人机通道提供者
   transport_stdio.py Transport：stdin/stdout 那三件"开工前必须做掉"的事
-  serve.py           --runtime-stdio 那个进程的主循环
+  serve.py           --runtime-stdio 那个进程的主循环，外加**装配那一份做法**
+                     （make_session_opener：第一个会话和"换会话"共用它）
   client.py          **前端那一侧的公共层**：起子进程、拆行、回回应。
                      前端只实现三个回调（on_message / on_permission /
                      on_question），不需要认识消息种类
@@ -748,8 +754,8 @@ protocol/           跨进程契约：runtime 的"远程 API"。**不认识任�
 frontends/          界面：**各前端之间不共享代码**，只讲协议
   cli/               老 CLI（含四个"不需要模型"的子命令）+ 它的参数形状（args.py）
   tui/               Python + Textual
-    app.py             App + 四个协议回调 + 50ms 消息泵（跨线程那个坑见它的注释）
-    widgets.py         三条上下栏 / 上下文栏 / 回合块 / 命令面板 / 三个弹层
+    app.py             App + 三个协议回调 + 50ms 消息泵（跨线程那个坑见它的注释）
+    widgets.py         三条上下栏 / 上下文栏 / 回合块 / 命令面板 / 会话选择面板 / 三个弹层
     view_state.py      **只放显示状态**：折叠、左栏开合 + 纯渲染函数（可单测）
     theme.py           14 套配色（**纯数据，不 import textual**；派生角色按固定规则算）
   ansi/              200 行零依赖客户端 —— 协议的验收工具，**允许被扔掉**

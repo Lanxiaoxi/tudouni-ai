@@ -274,6 +274,41 @@ class ViewState:
     # 用户手动按过 Ctrl+B 之后就不再自动开合 —— 一次明确的操作不该被下一次更新推翻。
     rail_pinned: bool = False
 
+    def reset_for_session(self) -> None:
+        """把**属于某一个会话**的东西全清掉，只留下界面自己的开关。
+
+        换会话（`/new` / `/resume`）时调它。**这份清单必须完整**，因为"漏了哪个字段"
+        的症状全都很难看而且各不相同：
+
+          * 漏 `turns` / `answers` / `thinking` / `calls` —— 新会话里混着旧会话的回合，
+            而且 `Ctrl+T` 会去展开一个已经不在的 run（它按 run_id 查，查得到旧的那份）；
+          * 漏 `todos` / `skills` / `skill_catalog` —— 左栏显示**上一个会话**的任务列表。
+            这一条最坏：它看起来完全正常，而用户会以为那些任务是现在这个会话的；
+          * 漏 `agent` —— 状态栏按上一个会话的 phase 显示"正在跑"或"已答"，而新会话
+            一步都没走（协议那边是干净的，所以这个"正在跑"永远不会结束）；
+          * 漏 `pending_input` —— 上一句话贴到新会话的第一个回合头上。
+
+        **rail_open / rail_pinned 不清**：那是"我要不要看左栏"，和聊的是哪个会话无关
+        —— 换一次会话就把用户手动收起的栏顶开，是最容易被当成 bug 的那种"贴心"。
+        """
+        self.agent = agent_state.initial()
+        self.answers.clear()
+        self.thinking.clear()
+        self.turns.clear()
+        self.calls.clear()
+        self.todos = []
+        self.skills = []
+        self.skill_catalog = []
+        self.risk_scope = []
+        self.granted_tools = []
+        self.granted_prefixes = []
+        self.denied_tools = []
+        self.messages = 0
+        self.steps = 0
+        self.prompt_tokens = None
+        self.cached_tokens = None
+        self.pending_input = ""
+
     # -- 回合 ------------------------------------------------------------------
 
     @property
@@ -893,16 +928,42 @@ class Command:
 # 命令集。v1 那六条是决策 15 定下来的，**顺序也照设计稿 F2 的面板**；
 # 后面三条是这一版新增的（面板、技能清单、配色），加在末尾而不是插在中间 ——
 # 那六条的位置是用户已经见过的肌肉记忆。
+#
+# **`/list` 在第二期被去掉了**（设计决策，见 doc/TUI-design.md 13.3）：它和
+# "`/resume` 不带参数"说的是同一件事，而两条命令指向同一个出口时，人会先猜哪一条
+# 才是对的。留 `/resume` 一条，它自己负责列出候选。
 COMMANDS: tuple[Command, ...] = (
-    Command("/new", "换一个新会话（重开：main.py --tui）"),
-    Command("/resume", "接着某个会话（重开：main.py --tui --session <id>）", True),
-    Command("/list", "列出已保存的会话"),
+    Command("/new", "换一个新会话（立刻生效，不用退出）"),
+    Command("/resume", "换一个会话：不带参数从列表里挑，带 id 直接切", True),
     Command("/audit", "审计日志在哪"),
     Command("/exit", "退出"),
     Command("/help", "命令列表"),
     Command("/theme", "换配色（14 套，不带参数就看清单）", True),
     Command("/skills", "看全部技能（可用的 + 已加载的）"),
 )
+
+
+def session_row(item: dict[str, Any], *, conflict: bool = False) -> Line:
+    """会话清单里的一行：`20250101-120000   12 条消息 · 7 步   第一句话…`
+
+    三段各自解决一个"选不出来"的问题：**id** 是切过去要用的东西，**条数/步数**
+    说明它有多长（"那个聊了很久的"），**预览**说明它是哪一次对话（会话 id 是时间戳，
+    人对不上号）。任务进度跟在最后 —— 它是"哪个会话还剩着活"唯一看得见的地方。
+
+    `conflict=True` 给当前会话那一行加一枚记号：不带参数调 `/resume` 时，候选里
+    一定有正在用的这一个，而不标出来的话"点进去什么都没发生"看起来像坏了。
+    """
+    name = str(item.get("session_id", ""))
+    count = int(item.get("messages") or 0)
+    steps = int(item.get("steps") or 0)
+    preview = str(item.get("preview") or "") or "（还没说过话）"
+    todos = str(item.get("todos") or "")
+    return Line(
+        f"  {'● ' if conflict else '  '}{name:<22} "
+        f"{count:>3} 条消息 · {steps:>3} 步   {preview}"
+        + (f"   [任务 {todos}]" if todos else ""),
+        ROLE_WAITING if conflict else ROLE_PROCESS,
+    )
 
 
 def filter_commands(query: str) -> list[Command]:

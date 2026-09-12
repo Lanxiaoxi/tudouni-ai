@@ -33,10 +33,20 @@ SCHEMA_DIR = Path(__file__).resolve().parent / "schema"
 # 的情况下演进语义是可能的 —— 而那是迟早的事。
 VERSION = 1
 
-# 入站（前端 → runtime）五种。
+# 入站（前端 → runtime）七种。
 IN_USER_MESSAGE = "user_message"
 IN_PERMISSION_RESPONSE = "permission_response"
 IN_QUESTION_RESPONSE = "question_response"
+# **原地换一个会话**（TUI 的 `/new` 和 `/resume`）。它和"shutdown + 重开进程"是
+# 同一件事的两条路，而这条路让**界面进程活着** —— 会话流、左栏、输入框都在原位刷新。
+#
+# 它不能和 `user_message` 合并：换会话不产生任何用户消息，而它的副作用（收掉当前
+# runtime、按新会话重新装配）比"说一句话"大得多。
+IN_SESSION_SWITCH = "session_switch"
+# 请 runtime 回一份会话清单（出站 `sessions`）。**前端不许自己去读
+# `.tudouni/sessions/`** —— 那会让目录布局变成前端也认识的一件事实，而 store 的
+# 实现是明确留着"将来换 SQLite"的余地的（state/store.py 的类 docstring）。
+IN_SESSION_LIST = "session_list"
 # **中断当前这一轮**（Esc）。它和 `shutdown` 是两件事，这一点是实测踩出来的：
 # `shutdown` 的语义是"收摊"，而它**不取消**当前回合（否则客户端发完 user_message
 # 紧跟一条 shutdown，那一轮会在第一个安全点被砍掉，界面永远拿不到答案）。
@@ -45,20 +55,22 @@ IN_INTERRUPT = "interrupt"
 IN_SHUTDOWN = "shutdown"
 
 INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
-           IN_INTERRUPT, IN_SHUTDOWN)
+           IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SHUTDOWN)
 
-# 出站（runtime → 前端）八种。
+# 出站（runtime → 前端）九种。
 OUT_INIT = "init"
 OUT_SESSION_LOAD = "session_load"
 OUT_EVENT = "event"
 OUT_UI = "ui"
 OUT_NOTICE = "notice"
+# 已保存会话的清单。**它只回答入站的 `session_list`**，不是"每一次启动都发"的东西。
+OUT_SESSIONS = "sessions"
 OUT_PERMISSION_REQUEST = "permission_request"
 OUT_QUESTION_REQUEST = "question_request"
 
 OUTBOUND = (
     OUT_INIT, OUT_SESSION_LOAD, OUT_EVENT, OUT_UI,
-    OUT_NOTICE, OUT_PERMISSION_REQUEST, OUT_QUESTION_REQUEST,
+    OUT_NOTICE, OUT_SESSIONS, OUT_PERMISSION_REQUEST, OUT_QUESTION_REQUEST,
 )
 
 # 审批的三个答案。`always_group` 是**一次性的**（只对那一条请求有效）。

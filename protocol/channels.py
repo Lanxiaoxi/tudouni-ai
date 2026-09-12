@@ -34,9 +34,9 @@ asker / questioner 是**同步**端口（`Callable[[Tool, Mapping], bool]` /
 
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 from agent_runtime.agents import RunCancelled
@@ -44,9 +44,50 @@ from agent_runtime.models.types import ModelError
 from agent_runtime.protocol import codec, messages
 from agent_runtime.protocol.transport_stdio import StdioTransport
 from agent_runtime.runtime.channels import Channels, TrustGroupLookup
+from agent_runtime.runtime.config import ConfigError
 from agent_runtime.security.memory import ApprovalMemory
+from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin.ask import ANSWERED, SKIPPED, UNAVAILABLE, Answer, AskUserArgs
 from agent_runtime.tools.tool import Tool
+
+
+# 造一个已装配的 runtime：给会话 id，还一个能跑的东西。
+#
+# 它的存在理由和 `runtime/channels.py` 里那份 `AskerFactory` 是同一个：**打破一个
+# 顺序上的环**。换会话要"收旧 runtime → 造新 runtime"，而"怎么造"的知识在装配层；
+# 可是造出来的 runtime 又要挂回这个 server（asker 从它身上取 memory）。所以 server
+# 拿的是一份**工厂**，而不是一个现成的 runtime。
+RuntimeFactory = Callable[[str], Any]
+
+# 列会话清单的做法：给一个 store，还一份从新到旧的 summary list（见 `Bootstrap`）。
+SessionLister = Callable[[Any], list[dict[str, Any]]]
+
+
+class Bootstrap(NamedTuple):
+    """开一个会话需要、但**整个进程只做一次**的那些东西。
+
+    `boot()` 的产物（store / logs / 技能扫描）加上两件装配层的做法：
+
+      * `session_lister` —— "把已保存的会话读成一份清单"。**做成一份可调用的东西，
+        而不是让协议层 import `composition.session_summaries`**：那会把整个装配层
+        （模型 client、httpx、工具注册表）拖进 `protocol/` 的加载路径，而协议层
+        只需要"一份清单"这个结果。它和 `runtime_factory` 是同一条规矩的两次应用；
+      * `autopilot` / `debug` —— 进程级的开关，换会话要用同一份。
+
+    **它和"会话是谁"是两件事**，所以要分开传：换会话的工厂拿到的必须是同一份
+    bootstrap，否则第二个会话会是另一套技能目录、另一个审计目录。
+
+    **字段顺序不要动**：`booted` 在前面，因为它是唯一必填的那个。
+    """
+
+    booted: Any                    # runtime.composition.Booted
+    autopilot: bool = False
+    debug: bool = False
+    session_lister: SessionLister | None = None
+
+
+# 默认那份工厂的签名：`(bootstrap, session_id) -> runtime`。测试注入的就是它。
+BootstrapFactory = Callable[[Bootstrap, str], Any]
 
 
 class _Pending:
@@ -250,12 +291,28 @@ class ProtocolQuestioner:
 
 
 class ProtocolServer:
-    """协议服务器。见模块 docstring 的那三件事。"""
+    """协议服务器。见模块 docstring 的那三件事。
 
-    def __init__(self, transport: StdioTransport):
+    `bootstrap` / `runtime_factory` 这两个参数是**换会话**（`session_switch`）加进来的，
+    而它们的位置很讲究：`bootstrap` 是"整个进程只做一次的那几件事"，`runtime_factory`
+    是"按一个会话 id 造出 runtime 的做法"。默认那份做法（`open_session`）住在
+    `serve.py` 那一侧 —— 协议层不许 import 装配层，这条依赖方向有测试盯着
+    （`tests/test_imports.py`）。
+    """
+
+    def __init__(self, transport: StdioTransport, *,
+                 bootstrap: Bootstrap | None = None,
+                 runtime_factory: BootstrapFactory | None = None):
         self.transport = transport
         self.pending = _PendingTable()
         self.runtime: Any = None
+        self.bootstrap = bootstrap
+
+        # 怎么按一个会话 id 造出一个新 runtime。**换会话要重来一遍装配**，而"装配"
+        # 这件事的知识住在 `runtime/composition.py`。所以它是一份可注入的工厂：
+        # 默认那份拒绝工作（见 `_no_runtime_factory` 的 docstring），真跑时由
+        # `serve.py` 交进来，测试交一份离线的。
+        self._factory: BootstrapFactory = runtime_factory or _no_runtime_factory
 
         # 审批里那个 `a` 的查询口，由 `bind()` 从装配层接过来（它要等 MCP 连上）。
         self._trust_group: TrustGroupLookup | None = None
@@ -352,17 +409,7 @@ class ProtocolServer:
         """
         self.assert_attached()
         self._serving = True
-        runtime = self.runtime
-
-        self.send(self._init_message())
-        self.send({
-            "v": messages.VERSION,
-            "t": messages.OUT_SESSION_LOAD,
-            "messages": runtime.session.messages,
-        })
-        # 面板开场数据。**带可用技能清单**（这一条要扫目录，整个会话只发这一次）；
-        # 之后的每一次快照都只有"已经在那儿"的那几个数。
-        self.send(self._state_message(with_catalog=True))
+        self._emit_opening()
 
         try:
             for message in self.transport.recv():
@@ -376,6 +423,25 @@ class ProtocolServer:
             self._join_turn()
             self.transport.close()
         return 0
+
+    def _emit_opening(self) -> None:
+        """把"一个会话的开场三连"发出去：`init` → `session_load` → `ui state`。
+
+        **它是一段独立的方法，因为它有两个调用点**：`serve()` 的开头，以及换会话
+        成功之后（`_session_switch`）。两处发的必须是同一组消息、同一个顺序 ——
+        抄一遍的话，换会话之后的前端会缺一条（而缺哪一条取决于抄漏了哪个），
+        症状是"切过去之后左栏/历史有一半是旧的"。
+        """
+        runtime = self.runtime
+        self.send(self._init_message())
+        self.send({
+            "v": messages.VERSION,
+            "t": messages.OUT_SESSION_LOAD,
+            "messages": runtime.session.messages,
+        })
+        # 面板开场数据。**带可用技能清单**（这一条要扫目录，整个会话只发这一次）；
+        # 之后的每一次快照都只有"已经在那儿"的那几个数。
+        self.send(self._state_message(with_catalog=True))
 
     def assert_attached(self) -> None:
         if self.runtime is None:
@@ -436,6 +502,17 @@ class ProtocolServer:
             )
             return True
 
+        if kind == messages.IN_SESSION_SWITCH:
+            # **就地换会话**（TUI 的 `/new` / `/resume`）。它同步做完：收旧 runtime、
+            # 造新的、重发开场三连。做完之前这个循环不会去读别的消息 —— 这是有意的，
+            # 换会话的中途读到一条 user_message 会把它投给一个正在被收掉的 runtime。
+            self._session_switch(message.get("session_id"))
+            return True
+
+        if kind == messages.IN_SESSION_LIST:
+            self._send_session_list()
+            return True
+
         if kind == messages.IN_USER_MESSAGE:
             # 上一轮还没走完就先等它 —— 两条回合叠着跑会让事件顺序错乱，
             # 而"顺序"是这条协议唯一的同步手段。
@@ -450,6 +527,116 @@ class ProtocolServer:
         # 不认识的 `t`：**忽略并继续**。协议的两端会分别升级，而一个老客户端
         # 死在不认识的消息上是最没必要的兼容性损失。
         return True
+
+    # -- 会话切换 --------------------------------------------------------------
+
+    def open_session(self, session_id: str | None) -> Any:
+        """按一个会话 id 造出 runtime 的**唯一入口**。见 `RuntimeFactory` 那段。
+
+        两个调用点：`serve.py` 开第一个会话（它自己起了头，所以把 bootstrap 交进来
+        一次），以及 `_session_switch` 换会话（复用同一份 bootstrap）。
+        """
+        if self.bootstrap is None:
+            raise RuntimeError(
+                "换会话需要一个 bootstrap（boot() 的产物 + autopilot/debug）——"
+                "ProtocolServer 是从 serve.py 起来的吗？"
+            )
+        return self._factory(self.bootstrap, session_id or "")
+
+    def set_runtime_factory(self, factory: BootstrapFactory) -> None:
+        """接上"怎么按会话 id 装配"那一份做法。
+
+        做成 setter 而不是构造参数，是因为**装配那一侧需要先有一个 server**：
+        `serve.py` 得拿到 `server.channels()` 才能装出第一个 runtime，而 channels
+        只有 server 有。构造参数版本会逼出一个"先造一个假的再换掉"的循环。
+        """
+        self._factory = factory
+
+    def _send_session_list(self) -> None:
+        """回一份会话清单（`sessions`）。**它不改变任何状态**，所以不算会话切换。"""
+        lister = self.bootstrap.session_lister
+        self.send({
+            "v": messages.VERSION,
+            "t": messages.OUT_SESSIONS,
+            "items": lister(self.bootstrap.booted.store) if lister else [],
+        })
+
+    def _session_switch(self, session_id: Any) -> None:
+        """收掉当前 runtime、按新会话装配、重发开场三连。**失败时保留旧会话。**
+
+        ## 为什么这件事应该由 runtime 做，而不是前端重启进程
+
+        在它之前，这条路的做法是"前端杀掉子进程、带另一个 `--session` 重启"。那让
+        `/new` 和 `/resume` 变成"知道一个命令行开关"的人才用得动的东西，而界面里
+        最需要它们的时刻（刚聊完一个话题、想换一个）恰恰是最不该退出重来的时候。
+
+        代价说白：换会话要**完整重来一遍装配**（模型 client、工具注册表、Agent、
+        MCP 子进程）。这不是优化问题，是正确性问题 —— `TodoBoard` / `SkillBoard` 绑在
+        `session.metadata` 上，复用旧注册表就会让新会话看到旧会话的任务列表。
+
+        ## 顺序，以及每一步为什么在那儿
+
+          1. `_join_turn()` —— 先在**旧** runtime 上把当前这一轮跑完。中断它会在会话里
+             留下一条带 `tool_calls` 却没有对应结果的 assistant 消息，那种会话此后每轮
+             都发不出去（API 直接 400）。所以换会话的语义是"等这一轮回合结束"，和
+             `shutdown` 是同一条规矩；
+          2. `_factory(...)` —— 造新的。**它抛异常时旧 runtime 还活着**，所以失败路径
+             只需要发一条 notice，界面那边什么都不用收拾（它按 `init` 才清屏）；
+          3. `close()` 旧的那个 —— 放在新 runtime **造出来之后**：装配失败是真实会
+             发生的（缺密钥、permissions.json 写坏、MCP 起不来），而那时候用户最不
+             需要的就是"会话没了";
+          4. `attach()` —— 在新 runtime 发任何事件之前接上（不变式，见模块 docstring）。
+             asker 在**被调用时**才从 runtime 上取 memory，所以这一步晚了就会让第一次
+             审批拿到上一个会话的记忆。
+        """
+        if session_id is not None and not isinstance(session_id, str):
+            self._notice("warn", "session", "[会话] 换会话的 id 必须是一个字符串")
+            return
+
+        # 合法性在这里查一次（和 `main.py` 那条 `--session` 同一条规矩）。不查的话
+        # `store.exists()` 会从 `_path` 里抛 ValueError —— 那是一条会打断读循环的异常，
+        # 而"会话 id 打错了"是最常见的手滑，不该有这种后果。
+        if session_id and not is_valid_session_id(session_id):
+            self._notice(
+                "warn", "session",
+                f"[会话] 非法 id：{session_id!r} —— 只能用字母、数字、下划线、连字符"
+                f"（1~64 个字符）。/resume 不带参数可以从列表里挑。",
+            )
+            return
+
+        previous = self.runtime
+        self._join_turn()
+        try:
+            runtime = self.open_session(session_id)
+        except ConfigError as exc:
+            self._notice("warn", "session",
+                         f"[会话] 换不过去（当前会话没有变）：{exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - 一个坏会话不该让整个进程退出
+            self._notice(
+                "warn", "session",
+                f"[会话] 换不过去（当前会话没有变）：{type(exc).__name__}: {exc}",
+            )
+            return
+
+        if previous is not None and previous is not runtime:
+            try:
+                previous.close()
+            except Exception as exc:  # noqa: BLE001 - 收旧摊失败不该盖住新会话
+                self._warn(f"收掉上一个会话的 runtime 时出错：{type(exc).__name__}: {exc}")
+
+        self.runtime = runtime
+        # 换会话时把这几个"上一个会话的残留"清掉：
+        #   * `_stop`：不 clear 的话，在上一轮按过 Esc 之后，新会话的**每一轮**都会在
+        #     第一个安全点被砍掉（症状是"发消息没反应"，没有任何地方报错）——
+        #     和 `_run_turn` 里那句 clear 是同一个坑，只是这条路上更容易踩到；
+        #   * `_answer` / `current_call_id`：它们属于上一个会话的那一轮。
+        self._stop.clear()
+        self._answer = ""
+        self.current_call_id = ""
+        self._last_run_id = ""
+
+        self._emit_opening()
 
     def _run_turn(self, text: str) -> None:
         """跑一个回合（**在工作线程里**），并把该发的都发出去。"""
@@ -515,6 +702,15 @@ class ProtocolServer:
             "v": messages.VERSION, "t": messages.OUT_NOTICE,
             "level": level, "code": code, "text": text,
         })
+
+    def _warn(self, text: str) -> None:
+        """只在**收尾失败**那条路上用。走 stderr（和 `composition._warn` 同一条路）。
+
+        **不能走 `_notice`**：那种失败发生在换会话**成功之后**，往界面上再发一条
+        警告只会让人以为换会话出了问题 —— 而它其实好了，只是旧的 http client 或
+        MCP 子进程没干净地收掉。
+        """
+        print(f"[warn] {text}", file=sys.stderr)
 
     # -- 出站构造 --------------------------------------------------------------
 
@@ -596,4 +792,19 @@ class ProtocolServer:
         return self._stop.is_set()
 
 
-__all__ = ["ProtocolAsker", "ProtocolQuestioner", "ProtocolServer"]
+def _no_runtime_factory(bootstrap: Bootstrap, session_id: str) -> Any:
+    """没被交进工厂时的兜底：**大声拒绝，而不是假装能造**。
+
+    默认拒绝（而不是在这里 import `composition` 自己造一个）是刻意的：那样会让
+    "换会话怎么装配"多出第二个实现，而两个实现漂掉的时候症状是"换过去之后少了半个
+    工具集"—— 那种不一致没人查得出来。所以工厂只有一份，由 `serve.py` 交进来
+    （它本来就是唯一做装配的地方）。
+    """
+    raise RuntimeError(
+        "这个 ProtocolServer 没有装配工厂，换不了会话 —— "
+        "从 `protocol/serve.py` 起来（或测试里注入一份 runtime_factory）。"
+    )
+
+
+__all__ = ["Bootstrap", "ProtocolAsker", "ProtocolQuestioner", "ProtocolServer",
+           "RuntimeFactory", "BootstrapFactory", "SessionLister"]

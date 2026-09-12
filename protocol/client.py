@@ -194,6 +194,23 @@ class ProtocolClient:
         """
         self.send({"t": messages.IN_INTERRUPT})
 
+    def switch_session(self, session_id: str | None = None) -> None:
+        """**原地换一个会话**（TUI 的 `/new` 和 `/resume`）。
+
+        `session_id=None` = 新会话（id 由 runtime 分配）。**它不是"重启"**：子进程
+        活着，runtime 换掉自己那一半，然后重发 `init` / `session_load` / `ui state`
+        三连 —— 界面按那一组消息刷新即可（见 `protocol/channels.py` 的
+        `_session_switch`）。
+
+        它是非阻塞的：这里只写一行。成功与失败都由回来的消息说 —— 成功是新的
+        `init`，失败是一条 `notice`（换不过去时旧会话**原样保留**）。
+        """
+        self.send({"t": messages.IN_SESSION_SWITCH, "session_id": session_id})
+
+    def list_sessions(self) -> None:
+        """请 runtime 回一份会话清单（出站 `sessions`）。**同样是发一条就走。**"""
+        self.send({"t": messages.IN_SESSION_LIST})
+
     def shutdown(self) -> None:
         self.send({"t": messages.IN_SHUTDOWN})
 

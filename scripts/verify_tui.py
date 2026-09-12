@@ -109,11 +109,16 @@ async def main() -> int:
     os.environ["DEEPSEEK_BASE_URL"] = f"http://127.0.0.1:{server.server_port}/v1"
     os.environ["PYTHONIOENCODING"] = "utf-8"
 
+    # **每次一个干净的会话 id**：这条验收会换会话，而换回来的那个必须是"接着聊"。
+    # 用一个写死的 id 时，上一次跑留下的会话文件会让"新会话"那条断言变成 False
+    # （实测踩过 —— 那是"第二次跑才红"的典型）。
+    first = f"acceptance-{int(time.time())}"
+
     from textual.widgets import Button
 
     from agent_runtime.frontends.tui.app import TuiApp
 
-    app = TuiApp(session="acceptance")
+    app = TuiApp(session=first)
     ok = True
     try:
         async with app.run_test(size=(100, 30)) as pilot:
@@ -216,6 +221,59 @@ async def main() -> int:
             print(f"  phase={app.state.agent.phase}")
             assert stopped, f"Esc 之后这一轮没有停下：{app.state.agent.phase}"
             assert "已中断" in _log_text(app), "界面上没说清这一轮是被中断的"
+
+            # --- 5. 换会话（第二期新增：**原地换，不重启进程**）---
+            #
+            # 这是"`/new` 和 `/resume` 不再是重开进程"唯一的端到端证据。它要验的三段
+            # 只有真子进程才看得见：界面发一条 `session_switch` → 子进程收掉自己的
+            # runtime、换一个会话重新装配、重发开场三连 → 界面按新的 `init` 换屏。
+            #
+            # 三层各钉一条：**id 真的变了**、**画面真的清了**（旧回合不能留在新会话里）、
+            # **换回去真的还是那个会话**（`resumed=True` + 历史在）。
+            await _drive(app, pilot, lambda: not app.state.agent.is_busy, tries=200)
+            before_id = app.state.session_id
+
+            app.submit("/new")
+            switched = await _drive(
+                app, pilot,
+                lambda: app.state.session_id not in ("", before_id), tries=200)
+            print("=== 换会话 ===")
+            print(f"  {before_id} → {app.state.session_id}")
+            assert switched, f"/new 之后会话没换：还是 {app.state.session_id}（见 stderr）"
+            assert app.state.turns == [], "新会话里还留着上一个会话的回合"
+            assert "已中断" not in _log_text(app), "会话流没跟着换"
+
+            # `/resume` 不带参数：清单从子进程来，面板要弹出来；`Esc` 什么都不做。
+            from agent_runtime.frontends.tui import widgets as tui_widgets
+
+            app.submit("/resume")
+            popped = await _drive(
+                app, pilot,
+                lambda: isinstance(app.screen, tui_widgets.SessionPicker), tries=200)
+            assert popped, "/resume 没有弹出会话面板（清单没回来？）"
+            picked = app.screen.selected()
+            print(f"  面板：{type(app.screen).__name__}  默认选中 {picked}（共 "
+                  f"{len(app.screen.sessions)} 个）")
+            assert picked, "面板里没选出东西"
+            await pilot.press("escape")
+            await _drive(app, pilot, lambda: not isinstance(
+                app.screen, tui_widgets.SessionPicker), tries=40)
+
+            # 换回原来那个：它就是"接着聊"（那个会话里已经有前面那几轮了）。
+            app.submit(f"/resume {before_id}")
+            restored = await _drive(
+                app, pilot, lambda: app.state.session_id == before_id, tries=200)
+            log = _log_text(app)
+            has_history = "你好" in log
+            print(f"  换回来 resumed={app.state.resumed}  历史里能找到"
+                  f"{'原来的对话' if has_history else '（空）'}")
+            assert restored and app.state.resumed, \
+                f"换回去的应该是接着聊：{app.state.session_id} resumed={app.state.resumed}"
+            # **画出来的是"你说过的 + 它答过的"**（`session_load` 只重建这两类，
+            # 见 `app._on_session_load`）—— 所以拿第一句话和它的答案来验，
+            # 而不是拿"已中断"那种**只属于事件流、不进历史**的行。
+            assert has_history, "换回来该把那个会话的历史画出来"
+            assert "我很好，谢谢。" in log, "恢复会话要把 agent 答过的话也画出来"
             print("=== 通过 ===")
     except AssertionError as exc:
         print(f"=== 失败：{exc} ===")

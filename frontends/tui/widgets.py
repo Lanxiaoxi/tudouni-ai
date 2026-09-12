@@ -270,8 +270,8 @@ class KeyHintBar(Panel):
     代价远小于"输入行跑到屏幕外"（实测：122 列时最后那条 `Esc 中断本轮` 正好被裁掉，
     看起来像没实现这个键）。
 
-    所以**顺序本身就是优先级**：`Esc` 排在 `Ctrl+S` / `Ctrl+R` 前面，因为前两个是
-    "有东西要停下来"和"看清单"，后两个都是可以另找入口的。
+    所以**顺序本身就是优先级**：`Esc` 排在 `Ctrl+S` 前面，因为前一个是"有东西要停下来"，
+    后一个是可以另找入口的（输入 `/skills`）。
 
     窄屏（< 120 列）另外用一套更短的措辞：那几列连"思考过程"四个字都嫌长。
     """
@@ -279,7 +279,7 @@ class KeyHintBar(Panel):
     FULL = [
         ("Enter", "发送"), ("/", "命令面板"),
         ("Ctrl+T", "思考过程"), ("Ctrl+B", "上下文栏"), ("Esc", "中断本轮"),
-        ("Ctrl+S", "全部技能"), ("Ctrl+R", "重开会话"),
+        ("Ctrl+S", "全部技能"),
     ]
     NARROW = [
         ("Enter", "发送"), ("/", "命令"), ("Ctrl+T", "思考"), ("Esc", "中断"),
@@ -1295,9 +1295,139 @@ class SkillsPanel(ModalScreen):
         self.dismiss(None)
 
 
+class SessionPicker(ModalScreen):
+    """**选一个会话**（`/resume` 不带参数时弹这个）。
+
+    它替换掉的是"先 `/list` 看一眼 id、再 `/resume <id>` 打一遍"—— 两步里第一步
+    只是为了把 id 抄出来，而 id 是时间戳，抄错一位就切到另一个会话上（或者建一个
+    新的）。
+
+    ## 三条约束，都是从它替代的那条路里学来的
+
+      * **`Enter` = 切过去，`Esc` = 什么都不做**（`dismiss(None)`）。这里刻意不给
+        `Esc` 任何"关掉顺便做点什么"的语义 —— 换会话是会把当前 runtime 收掉的，
+        而误触的代价比"没换"大得多；
+      * **当前会话那一行带一个 `●`**（`view_state.session_row(conflict=True)`）：
+        候选里一定有它，而不标出来的话"选中了却什么都没发生"看起来像坏了；
+      * **数据是 runtime 给的**（`sessions` 那条消息），界面不自己去读
+        `.tudouni/sessions/` —— 目录布局不是前端该认识的事实（见
+        `protocol/messages.py` 里 `IN_SESSION_LIST` 那段）。
+
+    `↑↓` 用 `on_key` 而不是 `BINDINGS`：和 `QuestionPanel` 同一个理由 —— 这个
+    面板没有焦点在可编辑控件上，键直接落到 screen 上；走绑定反而要和 `App` 那一层
+    的 `↑↓`（翻会话流）抢。
+    """
+
+    BINDINGS = [("escape", "close", "取消")]
+
+    def __init__(self, sessions: list[dict[str, Any]], current: str,
+                 palette: theme_mod.Theme, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.palette = palette
+        self.sessions = list(sessions)
+        self.current = current
+        self._index = self._default_index()
+
+    def _default_index(self) -> int:
+        """默认选中**最新那个会话**（清单是从新到旧给的）。
+
+        为什么不是"当前那一个"：打开这个面板的人几乎总是想换一个 —— 默认停在当前
+        会话上会让人按一下 `Enter` 之后什么都没发生，而那是这个面板最坏的失败形态
+        （看不出自己按成功了没有）。想留在原地的做法是按 `Esc`。
+        """
+        return 0 if self.sessions else -1
+
+    def compose(self):
+        with Modal("session-body"):
+            yield Horizontal(
+                Static(Text("◱ 换一个会话", style=self.palette.ink + " bold")),
+                Static(Text(f"{len(self.sessions)} 个", style=self.palette.ink4),
+                       classes="modal-badge"),
+                classes="modal-head",
+            )
+            if not self.sessions:
+                yield Static(Text("还没有保存过任何会话 —— 说出第一句话之后才会有。",
+                                  style=self.palette.ink4), classes="modal-hint")
+            else:
+                yield Vertical(id="session-options")
+            yield Static(Text(
+                "↑↓ 选择  ·  Enter 切过去  ·  Esc 取消   "
+                "（● = 你现在所在的会话；切换会收掉当前会话的 runtime）",
+                style=self.palette.ink4), classes="modal-foot")
+
+    def on_mount(self) -> None:
+        self._paint()
+
+    def _paint(self) -> None:
+        if not self.sessions:
+            return
+        options = self.query_one("#session-options", Vertical)
+        options.remove_children()
+        for index, item in enumerate(self.sessions):
+            selected = index == self._index
+            row = view_state.session_row(item,
+                                         conflict=item.get("session_id") == self.current)
+            text = Text()
+            if selected:
+                # 选中那条**不带行内样式**（除了那个块字符）：反白由 CSS 的
+                # `.option.selected` 给，那样底色铺满整行而不是只有文字那么长
+                # （和 QuestionPanel 里那条同一个坑，见那里的说明）。
+                text.append("▌  ")
+                text.append(str(row))
+            else:
+                text.append("   ")
+                # 分段着色走 `Line.segments`（和 `paint()` 同一条规矩），而不是
+                # `paint().style` —— 后者拿到的是**整行的基样式**，把它套上去会把
+                # 分段之间的差别抹平（`Line` 的分段正是为了这个才存在的）。
+                for chunk, role in (row.segments or [(str(row), row.role)]):
+                    text.append(chunk, style=style_of(self.palette, role))
+            options.mount(Static(text, classes=(
+                "option selected" if selected else "option")))
+
+    def _move(self, delta: int) -> None:
+        if not self.sessions:
+            return
+        self._index = (self._index + delta) % len(self.sessions)
+        self._paint()
+
+    def on_key(self, event: Any) -> None:
+        if event.key == "up":
+            self._move(-1)
+            event.stop()
+        elif event.key == "down":
+            self._move(1)
+            event.stop()
+        elif event.key == "enter":
+            self.action_choose()
+            event.stop()
+
+    def on_click(self, event: Any) -> None:
+        widget = getattr(event, "widget", None)
+        if widget is None or "option" not in getattr(widget, "classes", ()):
+            return
+        for index, child in enumerate(self.query(".option")):
+            if child is widget:
+                self._index = index
+                self._paint()
+                return
+
+    def selected(self) -> str | None:
+        if not self.sessions or self._index < 0:
+            return None
+        return str(self.sessions[self._index].get("session_id", "")) or None
+
+    def action_choose(self) -> None:
+        self.dismiss(self.selected())
+
+    def action_close(self) -> None:
+        """`Esc` = **什么都不做**。见类 docstring 第 1 条。"""
+        self.dismiss(None)
+
+
 __all__ = [
     "CommandPalette", "ContextRail", "ConversationLog", "KeyHintBar",
     "LineBlock", "MessageBlock", "Panel", "PermissionPanel", "QuestionPanel",
-    "SessionBar", "SkillsPanel", "StatusBar", "TopBar", "TurnBlock", "TwoPart",
-    "WelcomeBlock", "color_of", "paint", "paint_lines", "style_of",
+    "SessionBar", "SessionPicker", "SkillsPanel", "StatusBar", "TopBar",
+    "TurnBlock", "TwoPart", "WelcomeBlock", "color_of", "paint", "paint_lines",
+    "style_of",
 ]

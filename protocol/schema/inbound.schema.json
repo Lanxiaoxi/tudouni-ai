@@ -9,6 +9,30 @@
     },
     "required": ["v", "t", "text"]
   },
+  "session_switch": {
+    "summary": "**原地换一个会话**：runtime 收掉当前 runtime、按这个 id 重新装配，然后重发 init / session_load / state。进程不动，所以前端不用重启。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "session_switch"},
+      "session_id": {
+        "type": "string",
+        "nullable": true,
+        "doc": [
+          "要切到哪个会话。**null/缺省 = 新会话**（id 由 runtime 分配）。",
+          "给了 id 而那个会话文件不存在时**也算新会话** —— 和 `--session` 是同一条语义"
+        ]
+      }
+    },
+    "required": ["v", "t"]
+  },
+  "session_list": {
+    "summary": "请 runtime 回一份会话清单（出站的 `sessions`）。界面用它做选会话的面板。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "session_list"}
+    },
+    "required": ["v", "t"]
+  },
   "interrupt": {
     "summary": "**中断当前这一轮。** 不是收摊，也不是取消已经发出去的那一步。",
     "fields": {
