@@ -1,16 +1,25 @@
 """
 Agent Runtime 主入口。
 
-这个文件只做一件事：**把各个部件接起来**。怎么跟用户说话在 cli.py，配置从哪来在
-config.py，重试策略在 agents/retry.py，权限裁决在 security/gate.py，审计落盘在
-audit/。入口保持薄，是因为它的变化原因只有一个 —— 装配方式变了。
+这个文件只做一件事：**决定这次运行走哪条路，然后把活交给别人**。
+
+装配在 `runtime/composition.py`（它认识内核的每一个零件），怎么跟用户说话在
+`frontends/cli/`，配置从哪来在 `runtime/config.py`。
+
+**第零期之后它有多薄**：以前这里有 465 行，其中一半是真正的运行时职责（起 MCP
+子进程、渲染载荷尾部、接 trust group、读策略），另一半是呈现（7 处 print）。
+前者搬进了 `runtime/`，后者变成了 `Runtime.notices()` 返回的数据。留下的只有
+分派和"用哪个流把它打出来"。
+
+**两条刻意的顺序约定，改的时候要小心**：
+
+  1. 四个"不需要模型"的子命令（`--list` / `--skills` / `--audit` / `--history`）
+     排在配置检查**之前** —— 没配密钥的人照样该能查自己的历史；
+  2. 横幅排在配置检查**之后** —— 密钥没配就退出的那种启动，不需要先看一幅图案。
 """
 
 import sys
-from functools import partial
 from pathlib import Path
-
-import httpx
 
 # 项目自身目录与它的父目录是两件事，不要共用一个变量：
 #   - agent_runtime 是一个包，要能 `import agent_runtime`，
@@ -22,192 +31,91 @@ REPO_ROOT = PROJECT_DIR.parent
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from agent_runtime.agents import Agent
-from agent_runtime.audit import JsonlSink
-from agent_runtime.cli import (
-    build_parser,
+from agent_runtime.frontends.cli import (
     print_audit,
     print_banner,
     print_history,
     print_sessions,
     print_skills,
-    resolve_session,
     run_repl,
 )
-from agent_runtime.config import (
-    MCP_FILE,
-    PERMISSION_FILE,
-    PERMISSION_FILE_NAME,
-    ConfigError,
-    McpConfig,
-    ModelConfig,
-    PermissionConfig,
-    WebConfig,
-    save_approvals,
+from agent_runtime.frontends.cli.args import build_parser
+from agent_runtime.runtime.channels import cli_channels
+from agent_runtime.runtime.composition import (
+    Notice,
+    boot,
+    check_session_id,
+    open_runtime,
+    resolve_session,
 )
-from agent_runtime.models import OpenAICompatibleModel
-from agent_runtime.security import ApprovalMemory, PermissionPolicy, TrustGroup, cli_asker
-from agent_runtime.security.commands import format_rule
-from agent_runtime.skills import (
-    RUNTIME_DIR_NAME,
-    SkillCatalog,
-    SkillLoader,
-    active_line,
-    catalog_entries,
-    catalog_part,
-    skill_note,
-)
-from agent_runtime.state import JsonSessionStore
-from agent_runtime.state.session import is_valid_session_id
-from agent_runtime.tools.builtin import create_tool_registry
-from agent_runtime.tools.builtin.ask import cli_questioner, unavailable_questioner
-from agent_runtime.tools.builtin.todo import TodoBoard, progress_line, todo_note
-from agent_runtime.tools.builtin.webfetch import USER_AGENT, WebFetch
-from agent_runtime.tools.builtin.websearch import TavilySearch, WebSearch
-from agent_runtime.tools.mcp import McpToolset
-
-SESSIONS_DIR = PROJECT_DIR / RUNTIME_DIR_NAME / "sessions"
-LOGS_DIR = PROJECT_DIR / RUNTIME_DIR_NAME / "logs"
+from agent_runtime.runtime.config import ConfigError
 
 
-def report_permissions(policy: PermissionPolicy, memory: ApprovalMemory) -> None:
-    """把这次启动生效的权限范围说出来。
+def _emit(notices: list[Notice], *, audit_line: str | None = None) -> None:
+    """把装配期那些说明打出来，**按它自己记的流**。
 
-    **每次启动都说一遍。** 「按一次 t 就永久生效」是最容易忘掉的那类设置，而这份
-    文件攒上几条之后，光盯着它已经答不出"现在到底还有什么会问我"。
+    一次遍历、按 `notice.stream` 分派，而不是分两趟（先 stdout 再 stderr）：
+    两趟会改掉两者的相对顺序，而 `> 对话.txt` 和终端上看到的都依赖那个顺序。
 
-    走 stderr：它和横幅、提示符是一类东西（关于这次运行的说明），不是对话内容。
+    `audit_line` 是"审计日志写到哪"，**单独一个参数而且排在最后** —— 它属于装配
+    事实（所以它在 `notices()` 里），但老 CLI 的输出顺序是「已注册工具 → 审计日志
+    写到」，而那份工具清单是 notices 里的一条。把它单独拎出来打就两全了：位置对得上，
+    内容也仍然由装配层提供（前端只是负责打出来）。`--audit` / `--list` 那些子命令
+    根本不走这条路，所以它们不会看到这一行。
     """
-    levels = ", ".join(sorted(policy.auto_approve)) or "（无）"
-    named = ", ".join(sorted(memory.tools())) or "（无）"
-    print(f"[权限] 按等级自动放行 {levels}；点名免问 {named}", file=sys.stderr)
-    if policy.deny_tools:
-        print(f"[权限] 直接拒绝 {', '.join(sorted(policy.deny_tools))}", file=sys.stderr)
-
-    # 命令行规则单列一行：它是"按一次 t 记住哪条前缀"的产物，也是最容易被忘掉的一条 ——
-    # 印象里只批准过一次 git add，而它此后一直静默生效。
-    rules = ", ".join(format_rule(rule) for rule in sorted(memory.prefixes())) or "（无）"
-    print(f"[权限] 命令规则（按前缀放行）{rules}", file=sys.stderr)
-
-
-def report_todos(session) -> None:
-    """恢复会话时，把当前任务列表说一遍。
-
-    **它必须有，因为列表比进程活得久。** 任务列表存在会话文件里（`session.metadata`），
-    所以恢复一个会话时，提示词里没有它、而历史里那一版可能已经是几十步之前的 ——
-    不说的话，用户看到的会是"它怎么突然开始更新一个我从没见过的列表"。
-
-    和 `report_permissions` 同一类东西：关于这次运行的既有状态，走 stderr。
-    """
-    line = progress_line(session.metadata)
-    if line:
-        print(f"[任务] {line}", file=sys.stderr)
-
-
-def report_skills(catalog: SkillCatalog, session=None) -> None:
-    """把这次启动扫到的技能说一遍。
-
-    和 `[权限]` / `[任务]` 那几行同一类东西（关于这次运行的既有状态），走 stderr。
-
-    **坏技能和被遮住的同名技能必须逐条报出来，这是这个函数存在的主要理由。** 两者的
-    症状一模一样：磁盘上那份文件明明在，却完全不起作用。一份写错 frontmatter 的
-    SKILL.md 从启动到会话结束都不会有任何异常；而一份被个人级技能遮住的项目级技能更
-    隐蔽 —— 人改它、改了很多遍，改的却是一份不算数的文件。取向和
-    `PermissionConfig.unknown_tools` 完全一样：不该拦启动，但绝不能不说。
-
-    已加载的技能也报一遍（恢复会话时 `session.metadata` 里可能就有）：技能正文比进程
-    活得久，而"它现在按哪份说明在做"是接着聊之前唯一该先看一眼的事实。
-    """
-    if catalog.skills:
-        print(f"[技能] 可用 {len(catalog.skills)} 个："
-              f"{'、'.join(skill.name for skill in catalog.skills)}", file=sys.stderr)
-    for item in catalog.shadowed:
-        print(f"[技能] 同名遮蔽：{item}", file=sys.stderr)
-    for problem in catalog.problems:
-        print(f"[技能] {problem}", file=sys.stderr)
-    if session is not None and (line := active_line(session.metadata)):
-        print(f"[技能] {line}", file=sys.stderr)
-
-
-def report_mcp(cfg, toolset) -> None:
-    """把这次启动连上的外部 server 说一遍。
-
-    和 `[权限]` / `[技能]` 那几行同一类东西（关于这次运行的既有状态），走 stderr。
-    **每次启动都说，而且说清"它们的工具每次都要审批"**：外部工具默认每条都要问人，
-    而这句话是"为什么它又问我了"唯一的解释；不说的话，用户会以为配置错了。
-
-    工作区里那份 mcp.json **不读**（理由写在 config.McpConfig 上），但它在磁盘上时
-    必须报一句 —— "文件明明在那儿却完全不起作用"和坏技能是同一类症状。
-    """
-    if cfg.servers:
-        print(f"[MCP] {MCP_FILE} 里配了 {len(cfg.servers)} 个 server："
-              f"{'、'.join(server.name for server in cfg.servers)}", file=sys.stderr)
-    for name, count in toolset.counts.items():
-        print(f"[MCP] server {name}：连上了，提供 {count} 个工具"
-              f"（风险一律 high，每次调用都要你批准）", file=sys.stderr)
-
-    # 工作区里那份是**故意不读**的，所以它存在就等于"有人按旧位置写了一份"。
-    ignored = PROJECT_DIR / RUNTIME_DIR_NAME / "mcp.json"
-    if ignored.is_file():
-        print(f"[MCP] 忽略了 {ignored}：server 清单只从用户级 {MCP_FILE} 读。"
-              f"理由是这里的 command 是启动时就要执行的代码，而工作区里的文件可能"
-              f"随仓库一起被 clone 进来（见 config.McpConfig 上面的说明）。"
-              f"要用就把它挪到 {MCP_FILE}", file=sys.stderr)
-
-
-def _check_session_id(session_id: str | None) -> str | None:
-    """`--session` 是用户直接敲进来的字符串，写错了要能照着改。
-
-    校验规则本身在 state/session.py（它描述的是"什么算合法会话 id"），而这条只负责
-    把"不合法"翻译成一句人话。**必须在碰 store 之前**做，否则 ValueError 会从
-    `store.load` / `_path` 里冒出来，用户在终端上看到的是一整段 Python 栈 —— 而
-    `--session` 写错（带空格、带斜杠、复制进来一个 Windows 路径）是最常见的手滑，
-    项目别处（ConfigError、缺密钥）刻意都做到了"报错 + 退出码 2"。
-
-    返回 None 表示没问题；返回字符串就是那棵写好的报错文案。
-    """
-    if session_id is None or is_valid_session_id(session_id):
-        return None
-    return (
-        f"非法的 --session：{session_id!r}\n"
-        f"  会话 id 只能由字母、数字、下划线、连字符组成，长度 1~64 ——\n"
-        f"  因为它会被拿去拼文件名（{RUNTIME_DIR_NAME}/sessions/<id>.json 和"
-        f" {RUNTIME_DIR_NAME}/logs/<id>.jsonl）。\n"
-        f"  用 --list 看一下有哪些现成的 id。"
-    )
+    for notice in notices:
+        stream = sys.stdout if notice.stream == "out" else sys.stderr
+        print(notice.text, file=stream)
+    if audit_line is not None:
+        print(audit_line, file=sys.stderr)
 
 
 def main() -> int:
     """返回退出码：配置缺失是"用户得先做点事"，脚本调用方应该能看出失败。"""
     args = build_parser().parse_args()
 
+    # ---- `--tui`：父进程，只起界面 ----
+    #
+    # **它排在最前面，而且不装配任何东西。** 真正的 runtime 在它拉起的
+    # `--runtime-stdio` 子进程里；父进程扫一遍技能、建一遍日志目录、再装配一个
+    # Agent 然后什么都不干，是纯浪费。
+    #
+    # 它也必须早于配置检查：父进程自己**不需要密钥**（要密钥的是子进程），
+    # 而"没配密钥"那种失败必须能在界面上显示出来，而不是让父进程先崩掉。
+    #
+    # import 放在函数里：`frontends/tui/__init__.py` 不许在顶层 import textual
+    # （否则 `--list` 那种查询子命令也要加载一个 TUI 框架）。
+    if args.tui:
+        from agent_runtime.frontends.tui.app import run_tui
+        return run_tui(args.session, autopilot=args.autopilot)
+
+    # ---- `--runtime-stdio`：协议子进程 ----
+    #
+    # **它也不碰 cli 前端**：那一支的 stdout 是协议通道，任何一行人话（横幅、
+    # 提示符）打上去都会毒了它。
+    #
+    # 它也不做配置检查 —— 配置错误由 `protocol.serve` 负责报（打到 stderr 并以
+    # 退出码 2 结束），因为那时候才有 stdout 要被保护。
+    if args.runtime_stdio:
+        from agent_runtime.protocol.serve import main as serve
+        return serve(args.session, autopilot=args.autopilot, debug=args.debug)
+
     # 会话 id 的合法性在这里一次查清，早于任何会碰它的东西。--list 不看这个参数，
-    # 但传了非法值仍然报错 —— 一个地方查一次，比让三条子命令各自去猜自己会不会用
-    # 到它可靠。
-    if (problem := _check_session_id(args.session)) is not None:
+    # 但传了非法值仍然报错 —— 一个地方查一次，比让三条子命令各自去猜自己会不会
+    # 用到它可靠。
+    if (problem := check_session_id(args.session)) is not None:
         print(problem, file=sys.stderr)
         return 2
 
-    store = JsonSessionStore(SESSIONS_DIR)
-    logs = JsonlSink(LOGS_DIR)
-
-    # 技能是硬盘上的文件，所以扫它不需要模型 —— 和 --list 同一档，排在配置检查之前。
-    # 造在这个位置还有第二个理由：后面装配工具和注 session_notes 都要用到这一份
-    # （`--skills` 只需要读它，别的子命令连碰都不碰）。
-    #
-    # 扫的是**六个约定目录**（用户级三个、项目级三个，见 skills/loader.py 的
-    # default_roots）：用户级那三个在工作区外面，而这条路径是硬编码的 —— SkillLoader
-    # 不接受模型给的路径，所以"技能只有人能改"在用户级目录上是操作系统帮着保证的。
-    skill_loader = SkillLoader(PROJECT_DIR)
-    skill_catalog = skill_loader.reload()
+    booted = boot()
 
     # ---- 不需要模型的子命令：先处理掉，这样没配密钥也能查历史/审计 ----
     if args.list:
-        print_sessions(store)
+        print_sessions(booted.store)
         return 0
 
     if args.skills:
-        print_skills(skill_loader)
+        print_skills(booted.skill_loader)
         return 0
 
     if args.audit or args.history:
@@ -216,248 +124,54 @@ def main() -> int:
             print(f"{flag} 需要配合 --session <id>；先用 --list 看有哪些会话", file=sys.stderr)
             return 2
         if args.audit:
-            print_audit(logs, args.session)
+            print_audit(booted.logs, args.session)
         else:
-            print_history(store.load(args.session))
+            print_history(booted.store.load(args.session))
         return 0
 
     # ---- 以下需要模型 ----
+    #
+    # 配置错误（缺密钥、permissions.json 写坏、mcp.json 写坏）由 open_runtime 抛
+    # ConfigError。它发生在**开出一个 Runtime 之前**，所以不需要收摊。
+    print_banner()
+
+    session_id, session, resumed = resolve_session(booted.store, args.session)
+
     try:
-        cfg = ModelConfig.from_env()
-        # 权限策略和密钥一起在这里读：两类配置错误都是「用户得先做点事」，
-        # 都该在开出会话之前停下，而不是跑到第一次工具调用才炸。
-        permissions = PermissionConfig.from_file()
-        # 联网工具的密钥**不在这一档**：缺了只是少一个工具，不是"什么都干不了"。
-        web = WebConfig.from_env()
-        # 外部 MCP server 的**清单**在这一档：文件里写错一个键名就停下。但"清单是空的"
-        # 或"某个 server 起不来"不在这一档 —— 前者是默认状态，后者只是少一批工具
-        # （见下面 connect 那段）。这一条界线就是"用户得先做点事"和"少一个能力"的界线。
-        mcp_cfg = McpConfig.from_file()
+        runtime = open_runtime(
+            booted=booted,
+            session_id=session_id,
+            session=session,
+            # `--autopilot` 同时管住两条人机通道：审批不问、提问拿到"没有人回答"。
+            channels=cli_channels(unavailable=args.autopilot),
+            autopilot=args.autopilot,
+            debug=args.debug,
+            resumed=resumed,
+        )
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
 
-    # 横幅放在配置检查**之后**：密钥没配就退出的那种启动，不需要先看一幅图案。
-    # 它也不属于 --list / --history / --audit 那三条路径 —— 那些子命令特意排在配置
-    # 检查之前，为的是「没配密钥也能查历史」，跟"要开会话了"是两回事。
-    print_banner()
+    with runtime:
+        # 顺序是有意的，而且是**照老 CLI 的输出顺序**定下来的（第零期的验收标准
+        # 就是"逐字节不变"）：
+        #
+        #   1. 会话身份那两行排在最前 —— 老 CLI 里 `resolve_session` 就在配置检查
+        #      之后、工具清单之前打印它们；
+        #   2. 然后是装配那些说明；
+        #   3. 「审计日志写到」排在最后，而它同时是**唯一走 stderr 的 stdout 内容**
+        #      （见 `_emit` 的 docstring）。
+        # 恢复会话时老 CLI 的顺序略有不同（那行在所有说明之前），这里统一成新会话那
+        # 一种：那一行是说给"接着聊"的人听的，位置不影响它说的事，而 stdout 的干净
+        # 程度是 README 写着的契约 —— 两害相权，保契约。
+        if resumed:
+            print(f"继续会话 {session_id!r}：{len(session.messages)} 条消息")
+        else:
+            print(f"新会话 {session_id!r}（说出第一句话之后才会落盘）")
+            print(f"  想回来继续它：  --session {session_id}")
 
-    # 末尾那句统计里的"xx/yy"需要有 yy。响应里没有这个字段，所以它来自 config 里那张
-    # 按模型名的表；表里没有就**只报用量、不报占比**（错的百分比比没有百分比更坏）。
-    # 这句话只在真的缺分母时出现一次，而且它同时就是"该往哪加"的说明。
-    if cfg.context_tokens is None:
-        print(f"[上下文] 模型 {cfg.model!r} 不在 config.CONTEXT_WINDOWS 里，"
-              f"末尾只报上下文用量、不报占比；把它的窗口长度加进那张表即可。",
-              file=sys.stderr)
-
-    session_id, session = resolve_session(store, args.session)
-
-    model = OpenAICompatibleModel(
-        api_key=cfg.api_key,
-        base_url=cfg.base_url,
-        model=cfg.model,
-        http_client=httpx.Client(),
-    )
-
-    # 联网抓取用的 http client：**一个进程一个**，连接复用、TLS 握手只付一次。
-    #
-    # trust_env=False：环境变量里的 HTTP_PROXY 不该悄悄改掉这个程序的行为 ——
-    # 和 config 里"环境变量优先、但方向不能反"是同一个担心的两半。要代理就显式构造
-    # 一个 client 传进来。
-    http = httpx.Client(trust_env=False, headers={"User-Agent": USER_AGENT})
-
-    # 缺搜索密钥时把话说在 stderr 上，而不是"注册了再让模型去撞墙"：工具 schema 每一轮
-    # 都要发出去，而模型对"没有密钥"这件事无能为力 —— 它只会白花一步去调一次。这句话
-    # 让它变成"用户得先做点事"，和 [上下文]/[权限] 那几行是同一种做法。
-    if not web.tavily_api_key:
-        print("[联网] 没找到 TAVILY_API_KEY，web_search 未注册（fetch_web 不受影响）。"
-              "要启用就写进 .env：TAVILY_API_KEY=tvly-...", file=sys.stderr)
-
-    try:
-        tools = create_tool_registry(
-            str(PROJECT_DIR),
-            # 提问通道和审批通道**分开装配**：审批回答"要不要执行"，它的答案改变权限；
-            # 提问回答"你要什么"，它的答案只是内容。两者唯一的共同点是"都需要有人在" ——
-            # 而 --autopilot 说的正是这件事本身，所以它同时管住两者：提问那一支拿到的是
-            # unavailable（如实说没有人回答，**不伪造答案、也不记成默许**）。
-            questioner=unavailable_questioner if args.autopilot else cli_questioner,
-            # 任务列表是**按会话的状态**，所以它只能在这里造（会话上面刚解析出来），而且
-            # 拿到的是 session.metadata 这个活字典 —— 写进去的东西跟着会话一起落盘。
-            todos=TodoBoard(session.metadata),
-            # 联网那一对。**密钥的读取留在入口这一层**（tools/ 不能 import config，
-            # 依赖方向是单向的）—— 和 questioner / todos 走的是同一条路。
-            web_fetch=WebFetch(http),
-            web_search=(
-                WebSearch(
-                    TavilySearch(http, web.tavily_api_key, web.tavily_base_url),
-                    provider="tavily",
-                )
-                if web.tavily_api_key
-                else None
-            ),
-            # 技能。和 todos 一样是**按会话的状态**（加载了哪个技能存在 session.metadata
-            # 里），所以只能在这里造 —— 但造出来的那个 SkillBoard 留在注册表的
-            # `tools.skills` 上，载荷尾部那段渲染从那里取回**同一个**对象。
-            #
-            # 自己再 new 一个的后果很隐蔽：那个副本会带着另一个重扫口，于是"技能加载
-            # 成功了、却永远不出现在载荷里"—— 没有异常、没有审计痕迹（tools/tool.py 里
-            # 那段写了为什么；tests 里那条 test_the_note_never_enters_session_messages
-            # 就是盯着它的）。
-            #
-            # loader 一起传进去，board 每次读清单都重扫技能目录：会话开着的时候新加的
-            # 技能下一轮就能加载（只给一次快照的话，模型会看得见一个加载不了的技能）。
-            #
-            # 一个技能都没有时传 None，create_tool_registry 因此**不注册** load_skill
-            # —— 和缺 TAVILY_API_KEY 不注册 web_search 同一条路。代价说明白：这种情况下
-            # 中途新建技能要重开会话才用得上（"连工具都还不在"，和"工具有了、技能换了"
-            # 是两件事，后者由重扫兜住）。
-            skills=skill_catalog if skill_catalog.skills else None,
-            skill_metadata=session.metadata,
-            skill_loader=skill_loader,
-        )
-    except Exception:
-        http.close()
-        raise
-
-    # 外部 MCP server：连上、列工具、注册进同一个注册表。
-    #
-    # **它为什么不进 create_tool_registry 的参数表**（questioner / todos / web_* 都在
-    # 那儿）：那边的每一个参数都是"一个可以随注册表一起造出来的协作者"，而 MCP 带着
-    # **进程生命周期**（连上 → 每次工具调用 → 关闭），并且它的失败是**每个 server
-    # 各自的**（一个起不来只是少一批工具）。所以它由入口持有，这里只是往注册表里放工具
-    # —— 入口的职责本来就是"把各个部件接起来"。
-    #
-    # 位置也不能再晚：下面那条 `unknown_tools` 会拿"已注册的工具名"去核对权限文件，
-    # 而 mcp__… 这些名字必须已经在里面（否则在 permissions.json 里点名放行一个外部工具
-    # 的人会收到一句"这个工具没有注册，规则不会生效"的假警告）。
-    mcp = McpToolset.connect(
-        mcp_cfg.servers,
-        on_problem=lambda message: print(message, file=sys.stderr),
-    )
-    try:
-        for tool in mcp.tools:
-            tools.register(tool)
-    except Exception:
-        # 注册失败（撞名之类）时**必须把这个进程收掉**再往外抛：它是我们起的，
-        # 而它不在 http 那条清理路径上。
-        mcp.close()
-        http.close()
-        raise
-
-    report_mcp(mcp_cfg, mcp)
-
-    print("已注册工具:")
-    for tool in tools.all():
-        print(f"  - {tool.name:16} 风险={tool.risk.value}")
-
-    unknown = permissions.unknown_tools(tool.name for tool in tools.all())
-    if unknown:
-        # 把 shell 写成 shall 的人以为自己放行了。这是唯一能告诉他的地方 ——
-        # 它不该拦启动，但绝不能不说。
-        print(f"[权限] {PERMISSION_FILE.name} 里这些工具没有注册，规则不会生效："
-              f"{', '.join(sorted(unknown))}", file=sys.stderr)
-
-    # 只自动放行名单里列出的等级，其余一律弹审批。名单来自 .tudouni.json（缺省 low）。
-    policy = PermissionPolicy(
-        auto_approve=permissions.auto_approve,
-        deny_tools=permissions.deny_tools,
-    )
-
-    # 人按 t 记下的东西：工具名，以及命令前缀（shell 那种"一条命令一个样"的粒度）。
-    # 落盘那一半是注入进来的 —— memory 自己不碰文件，所以它在测试里是纯内存的。
-    memory = ApprovalMemory(
-        permissions.auto_approve_tools,
-        on_change=lambda tools, prefixes: save_approvals(
-            PERMISSION_FILE, tools=tools, prefixes=prefixes
-        ),
-        prefixes=permissions.shell_allow,
-        label=PERMISSION_FILE_NAME,
-    )
-    report_permissions(policy, memory)
-    report_todos(session)
-    report_skills(skill_catalog, session)
-
-    # autopilot 要在启动时大声说一次：它意味着接下来所有需要审批的工具都会**直接执行**，
-    # 而这件事一旦忘了自己开着，事后看日志只会觉得"这个项目怎么什么都没问"。
-    # 它也不做成配置项 —— 一次性的决定不该悄悄变成永久默认。
-    if args.autopilot:
-        print("[权限] autopilot：不询问任何审批，需要审批的工具会直接执行；"
-              "也不会向你提问 —— 模型调 ask_user 会拿到「没有人回答」，"
-              "并被告知自己决定、把假设说出来（拒绝名单、工作区边界、控制面写入仍然生效）",
-              file=sys.stderr)
-
-    # 载荷尾部那段会话状态：技能目录 + 已加载技能的正文 + 任务列表，合成**一条**临时
-    # 消息（Agent 里 _status_note 负责合成，这里只负责"这一段说什么"）。
-    #
-    # 顺序是刻意的，而且它只在这一个地方定：先目录（有哪些能用），再正文（现在该按哪份
-    # 做），最后任务列表（做到哪了）。倒过来的话，模型会先读到一份"还剩什么活"的清单，
-    # 再读到"该怎么做" —— 而它做决策的瞬间需要的是后者。
-    #
-    # 读的必须是 `tools.skills.catalog`（注册表上那个 board）而不是上面那份启动快照：
-    # board 每次读都会重扫目录 —— 所以中途新加的技能下一轮就会出现在清单里，而且和"能不能
-    # 加载"读到的是同一份事实。重扫在这个函数里**只做一次**（读到局部变量再分别渲染两段）：
-    # 它每次读盘都会把每个技能文件读一遍，而这个函数每一步都会被调一次。
-    #
-    # 三段都**不进 session.messages**（逐轮变化的东西不持久化，见 agent._status_note），
-    # 所以它必须只读 metadata + 技能目录，不做别的事。
-    def session_notes(metadata):
-        board = tools.skills
-        catalog = board.catalog if board is not None else skill_catalog
-        return "\n\n".join(filter(None, (
-            catalog_part(metadata, catalog),
-            skill_note(metadata, catalog),
-            todo_note(metadata),
-        )))
-
-    # 审批里那个 a（信任一整个 MCP server 的全部工具）的接线。
-    #
-    # 连接那一层（tools/mcp.py）只报事实 —— "这些工具同属一个 server"；"怎么把它们
-    # 一起放行"是审批那一层的事（security/asker.py 的 TrustGroup）。两边都不认识对方
-    # 的类型，接起来的地方就在这里，和 session_notes 同一条路。
-    def mcp_trust_group(tool_name: str) -> TrustGroup | None:
-        pair = mcp.group(tool_name)
-        if pair is None:
-            return None
-        server, names = pair
-        # 只有一个工具时不提供 a：那个按键的效果和 t 完全一样，而多一个键只会让人
-        # 多读一行提示。
-        if len(names) < 2:
-            return None
-        return TrustGroup(label=f"MCP server {server} 的 {len(names)} 个工具", tools=names)
-
-    # 四个注入点，同一个原则：判定留在 Agent 内部，执行交给注入的实现。
-    # （提问通道是第五个，但它在上面装配工具时就注入了 —— 它不属于 Agent：Agent 只看见
-    # 一次普通的工具调用，ask_user 会不会阻塞在人的输入上，它不知道也不需要知道。）
-    agent = Agent(
-        model, tools, policy,
-        asker=partial(cli_asker, memory=memory, trust_group=mcp_trust_group),
-        memory=memory,
-        on_checkpoint=store.save,
-        on_event=logs,
-        # 会话状态每轮都要重新贴在请求末尾（当前状态，不是让模型去翻历史找最近那一版）。
-        # 注入的是一段"怎么说"的实现：Agent 自己不知道技能和任务列表长什么样 ——
-        # 它只知道"每次请求末尾要把当前会话状态贴上"（见 agent.py 的 SessionNotes）。
-        session_notes=session_notes,
-        debug=args.debug,
-        # autopilot 只管审批那一关：工作区边界、控制面写入、拒绝名单都在它管不着的地方，
-        # 所以它不是"关掉权限"，只是"这一轮没人可问"。
-        autopilot=args.autopilot,
-    )
-    print(f"审计日志写到 {logs.directory}\\{session_id}.jsonl")
-
-    # logs 同时交给 run_repl：末尾那句累计用量是从审计日志里数出来的，传的是
-    # **同一个** sink（也就是同一个 on_event）—— 换成别的东西就会报出另一套数字。
-    # context_tokens 是那句话里 xxx/total 的分母。
-    try:
-        run_repl(agent, session, session_id, logs, cfg.context_tokens)
-    finally:
-        # 会话结束就关掉：连接池里那些 keep-alive 的 socket 不该留到进程退出。
-        # （模型那个 client 由 OpenAI SDK 自己管，这里是**我们**建的那个。）
-        http.close()
-        # MCP 的 server 是**我们起的子进程**，也必须在这里收掉。顺序放在 http 之后
-        # 不重要，但两件事都要做：漏了它，`npx` 起的 node 会活过这个进程（见
-        # tools/mcp.py 的 _terminate_tree）。
-        mcp.close()
+        _emit(runtime.notices(), audit_line=runtime.audit_log_line())
+        run_repl(runtime)
     return 0
 
 

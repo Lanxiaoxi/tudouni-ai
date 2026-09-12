@@ -34,7 +34,11 @@ from agent_runtime.skills import RUNTIME_DIR_NAME
 from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+# 仓库根，也就是 agent_runtime 这个包的父目录。**这个文件从仓库根搬进 runtime/ 之后
+# 多了一层**，所以比原来多一次 .parent —— 这一点是硬编码的，不能靠"当前工作目录"
+# 推断：`.env` 的位置由源码位置决定，不由 cwd 决定。
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = REPO_ROOT / "agent_runtime"
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE_FILE = PROJECT_ROOT / ".env.example"
 

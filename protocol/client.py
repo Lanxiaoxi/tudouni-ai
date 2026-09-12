@@ -1,0 +1,278 @@
+"""协议客户端：**前端那一侧的公共层**。
+
+## 为什么它在 `protocol/` 而不在 `frontends/`
+
+因为它是"协议怎么走"的知识，不是"界面怎么画"的知识。两个前端（TUI、ansi 冒烟
+渲染器）要做的事**一模一样**：起子进程、读 JSONL、把 `permission_request` 交给
+界面的回调、把回答写回去。如果这一层住在 `frontends/`，那么：
+
+  * 每个前端都要自己 `import agent_runtime.protocol.messages` 去认那些消息种类
+    —— 而前端只该认识**回调**；
+  * 换一个前端就得把这段重写一遍（或者从别的前端 import，那就变成"前端之间共享
+    代码"，而 `frontends/` 的规矩是各前端互不依赖）。
+
+放在这里，前端的接口就缩成四个回调：**收到消息、要审批、要提问、子进程没了**。
+
+## 同步而不是 async
+
+协议服务端是同步的（一个读循环 + 一个回合线程），客户端这一侧也就没必要 async：
+一个读线程把 stdout 拆成消息，主线程做界面。`Textual` 有它自己的事件循环，到时候
+在回调里 `call_from_thread` 即可 —— 那是 Textual 的事，不是这一层的事。
+
+**这一层不认识任何界面**：它不知道 ANSI 还是 Textual 还是 Web，只认识那四个回调。
+（`tests/test_imports.py` 里有一条测试盯着"protocol 不许 import 前端"。）
+"""
+
+import subprocess
+import sys
+import threading
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Protocol
+
+from agent_runtime.protocol import codec, messages
+
+
+class ClientHooks(Protocol):
+    """前端的接口。**四个回调，没有别的。**
+
+    做成 Protocol 而不是基类，是为了让前端**不必** import 任何东西就能实现它 ——
+    Textual 那个应用和 200 行的 ANSI 渲染器都可以是普通函数。
+    """
+
+    def on_message(self, message: dict[str, Any]) -> None:
+        """收到一条出站消息（`init` / `session_load` / `event` / `ui` / `notice`）。
+
+        人机交互那两条**不走这里** —— 它们有专门的钩子，因为它们的处理方式不同：
+        必须回一句话，而且会阻塞对方。
+        """
+
+    def on_permission(self, request: dict[str, Any]) -> str | None:
+        """要审批。**返回 `messages.DECISIONS` 里的一个字符串，或者 `None`。**
+
+        `None` 的意思是 **"我的界面会稍后自己回"** —— 这条通道是给 TUI 那种
+        异步界面的：它没法在**读线程**上等人点按钮（那会把读线程钉住，而读线程还要
+        负责收别的消息）。
+
+        **不返回 `None` 的界面必须当场给出答案**（ANSI/CLI 那种行式界面就是）。
+        子进程那一侧本来就会一直等（`ProtocolServer.wait`），所以"等"发生在它那儿
+        —— 而这正是 `None` 能成立的原因：不回答 = 它继续等，而不是它按默认值走。
+
+        ## 一个实测踩到的坑
+
+        第一版 TUI 这里 `return messages.DENY` 当兜底 —— 想的是"我稍后会用真答案覆盖
+        它"。**那不可能成立**：客户端立刻就把这个 DENY 发出去了，子进程据此拒绝并
+        继续往下跑，等用户点 [允许] 时那条回应已经没人要了（而且更糟：中间那次
+        拒绝会进审计，记成 `user_denied`）。所以"稍后回答"必须在协议层就表达出来，
+        而不是靠一个会被抢先送出的兜底值。
+        """
+
+    def on_question(self, request: dict[str, Any]) -> tuple[str, str] | None:
+        """要提问。返回 `(status, text)`，或者 `None`（同 `on_permission`）。
+
+        `status` ∈ `answered` / `skipped` —— `unavailable` 是 runtime 自己产生的，
+        界面永远不回它。
+        """
+
+
+def runtime_entrypoint() -> Path:
+    """`main.py` 的绝对路径。
+
+    `__file__` 是 `<包>/protocol/client.py`，所以包目录是**上两级**、仓库根是再上一级
+    （实测踩过一次：少算一级会让子进程去找 `C:\\...\\repo\\main.py`，而报错是
+    "can't open file" —— 看起来像路径写错了，其实是层级算错了）。
+    """
+    return Path(__file__).resolve().parent.parent / "main.py"
+
+
+def repo_root() -> Path:
+    return runtime_entrypoint().parent.parent
+
+
+def default_argv(session: str | None = None, *, autopilot: bool = False,
+                 debug: bool = False) -> list[str]:
+    """起 runtime 子进程的命令行。
+
+    **三件事都是踩过才知道的**（完整理由见 `doc/protocol.md` 和
+    `protocol/transport_stdio.py`）：
+
+      1. **`sys.executable`，不是 `"python"`** —— 父进程跑在哪个解释器里（venv、
+         uv 管的那个），子进程就必须是同一个。写 `"python"` 会走到系统 PATH 上另一个
+         解释器，而那个里面**没装 openai / pydantic**，症状是子进程立刻退出、
+         父进程读到 EOF；
+      2. **`-u`** —— stdout 接管道时 Python 用块缓冲，不关掉就会出现"事件攒在缓冲区
+         里、界面几秒不动"；
+      3. **绝对路径 + `cwd=仓库根`，不能用 `python -m agent_runtime.main`** ——
+         项目是 `package = false`，`agent_runtime` 根本没被安装，`-m` 找不到它。
+         `main.py` 里那句 `sys.path.insert` 在当脚本跑时生效、在 `-m` 下不生效。
+    """
+    argv = [sys.executable, "-u", str(runtime_entrypoint()), "--runtime-stdio"]
+    if session is not None:
+        argv += ["--session", session]
+    if autopilot:
+        argv.append("--autopilot")
+    if debug:
+        argv.append("--debug")
+    return argv
+
+
+class ProtocolClient:
+    """一个协议客户端。用 `with` 或显式 `close()`。"""
+
+    def __init__(
+        self,
+        hooks: ClientHooks,
+        *,
+        session: str | None = None,
+        autopilot: bool = False,
+        debug: bool = False,
+        stderr_to: Any = None,
+    ):
+        self.hooks = hooks
+        self._process: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
+        self._closed = False
+        self._started = False
+        # 写锁：审批回调从读线程来、用户输入从主线程来，两边都可能写。
+        self._lock = threading.Lock()
+        # 子进程以非 0 退出时的那句话（父进程要把它显示出来，而不是当成崩溃）。
+        self.exit_code: int | None = None
+        self._spawn(session, autopilot=autopilot, debug=debug, stderr_to=stderr_to)
+
+    def _spawn(self, session, *, autopilot, debug, stderr_to) -> None:
+        self._process = subprocess.Popen(
+            default_argv(session, autopilot=autopilot, debug=debug),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # stderr **继承**（None）：子进程的 traceback 和 `[warn]` 直接落在终端上。
+            # 这是刻意选的失败方向 —— 一个什么都不显示的 traceback 比花屏更坏。
+            # 想收进面板就传一个流进来（第二期的 Textual 客户端会这么做）。
+            stderr=stderr_to,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(repo_root()),
+            env=_child_env(),
+        )
+
+    # -- 发 --------------------------------------------------------------------
+
+    def send(self, message: dict[str, Any]) -> None:
+        """写一条。**加锁**：审批回调在读线程里、用户输入在主线程里。"""
+        if self._closed or self._process is None or self._process.stdin is None:
+            return
+        line = codec.encode({"v": messages.VERSION, **message})
+        with self._lock:
+            try:
+                self._process.stdin.write(line)
+                self._process.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                # 子进程已经走了。**不抛** —— 界面接下来会发现（读线程会结束、
+                # `wait()` 会给出退出码），由它决定怎么显示。
+                self._closed = True
+
+    def user_message(self, text: str) -> None:
+        self.send({"t": messages.IN_USER_MESSAGE, "text": text})
+
+    def answer_permission(self, request_id: str, decision: str) -> None:
+        assert decision in messages.DECISIONS, f"非法 decision：{decision!r}"
+        self.send({"t": messages.IN_PERMISSION_RESPONSE, "id": request_id,
+                   "decision": decision})
+
+    def answer_question(self, request_id: str, status: str, text: str) -> None:
+        self.send({"t": messages.IN_QUESTION_RESPONSE, "id": request_id,
+                   "status": status, "text": text})
+
+    def shutdown(self) -> None:
+        self.send({"t": messages.IN_SHUTDOWN})
+
+    # -- 收 --------------------------------------------------------------------
+
+    def start(self) -> None:
+        """起读线程。它把每一条消息交给 `hooks`，**并在需要回应时自己回**。
+
+        为什么要自己回（而不是把 `permission_request` 交给 `on_message` 让前端回）：
+        因为"回了什么"必须是**一个**决定，而前端只该回答"选哪个"。让前端自己拼那条
+        `permission_response` 就等于让它认识协议 —— 那正是这一层存在的理由。
+        """
+        self._reader = threading.Thread(target=self._read_loop, name="protocol-client",
+                                        daemon=True)
+        self._reader.start()
+
+    def _read_loop(self) -> None:
+        assert self._process is not None and self._process.stdout is not None
+        try:
+            for line in self._process.stdout:
+                if not line.strip():
+                    continue
+                try:
+                    message = codec.decode(line)
+                except Exception:
+                    # 坏行跳过（和子进程那边同一条规矩）。**不静默**：这一层没法
+                    # 打印（可能是 Textual 在管终端），所以交给上层 —— 用一条 notice
+                    # 形状的东西，前端至少有地方显示它。
+                    self.hooks.on_message({
+                        "v": messages.VERSION, "t": messages.OUT_NOTICE,
+                        "level": "warn", "code": "protocol",
+                        "text": "[协议] 丢弃了一行读不懂的输出",
+                    })
+                    continue
+
+                kind = message.get("t")
+                if kind == messages.OUT_PERMISSION_REQUEST:
+                    decision = self.hooks.on_permission(message)
+                    # `None` = 界面会稍后自己回（见 `ClientHooks.on_permission`）。
+                    # **这里绝不能用兜底值替它回** —— 那会抢在用户前面把答案发出去。
+                    if decision is not None:
+                        self.answer_permission(message.get("id", ""), decision)
+                elif kind == messages.OUT_QUESTION_REQUEST:
+                    answered = self.hooks.on_question(message)
+                    if answered is not None:
+                        status, text = answered
+                        self.answer_question(message.get("id", ""), status, text)
+                else:
+                    self.hooks.on_message(message)
+        finally:
+            self.exit_code = self._process.wait()
+
+    def wait(self) -> int:
+        """等子进程结束，返回退出码。"""
+        if self._process is None:
+            return -1
+        if self._reader is not None:
+            self._reader.join()
+        self.exit_code = self._process.wait()
+        return self.exit_code
+
+    def close(self) -> None:
+        """收摊。**先请求停止，再等**，最后才强杀。
+
+        顺序要紧：直接 kill 会让子进程死在半个回合上 —— 而 `messages` 的一致性
+        只在"两步之间"成立（一条带 `tool_calls` 却没有对应结果的 assistant 消息
+        会让那个会话此后每一轮都发不出去）。
+        """
+        if self._closed or self._process is None:
+            return
+        self._closed = True
+        self.shutdown()
+        try:
+            if self._process.stdin is not None:
+                self._process.stdin.close()
+        except OSError:
+            pass
+        try:
+            self._process.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - 正常路径不会走到
+            self._process.kill()
+
+    def __enter__(self) -> "ProtocolClient":
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def _child_env() -> dict[str, str]:
+    from agent_runtime.protocol.transport_stdio import child_env
+
+    return child_env()

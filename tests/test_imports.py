@@ -32,7 +32,7 @@ MODULES = _all_module_names()
 
 def test_the_walk_actually_found_modules():
     """先证明收集器有效 —— 否则下面那个参数化测试可能一个用例都没跑。"""
-    assert "agent_runtime.cli" in MODULES
+    assert "agent_runtime.frontends.cli" in MODULES
     assert "agent_runtime.agents.retry" in MODULES
     assert "agent_runtime.skills.loader" in MODULES
     assert len(MODULES) > 15
@@ -92,7 +92,7 @@ _CONTRACT_MODULES = {"agent_runtime.tools", "agent_runtime.tools.tool"}
 #   * main.py / cli.py —— 它们就是装配处，必须能拿到具体工具和 create_tool_registry；
 #   * config.py —— 它要解析 mcp.json 的形状，那份形状知识住在 tools/mcp.py（见那里的
 #     说明：反向的 tools → config 是禁止的，所以解析只能由 config 这一侧调过去）。
-_EXEMPT_FILES = {"main.py", "cli.py", "config.py"}
+_EXEMPT_FILES = {"main.py", "frontends/cli/__init__.py", "runtime/config.py"}
 
 # 盯住的包：这些是"运行时内核"，它们的 import 面应该只有契约。
 _PACKAGES = ("security", "agents", "state", "audit", "skills", "models")
@@ -157,3 +157,155 @@ def test_the_contract_export_carries_no_baggage():
     assert result.stdout.strip() == "False False", (
         f"tools 的包出口把东西拖进来了：{result.stdout.strip()}（见 tools/__init__.py）"
     )
+
+# --- 分层：内核 / runtime / protocol / frontends ---------------------------------
+#
+# 这三条测试盯的是 doc/TUI-design.md 决策 18 的那张依赖图。它们和上面那些的取向一样：
+# **靠"记得"维持的边界一定会烂**，而烂掉的时候什么都不报 —— 只是某天出现一个 import 环，
+# 或者 `--list` 莫名其妙地开始加载一个 TUI 框架。
+#
+# 第零期（抽 Runtime、搬目录）只加这三条；`protocol/` 和 `frontends/tui/` 还不存在，
+# 所以第 2、3 条现在会在"目录不存在"时直接跳过 —— 等第一期、第二期把它们建出来，
+# 这两条就自动开始生效，不需要再回来改测试。
+
+# 内核：这些包不该认识 runtime / protocol / frontends 里的任何东西。
+# 它们只该依赖工具契约（上面那条测试管的是 tools.* 的可见性，这条管的是**分层**）。
+_KERNEL_PACKAGES = ("security", "agents", "state", "audit", "skills", "models")
+
+# 分层前缀：内核不许 import 它们。
+_LAYER_PREFIXES = ("agent_runtime.runtime", "agent_runtime.protocol", "agent_runtime.frontends")
+
+# 前端不许 import runtime 内部（决策 18 —— 这是"前端只是协议的一个客户端"的全部内容）。
+# 例外是 frontends 内部互相 import，那不算。
+_FRONTEND_FORBIDDEN = ("agent_runtime.runtime",)
+
+# 决策 18 的唯一例外：CLI 直连 runtime（决策 19）。**只有这一项**，而且有退出条件 ——
+# 见 test_the_frontend_exemption_is_only_the_cli。
+_FRONTEND_EXEMPT = {"frontends/cli/__init__.py"}
+
+# textual 只准出现在这两个文件里：其余任何模块 import 它，都会让"老 CLI 不加载 TUI
+# 框架"这条性质失效，而症状是 `--list` 在没装 textual 的环境里直接崩。
+#
+# 路径用 **`_relative()` 的形式**（相对包目录、posix 分隔符、**不带 `agent_runtime/`
+# 前缀**）—— 和 `_FRONTEND_EXEMPT` 一致。写错的两种下场都很难看：带前缀或写反斜杠
+# 时这条断言永远命中不了，也就是**测试静默失效**（实测踩过两次，第一次是反斜杠）。
+_TEXTUAL_ALLOWED = {
+    "frontends/tui/app.py",
+    "frontends/tui/widgets.py",
+}
+
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _source_files(subdir: str) -> list[Path]:
+    """某个子树下的全部 .py；目录不存在就返回空（分层还没建出来的期）。"""
+    root = _PKG_ROOT / subdir
+    return sorted(root.rglob("*.py")) if root.is_dir() else []
+
+
+def _relative(path: Path) -> str:
+    return path.relative_to(_PKG_ROOT).as_posix()
+
+
+def test_protocol_never_imports_a_frontend():
+    """`protocol/` 是跨进程契约，**不许认识任何一个前端**。
+
+    反过来（前端 import 协议）是设计要的 —— 前端只讲协议。而协议认识前端就意味着
+    "契约里掺进了某个界面的偏好"，那时候它就不再是三个前端能共用的东西了。
+
+    这条比 `frontends` 那两条更严一点，因为方向搞反的代价是隐形的：
+    `protocol/channels.py` 里 import 一个 TUI 的 widget 也能跑，只是从此
+    Web 那一侧就依赖上了一个终端库。
+    """
+    for path in _source_files("protocol"):
+        for lineno, module in _internal_imports(path):
+            assert not module.startswith("agent_runtime.frontends"), (
+                f"{_relative(path)}:{lineno} 从 {module} import 了东西 —— "
+                f"协议不许认识任何前端（它要能被 Web 那一侧原样复用）"
+            )
+
+
+@pytest.mark.parametrize("package", _KERNEL_PACKAGES)
+def test_kernel_does_not_know_about_layers(package):
+    """内核不许 import runtime / protocol / frontends。
+
+    这条是**单向**的：runtime 可以 import 内核（它就是来装配内核的），反过来不行。
+    破掉的后果不是"坏了"，而是内核悄悄依赖上某个前端 —— 那时候 `--list`（一个只读
+    会话文件的子命令）会连带把整个装配层和界面层拖进来。
+    """
+    root = Path(importlib.import_module(f"agent_runtime.{package}").__file__).parent
+    for path in sorted(root.rglob("*.py")):
+        for lineno, module in _internal_imports(path):
+            assert not module.startswith(_LAYER_PREFIXES), (
+                f"{_relative(path)}:{lineno} 从 {module} import 了东西 —— "
+                f"{package}/ 是内核，只该依赖内核自己的东西（决策 18）"
+            )
+
+
+def test_frontends_do_not_import_runtime_internals():
+    """前端只准讲协议，不许 import runtime 内部（决策 18）。
+
+    这是"前端 = 协议的一个客户端"这句话的全部内容。它在**同一个仓库、同一个 venv**
+    里只能靠这条测试守着 —— 一个 import 就能把它抹掉，而那正是 Web 前端能不能加进来
+    的前提。
+
+    **一个带日期的例外：`frontends/cli/__init__.py`。** 决策 18 和决策 19 在这里
+    直接冲突：前者要求前端只讲协议，而后者明确让"老 CLI 直连 runtime、v1 不改"。
+    两者不能同时成立，所以照决策 19 给 CLI 开一个**写清了理由和退出条件**的口子：
+
+        例外在 `_FRONTEND_EXEMPT` 里，而那个集合只有一项。
+        等 CLI 也改成协议客户端（决策 19 说的"以后"）时，那一项就该删掉 ——
+        那时这条测试才第一次对**所有**前端生效。
+
+    `frontends/tui/` 和 `frontends/web/` 现在还不存在，所以这条测试眼下护着的正是
+    它们的将来：任何新前端从第一天起就必须只讲协议。
+    """
+    for path in _source_files("frontends"):
+        if _relative(path) in _FRONTEND_EXEMPT:
+            continue
+        for lineno, module in _internal_imports(path):
+            assert not module.startswith(_FRONTEND_FORBIDDEN), (
+                f"{_relative(path)}:{lineno} 从 {module} import 了东西 —— "
+                f"前端只能通过 protocol/ 说话（决策 18）"
+            )
+
+
+def test_the_frontend_exemption_is_only_the_cli():
+    """例外只能有一个，而且必须真的是 CLI。
+
+    这条挡的是"例外慢慢变多"：一个集合里多了第二项时没人会注意，而那时决策 18
+    已经被削弱到没有意义 —— 而它的全部价值就在"每一个新前端都必须只讲协议"。
+    """
+    assert _FRONTEND_EXEMPT == {"frontends/cli/__init__.py"}, (
+        "决策 18 的例外只允许 CLI 那一个（决策 19）。新增例外之前先读那两个决策 —— "
+        "如果新前端也需要直连 runtime，那要改的是决策，不是这张表。"
+    )
+    for name in _FRONTEND_EXEMPT:
+        assert (_PKG_ROOT / name).is_file(), f"{name} 不在了，例外该删掉"
+
+
+def test_textual_stays_in_the_tui_client():
+    """`textual` 只准出现在 TUI 的 app/widgets 里。
+
+    它保证两件事：老 CLI（`uv run main.py`）和子进程（`--runtime-stdio`）都不加载
+    一个 TUI 框架。代价是"这个依赖被关在 frontends/tui/ 里"这句话只能靠测试守 ——
+    而它破掉时的症状很隐蔽（不是报错，是启动变慢），所以值得一条。
+
+    TUI 还没写出来时这条也是空转。
+    """
+    for subdir in ("protocol", "frontends", "runtime"):
+        for path in _source_files(subdir):
+            if _relative(path) in _TEXTUAL_ALLOWED:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+            for node in ast.walk(tree):
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    names = [node.module]
+                for name in names:
+                    assert name.split(".")[0] != "textual", (
+                        f"{_relative(path)}:{node.lineno} import 了 {name} —— "
+                        f"textual 只准出现在 {sorted(_TEXTUAL_ALLOWED)}"
+                    )

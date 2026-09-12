@@ -1,0 +1,162 @@
+{
+  "$comment": "运行时 → 前端。形状的权威在这里；语义（什么时候发、收到怎么办）在 doc/protocol.md。",
+  "init": {
+    "summary": "握手。**永远是第一条**。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "init"},
+      "protocol": {
+        "type": "integer",
+        "doc": "协议的版本号。它和 v 是两件事：v 是每条消息都带的信封版本，protocol 是这一整轮会话谈定的协议版本。分开是为了将来能在 v 不变的情况下演进语义。"
+      },
+      "session_id": {"type": "string"},
+      "resumed": {"type": "boolean", "doc": "true = 接上了一个已存在的会话"},
+      "model": {"type": "string"},
+      "workspace": {"type": "string", "doc": "工作区绝对路径（agent 的文件工具能碰的范围）"},
+      "max_steps": {"type": "integer"},
+      "tools": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "fields": {
+            "name": {"type": "string"},
+            "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+            "parallel_safe": {"type": "boolean"},
+            "interactive": {"type": "boolean", "doc": "handler 会阻塞在人的输入上（目前只有 ask_user）"}
+          },
+          "required": ["name", "risk", "parallel_safe", "interactive"]
+        }
+      },
+      "permissions": {
+        "type": "object",
+        "doc": "这次启动生效的权限范围。**只含非默认项** —— 默认（只有 low 自动放行、其余三个键空）时它是个空对象，于是界面那一行什么都不用显示。判断'什么算非默认'是 config 的知识，所以由 runtime 决定，不由界面硬编码一份默认值。",
+        "fields": {
+          "auto_approve": {"type": "array", "items": {"type": "string"}},
+          "auto_approve_tools": {"type": "array", "items": {"type": "string"}},
+          "deny_tools": {"type": "array", "items": {"type": "string"}},
+          "shell_allow": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "audit_path": {"type": "string", "doc": "审计日志的路径，供界面显示/打开"},
+      "notices": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "fields": {
+            "level": {"type": "string", "enum": ["info", "warn"]},
+            "code": {"type": "string", "doc": "机器认的类别：context / web / mcp / tools / permissions / todos / skills / autopilot"},
+            "text": {"type": "string", "doc": "给人看的整行"}
+          },
+          "required": ["level", "code", "text"]
+        }
+      }
+    },
+    "required": ["v", "t", "protocol", "session_id", "resumed", "model", "workspace",
+                 "max_steps", "tools", "permissions", "audit_path", "notices"]
+  },
+  "session_load": {
+    "summary": "会话恢复的画面数据。0 或 1 条，紧跟 init。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "session_load"},
+      "messages": {
+        "type": "array",
+        "doc": "**原样的 session.messages**。代价说明白：恢复一个长会话时这一条可能几 MB（read_file 不分页），所以它是**一条**、只发一次，而不是每条消息一个事件。"
+      }
+    },
+    "required": ["v", "t", "messages"]
+  },
+  "event": {
+    "summary": "审计事件的**原样转发**。一个字段都不加、一个字段都不减。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "event"},
+      "kind": {
+        "type": "string",
+        "enum": ["run_started", "model_call", "tool_call", "tool_result",
+                 "permission", "tool_batch", "run_finished"],
+        "doc": "**就是 audit/events.py 那七种**，不新造。"
+      },
+      "session_id": {"type": "string"},
+      "run_id": {"type": "string"},
+      "step": {"type": "integer"},
+      "ts": {"type": "string"},
+      "$rest": {"doc": "其余字段随 kind 不同，见 audit/events.py 和各 _emit 调用点。前端必须忽略不认识的 kind 和字段，不许崩。"}
+    },
+    "required": ["v", "t", "kind", "session_id", "run_id", "step", "ts"]
+  },
+  "ui": {
+    "summary": "只给界面、不进审计的东西。目前只有一条。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "ui"},
+      "kind": {"type": "string", "const": "run_finished"},
+      "answer": {
+        "type": "string",
+        "doc": "这一轮的最终答案（Agent.run 的返回值）。**审计里没有正文**，所以非流式模式下这是界面拿到答案的唯一途径。"
+      },
+      "run_id": {"type": "string"}
+    },
+    "required": ["v", "t", "kind", "answer", "run_id"]
+  },
+  "notice": {
+    "summary": "运行期的说明，不阻塞。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "notice"},
+      "level": {"type": "string", "enum": ["info", "warn"]},
+      "code": {"type": "string"},
+      "text": {"type": "string"}
+    },
+    "required": ["v", "t", "level", "code", "text"]
+  },
+  "permission_request": {
+    "summary": "**要前端回应，而且会一直阻塞。** 审批面板。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "permission_request"},
+      "id": {"type": "string", "doc": "回 permission_response 时要带回来"},
+      "call_id": {"type": "string", "doc": "对应哪一次工具调用（和工具事件上的 call_id 一致）"},
+      "tool": {"type": "string"},
+      "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+      "arguments": {
+        "type": "object",
+        "doc": "**全文**，不带任何预览截断。它不是一个事件的伴随字段，而是'给人做判断的那份参数'本身 —— 和 cli_asker 打的东西一致。高风险工具尤其不能截断：shell 命令的重点常在后半句。"
+      },
+      "remember": {
+        "type": "object",
+        "doc": "**记什么**：`{\"tool\": \"shell\"}` 或 `{\"prefix\": [\"git\",\"add\"]}`。是 runtime 真正会写进 permissions.json 的东西。**前端不用懂它** —— 只在它为空时不显示'总是允许'。",
+        "nullable": true
+      },
+      "remember_hint": {
+        "type": "string",
+        "doc": "**怎么把这件事说给人听**：那一整句后果说明，出自 asker.py 的 _remember_hint。**前端原样显示，一个字都不许改。**",
+        "nullable": true
+      },
+      "allow_trust_all": {
+        "type": "boolean",
+        "doc": "这次能不能按'都允许'（一次性放行同一个 MCP server 此刻的全部工具）。为 false 时前端必须隐藏那个按钮。"
+      },
+      "trust_all_hint": {
+        "type": "string",
+        "doc": "那一整句说明，出自 asker.py 的 _trust_all_hint。它比 remember_hint 多担一件事：**说清这是快照**（server 以后新加的工具仍然会问）。",
+        "nullable": true
+      }
+    },
+    "required": ["v", "t", "id", "call_id", "tool", "risk", "arguments",
+                 "remember", "remember_hint", "allow_trust_all", "trust_all_hint"]
+  },
+  "question_request": {
+    "summary": "**要前端回应，而且会一直阻塞。** 提问面板。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "question_request"},
+      "id": {"type": "string", "doc": "回 question_response 时要带回来"},
+      "question": {"type": "string"},
+      "header": {"type": "string", "doc": "不超过 12 字的标签，供界面显示；空串表示没有"},
+      "options": {"type": "array", "items": {"type": "string"}, "doc": "空数组 = 让用户自由作答"},
+      "multi_select": {"type": "boolean"}
+    },
+    "required": ["v", "t", "id", "question", "header", "options", "multi_select"]
+  }
+}

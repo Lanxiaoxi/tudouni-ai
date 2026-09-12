@@ -4,12 +4,15 @@
 （`.sessions/<id>.json`、`.logs/<id>.jsonl`）—— 所以它既必须受限（安全），
 又必须**报得清楚**（可用）。这两件事分开测：
 
-  * `_check_session_id` 的单元断言（纯函数，不用起进程）；
+  * `check_session_id` 的单元断言（纯函数，不用起进程）；
   * 起真入口跑一遍 —— 这是唯一能证明"用户在终端上看到的是那句话、退出码是 2"
     的地方。一段从 store 里冒出来的 traceback 也能让"拒绝"这件事成立，但用户
     照着它改不了任何东西。
 
 校验规则本身在 state/session.py，那里另有测试；这里只测**入口怎么用它**。
+
+这条检查的实现在 `runtime/composition.py`（第零期从 `main.py` 搬过去的，并且
+去掉了下划线）：它和 `resolve_session` 是一对，都住在装配层。
 """
 
 import subprocess
@@ -18,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-import main
+from agent_runtime.runtime.composition import check_session_id
 from agent_runtime.state.session import is_valid_session_id
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
@@ -28,7 +31,7 @@ MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 
 @pytest.mark.parametrize("bad", ["../../evil", "a b", "a/b", "", "x" * 65])
 def test_an_invalid_id_gets_a_readable_message(bad):
-    message = main._check_session_id(bad)
+    message = check_session_id(bad)
 
     assert message is not None
     assert "非法的 --session" in message
@@ -39,7 +42,7 @@ def test_an_invalid_id_gets_a_readable_message(bad):
 @pytest.mark.parametrize("good", ["demo", "20260911-165811", "a_b-c", None])
 def test_valid_ids_and_the_absent_parameter_pass(good):
     """None 是正常的（不传 --session）—— 校验不该把"没给"当成"给错了"。"""
-    assert main._check_session_id(good) is None
+    assert check_session_id(good) is None
     if good is not None:
         assert is_valid_session_id(good)         # 前提：这些确实是合法 id
 
@@ -51,7 +54,7 @@ def test_the_message_is_a_translation_not_a_second_rule():
     "入口说合法、store 说非法"（或反过来），而后者正是这次要消灭的 traceback。
     """
     for candidate in ["demo", "a b", "a/b", "x" * 65]:
-        assert (main._check_session_id(candidate) is None) == is_valid_session_id(candidate)
+        assert (check_session_id(candidate) is None) == is_valid_session_id(candidate)
 
 
 # --- 端到端：真入口、真退出码 ---------------------------------------------

@@ -4,7 +4,7 @@ Agent 那头**怎么把时间记准**（口径互不重叠、时钟可注入）�
 汇总这一侧的两件事：数得对不对、什么时候不该说话。
 """
 
-from agent_runtime.cli import _print_timing, summarize_time
+from agent_runtime.frontends.cli import _print_timing, summarize_time
 
 
 def test_summarize_time_reads_every_part_from_the_events():

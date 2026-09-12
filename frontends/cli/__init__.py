@@ -1,25 +1,38 @@
-"""命令行界面：参数解析、会话选择、交互循环、历史与审计的展示。
+"""多轮对话循环，以及四个"不需要模型"的子命令的展示。
 
-和 main.py 分开，是因为**它们的变化原因不同**：main.py 关心"把哪些部件接起来"，
-改动来自架构演进；这里关心"怎么跟用户说话"，改动来自使用习惯。放在一个文件里，
-两种改动的 diff 会互相淹没。
+和装配分开，是因为**它们的变化原因不同**：`runtime/composition.py` 关心"把哪些
+部件接起来"，改动来自架构演进；这里关心"怎么跟用户说话"，改动来自使用习惯。
+放在一起，两种改动的 diff 会互相淹没。
+
+**第零期之后这里少了一样东西**：启动横幅、`[权限]` / `[技能]` / `[任务]` 那几行、
+已注册工具的清单全都不在这里了 —— 它们变成了 `Runtime.notices()` 返回的数据，
+由启动器按 `notice.stream` 打出来。这里只留下**交互和查看**：REPL、历史、审计、
+会话列表、技能列表。
+
+四个"不需要模型"的子命令（`print_sessions` / `print_skills` / `print_history` /
+`print_audit`）仍然住在这里（决策 20）：它们只读 store / logs / 技能目录，
+不装配 Runtime，而且有意排在配置检查之前 —— 没配密钥的人照样该能查自己的历史。
 
 顺带解决了一个具体的别扭：以前"新会话 X"是在配置检查之前打印的，所以没配
-DEEPSEEK_API_KEY 时会先看到"新会话"再看到报错。现在子命令分两段 —— 不需要模型
-的（--list / --history / --audit）先处理，需要模型的才读配置。
+DEEPSEEK_API_KEY 时会先看到"新会话"再看到报错。现在子命令分两段。
 """
 
-import argparse
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from agent_runtime.agents import StepLimitExceeded
+from agent_runtime.agents import RunCancelled, StepLimitExceeded
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
+from agent_runtime.runtime.composition import Runtime
 from agent_runtime.skills import SkillLoader
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.tools.builtin.todo import progress_line
+
+# 参数形状住在 frontends/cli/args.py。这里再导出一次，是因为现有调用点（包括
+# `main.py` 和一堆测试）写的是 `from agent_runtime.frontends.cli import build_parser`
+# —— 让它们照旧工作，而不是把一次搬动扩散到每一个调用点。
+from agent_runtime.frontends.cli.args import build_parser  # noqa: F401
 
 
 # --- 启动横幅 -------------------------------------------------------------
@@ -55,34 +68,6 @@ def print_banner() -> None:
     print(file=sys.stderr)
     print(BANNER, file=sys.stderr)
     print(file=sys.stderr)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Agent Runtime 命令行入口")
-    parser.add_argument(
-        "--session", default=None,
-        help="会话 id。给了就接着那个会话聊（不存在则新建）；不给就自动开一个新的",
-    )
-    parser.add_argument(
-        "--history", action="store_true",
-        help="打印 --session 指定会话的对话历史，不调用模型",
-    )
-    parser.add_argument(
-        "--audit", action="store_true",
-        help="打印 --session 指定会话的审计轨迹（token、权限裁决、耗时），不调用模型",
-    )
-    parser.add_argument("--list", action="store_true", help="列出已保存的会话")
-    parser.add_argument(
-        "--skills", action="store_true",
-        help="列出工作区里的技能（.tudouni/skills/<名字>/SKILL.md），不调用模型",
-    )
-    parser.add_argument(
-        "--autopilot", action="store_true",
-        help="不询问任何审批：需要审批的工具直接执行。拒绝名单、工作区边界、控制面写入"
-             "仍然生效；审计里每次放行记为 outcome=autopilot",
-    )
-    parser.add_argument("--debug", action="store_true", help="把中间过程打到 stderr")
-    return parser
 
 
 # --- 用量汇总 -------------------------------------------------------------
@@ -152,9 +137,9 @@ class Timing:
 
     **工具那一段在并行之后换了口径。** 只读工具整批并发时，逐条 duration_ms 之和已经
     大于它占用的墙上时间（两个 5 秒的工具并行：和是 10 秒，墙上只花了 5 秒），再拿
-    这个和去减"未归因"就会减出负数、被 max(0, ...) 吞掉 —— 报出一行恒为 0 的"未归因"，
-    而它看起来完全正常。所以并行批次读的是 `tool_batch.wall_ms`（那一批实际占了多久），
-    逐条的和挪去回答另一个问题：省下了多少（见 saved_ms）。
+    这个和去减"未归因"就会减出负数、被 max(0, ...) 吞掉 —— 报出一行恒为 0 的
+    "未归因"，而它看起来完全正常。所以并行批次读的是 `tool_batch.wall_ms`（那一批
+    实际占了多久），逐条的和挪去回答另一个问题：省下了多少（见 saved_ms）。
     """
 
     run_ms: int          # 各回合墙上时间之和（run_finished.duration_ms）
@@ -226,8 +211,7 @@ def summarize_time(events: Iterable[dict]) -> Timing:
     # 工具耗时原来是从 handler 入口起表的，而 ask_user 的 handler 整段时间都阻塞在人的
     # 输入上 —— 不减，"我看了 30 秒才回答"就报成"这个工具要 30 秒"。审批没有这个问题
     # （裁决在 _prepare 里，本来就单独计时），提问发生在 handler 里，只有工具自己能报。
-    # 下界取 0 的理由和下面 unattributed_ms 一样：从别处复制来的日志、毫秒取整都可能
-    # 让它减成负数，而负数在这里没有解释价值。
+    # 下界取 0 的理由和下面 unattributed_ms 一样。
     human_ms = total("tool_result", "human_wait_ms")
     tool_ms = max(0, tool_durations(parallel=False) + batch_wall - human_ms)
 
@@ -258,8 +242,9 @@ def _ms_text(ms: int) -> str:
 def _tokens_text(count: int) -> str:
     """token 数的人读形式。
 
-    要用它的地方量级差得很远：一轮的用量可能几千，而窗口是百万级。所以 1k 以下给精确值，
-    10k 以下给一位小数，再往上给整数 k，百万以上给 M —— 占比这种东西不需要四位有效数字。
+    要用它的地方量级差得很远：一轮的用量可能几千，而窗口是百万级。所以 1k 以下给
+    精确值，10k 以下给一位小数，再往上给整数 k，百万以上给 M —— 占比这种东西不需要
+    四位有效数字。
     """
     if count < 1_000:
         return str(count)
@@ -358,8 +343,8 @@ def print_sessions(store: JsonSessionStore) -> None:
 def print_skills(loader: SkillLoader) -> None:
     """`--skills`：列出工作区里的技能，不调用模型。
 
-    和 `--list` 同档 —— 它读的是硬盘上的文件，不需要密钥，所以也排在配置检查之前
-    （见 main.py 里那段子命令分两段的说明）：没配密钥的人照样该能查自己写了什么技能。
+    和 `--list` 同档 —— 它读的是硬盘上的文件，不需要密钥，所以也排在配置检查之前：
+    没配密钥的人照样该能查自己写了什么技能。
 
     它打印两样东西，正好对应人在这台机器上能做的两件事：
 
@@ -472,27 +457,6 @@ def _print_audit_summary(events: list[dict]) -> None:
 
 # --- 需要模型的部分 -------------------------------------------------------
 
-def resolve_session(store: JsonSessionStore, session_id: str | None) -> tuple[str, Session]:
-    """决定这次聊哪个会话：给了 id 就接着（不存在则新建），没给就自动开一个新的。
-
-    注意这里还不会落盘 —— 第一次写盘发生在你说出第一句话之后（Agent 在把用户
-    消息追加进 messages 之后才触发 checkpoint）。所以"开了不用"不会留下空文件。
-    """
-    if session_id:
-        if store.exists(session_id):
-            session = store.load(session_id)
-            print(f"继续会话 {session_id!r}：{len(session.messages)} 条消息")
-        else:
-            session = Session.new(session_id)
-            print(f"新建会话 {session_id!r}")
-        return session_id, session
-
-    session_id = store.new_session_id()
-    print(f"新会话 {session_id!r}（说出第一句话之后才会落盘）")
-    print(f"  想回来继续它：  --session {session_id}")
-    return session_id, Session.new(session_id)
-
-
 def _usage_note(events: Iterable[dict]) -> str:
     """末尾那句统计里的用量部分。返回空串表示没什么可报的。
 
@@ -579,8 +543,8 @@ def _report_todos(session: Session, prefix: str = "[任务] ") -> None:
     """把当前任务列表打一行到 stderr；没有列表就什么都不说。
 
     行式终端里没有"常驻面板"这回事，所以进度只能靠每轮重打一遍。这一行是给**人**看的
-    —— 模型每轮看到的是载荷尾部那一份完整列表（见 tools/builtin/todo.py），两者刻意不是同一份
-    文本：模型要"还剩什么、现在做哪条"，人只要一眼看出做到哪了。
+    —— 模型每轮看到的是载荷尾部那一份完整列表（见 tools/builtin/todo.py），两者刻意
+    不是同一份文本：模型要"还剩什么、现在做哪条"，人只要一眼看出做到哪了。
 
     走 stderr：和提示符、横幅、每轮末尾那句统计同一条线，stdout 只留对话正文。
     """
@@ -589,22 +553,21 @@ def _report_todos(session: Session, prefix: str = "[任务] ") -> None:
         print(f"{prefix}{line}", file=sys.stderr)
 
 
-def run_repl(
-    agent,
-    session: Session,
-    session_id: str,
-    sink: JsonlSink | None = None,
-    context_tokens: int | None = None,
-) -> None:
+def run_repl(runtime: Runtime) -> None:
     """多轮对话循环。
 
     这个 while 刻意留在 Agent 外面：Agent 的契约是"一个回合"，多轮循环属于驱动层，
     因为它的形态随环境而变（CLI 是循环、Web 是每请求一次、测试是遍历列表）。
     把循环塞进 Agent，它就得知道"从哪读用户输入"。
 
-    sink 和 context_tokens 只影响每轮末尾那行统计（见 `_stats_note`）：模型窗口为 None
-    时就只报用量、不报占比。两者都不影响对话本身，缺了只是少几个字。
+    **它收一个 `Runtime` 而不是五个散参数**（第零期之后）：那些参数全都是 Runtime
+    的字段，而"从哪拿会话、从哪读审计"只有一个答案。散着传的代价是真实的 —— 以前
+    调用点得记住"logs 必须是同一个 sink，否则数字对不上"，改成 Runtime 之后那件事
+    在类型上就成立了。
     """
+    agent, session, session_id = runtime.agent, runtime.session, runtime.session_id
+    sink, context_tokens = runtime.logs, runtime.context_tokens
+
     print("输入内容回车发送。空行、exit、quit 或 Ctrl+C 退出。\n")
     while True:
         try:
@@ -633,6 +596,12 @@ def run_repl(
             # 手上唯一的问题正是"还差多少"。它跨进程活着，所以下一次接着跑时模型也
             # 会在请求尾部看到同一份列表。
             _report_todos(session, prefix="  未做完的：")
+        except RunCancelled as exc:
+            # 取消**必须在这里被接住**：它继承 `BaseException`（理由见那个类），
+            # 所以不接的话它会穿透到顶层，把进程干掉 —— 而 CLI 这一支**没有**注入
+            # `should_stop`，所以它本来不可能被取消。仍然接住是因为"不可能"会变：
+            # 有一天给 CLI 加上停止键，漏了这一支的症状是"按了停止，整个程序退了"。
+            print(f"\n[本轮已取消] {exc}", file=sys.stderr)
         except ModelFatalError as exc:
             # 重试没有意义的那类失败（鉴权、模型名、请求格式）—— 告诉用户原因，
             # 但**不退出**：一个回合失败不等于整个会话结束。
@@ -646,8 +615,8 @@ def run_repl(
         # 同一条线。stdout 只留"用户问 + Agent 答"的对话正文，`> 对话.txt` 拿到的
         # 才真是能回头读的东西；token 数字混进那份文件，就是往答案里掺元数据。
         # 这一行只说"刚才发生了什么"：会话 id、规模、累计用量、本轮耗时。**不再复述怎么
-        # 续聊** —— 新会话在启动时已经说过一次（resolve_session 里那句"想回来继续它"），
-        # 恢复会话时启动那行也带着 id，每轮再刷一遍只是把同一句话说三十遍。
+        # 续聊** —— 新会话在启动时已经说过一次，恢复会话时启动那行也带着 id，
+        # 每轮再刷一遍只是把同一句话说三十遍。
         #
         # 步数用尽那条路仍然会说"接着跑：--session X"：那里的意思是"这一轮没走完"，
         # 和"你随时可以回来"是两件事，它每次也只在那一种情况下出现。

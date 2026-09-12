@@ -1,0 +1,57 @@
+{
+  "$comment": "人机交互消息：前端 → runtime。",
+  "user_message": {
+    "summary": "用户说了一句话，跑一个回合。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "user_message"},
+      "text": {"type": "string", "doc": "用户说的话，原样进会话历史。"}
+    },
+    "required": ["v", "t", "text"]
+  },
+  "shutdown": {
+    "summary": "收摊。**当前这一轮会跑完**，不是打断它。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "shutdown"}
+    },
+    "required": ["v", "t"]
+  },
+  "permission_response": {
+    "summary": "对一条 permission_request 的回答。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "permission_response"},
+      "id": {"type": "string", "doc": "要回应的那条 permission_request 的 id"},
+      "decision": {
+        "type": "string",
+        "enum": ["allow", "deny", "always", "always_group"],
+        "doc": [
+          "allow 批准这一次；deny 拒绝（gate 记 user_denied）；",
+          "always 记住'这个工具以后别再问'（或一条命令前缀，粒度由 runtime 定）；",
+          "always_group 放行这一组工具（目前只有'MCP 的同一个 server'）——",
+          "**它只对这条请求有效**，靠 id 查 runtime 手里那份名额，前端不许自己带名单。"
+        ]
+      }
+    },
+    "required": ["v", "t", "id", "decision"]
+  },
+  "question_response": {
+    "summary": "对一条 question_request 的回答。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "question_response"},
+      "id": {"type": "string", "doc": "要回应的那条 question_request 的 id"},
+      "text": {"type": "string", "doc": "用户的答案；skipped 时是空串"},
+      "status": {
+        "type": "string",
+        "enum": ["answered", "skipped"],
+        "doc": [
+          "只有这两种是**前端**能回的。第三种 unavailable（没有人可问）由 runtime",
+          "自己产生，前端永远不会回它 —— 见 tools/builtin/ask.py 那三个常量的分工。"
+        ]
+      }
+    },
+    "required": ["v", "t", "id", "status"]
+  }
+}

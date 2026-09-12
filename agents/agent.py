@@ -126,6 +126,34 @@ class _Prepared:
     settled: _Outcome | None        # 有值表示不需要再执行（准备失败、或被拒）
 
 
+class RunCancelled(BaseException):
+    """有人要求停止这一轮，而我们在一个**安全点**停下来了。
+
+    **它必须继承 `BaseException`（像 `KeyboardInterrupt` 那样），这不是风格问题。**
+    继承 `Exception` 的话它会先撞上 `_run` 里那个 `except Exception`（工具执行那一段）
+    或 `_prepare` 里那个，被吞成一条"工具执行失败：RunCancelled"的结果 —— 于是模型
+    拿到一句看不懂的话继续跑，而用户以为已经停下了。这种"按了没用但也不报错"是最坏
+    的失败形态，所以类型上就必须绕开那两个兜底。
+
+    它继承 BaseException 还有第二个后果要记住：**调用方必须显式接住它**。`main.py`
+    和协议循环都接；测试里也是。漏接的后果是整轮异常穿透到顶层 —— 那比静默继续好，
+    所以这个方向是对的。
+
+    **什么时候能取消，只有两个安全点**（见 `Agent.run`）：
+
+      * **两步之间** —— messages 一致（上一步的工具结果全 append 完、★ 也落过盘），
+        唯一一个真安全的位置。`should_stop` 就在那里被问。
+      * **不中途取消** —— 模型往返（同步阻塞的一次 `complete()`）和工具执行（同步
+        handler）都打断不了。没有流式就没有天然的打断点，而"停在一个半截状态"会让
+        会话永久损坏（一条带 tool_calls 却没有对应结果的 assistant 消息，API 直接 400，
+        而且此后每一轮都发不出去）。
+    """
+
+    def __init__(self, step: int):
+        super().__init__(f"已在第 {step} 步之后停止。会话是完好的，可以直接接着跑。")
+        self.step = step
+
+
 class StepLimitExceeded(RuntimeError):
     """步数预算用尽：任务既没失败，也没收尾。
 
@@ -164,6 +192,7 @@ class Agent:
         debug: bool = False,
         clock: Clock = time.perf_counter,
         autopilot: bool = False,
+        should_stop: "Callable[[], bool] | None" = None,
     ):
         # 前三个是【能力】：每个应用构造一次，长期复用、可以跨会话共享。
         self.model = model
@@ -211,6 +240,16 @@ class Agent:
         # 控制面写入、拒绝名单都不归它管（那些是"不许做"，不是"要不要问"）。审计里每次
         # 放行会记成 outcome=autopilot，好回答"这次会话到底有没有人看着"。
         self.autopilot = autopilot
+
+        # should_stop 是第六个注入点：**"要不要停"由外面决定，怎么停是这里的事。**
+        #
+        # 它是一个返回布尔的纯查询（不是"抛异常的回调"）：外面只管回答"现在该停了吗"，
+        # 而"在哪个位置问、问了之后做什么"（落盘 + 记审计 + 抛 RunCancelled）留在这里 ——
+        # 因为那个位置是 messages 一致性的知识，只有 Agent 有。
+        #
+        # 为 None 表示"这一轮没有取消这回事"（CLI、测试、一次性任务）。这和 asker 可以为
+        # None 是同一条：不注入就是没有这个能力，而不是"永远返回 False 的桩"。
+        self.should_stop = should_stop
 
     def _emit(self, kind: str, session: Session, run_id: str, step: int, **data: Any) -> None:
         """报告一条审计事件。
@@ -388,6 +427,18 @@ class Agent:
             if attempt.response is not None:
                 data["tool_calls"] = len(attempt.response.tool_calls)
                 data.update(self._usage_fields(attempt.response.usage))
+                # 思维链**整段**进审计（决策 5）。
+                #
+                # 它是审计里第一个"内容型"字段 —— 在此之前审计只有数字、枚举和
+                # 200 字符预览，所以读日志的人会下意识以为它很小。三笔代价写在
+                # doc/TUI-design.md 的 D2 里，这里只说最要紧的一条：它里面会原样
+                # 出现模型读到的代码、路径、以及 ask_user 的答案，所以审计文件从
+                # "元数据"变成了"可能含工作区内容"。
+                #
+                # 键只在真的有思维链时才写（空串和 None 都不写）：一个恒为 null 的
+                # 键会让后面做统计的人处处判空，而这一条本来就是可选的。
+                if attempt.response.reasoning:
+                    data["reasoning"] = attempt.response.reasoning
             self._emit("model_call", session, run_id, step, **data)
 
             if attempt.status == "error":
@@ -463,6 +514,19 @@ class Agent:
         last_tools: list[str] = []
 
         for step in range(max_steps):
+            # 取消检查点。**位置是它唯一的讲究**：这里 messages 是一致的（上一步的
+            # 工具结果全 append 完了，★ 也落过盘），所以从这里退出不会留下一条带
+            # tool_calls 却没有对应结果的 assistant 消息。
+            #
+            # 「什么时候不能取消」写在 `RunCancelled` 的 docstring 里。
+            if self.should_stop is not None and self.should_stop():
+                self._debug("!! 收到取消，停止")
+                # 顺序和步数用尽那条一样：审计和落盘都必须在 raise **之前**完成，
+                # 否则日志里只剩一条悬空的 run_started。
+                self._finish_run(session, run_id, step, run_started, "cancelled")
+                self._checkpoint(session)
+                raise RunCancelled(step)
+
             self._debug(
                 f"── step {step + 1}/{max_steps}  "
                 f"消息数={len(messages)} "
@@ -482,19 +546,9 @@ class Agent:
                 f"   ← 模型返回  content={'有' if response.content else '无'}  "
                 f"tool_calls={len(response.tool_calls)}"
             )
-            if response.reasoning:
-                # 思考过程**整段打，不截断** —— 和下面 content 的预览不一样，理由是
-                # "别处能不能看到"：答案在 stdout 上有全文，所以 debug 只给一眼预览；
-                # 思维链别处根本看不到，截断它等于不给看。
-                #
-                # 非流式拿不到"逐字"：这段文字是整块回来的，只能等它回来之后一次打完。
-                # 想要 Claude Code 那种实时效果得先把适配层改成流式（另一件事）。
-                #
-                # 用惰性版：这段正文可能几千字，拼进 f-string 就是一次整段拷贝。
-                self._debug_lazy(
-                    lambda: f"      thinking（{len(response.reasoning)} 字符）:\n"
-                            f"{response.reasoning}"
-                )
+            # 思维链**不在这里打了** —— 它现在整段进审计（上面 `_attempt_reporter`），
+            # 而同一份正文有两条出口正是 README 第 3 条设计原则反对的事。想读它就去
+            # `--audit` 或者直接读 `.tudouni/logs/<id>.jsonl` 里那条 model_call。
             if response.content:
                 self._debug_lazy(
                     lambda: f"      content: {self._preview(response.content)}"
@@ -593,8 +647,16 @@ class Agent:
             return self._run_parallel(batch, session, run_id, step)
         return self._run_serial(batch, session, run_id, step)
 
-    def _report_tool_call(self, call: dict, session: Session, run_id: str, step: int) -> None:
-        """两条路径共用的"模型要调什么"那一句（debug + 审计）。"""
+    def _report_tool_call(
+        self, call: dict, session: Session, run_id: str, step: int, index: int = 0
+    ) -> None:
+        """两条路径共用的"模型要调什么"那一句（debug + 审计）。
+
+        `call_id` / `tool_index` 是给**跨进程的消费者**用的（决策 4）：同一批里两个
+        `read_file`（a.py 和 b.py）在事件流里长得一模一样，只能靠"按顺序发"这个隐式
+        约定配对 —— 而"顺序一致"是 `_run_parallel` 的实现细节，不是契约。
+        前端要把调用和结果配成一条，就得有一个稳定的身份。
+        """
         # 惰性：write_file 的 content 可以很长，而 _preview 要把它扫一遍。
         self._debug_lazy(
             lambda: f"   → 工具调用 {call['name']}"
@@ -603,17 +665,21 @@ class Agent:
         self._emit(
             "tool_call", session, run_id, step,
             tool=call["name"],
+            call_id=call["id"],
+            tool_index=index,
             arguments=self._preview(call["arguments"], AUDIT_PREVIEW_LIMIT),
         )
 
     def _report_tool_result(
         self, call: dict, outcome: _Outcome, session: Session, run_id: str, step: int,
-        parallel: bool = False,
+        parallel: bool = False, index: int = 0,
     ) -> None:
         """两条路径共用的"这条调用结果如何"那一句（审计 + debug）。"""
         self._emit(
             "tool_result", session, run_id, step,
             tool=call["name"],
+            call_id=call["id"],
+            tool_index=index,
             status=outcome.status,      # ok / denied / invalid_args / error
             chars=len(outcome.text),    # 只记长度，不记全文 —— 全文已经在会话文件里了
             duration_ms=outcome.duration_ms,
@@ -639,11 +705,11 @@ class Agent:
         才被问到下一条的，而上一条的结果正是他判断"这条该不该放行"的依据之一。
         """
         outcomes: list[_Outcome] = []
-        for call in batch:
-            self._report_tool_call(call, session, run_id, step)
+        for index, call in enumerate(batch):
+            self._report_tool_call(call, session, run_id, step, index)
             outcome = self._run(self._prepare(call, session, run_id, step))
             self._report_tool_bug(outcome)
-            self._report_tool_result(call, outcome, session, run_id, step)
+            self._report_tool_result(call, outcome, session, run_id, step, index=index)
             outcomes.append(outcome)
         return outcomes
 
@@ -660,8 +726,8 @@ class Agent:
         是秒级以下的活），换来的确定性更值钱 —— 按完成顺序发事件的话，同一个会话
         两次跑出来的审计顺序会不一样。
         """
-        for call in batch:
-            self._report_tool_call(call, session, run_id, step)
+        for index, call in enumerate(batch):
+            self._report_tool_call(call, session, run_id, step, index)
 
         # 裁决（含问人）仍在主线程、仍按原顺序。这里比串行路径多了一点：整批先问完
         # 再执行。只读工具在默认策略下不会问人（LOW 自动放行），所以这个差别平时看
@@ -679,9 +745,11 @@ class Agent:
             outcomes = list(pool.map(self._run, prepared))
         wall_ms = int((self.clock() - started) * 1000)
 
-        for call, outcome in zip(batch, outcomes):
+        for index, (call, outcome) in enumerate(zip(batch, outcomes)):
             self._report_tool_bug(outcome)
-            self._report_tool_result(call, outcome, session, run_id, step, parallel=True)
+            self._report_tool_result(
+                call, outcome, session, run_id, step, parallel=True, index=index,
+            )
 
         # 这一批实际占了多长墙上时间。**必须单独记一笔**：并发时逐条 duration_ms
         # 相加大于墙上时间（两个 5 秒的工具并行，和是 10 秒），而 cli.py 那个

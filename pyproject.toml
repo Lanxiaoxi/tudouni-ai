@@ -15,6 +15,15 @@ dependencies = [
     "pydantic>=2",
     # 读项目根的 .env。只用来装本地配置（主要是密钥），不参与任何运行时逻辑。
     "python-dotenv>=1.0",
+    # TUI 前端（`frontends/tui/`）。**只有那个包会 import 它**，其余路径
+    # （老 CLI、`--runtime-stdio` 子进程、四个不需要模型的子命令）都不加载它 ——
+    # 这一点由 `tests/test_imports.py` 里那条"textual 只准出现在 app/widgets 里"
+    # 盯着。
+    #
+    # 它是这个项目里最重的一个依赖（连带 rich / markdown-it-py / linkify-it-py /
+    # platformdirs 一串），收下的理由是"另一个选择是自己写一个 TUI 框架"——
+    # 权衡写在 doc/TUI-design.md 的第五节。
+    "textual>=0.80",
 ]
 
 [dependency-groups]

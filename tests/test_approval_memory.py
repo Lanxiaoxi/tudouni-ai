@@ -1,4 +1,4 @@
-"""按 t 记住的免问规则：记住什么、谁记的、以及审计里能不能看出来。
+﻿"""按 t 记住的免问规则：记住什么、谁记的、以及审计里能不能看出来。
 
 这是整套权限里唯一会**改自己状态**的东西，所以三件事都要有证据：
 
@@ -12,7 +12,7 @@ import builtins
 import pytest
 
 from agent_runtime.agents import Agent
-from agent_runtime.config import PERMISSION_FILE_NAME
+from agent_runtime.runtime.config import PERMISSION_FILE_NAME
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import ApprovalMemory, PermissionPolicy
 from agent_runtime.security.asker import cli_asker

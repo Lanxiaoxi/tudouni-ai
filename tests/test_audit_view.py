@@ -14,7 +14,7 @@ import json
 import pytest
 
 from agent_runtime.audit import JsonlSink
-from agent_runtime.cli import print_audit
+from agent_runtime.frontends.cli import print_audit
 
 
 def write_log(workdir, *records: dict) -> JsonlSink:

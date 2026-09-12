@@ -18,7 +18,7 @@ import threading
 import pytest
 
 from agent_runtime.agents import Agent
-from agent_runtime.cli import Timing, _print_timing, summarize_time
+from agent_runtime.frontends.cli import Timing, _print_timing, summarize_time
 from agent_runtime.models.base import ChatModel
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import PermissionPolicy

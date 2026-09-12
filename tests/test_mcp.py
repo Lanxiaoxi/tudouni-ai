@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from agent_runtime.agents import Agent
-from agent_runtime.config import ConfigError, McpConfig
+from agent_runtime.runtime.config import ConfigError, McpConfig
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, TrustGroup
 from agent_runtime.security.asker import cli_asker
@@ -769,65 +769,78 @@ def test_the_servers_stderr_noise_does_not_break_the_channel():
 def test_exposed_name_matches_the_documented_shape():
     assert exposed_name("github", "create_file") == "mcp__github__create_file"
 
-
-# --- 入口装配：真的走一遍 main() --------------------------------------------
-
-
-class _FakeModelConfig:
-    """一个不需要密钥的模型配置。main() 只在装配时读它，不会真的发请求。"""
-
-    api_key = "sk-test"
-    base_url = "http://127.0.0.1:1"
-    model = "fake-model"
-    context_tokens = None
-
-    @classmethod
-    def from_env(cls, env_file=None):
-        return cls()
-
-
-def test_the_entry_point_wires_mcp_tools_and_closes_them(monkeypatch, workdir, capsys):
-    """入口那一层：读配置 → 连 server → 注册工具 → 报告 → 关掉。
+def test_open_runtime_wires_mcp_tools_and_closes_them(workdir, capsys):
+    """装配那一层：读配置 → 连 server → 注册工具 → 报告 → 关掉。
 
     这是**唯一**能证明"配了 mcp.json 之后真的能用"的地方：协议、工具构造、审批各自
-    都有单测，但它们之间的接线、以及"谁来关这些子进程"，只有走一遍入口才看得见。
+    都有单测，但它们之间的接线、以及"谁来关这些子进程"，只有真的走一遍装配才看得见。
+
+    第零期之后它从"跑 `main()` 并 monkeypatch `main` 的全局量"改成**直接调
+    `open_runtime()` 并注入配置**：装配搬进了 `runtime/composition.py`，会话目录、
+    日志目录、`ModelConfig` 都不再是 `main` 的模块级名字，那种 monkeypatch 已经不可能。
+    直接调装配还免掉了假装 `argv` 那一段 —— 而四个 `*_config` 参数本来就是为这件事加的
+    （见 `open_runtime` 的 docstring）：想测一条装配路径不必先设一个假 API key。
     """
-    import main
+    from unittest import mock
 
-    monkeypatch.setattr(sys, "argv", ["main.py"])
-    # 会话和日志落到临时目录，别污染这个项目自己的 .tudouni/。
-    monkeypatch.setattr(main, "SESSIONS_DIR", workdir / "sessions")
-    monkeypatch.setattr(main, "LOGS_DIR", workdir / "logs")
-    monkeypatch.setattr(main, "ModelConfig", _FakeModelConfig)
-    monkeypatch.setattr(main, "print_banner", lambda: None)
-    monkeypatch.setattr(
-        main.McpConfig, "from_file",
-        classmethod(lambda cls, path=None: McpConfig(servers=(real_server(),))),
+    from agent_runtime.runtime.channels import cli_channels
+    from agent_runtime.runtime.composition import boot, open_runtime, resolve_session
+    from agent_runtime.runtime.config import (
+        McpConfig,
+        ModelConfig,
+        PermissionConfig,
+        WebConfig,
     )
 
-    seen: dict[str, Any] = {}
-    monkeypatch.setattr(
-        main, "run_repl",
-        lambda agent, session, session_id, logs, tokens: seen.update(agent=agent),
-    )
+    booted = boot()
+    session_id, session, _resumed = resolve_session(booted.store, None)
 
     closed: list[bool] = []
+    real_close = McpToolset.close
 
-    class Recording(McpToolset):
-        def close(self) -> None:
-            closed.append(True)
-            super().close()
+    def recording_close(self):
+        closed.append(True)
+        real_close(self)
 
-    monkeypatch.setattr(main, "McpToolset", Recording)
+    # 手工 start/stop 而不是 `with`：patch 必须罩住 open_runtime **和** close 两段。
+    # 用 `with` 把它只套在 open_runtime 上过一次（这次的错），结果是 patch 在关闭之前
+    # 就退出了 —— 断言恒为 `[]`，也就是"谁来关这些子进程"这件事根本没被验到。
+    patcher = mock.patch.object(McpToolset, "close", recording_close)
+    patcher.start()
+    try:
+        runtime = open_runtime(
+            booted=booted,
+            session_id=session_id,
+            session=session,
+            channels=cli_channels(),
+            model_config=ModelConfig(
+                api_key="sk-test", base_url="http://127.0.0.1:1", model="fake-model",
+            ),
+            # 权限文件是**真的从磁盘读**的；这里给一份明确的，免得依赖跑测试的机器上
+            # 恰好有 .tudouni/permissions.json。
+            permission_config=PermissionConfig(),
+            web_config=WebConfig(),
+            mcp_config=McpConfig(servers=(real_server(),)),
+        )
 
-    assert main.main() == 0
+        try:
+            tool = runtime.agent.tools.get("mcp__fake__echo")
+            assert tool.risk == RiskLevel.HIGH
 
-    tool = seen["agent"].tools.get("mcp__fake__echo")
-    assert tool.risk == RiskLevel.HIGH
-    assert closed == [True], "入口必须把这些子进程收掉"
+            # 外部工具一律 HIGH ⇒ 进不了并行批次，也过不了注册期那条校验。
+            assert not tool.parallel_safe
 
-    captured = capsys.readouterr()
-    assert "server fake：连上了，提供 5 个工具" in captured.err
-    assert "每次调用都要你批准" in captured.err
-    # "已注册工具"那份清单里也有它（那是人核对权限文件时对照的那一份）。
-    assert "mcp__fake__echo" in captured.out
+            notices = runtime.notices()
+            err = "\n".join(n.text for n in notices if n.stream == "err")
+            out = "\n".join(n.text for n in notices if n.stream == "out")
+
+            assert "server fake：连上了，提供 5 个工具" in err
+            assert "每次调用都要你批准" in err
+            # "已注册工具"那份清单里也有它（那是人核对权限文件时对照的那一份）。
+            assert "mcp__fake__echo" in out
+        finally:
+            runtime.close()
+    finally:
+        patcher.stop()
+
+    assert closed == [True], "Runtime.close() 必须把这些子进程收掉"

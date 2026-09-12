@@ -11,12 +11,13 @@
 """
 
 import builtins
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from agent_runtime.agents import Agent, StepLimitExceeded
-from agent_runtime.cli import run_repl
+from agent_runtime.frontends.cli import run_repl
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import JsonSessionStore, Session
@@ -340,7 +341,13 @@ def test_hitting_the_step_limit_says_what_is_left(monkeypatch, capsys):
 
     monkeypatch.setattr(builtins, "input", fake_input)
 
-    run_repl(LimitAgent(), session, "s", None, None)
+    # run_repl 现在收一个 Runtime（第零期之后：那些参数全是它的字段）。
+    # 这里只用到五个字段，所以给一个替身而不是装配真的 Runtime —— 这条测试问的是
+    # "撞上限时说了什么"，不是装配对不对（装配另有测试）。
+    run_repl(SimpleNamespace(
+        agent=LimitAgent(), session=session, session_id="s",
+        logs=None, context_tokens=None,
+    ))
 
     err = capsys.readouterr().err
     assert "步数用尽" in err

@@ -1,4 +1,4 @@
-"""权限文件（`.tudouni/permissions.json`）：读法、报错，以及按 t 之后写回去的那一半。
+﻿"""权限文件（`.tudouni/permissions.json`）：读法、报错，以及按 t 之后写回去的那一半。
 
 这个文件是**唯一由人写给权限系统看的东西**，所以两种失败都不能容忍：
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.config import (
+from agent_runtime.runtime.config import (
     ConfigError,
     PERMISSION_FILE,
     PermissionConfig,

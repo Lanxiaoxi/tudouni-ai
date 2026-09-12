@@ -12,7 +12,7 @@
 import pytest
 
 from agent_runtime.audit import JsonlSink
-from agent_runtime.cli import (
+from agent_runtime.frontends.cli import (
     _context_note,
     _stats_note,
     _tokens_text,

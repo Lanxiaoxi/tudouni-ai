@@ -1,4 +1,4 @@
-"""配置的优先级与报错。
+﻿"""配置的优先级与报错。
 
 优先级（高 → 低）：**真实环境变量 > .env > 默认值**。
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.config import (
+from agent_runtime.runtime.config import (
     CONTEXT_WINDOWS,
     DEFAULT_MODEL,
     DEFAULT_TAVILY_BASE_URL,

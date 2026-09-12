@@ -13,7 +13,7 @@
 import pytest
 
 from agent_runtime.agents import Agent
-from agent_runtime.cli import build_parser
+from agent_runtime.frontends.cli import build_parser
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import ApprovalMemory, PermissionPolicy
 from agent_runtime.security.gate import check_permission
