@@ -26,13 +26,14 @@ from agent_runtime.agents import Agent
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import Decision, PermissionPolicy
 from agent_runtime.state import Session
-from agent_runtime.tools.builtin import ShellArgs, create_tool_registry
-from agent_runtime.tools.shell import (
+from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.builtin.shell import (
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_SECONDS,
     MIN_TIMEOUT_SECONDS,
     TIMEOUT_SECONDS,
     Shell,
+    ShellArgs,
     _format,
     _truncate,
     shell_argv,
@@ -80,7 +81,7 @@ def test_chinese_output_is_not_mangled(workdir):
 def test_commands_start_in_the_workspace(workdir):
     """cwd 是工作区。
 
-    注意这**不是**沙箱 —— 命令随时可以 `cd ..`。它只是默认起点，见 tools/shell.py
+    注意这**不是**沙箱 —— 命令随时可以 `cd ..`。它只是默认起点，见 tools/builtin/shell.py
     的模块注释。
     """
     (workdir / "hello.txt").write_text("x", encoding="utf-8")

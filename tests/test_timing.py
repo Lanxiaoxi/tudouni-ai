@@ -14,7 +14,7 @@ from agent_runtime.models.base import ChatModel
 from agent_runtime.models.types import ModelResponse, ModelTransientError
 from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import Session
-from agent_runtime.tools.builtin import ListFilesArgs
+from agent_runtime.tools.builtin.filesystem import ListFilesArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
 
 from fakes import Collector, ExplodingModel, tool_call, usage

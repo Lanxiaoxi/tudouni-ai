@@ -23,7 +23,7 @@ from agent_runtime.agents import Agent
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import ApprovalMemory, PermissionPolicy
 from agent_runtime.state import Session
-from agent_runtime.tools.ask import (
+from agent_runtime.tools.builtin.ask import (
     ANSWERED,
     SKIPPED,
     UNAVAILABLE,
@@ -33,7 +33,8 @@ from agent_runtime.tools.ask import (
     cli_questioner,
     unavailable_questioner,
 )
-from agent_runtime.tools.builtin import ListFilesArgs, create_tool_registry
+from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.builtin.filesystem import ListFilesArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
 
 from fakes import Collector, ScriptedModel, ScriptedQuestioner, tool_call, usage
@@ -46,7 +47,7 @@ def run(questioner, arguments=None, session=None, policy=None, asker=None, on_ev
     """一轮对话：模型问一个问题，拿到答案，然后给出最终答复。
 
     走的是**真实的注册表**（create_tool_registry），所以这条测试同时钉住了"装配起来
-    确实能用"—— 只测一个手搭的工具的话，tools/builtin.py 里忘了注册也发现不了。
+    确实能用"—— 只测一个手搭的工具的话，tools/builtin/__init__.py 里忘了注册也发现不了。
     """
     registry = create_tool_registry(".", questioner=questioner)
     model = ScriptedModel([

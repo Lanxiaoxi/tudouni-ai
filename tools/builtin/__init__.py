@@ -1,11 +1,9 @@
 """内置工具的装配。
 
-工具的「参数格式」在这里定义一次、两用：
-
-  1. 生成发给模型的 schema（**预防**：模型提前看到约束）
-  2. 校验模型实际给出的参数（**兜底**：错了就明确告诉它哪个字段不对）
-
-两者同源，所以不会漂移 —— 这条是第 4 阶段的核心结论。
+**这个文件里只有装配。** 每个工具的参数模型住在它自己的文件里、和它的 handler 同居
+（filesystem.py / shell.py / clock.py / webfetch.py / websearch.py / todo.py / ask.py /
+skills.py）—— 参数模型与行为是同一个事实的两面，而这里是唯一需要同时看见它们的地方。
+这里声明的是**另外两件事**：风险等级，以及能不能和其他工具同时执行。
 
 为什么放在 tools/ 而不是入口：它描述的是「这个项目自带哪些工具」，属于工具层
 的知识。放在入口里会有一个具体代价 —— 测试为了拿到一个工具注册表，不得不
@@ -14,8 +12,6 @@ import 整个应用入口（连带把 CLI、httpx、配置全都拖进来）。
 
 from collections.abc import MutableMapping
 from typing import Any
-
-from pydantic import Field
 
 from agent_runtime.skills import (
     MAX_ACTIVE_SKILLS,
@@ -26,160 +22,25 @@ from agent_runtime.skills import (
     SkillLoader,
 )
 
+from ..tool import RiskLevel, Tool, ToolRegistry
 from .ask import AskUser, AskUserArgs, Questioner
-from .clock import get_current_time
-from .filesystem import FileSystem
-from .shell import (
-    MAX_OUTPUT_CHARS,
-    MAX_TIMEOUT_SECONDS,
-    MIN_TIMEOUT_SECONDS,
-    TIMEOUT_SECONDS,
-    Shell,
-    shell_name,
+from .clock import GetCurrentTimeArgs, get_current_time
+from .filesystem import (
+    EditFileArgs,
+    FileSystem,
+    ListFilesArgs,
+    ReadFileArgs,
+    WriteFileArgs,
 )
+from .shell import MAX_OUTPUT_CHARS, Shell, ShellArgs, shell_name
 from .skills import LoadSkillArgs, SkillBoard
 from .todo import TodoArgs, TodoBoard
-from .tool import RiskLevel, Tool, ToolArgs, ToolRegistry
 from .webfetch import (
-    DEFAULT_TIMEOUT_SECONDS as FETCH_TIMEOUT_SECONDS,
     MAX_TIMEOUT_SECONDS as FETCH_MAX_TIMEOUT_SECONDS,
-    MIN_TIMEOUT_SECONDS as FETCH_MIN_TIMEOUT_SECONDS,
+    FetchWebArgs,
     WebFetch,
 )
-from .websearch import (
-    DEFAULT_MAX_RESULTS as SEARCH_DEFAULT_RESULTS,
-    MAX_MAX_RESULTS,
-    WebSearch,
-)
-
-
-class ReadFileArgs(ToolArgs):
-    """read_file 的参数。"""
-
-    path: str = Field(min_length=1, description="文件路径")
-
-
-class WriteFileArgs(ToolArgs):
-    """write_file 的参数。"""
-
-    path: str = Field(min_length=1, description="文件路径")
-    content: str = Field(description="文件内容")
-
-
-class EditFileArgs(ToolArgs):
-    """edit_file 的参数。
-
-    `old_string` 用 min_length=1：空串的 `str.count` 语义是"每个字符间隙都算一次"，
-    放过去会替换出一堆意料之外的东西。真正"找不到/不唯一"的判断在 handler 里 ——
-    那些只有读到文件正文之后才知道。
-
-    `replace_all` 带默认值 False：唯一匹配是**绝大多数**调用，而默认 False 意味着
-    模型必须显式说"我就是要全改"，才可能误伤多处命中。
-    """
-
-    path: str = Field(min_length=1, description="要修改的文件路径")
-    old_string: str = Field(
-        min_length=1,
-        description="要被替换掉的原文片段，必须和文件里的内容逐字符一致（含缩进和换行）",
-    )
-    new_string: str = Field(description="替换成的新内容；传空串表示删除这段")
-    replace_all: bool = Field(
-        default=False,
-        description="old_string 在文件里出现多次时：true 表示全部替换，false（默认）"
-                    "会拒绝执行并要求把 old_string 改得更长、更唯一",
-    )
-
-
-class ListFilesArgs(ToolArgs):
-    """list_files 的参数。
-
-    path 带默认值，所以生成的 schema 里它不是必填 —— 模型可以省略它。
-    """
-
-    path: str = Field(
-        default=".",
-        min_length=1,
-        description="目录路径（相对于工作区），默认为工作区根目录",
-    )
-
-
-class GetCurrentTimeArgs(ToolArgs):
-    """get_current_time 的参数。
-
-    一个字段都没有 —— 拿当前时间不需要任何输入，也就没有"模型填错参数"这条路。
-    空模型仍然要存在，而不是让 args_model 空着去手写一份 external_schema：内置工具的
-    schema 和校验都从 args_model 推导（见 tool.py），绕开它就得手写第二份 schema，
-    那就回到"两份事实互相漂移"的老问题。external_schema 是留给**别人的** schema 的
-    （MCP，见 tools/mcp.py），不是省一个空类的捷径。
-    """
-
-
-class FetchWebArgs(ToolArgs):
-    """fetch_web 的参数。
-
-    `url` 刻意只写 min_length：真正的合法性判据是 scheme 和可达性，而那两个只有真正
-    发请求（或者试图解析）时才知道 —— 在 schema 里假装成一条能提前校验的规则，只会
-    让模型的报错发生在错误的地方。
-
-    `timeout_seconds` 的边界和 ShellArgs 一样写成 ge/le，理由也一样：这个工具每条调用
-    都要过一次人工审批，撞一次参数错误就是白白多问用户一次。
-    """
-
-    url: str = Field(min_length=1, description="完整 URL，只支持 http/https")
-    timeout_seconds: int = Field(
-        default=FETCH_TIMEOUT_SECONDS,
-        ge=FETCH_MIN_TIMEOUT_SECONDS,
-        le=FETCH_MAX_TIMEOUT_SECONDS,
-        description="最多等这个 URL 多少秒。网页通常几百毫秒就回来；慢站点可以调大",
-    )
-
-
-class WebSearchArgs(ToolArgs):
-    """web_search 的参数。
-
-    它刻意**没有** timeout / 输出长度之类的旋钮：搜索发往一个已知的 provider，等多久由
-    工具自己定（DEFAULT_TIMEOUT_SECONDS），而输出上限一旦可调，模型填一个大数就能把
-    此后每一轮请求都买下来 —— 而它自己不会为此付账。
-
-    `max_results` 的上限挡的是"一口气把整个结果页买下来"，和 grep 的 MAX_MAX_FILES 是
-    同一个手法：没有上限的旋钮等于允许一次调用把上下文塞满。
-    """
-
-    query: str = Field(
-        min_length=1,
-        description="要搜的关键词或问题。它会被原样发给你无法控制的第三方搜索服务",
-    )
-    max_results: int = Field(
-        default=SEARCH_DEFAULT_RESULTS,
-        ge=1,
-        le=MAX_MAX_RESULTS,
-        description="返回几条结果。每条只是一份指针（标题/URL/摘要），不含网页正文",
-    )
-
-
-class ShellArgs(ToolArgs):
-    """shell 的参数。
-
-    command 写成字符串而不是 argv 数组，是因为模型要用的能力（管道、重定向、多个
-    命令串联）本来就得由 shell 解析 —— 拆成数组就等于把这些能力砍掉，而安全边界
-    无论如何都落在审批那一道，不在这里（见 tools/shell.py 的模块注释）。
-
-    timeout_seconds 的边界写成 ge/le，而不是让 shell.py 自己去夹：范围必须和 schema
-    同源，模型才可能**提前**看到「最多 300 秒」，而不是事后收到一个被悄悄改过的值 ——
-    而且工具调用每次都要过人工审批，撞一次参数错误就得再问一次人。
-    """
-
-    command: str = Field(
-        min_length=1,
-        description=f"要执行的命令，按 {shell_name()} 的语法写",
-    )
-    timeout_seconds: int = Field(
-        default=TIMEOUT_SECONDS,
-        ge=MIN_TIMEOUT_SECONDS,
-        le=MAX_TIMEOUT_SECONDS,
-        description="最多等这条命令多少秒。默认值只够 ls / git status 这种秒回的命令，"
-                    "装依赖、跑测试这类慢命令要显式调大",
-    )
+from .websearch import WebSearch, WebSearchArgs
 
 
 def create_tool_registry(
@@ -200,9 +61,9 @@ def create_tool_registry(
     后面几个参数都是**协作方**，形状不同，各自成一条：
 
       * `questioner` 是一份**能力**（怎么问人），替 ask_user 挡住"怎么问"这件事；
-        不传就是"没有人可问"（见 tools/ask.py 的 unavailable_questioner）。
+        不传就是"没有人可问"（见 tools/builtin/ask.py 的 unavailable_questioner）。
       * `todos` 是一块**会话作用域的状态**（任务列表写在哪），必须在会话定下来之后
-        才造得出来（见 tools/todo.py 的 TodoBoard）；不传就是一个没人看得见的列表。
+        才造得出来（见 tools/builtin/todo.py 的 TodoBoard）；不传就是一个没人看得见的列表。
       * `web_fetch` / `web_search` 是**联网**那一对：前者是一个持着 http client 的执行
         者，后者是一个持着搜索服务凭证的 handler。两者不传就是**不注册**这个工具 ——
         注意这和 questioner 的默认值方向一致：默认值绝不能偏到"看起来能用"那一边。
@@ -310,7 +171,7 @@ def create_tool_registry(
         parallel_safe=True,
     ))
 
-    # 风险定 HIGH，而且**刻意不做参数级判断** —— 理由见 tools/shell.py 的模块注释。
+    # 风险定 HIGH，而且**刻意不做参数级判断** —— 理由见 tools/builtin/shell.py 的模块注释。
     # 后果是明确的：main.py 的 auto_approve 里只有 LOW，所以每一条命令都会被拦下来
     # 问人。这是唯一诚实的默认值 —— 想给"只读命令"开自动放行，得先有 OS 级沙箱。
     #

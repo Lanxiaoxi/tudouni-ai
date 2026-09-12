@@ -23,7 +23,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .text import truncate
+from pydantic import Field
+
+from ..text import truncate
+from ..tool import ToolArgs
 
 
 # 命令的默认超时。
@@ -100,6 +103,33 @@ def _powershell() -> str:
     raise FileNotFoundError("找不到 pwsh 或 powershell，Windows 上的 shell 工具需要其中之一")
 
 
+# shell 的参数模型。**和 Shell 住在同一个文件里**（schema 与行为同一个事实的两面），
+# 而风险等级不在这里 —— 那是装配处的事（tools/builtin/__init__.py）。
+class ShellArgs(ToolArgs):
+    """shell 的参数。
+
+    command 写成字符串而不是 argv 数组，是因为模型要用的能力（管道、重定向、多个
+    命令串联）本来就得由 shell 解析 —— 拆成数组就等于把这些能力砍掉，而安全边界
+    无论如何都落在审批那一道，不在这里（见本模块开头的注释）。
+
+    timeout_seconds 的边界写成 ge/le，而不是让 handler 自己去夹：范围必须和 schema
+    同源，模型才可能**提前**看到「最多 300 秒」，而不是事后收到一个被悄悄改过的值 ——
+    而且工具调用每次都要过人工审批，撞一次参数错误就得再问一次人。
+    """
+
+    command: str = Field(
+        min_length=1,
+        description=f"要执行的命令，按 {shell_name()} 的语法写",
+    )
+    timeout_seconds: int = Field(
+        default=TIMEOUT_SECONDS,
+        ge=MIN_TIMEOUT_SECONDS,
+        le=MAX_TIMEOUT_SECONDS,
+        description="最多等这条命令多少秒。默认值只够 ls / git status 这种秒回的命令，"
+                    "装依赖、跑测试这类慢命令要显式调大",
+    )
+
+
 class Shell:
     """在一个工作目录下执行命令。
 
@@ -118,8 +148,8 @@ class Shell:
         并据此决策的信息。抛出去的话 agent.py 会把它记成工具故障，而模型恰恰拿不到
         退出码这个最关键的信号。
 
-        timeout_seconds 的范围**不由这里管** —— 边界定义在 builtin.py 的 ShellArgs
-        上（ge/le），校验也只有那一道。这里再夹一次就成了第二份事实，早晚和 schema
+        timeout_seconds 的范围**不由这里管** —— 边界定义在本模块的 ShellArgs 上
+        （ge/le），校验也只有那一道。这里再夹一次就成了第二份事实，早晚和 schema
         对不上，而且模型看不到被夹掉这件事。
 
         已知的不足：这样一来审计里 `tool_result.status` 永远只可能是 ok，从日志上

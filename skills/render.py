@@ -1,6 +1,6 @@
 """技能的三段渲染。**三个读者，三段文本，刻意不合成一份。**
 
-和 `tools/todo.py` 里 `todo_note` / `progress_line` 分开是同一条理由：模型的输入和
+和 `tools/builtin/todo.py` 里 `todo_note` / `progress_line` 分开是同一条理由：模型的输入和
 人的输出要回答的问题不一样 —— 模型要"有哪些技能、现在该按哪一份步骤做"，人只要一眼
 看出"这次会话加载了什么"。合成一份，两边都得为对方多付 token。
 
@@ -14,7 +14,7 @@
 **为什么目录表要每轮重贴，而不是塞进系统提示词。** 系统提示词只在建会话时写一次
 （state/session.py），而技能是随时能加的东西 —— 写进提示词的话，恢复的旧会话对新技能
 永久失明。这个坑项目里已经踩过两次（fetch_web 的 web_note、ask_user 的负面清单），
-结论写在 tools/builtin.py：**规则放每一轮都发的通道**。代价是每个技能每轮约 30 token，
+结论写在 tools/builtin/__init__.py：**规则放每一轮都发的通道**。代价是每个技能每轮约 30 token，
 相对百万级窗口可以忽略，而且尾部本来就在缓存前缀之外，不会打断命中。
 
 **技能正文是不可信输入，标注不能省。** 它比 fetch_web 的正文更危险：网页正文只进一次
@@ -23,7 +23,7 @@
 模型是从上往下读的。
 
 这里**只渲染，不判定**：哪些技能已加载由 metadata 说了算，正文长什么样由 loader 说了
-算。写的那一侧在 tools/skills.py 的 SkillBoard —— 两边共用 loader.SKILLS_KEY。
+算。写的那一侧在 tools/builtin/skills.py 的 SkillBoard —— 两边共用 loader.SKILLS_KEY。
 """
 
 from collections.abc import Mapping

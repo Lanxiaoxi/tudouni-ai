@@ -44,8 +44,8 @@
 import re
 from pathlib import Path
 
+from ..text import truncate
 from .filesystem import FileSystem
-from .text import truncate
 
 
 # 最多列出多少个有命中的文件。

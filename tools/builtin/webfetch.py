@@ -1,8 +1,8 @@
 """抓取一个网页并把它变成**模型能读的纯文本**。
 
 它和 read_file 是同一件事的两半：read_file 读工作区里的文件，这个读网上的页面。所以
-它的形状照 shell.py / filesystem.py：**这里只有执行**，参数格式和风险等级在 builtin.py
-里装配。
+它的形状照 shell.py / filesystem.py：**这里只有执行 + 它自己的参数模型**（FetchWebArgs），
+风险等级在 builtin/__init__.py 里装配。
 
 四条不能商量的，每一条都对应一种"看起来能用、其实会出事"的写法：
 
@@ -33,9 +33,10 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+from pydantic import Field
 
-from .text import truncate
-from .tool import ToolResult
+from ..text import truncate
+from ..tool import ToolArgs, ToolResult
 
 # 这个工具的输出上限。
 #
@@ -91,6 +92,28 @@ _ENCODING_ALIASES = {
 }
 
 _META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.I)
+
+
+# fetch_web 的参数模型。**和 WebFetch 住在同一个文件里**（schema 与行为同一个事实的
+# 两面），超时边界直接引本模块那三个常量，不再经装配处转一手别名。
+class FetchWebArgs(ToolArgs):
+    """fetch_web 的参数。
+
+    `url` 刻意只写 min_length：真正的合法性判据是 scheme 和可达性，而那两个只有真正
+    发请求（或者试图解析）时才知道 —— 在 schema 里假装成一条能提前校验的规则，只会
+    让模型的报错发生在错误的地方。
+
+    `timeout_seconds` 的边界和 ShellArgs 一样写成 ge/le，理由也一样：这个工具每条调用
+    都要过一次人工审批，撞一次参数错误就是白白多问用户一次。
+    """
+
+    url: str = Field(min_length=1, description="完整 URL，只支持 http/https")
+    timeout_seconds: int = Field(
+        default=DEFAULT_TIMEOUT_SECONDS,
+        ge=MIN_TIMEOUT_SECONDS,
+        le=MAX_TIMEOUT_SECONDS,
+        description="最多等这个 URL 多少秒。网页通常几百毫秒就回来；慢站点可以调大",
+    )
 
 
 def _ok_encoding(name: str | None) -> str | None:

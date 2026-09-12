@@ -179,7 +179,7 @@ L3 一行新代码都没有：技能目录就在文件系统上，`read_file` / 
 
 **L1 和 L2 都走载荷尾部，不进系统提示词。** 系统提示词只在建会话时写一次
 （`state/session.py`），而技能是随时能加的东西 —— 写进提示词的话，恢复的旧会话对新技能
-永久失明（这个坑项目里已经踩过两次，见 `tools/builtin.py` 里 `web_note` 那段）。代价是
+永久失明（这个坑项目里已经踩过两次，见 `tools/builtin/__init__.py` 里 `web_note` 那段）。代价是
 每个技能每轮约 30 token，相对百万级窗口可以忽略，而且尾部本来就在缓存前缀之外，不会打断
 命中。
 
@@ -189,7 +189,7 @@ L3 一行新代码都没有：技能目录就在文件系统上，`read_file` / 
    **指令** —— 它加载之后会拼进此后每一次请求。能写它就等于能改自己接下来每一轮的指令，
    而且改一次永久生效。这是控制面里最危险的那一个，也比改权限策略更隐蔽：策略改了至少
    还有一条 `permission` 事件，而"我给自己加了三条规矩"在审计里什么都看不出来。所以
-   `.tudouni/` 整个目录进了 `tools/filesystem.py` 的 `CONTROL_PLANE`。
+   `.tudouni/` 整个目录进了 `tools/builtin/filesystem.py` 的 `CONTROL_PLANE`。
    （用户级那三个目录在工作区外面，`write_file` 本来就够不着 —— 由操作系统保证。）
 2. **技能正文是不可信输入，标注不能省。** 它比网页正文危险：网页正文只进一次历史，技能
    正文**每一轮都重发**，等于把一段外来指令反复放大。所以那段文本带着"这是工作区数据、
@@ -386,7 +386,7 @@ handler 整段时间都阻塞在人的输入上，不减的话"我看了 30 秒�
 的 `deny_tools` 里点名 `ask_user` 即可 —— 那是"不许做"，和 `--autopilot` 的"没人可问"
 是两件事，而且两种情况下模型都应该自己决定、把假设说出来。
 
-**Web / 弹窗版怎么挂。** 提问通道是一个注入的 callable（`tools/ask.py` 的 `Questioner`），
+**Web / 弹窗版怎么挂。** 提问通道是一个注入的 callable（`tools/builtin/ask.py` 的 `Questioner`），
 换实现不动 Agent 一行 —— 和 `asker` / `on_checkpoint` / `on_event` 同一条原则。Web 版要做
 四件事：把问题推给前端、阻塞等一个 `Future`、`POST /answer` 时放行、断连或超时返回"没有人
 回答"（CLI 里刻意不设超时：人就在键盘前，而 Windows 上没法对 stdin 做优雅超时）。有一条
@@ -400,7 +400,7 @@ SSE）—— 不能做成"回合先结束、下次请求把答案带进来"，�
 决定了它们的接口：
 
 - `grep` 回答"**哪儿有**"，`read_file` 回答"**那儿是什么**"，而 grep 刻意不替模型读正文
-  （见 `tools/grep.py`：一次 grep 不该把几百 K 正文顺手塞进上下文）；
+  （见 `tools/builtin/grep.py`：一次 grep 不该把几百 K 正文顺手塞进上下文）；
 - 同理，**`web_search` 只返回指针**（标题、网址、摘要片段），不返回网页正文。想看哪一条，
   模型自己 `fetch_web` 去取。
 
@@ -435,7 +435,7 @@ SSE）—— 不能做成"回合先结束、下次请求把答案带进来"，�
   对这两个工具，`t` 记住的是**工具名**（它们没有"命令行"这种可拆的前缀，
   `security/commands.py` 的 `command_parameter()` 对它们返回 `None`）。
 
-三条不能商量的（实现与理由在 `tools/webfetch.py`）：
+三条不能商量的（实现与理由在 `tools/builtin/webfetch.py`）：
 
 1. **只走 http/https，而且在发请求之前就判，重定向的每一跳都重判。** `file:///C:/Users/x/.ssh/id_rsa`
    会把这个工具变成"读任意本地文件"，而那条路**绕过 `safe_path`** —— 文件工具花一整个模块
@@ -497,7 +497,7 @@ PDF / 图片这类二进制直接回一句"不是能读的文本"，不硬解。
 并且和步数提示一样**从不进 `session.messages`**：逐轮变化的东西不该被持久化，也不该去
 稀释「一条 assistant = 一步」那个派生规则。
 
-注入点叫 `session_notes`，注入的是一段"怎么说"的实现（`tools/todo.py` 的 `todo_note`），
+注入点叫 `session_notes`，注入的是一段"怎么说"的实现（`tools/builtin/todo.py` 的 `todo_note`），
 所以 Agent 自己不知道任务列表长什么样。注意写和读是**两条独立装配的路**（写：注入一个
 `TodoBoard`；读：注入 `todo_note`），只有 `main.py` 两条都接上 —— 少接一条的后果是
 "列表更新了但模型看不见"，而那不会报任何错。
@@ -719,25 +719,36 @@ skills/            技能层 —— **技能领域，不依赖任何内部模块
   render.py          三段渲染：目录（L1）/ 已加载正文（L2）/ 给人看的一行
                      （技能目录在文件系统里，这个包是读它们的代码 —— 同名但不是一回事）
 
-tools/             工具层
-  tool.py            Tool(名字/描述/风险/参数来源/handler/能否并行/会不会问人) + ToolRegistry
-                     + ToolResult（"文本 + 工具自己知道的审计字段"）
+tools/             工具层 —— 三类东西，两个子位置
+  tool.py            契约：Tool(名字/描述/风险/参数来源/handler/能否并行/会不会问人)
+                     + ToolRegistry + ToolResult（"文本 + 工具自己知道的审计字段"）
                      参数来源有且只有一个：内置工具给 args_model（schema 与校验都从它推导），
                      外部工具给 external_schema（原样透传，校验归 server）
-  mcp.py             外部 MCP server（stdio JSON-RPC）+ 把它的工具装配成 Tool
-  builtin.py         内置工具的装配（参数模型 + 风险等级 + 能否并行）
-  skills.py          load_skill 的薄代理层：参数模型 + SkillBoard（写 session.metadata）
-                     —— 技能领域在 skills/ 包里，这里只负责"接线"
-  ask.py             向用户提问：Questioner 端口 + CLI 版 + "没有人可问"版
-  todo.py            任务列表：TodoBoard（写进会话 metadata）+ 每轮注入的那份渲染
-  filesystem.py      文件操作 + safe_path（工作区边界）+ 控制面拒绝写（含 .tudouni/）
-  clock.py           当前时间（无参数、无状态、不需要注入任何东西）
-  grep.py            工作区内按正则搜文本 —— **未注册**（实现与测试保留，但模型看不到它）
-  shell.py           命令执行 —— 唯一不受工作区边界约束的工具，因此只能走人工审批
-  webfetch.py        抓一个网页并转成纯文本（互联网上的 read_file）
-  websearch.py       搜关键词，只给指针 —— SearchBackend 端口 + TavilySearch 实现
-                     （互联网上的 grep）
   text.py            超长文本取头尾两段 —— shell / grep / webfetch / websearch 四处共用
+
+  mcp.py             外部 MCP server（stdio JSON-RPC）+ 把它的工具适配成 Tool
+                     —— 工具的**来源**，不是某一个工具
+
+  builtin/           内置工具：**一个工具一个模块**，参数模型和它的 handler 同居
+    __init__.py        create_tool_registry —— 唯一需要同时看见所有工具的地方，
+                       也是**唯一**声明风险等级与能否并行的地方
+    filesystem.py      文件操作 + safe_path（工作区边界）+ 控制面拒绝写（含 .tudouni/）
+                       + read/write/edit/list 四个参数模型
+    shell.py           命令执行 —— 唯一不受工作区边界约束的工具，因此只能走人工审批
+    clock.py           当前时间（无参数、无状态、不需要注入任何东西）
+    grep.py            工作区内按正则搜文本 —— **未注册**（实现与测试保留，但模型看不到它）
+    webfetch.py        抓一个网页并转成纯文本（互联网上的 read_file）
+    websearch.py       搜关键词，只给指针 —— SearchBackend 端口 + TavilySearch 实现
+                       （互联网上的 grep）
+    skills.py          load_skill 的薄代理层：参数模型 + SkillBoard（写 session.metadata）
+                       —— 技能领域在 skills/ 包里，这里只负责"接线"
+    ask.py             向用户提问：Questioner 端口 + CLI 版 + "没有人可问"版
+    todo.py            任务列表：TodoBoard（写进会话 metadata）+ 每轮注入的那份渲染
+
+`tools/__init__.py` 只导出契约（六个名字）。这不是洁癖：包出口里每多一行 re-export，
+**每一个只想拿一个 `Tool` 的人**都要替它付加载费 —— `security/policy.py` 里那句
+`from agent_runtime.tools.tool import Tool` 实测会把 httpx 和整个技能包一起拖进来。
+那 35 个没人用的出口已经删掉了。
 
 security/          权限层
   policy.py          PermissionPolicy：纯函数，只裁定 ALLOW / DENY / ASK
@@ -772,12 +783,28 @@ skills   （无内部依赖 —— 它谁也不 import，所以能独立成包�
 config   → security.commands（校验 shell_allow 里的规则语法；密钥那条路仍然是环境变量）
          → tools.mcp（解析 mcp.json 的形状 —— 那份形状知识住在工具层，而"往磁盘上哪个
             文件读"住在配置层；反向的 tools → config 仍然是禁止的）
-security → tools
+security → tools（只准 `tools.tool` —— 见下面那条测试）
 audit    → state
-agents   → audit, models, security, state, tools
-tools    → skills（load_skill 的接线；技能领域住在 skills/ 里）
+agents   → audit, models, security, state, tools（同样只准 `tools.tool`）
+tools    → skills（只有 load_skill 那一条接线；技能领域住在 skills/ 里）
 main     → 全部
 ```
+
+工具层内部也是单向的：`builtin/` 里每个工具 → `tools/tool.py`（契约），没有一个工具
+import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也不反向依赖它。
+
+**这条边界现在由测试盯着**（`tests/test_imports.py` 三条）：
+
+  * `skills/` 不 import 任何内部模块（否则会成环）；
+  * `security/` `agents/` `state/` `audit/` `models/` 只能从 `tools.tool` 认识工具 ——
+    具体工具和外部来源是装配处（`main.py`）的事。以前这条只靠"记得"维持，而它破掉时
+    **什么都不会坏**，只是让每一次权限裁决都顺手拖进 httpx 和整个技能包；
+  * `tools` 的包出口不许带货：`import agent_runtime.tools.tool` 之后 `sys.modules` 里
+    不该有 httpx / skills。
+
+`config.py` 是那条规则的**点名例外**：它要解析 `mcp.json` 的形状，而那份形状知识住在
+`tools/mcp.py`（反向的 `tools → config` 是禁止的）。例外写在测试的 `_EXEMPT_FILES` 里，
+不是靠放宽规则。
 
 ## 贯穿全局的三个设计原则
 
@@ -796,12 +823,12 @@ main     → 全部
 （每回合一次 HTTP 请求、根本没有循环）不需要改 Agent。
 
 `session_notes`（任务列表每轮重新贴上去的那一份）是第五个：Agent 只知道"每次请求末尾要
-把当前会话状态贴上"，至于那段状态长什么样、怎么渲染，是 `tools/todo.py` 的知识。
+把当前会话状态贴上"，至于那段状态长什么样、怎么渲染，是 `tools/builtin/todo.py` 的知识。
 
 `questioner`（提问通道）是**同一条原则再往下沉一层**：这一层"内部"是工具自己，而不是
 Agent —— 所以它不在上表里，因为 Agent 根本不知道有这回事（它只看见一次普通的工具调用，
 ask_user 的 handler 阻塞在人的输入上这件事它不知道也不需要知道）。这也是"换实现不动
-Agent 一行"那句话在提问这条路上的具体形态，见 `tools/ask.py`。
+Agent 一行"那句话在提问这条路上的具体形态，见 `tools/builtin/ask.py`。
 
 ### 2. provider 的细节在适配层归一化
 
@@ -886,7 +913,7 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 **控制面只有人能写。** `.tudouni/`（权限策略、会话、日志、技能）就在工作区里，而
 `write_file` 的边界正好是整个工作区 —— 能写它们就等于能给自己发权限、伪造"用户批准过"
 的记录、抹掉"谁批准了什么"的证据。所以 `safe_path`（别出去）之外还有一张拒绝表
-（`tools/filesystem.py` 的 `CONTROL_PLANE`，别进来）：**读可以，写一律拒绝，和审批
+（`tools/builtin/filesystem.py` 的 `CONTROL_PLANE`，别进来）：**读可以，写一律拒绝，和审批
 无关 —— 人批准了也不行。** 这条边界是 `t` 能存在的前提：没有它，"按一次 t 永久免问"
 和"agent 改一次策略文件"合起来就是一条从一次写文件审批走到 shell 全权的路。
 
@@ -945,7 +972,7 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 
 三条和这个布局配套的约定：
 
-- **控制面只守一个目录。** `tools/filesystem.py` 的 `CONTROL_PLANE` 里是 `.tudouni/`，
+- **控制面只守一个目录。** `tools/builtin/filesystem.py` 的 `CONTROL_PLANE` 里是 `.tudouni/`，
   所以权限策略、会话、日志、技能**天生**都是"agent 读得到、写不了"—— 往里加东西不需要
   再改那张表。旧位置（`.tudouni.json` / `.sessions/` / `.logs/`）也留在表里：程序已经
   不读它们了，但磁盘上可能还有，而且装的是同一类东西。
@@ -1011,7 +1038,7 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
   一次大搬迁 —— 暂时不值得。
 - **`doc/` 里的文件。** `guide.md` 是本项目的分阶段设计文档；`summary.md` 是 Agent
   自己读 `guide.md` 之后写的摘要 —— 顺便当作"它真的能干活"的样例。
-- **`tools/filesystem.py` 里的 `safe_path`。** 它其实是一条安全策略，按职责该住在
+- **`tools/builtin/filesystem.py` 里的 `safe_path`。** 它其实是一条安全策略，按职责该住在
   `security/`。留在工具里的原因是它和文件操作绑得太紧，搬走会让两边都变难读。
 - **`get_current_time` 只给本机时区。** 想看任意时区得引入 IANA 时区库（Windows 上
   还要额外的 `tzdata` 依赖），那是"本来零依赖、不会失败"的工具凭空多出的失败点。

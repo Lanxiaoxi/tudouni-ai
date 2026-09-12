@@ -54,7 +54,7 @@ def test_missing_file_is_not_an_error(workdir):
 def test_the_permission_file_lives_in_the_runtime_dir():
     """路径本身也钉一下：它是"运行期私有数据都在一个目录里"这条约定的入口。
 
-    配套的是控制面（`tools/filesystem.py` 的 CONTROL_PLANE 守着 `.tudouni/`），
+    配套的是控制面（`tools/builtin/filesystem.py` 的 CONTROL_PLANE 守着 `.tudouni/`），
     所以这个文件天生就是"agent 不许写"的 —— 不需要再单独点名它。
     """
     from agent_runtime.skills import RUNTIME_DIR_NAME

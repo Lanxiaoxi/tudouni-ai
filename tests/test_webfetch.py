@@ -22,18 +22,19 @@ import ssl
 import httpx
 import pytest
 
-from agent_runtime.tools.builtin import FetchWebArgs, create_tool_registry
-from agent_runtime.tools.tool import RiskLevel, ToolResult
-from agent_runtime.tools.webfetch import (
+from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.builtin.webfetch import (
     MAX_BYTES,
     MAX_OUTPUT_CHARS,
     MAX_REDIRECTS,
+    FetchWebArgs,
     WebFetch,
     choose_encoding,
     decode_body,
     html_to_text,
     is_textual,
 )
+from agent_runtime.tools.tool import RiskLevel, ToolResult
 
 
 class Recorder:

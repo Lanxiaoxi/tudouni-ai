@@ -3,14 +3,14 @@
 **这一层是薄代理，技能的领域不在这里。** 扫描、解析、渲染全在 `skills/` 包里
 （`skills/loader.py` / `skills/render.py`），这里只做三件**只有工具层才知道**的事：
 
-  1. 定义参数模型（schema 和校验同源，见 tools/builtin.py 的模块 docstring）；
+  1. 定义参数模型（schema 和校验同源，见 tools/tool.py 的 ToolArgs）；
   2. 把"已加载哪些技能"写进 `session.metadata`（和 `todo.TodoBoard` 完全同构）；
   3. 返回 `ToolResult`（给模型的文本 + 只有工具自己知道的审计字段）。
 
 拆成两个文件不是洁癖，是**依赖方向**：`skills/` 一旦认识 `Tool`，就会出现
-`skills → tools`，而 `tools/builtin.py` 又要 import `skills` 来注册本工具 —— 成环。
-判定留在内部、接线交给工具层，和 `tools/webfetch.py`（有 WebFetch、注册在 builtin.py）
-是同一条原则的又一次应用。
+`skills → tools`，而 `tools/builtin/__init__.py` 又要 import `skills` 来注册本工具 —— 成环。
+判定留在内部、接线交给工具层，和 `tools/builtin/webfetch.py`（有 WebFetch、
+在 builtin/__init__.py 里注册）是同一条原则的又一次应用。
 
 **风险等级 LOW，不触发审批。** 理由和 `todo_write` 完全一样：它只读工作区里的技能
 文件、只改会话里属于它自己的那一小块，碰不到工作区、也碰不到控制面。为了读一份说明书
@@ -38,7 +38,7 @@ from agent_runtime.skills.loader import (
 )
 from agent_runtime.skills.render import active_names, load_entries, note_chars
 
-from .tool import ToolArgs, ToolResult
+from ..tool import ToolArgs, ToolResult
 
 
 class LoadSkillArgs(ToolArgs):
@@ -193,7 +193,7 @@ class SkillBoard:
         if len(active) >= MAX_ACTIVE_SKILLS:
             # 不挤掉旧的：悄悄卸载一个已经生效的技能，等于伪造模型的主张 ——
             # 它下一轮会按自己"记得"的技能做，而那份已经不在载荷里了
-            # （tools/todo.py 里"活性约束只提醒，不代填"是同一条原则）。
+            # （tools/builtin/todo.py 里"活性约束只提醒，不代填"是同一条原则）。
             return ToolResult(
                 f"现在已经有 {len(active)} 个技能在生效（{'、'.join(active)}），"
                 f"达到了上限 {MAX_ACTIVE_SKILLS}。先用 load_skill(unload=true) 卸掉"

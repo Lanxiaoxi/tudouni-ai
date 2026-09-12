@@ -3,7 +3,7 @@
 两条安全底线都是被实测咬过才写上的：
 
   1. **session_id 不能直接拼文件名。** 实测 session_id="../../evil" 会把状态文件
-     写到目录外面去（`C:\\Users\\XPS\\repo\\evil.json`）。这个洞在 tools/filesystem.py
+     写到目录外面去（`C:\\Users\\XPS\\repo\\evil.json`）。这个洞在 tools/builtin/filesystem.py
      里已经用 safe_path 堵过一次，不能在基础设施层又开回来。
   2. **写文件不是原子的。** 实测把 JSON 截断一半再 load 就是 JSONDecodeError。
      而状态持久化的意义恰恰是扛崩溃 —— 它不能在最需要它的那一刻毁掉自己的数据。

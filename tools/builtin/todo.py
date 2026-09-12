@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from .tool import ToolArgs, ToolResult
+from ..tool import ToolArgs, ToolResult
 
 # 会话 metadata 里存任务列表的那个键。**读写两侧共用这一个常量**（写入在 TodoBoard，
 # 读出在 todo_note / progress_line）—— 两边各写一份字面量，漂开一个字符就是"列表凭空

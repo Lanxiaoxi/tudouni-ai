@@ -58,7 +58,7 @@ class PermissionPolicy:
         """裁定一次工具调用，返回 Decision。
 
         arguments 现在没有被读取 —— 它是有意留在签名里的。风险等级是「每个工具
-        一个」，粒度很粗：write_file 写 doc/notes.md 和写 tools/filesystem.py
+        一个」，粒度很粗：write_file 写 doc/notes.md 和写 tools/builtin/filesystem.py
         同为 MEDIUM，实际风险却天差地别。将来要做参数级判断（比如拒绝对 runtime
         自身源码的写入）时，这个签名不需要改动，所有调用处也不用动。
         """

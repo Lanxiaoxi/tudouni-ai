@@ -15,7 +15,7 @@ from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import ApprovalMemory, PermissionPolicy
 from agent_runtime.security.gate import check_permission
 from agent_runtime.state import Session
-from agent_runtime.tools.builtin import ShellArgs
+from agent_runtime.tools.builtin.shell import ShellArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
 
 from fakes import Collector, ScriptedModel, tool_call, usage

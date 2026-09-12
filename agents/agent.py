@@ -195,7 +195,7 @@ class Agent:
         # session_notes 可以为空：不传就是"没有任何需要每轮重新贴上去的会话状态"。
         #
         # 它是这个类的第五个注入点，但和 session_notes 打交道的**不是 Agent 自己**：
-        # 那些文本由工具层提供（任务列表长什么样是 tools/todo.py 的知识），Agent 只
+        # 那些文本由工具层提供（任务列表长什么样是 tools/builtin/todo.py 的知识），Agent 只
         # 负责在每次请求的末尾把当前状态重新贴一遍。判定留在内部、沟通交给注入的实现
         # —— 和 asker / questioner 同一条原则，只不过这一份注入的是"怎么说"而不是
         # "去问谁"。

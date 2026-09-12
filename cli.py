@@ -19,7 +19,7 @@ from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
 from agent_runtime.skills import SkillLoader
 from agent_runtime.state import JsonSessionStore, Session
-from agent_runtime.tools.todo import progress_line
+from agent_runtime.tools.builtin.todo import progress_line
 
 
 # --- 启动横幅 -------------------------------------------------------------
@@ -579,7 +579,7 @@ def _report_todos(session: Session, prefix: str = "[任务] ") -> None:
     """把当前任务列表打一行到 stderr；没有列表就什么都不说。
 
     行式终端里没有"常驻面板"这回事，所以进度只能靠每轮重打一遍。这一行是给**人**看的
-    —— 模型每轮看到的是载荷尾部那一份完整列表（见 tools/todo.py），两者刻意不是同一份
+    —— 模型每轮看到的是载荷尾部那一份完整列表（见 tools/builtin/todo.py），两者刻意不是同一份
     文本：模型要"还剩什么、现在做哪条"，人只要一眼看出做到哪了。
 
     走 stderr：和提示符、横幅、每轮末尾那句统计同一条线，stdout 只留对话正文。

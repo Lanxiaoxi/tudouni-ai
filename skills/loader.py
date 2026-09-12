@@ -6,9 +6,10 @@
 方向成环：`tools → skills`，而 skills 谁也不依赖。
 
 一旦这里出现 `Tool` / `ToolRegistry` / `ToolResult`，就会变成 `skills → tools`，
-而 `tools/builtin.py` 又要 import 本包来注册 load_skill —— 环一出现，README 里那句
+而 `tools/builtin/__init__.py` 又要 import 本包来注册 load_skill —— 环一出现，README 里那句
 "依赖方向是单向的，无环"就成了假话。工具的接线（参数模型、handler、注册）全部留在
-`tools/skills.py`，和 `tools/webfetch.py`（有 WebFetch、注册在 builtin.py）同构。
+`tools/builtin/skills.py`，和 `tools/builtin/webfetch.py`（有 WebFetch、注册在
+builtin/__init__.py）同构。
 
 ## 技能住在哪
 
@@ -81,14 +82,14 @@ SKILLS_DIR_NAME = "skills"
 SKILL_FILE_NAME = "SKILL.md"
 
 # 会话 metadata 里存"哪些技能已加载"的键。**读写两侧共用这一个常量**（写入在
-# tools/skills.py 的 SkillBoard，读出在 skills/render.py）—— 两边各写一份字面量，
+# tools/builtin/skills.py 的 SkillBoard，读出在 skills/render.py）—— 两边各写一份字面量，
 # 漂开一个字符就是"技能凭空消失"，而且不会有任何报错（和 todo.TODOS_KEY 同一条）。
 SKILLS_KEY = "skills"
 
 # 一个技能正文的字节上限。它和 todo 列表面对的是同一个成本结构：正文会拼进
 # **每一次请求的载荷尾部**，此后每一轮都要重发一次。所以超限时**拒绝加载并说清楚**，
 # 而不是截断 —— 截断出来的是一份"看起来完整、其实少了后半段步骤"的说明，比读不到更坏
-# （tools/todo.py 里"坏数据一条不对就整份丢掉"是这个取向的另一半）。
+# （tools/builtin/todo.py 里"坏数据一条不对就整份丢掉"是这个取向的另一半）。
 MAX_SKILL_BYTES = 64_000
 
 # 同时生效的技能数上限。超了拒绝新的，不挤掉旧的：悄悄卸载一个已经生效的技能
@@ -447,7 +448,7 @@ class SkillLoader:
         """一个技能目录里 SKILL.md 的落点，必须仍在**它所属于的那个技能目录**里面。
 
         `resolve()` 把软链展开，所以"在技能目录下建一个指向 C:/Users/x/.ssh 的软链"
-        会在这里被拒。这条检查是**独立写的一份**，没有复用 tools/filesystem.py 的
+        会在这里被拒。这条检查是**独立写的一份**，没有复用 tools/builtin/filesystem.py 的
         safe_path —— 复用会让依赖方向多一条 `skills → tools` 的箭头，而那条箭头正是
         这个包能独立存在的前提。两者管的事也不重叠：safe_path 管的是"工具的参数别
         出去"，这里管的是"技能目录项别指出去"。

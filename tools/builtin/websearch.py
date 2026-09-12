@@ -14,7 +14,7 @@ grep 的模块注释把这条写得很清楚：一次 grep 不该把几百 K 正
   * 不请求 `include_answer`（第三方模型生成的摘要，没地方核验）；
   * 不做「搜完自动抓前三条」（那会带来模型没有要求过的正文，而每条抓取都要过一次审批）。
 
-**形状照 tools/ask.py**：一个端口（`SearchBackend`）+ 一个具体实现（`TavilySearch`）+
+**形状照 tools/builtin/ask.py**：一个端口（`SearchBackend`）+ 一个具体实现（`TavilySearch`）+
 一个薄薄的 handler（`WebSearch`，它不认识 http，也不认识 Tavily）。于是测试可以塞一个
 假 backend 进来，一行网络都不打 —— 和 `ScriptedQuestioner` 同一个手法。这是「判定留在
 内部，沟通交给注入的实现」的第五次适用（前四次：asker / memory / on_checkpoint /
@@ -27,9 +27,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from pydantic import Field
 
-from .text import truncate
-from .tool import ToolResult
+from ..text import truncate
+from ..tool import ToolArgs, ToolResult
 
 # 每条摘要片段回给模型时最多留多少字符。
 #
@@ -48,6 +49,31 @@ MAX_TIMEOUT_SECONDS = 60
 # 结果总量上限。条数有上限（10 条）之后这一条本来是兜底，但它挡的是 provider 返回
 # 超长 snippet 的情形 —— 而那不由我们控制。
 MAX_OUTPUT_CHARS = 8_000
+
+
+# web_search 的参数模型。**和 WebSearch 住在同一个文件里**（schema 与行为同一个事实
+# 的两面），上限直接引本模块那两个常量。
+class WebSearchArgs(ToolArgs):
+    """web_search 的参数。
+
+    它刻意**没有** timeout / 输出长度之类的旋钮：搜索发往一个已知的 provider，等多久由
+    工具自己定（DEFAULT_TIMEOUT_SECONDS），而输出上限一旦可调，模型填一个大数就能把
+    此后每一轮请求都买下来 —— 而它自己不会为此付账。
+
+    `max_results` 的上限挡的是"一口气把整个结果页买下来"，和 grep 的 MAX_MAX_FILES 是
+    同一个手法：没有上限的旋钮等于允许一次调用把上下文塞满。
+    """
+
+    query: str = Field(
+        min_length=1,
+        description="要搜的关键词或问题。它会被原样发给你无法控制的第三方搜索服务",
+    )
+    max_results: int = Field(
+        default=DEFAULT_MAX_RESULTS,
+        ge=1,
+        le=MAX_MAX_RESULTS,
+        description="返回几条结果。每条只是一份指针（标题/URL/摘要），不含网页正文",
+    )
 
 
 @dataclass(frozen=True, slots=True)

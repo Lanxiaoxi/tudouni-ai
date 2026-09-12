@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from agent_runtime.tools.builtin import ListFilesArgs, ReadFileArgs, create_tool_registry
-from agent_runtime.tools.filesystem import FileSystem
+from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.builtin.filesystem import FileSystem, ListFilesArgs, ReadFileArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry, ToolArgs
 
 

@@ -242,7 +242,7 @@ def test_a_tool_needs_a_schema_source():
 
 def test_both_schema_sources_is_an_error():
     """两个都给了 → 也是坏配置：两份来源会漂移（模型看到 A、执行按 B 校验）。"""
-    from agent_runtime.tools.builtin import ListFilesArgs
+    from agent_runtime.tools.builtin.filesystem import ListFilesArgs
 
     with pytest.raises(ValueError, match="两个都给了"):
         Tool(

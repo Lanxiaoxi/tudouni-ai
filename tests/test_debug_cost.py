@@ -13,7 +13,7 @@ from agent_runtime.agents.agent import DEBUG_PREVIEW_LIMIT
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import Session
-from agent_runtime.tools.builtin import ListFilesArgs
+from agent_runtime.tools.builtin.filesystem import ListFilesArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
 
 from fakes import ScriptedModel, tool_call, usage

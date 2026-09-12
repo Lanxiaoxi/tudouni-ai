@@ -1,7 +1,7 @@
 """grep 工具的实现。
 
 **它已经取消注册**：不再出现在 create_tool_registry 里，模型看不到它、也不会被
-调用。这里保留的是 tools/grep.py 本身的实现测试 —— 那艘船还在，只是没挂在这条
+调用。这里保留的是 tools/builtin/grep.py 本身的实现测试 —— 那艘船还在，只是没挂在这条
 装配线上。
 
 实现层的契约没变：路径走 FileSystem.safe_path（只在工作区内）；结果里的路径要能
@@ -11,8 +11,8 @@
 
 import pytest
 
-from agent_runtime.tools.filesystem import FileSystem
-from agent_runtime.tools.grep import (
+from agent_runtime.tools.builtin.filesystem import FileSystem
+from agent_runtime.tools.builtin.grep import (
     MAX_LINE_CHARS,
     _truncate,
     grep,

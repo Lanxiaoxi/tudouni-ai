@@ -17,9 +17,8 @@ from agent_runtime.agents import Agent
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import Session
-from agent_runtime.tools.builtin import WebSearchArgs, create_tool_registry
-from agent_runtime.tools.tool import RiskLevel, ToolResult
-from agent_runtime.tools.websearch import (
+from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.builtin.websearch import (
     MAX_MAX_RESULTS,
     MAX_SNIPPET_CHARS,
     Findings,
@@ -28,7 +27,9 @@ from agent_runtime.tools.websearch import (
     SearchTransientError,
     TavilySearch,
     WebSearch,
+    WebSearchArgs,
 )
+from agent_runtime.tools.tool import RiskLevel, ToolResult
 
 from fakes import Collector, ScriptedModel, tool_call, usage
 

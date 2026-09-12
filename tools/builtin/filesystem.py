@@ -1,6 +1,10 @@
-﻿from pathlib import Path
+from pathlib import Path
+
+from pydantic import Field
 
 from agent_runtime.skills import RUNTIME_DIR_NAME
+
+from ..tool import ToolArgs
 
 # 控制面路径：**只有人和程序自己能写**，agent 的 write_file 一律拒绝。
 #
@@ -33,6 +37,59 @@ CONTROL_PLANE = (".tudouni.json", RUNTIME_DIR_NAME, ".sessions", ".logs")
 # 比较必须折叠大小写：Windows 的文件系统不区分大小写，`.TUDOUNI.JSON` 写下去就是
 # 同一个目录。在 Linux 上那是另一个目录，但"绕过检查"的形态没必要放行任何一种。
 _CONTROL_PLANE_FOLDED = frozenset(name.casefold() for name in CONTROL_PLANE)
+
+
+# 四个文件工具的参数模型。**它们和 handler 住在同一个文件里**：schema 和校验同源是
+# 一条原则，而"同一个工具的参数和行为分居两地"是另一条 —— 改一个字段要去 A、改行为
+# 要去 B，早晚有一边忘了跟。这里只有**形状**，行为在下面的 FileSystem 里。
+class ReadFileArgs(ToolArgs):
+    """read_file 的参数。"""
+
+    path: str = Field(min_length=1, description="文件路径")
+
+
+class WriteFileArgs(ToolArgs):
+    """write_file 的参数。"""
+
+    path: str = Field(min_length=1, description="文件路径")
+    content: str = Field(description="文件内容")
+
+
+class EditFileArgs(ToolArgs):
+    """edit_file 的参数。
+
+    `old_string` 用 min_length=1：空串的 `str.count` 语义是"每个字符间隙都算一次"，
+    放过去会替换出一堆意料之外的东西。真正"找不到/不唯一"的判断在 handler 里 ——
+    那些只有读到文件正文之后才知道。
+
+    `replace_all` 带默认值 False：唯一匹配是**绝大多数**调用，而默认 False 意味着
+    模型必须显式说"我就是要全改"，才可能误伤多处命中。
+    """
+
+    path: str = Field(min_length=1, description="要修改的文件路径")
+    old_string: str = Field(
+        min_length=1,
+        description="要被替换掉的原文片段，必须和文件里的内容逐字符一致（含缩进和换行）",
+    )
+    new_string: str = Field(description="替换成的新内容；传空串表示删除这段")
+    replace_all: bool = Field(
+        default=False,
+        description="old_string 在文件里出现多次时：true 表示全部替换，false（默认）"
+                    "会拒绝执行并要求把 old_string 改得更长、更唯一",
+    )
+
+
+class ListFilesArgs(ToolArgs):
+    """list_files 的参数。
+
+    path 带默认值，所以生成的 schema 里它不是必填 —— 模型可以省略它。
+    """
+
+    path: str = Field(
+        default=".",
+        min_length=1,
+        description="目录路径（相对于工作区），默认为工作区根目录",
+    )
 
 
 class FileSystem:

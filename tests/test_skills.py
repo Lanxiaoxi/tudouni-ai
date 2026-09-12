@@ -1,4 +1,4 @@
-﻿"""技能：发现（skills/ 包）+ 装载（tools/skills.py）。
+﻿"""技能：发现（skills/ 包）+ 装载（tools/builtin/skills.py）。
 
 这一组测试盯的是五件容易被无声破坏的事：
 
@@ -41,8 +41,8 @@ from agent_runtime.skills.render import (
 )
 from agent_runtime.state import Session
 from agent_runtime.tools.builtin import create_tool_registry
-from agent_runtime.tools.filesystem import CONTROL_PLANE, FileSystem
-from agent_runtime.tools.skills import SkillBoard
+from agent_runtime.tools.builtin.filesystem import CONTROL_PLANE, FileSystem
+from agent_runtime.tools.builtin.skills import SkillBoard
 
 from fakes import Collector, ScriptedModel, tool_call
 
@@ -710,7 +710,7 @@ def test_empty_arguments_pass_validation(workdir):
 
     assert "one" in result.text
     # schema 里 name 不是必填（有默认值），所以 required 键干脆不出现 —— 用 get 而不是
-    # 下标：Pydantic 对"没有必填字段"的模型就是不给这个键（tools/ask.py 的 options
+    # 下标：Pydantic 对"没有必填字段"的模型就是不给这个键（tools/builtin/ask.py 的 options
     # 那几个同理）。
     assert registry.get("load_skill").parameters.get("required", []) == []
 

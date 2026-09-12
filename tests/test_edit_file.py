@@ -5,7 +5,7 @@
 所以每条断言都要落回"盘上那份文件到底变成什么样"，而不是只看返回了哪句话。
 """
 
-from agent_runtime.tools.filesystem import FileSystem
+from agent_runtime.tools.builtin.filesystem import FileSystem
 
 
 def fs_in(workdir) -> FileSystem:

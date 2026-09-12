@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 from agent_runtime.tools.builtin import create_tool_registry
-from agent_runtime.tools.clock import get_current_time
+from agent_runtime.tools.builtin.clock import get_current_time
 from agent_runtime.tools.tool import RiskLevel
 
 

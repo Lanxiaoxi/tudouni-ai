@@ -38,6 +38,14 @@ class RiskLevel(str, Enum):
 class ToolArgs(BaseModel):
     """所有工具参数模型的基类。
 
+    参数模型一处定义、两用：
+
+      1. 生成发给模型的 schema（**预防**：模型提前看到约束）
+      2. 校验模型实际给出的参数（**兜底**：错了就明确告诉它哪个字段不对）
+
+    两者同源，所以不会漂移。这也是**参数模型必须和它的 handler 住在同一个文件里**的
+    原因 —— 它们是同一个事实的两面，分居两地就只剩"改了一边忘了另一边"这一种结局。
+
     extra="forbid" 是这里的关键：Pydantic 默认是 "ignore"，会把模型多传的参数
     静默丢弃 —— 那样「模型读错了 schema」这件事就被藏起来了。统一改成拒绝，
     并且它会在生成的 schema 里写出 additionalProperties: false，让模型提前看到。

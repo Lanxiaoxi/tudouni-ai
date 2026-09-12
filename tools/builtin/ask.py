@@ -23,7 +23,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from .tool import ToolArgs, ToolResult
+from ..tool import ToolArgs, ToolResult
 
 # 一次提问的时钟。和 agents/agent.py 里的 Clock 是同一件事，但 tools 不能依赖
 # agents（依赖方向是单向的），所以在这里再说一遍。

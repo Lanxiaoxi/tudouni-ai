@@ -21,7 +21,7 @@ from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.tools.builtin import create_tool_registry
-from agent_runtime.tools.todo import (
+from agent_runtime.tools.builtin.todo import (
     IN_PROGRESS,
     TODOS_KEY,
     TodoBoard,

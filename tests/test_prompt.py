@@ -23,8 +23,8 @@ from agent_runtime.state import session as session_module
 from agent_runtime.state.session import SYSTEM_PROMPT_PATH, load_system_prompt
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.tool import RiskLevel
-from agent_runtime.tools.webfetch import WebFetch
-from agent_runtime.tools.websearch import Findings, Hit, WebSearch
+from agent_runtime.tools.builtin.webfetch import WebFetch
+from agent_runtime.tools.builtin.websearch import Findings, Hit, WebSearch
 
 from fakes import ScriptedModel, tool_call, usage
 
@@ -160,7 +160,7 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     # 提问的用法约束。它只能住在这里，因为它是**几个东西之间**的关系：ask_user 的描述
     # 说得出"什么时候别用我"，但说不出"审批那一关不该由你来问"—— 那句话讲的是提问和
     # 审批关卡之间的分工。少了它，模型会把 ask_user 当成征求意见的万金油，每做一步都
-    # 停下来问一次（而且提问换不来放行，见 tools/builtin.py 里那条注册说明）。
+    # 停下来问一次（而且提问换不来放行，见 tools/builtin/__init__.py 里那条注册说明）。
     assert "不要用 ask_user 去问能不能做" in prompt                 # 提问 ≠ 审批
     assert "不要拿提问省事" in prompt                               # 先自己查
     # 任务列表那两条也只能住在这里：「标已完成的依据是工具结果」讲的是**列表和工具结果
@@ -297,7 +297,7 @@ def test_the_capability_map_accounts_for_every_registered_tool():
 # fetch_web；system 消息是当初写下的，所以它没有那一节。它完全可能用 curl 去抓网页 ——
 # 而那条路进来的正文**没有**"不可信内容"的标注，那是提示词注入唯一的防线。
 #
-# 所以这条纪律多了一个落点：`shell` 的描述（tools/builtin.py 的 web_note）。下面三条从
+# 所以这条纪律多了一个落点：`shell` 的描述（tools/builtin/__init__.py 的 web_note）。下面三条从
 # 三个方向钉住它 —— 有它的那句、以及**没有它的那两种装配**（缺 web_search / 两个都没装配）
 # 里不能出现它。只量第一个方向的话，漏掉的恰好是缺 TAVILY_API_KEY 的那种会话。
 

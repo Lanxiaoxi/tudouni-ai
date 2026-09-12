@@ -19,7 +19,7 @@ from agent_runtime.security.asker import cli_asker
 from agent_runtime.security.gate import check_permission
 from agent_runtime.security.memory import SAVE_FAILED_NOTE
 from agent_runtime.state import Session
-from agent_runtime.tools.builtin import ListFilesArgs
+from agent_runtime.tools.builtin.filesystem import ListFilesArgs
 from agent_runtime.tools.tool import RiskLevel, Tool
 
 from fakes import Collector, ScriptedModel, recording_registry, tool_call, usage
