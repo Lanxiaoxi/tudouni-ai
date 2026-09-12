@@ -31,6 +31,7 @@ from dotenv import dotenv_values
 
 from agent_runtime.security.commands import Rule, format_rule, parse_rule
 from agent_runtime.skills import RUNTIME_DIR_NAME
+from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -274,6 +275,70 @@ class PermissionConfig:
         把 shell 写成 shall 的人以为自己放行了，实际什么都没发生。
         """
         return frozenset((self.auto_approve_tools | self.deny_tools) - set(known))
+
+
+# --- 外部 MCP server：`~/.tudouni/mcp.json` ------------------------------
+#
+# **只从用户级目录读，不从工作区读。** 这一条是刻意的，理由比"权限策略要不要提交"
+# 那一条更硬：mcp.json 里的 `command` 是"**启动时就要执行的代码**"，而不是"某个动作
+# 要不要问人"。它比放行一个工具强得多，而且发生在任何审批之前 —— 审批机制根本没有
+# 机会参与这个决定。
+#
+# 工作区级的位置（`<工作区>/.tudouni/mcp.json`）今天恰好是 gitignore 的（见
+# .gitignore 里 `.tudouni/` 那一段），但那段注释明确写着"想把它变成随仓库走的团队
+# 策略，删掉这一行即可"。那一天之后，工作区里的 mcp.json 就等于"clone 一个仓库就
+# 自动执行任意命令"——比 `.git/hooks` 那条更宽，因为那条至少还要有人去跑一条 git 命令。
+#
+# 所以这里写死用户级；工作区里那份**不读**，但要报出来（见 main.py 的 [MCP] 那行）
+# ——"文件明明在那儿却完全不起作用"和坏技能是同一类症状，绝不能静默。
+USER_RUNTIME_DIR = Path.home() / RUNTIME_DIR_NAME
+
+MCP_FILE = USER_RUNTIME_DIR / "mcp.json"
+
+MCP_FILE_NAME = MCP_FILE.name
+
+
+@dataclass(frozen=True)
+class McpConfig:
+    """外部 MCP server 的清单。
+
+    形状（每一项的语义与校验在 tools/mcp.py 的 parse_servers 里，那里也写着每一处
+    为什么这么严）：
+
+        {
+          "servers": {
+            "github": {
+              "command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-github"],
+              "env": {"GITHUB_TOKEN": "..."},
+              "timeout_seconds": 60
+            }
+          }
+        }
+
+    **密钥走 env，不进 .env。** 这看起来和"密钥不进配置文件"相反，其实是同一条：
+    这份文件在**用户级目录**（`~/.tudouni/`），不进版本库，也不在工作区里 —— 它和
+    `.env` 一样是"本机的、不被 review 的"那一类。反过来，进版本库的东西里不该有密钥。
+
+    文件不存在不是错误（和 .env / permissions.json 一样）：没有 server 就没有 MCP
+    工具，运行时其余部分一字不变。
+    """
+
+    servers: tuple[McpServer, ...] = ()
+
+    @classmethod
+    def from_file(cls, path: Path | None = None) -> "McpConfig":
+        path = MCP_FILE if path is None else Path(path)
+        if not path.is_file():
+            return cls()
+
+        raw = _read_json_object(path)
+        try:
+            return cls(parse_servers(raw))
+        except McpConfigError as exc:
+            # 形状问题归到 ConfigError 上：它和"缺密钥"是同一档 —— **用户得先做点事**，
+            # 而且必须在开出会话之前停下（main.py 里那个 except ConfigError 就是这里）。
+            raise ConfigError(f"{path.name} 有问题：{exc}") from None
 
 
 # --- 联网工具：Tavily 的密钥 ---------------------------------------------

@@ -19,7 +19,7 @@ from agent_runtime.security.gate import check_permission
 from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.security.policy import PermissionPolicy
 from agent_runtime.state import Session
-from agent_runtime.tools.tool import Tool, ToolRegistry, ToolResult
+from agent_runtime.tools.tool import InvalidArgsError, Tool, ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
     from agent_runtime.models.types import ModelResponse
@@ -436,7 +436,7 @@ class Agent:
         parts.append(self._budget_reminder(max_steps, step)["content"])
         return {"role": "user", "content": "\n\n".join(parts)}
 
-    def run(self, session: Session, user_input: str, max_steps: int = 40) -> str:
+    def run(self, session: Session, user_input: str, max_steps: int = 80) -> str:
         # 回合的起点：run_finished 里的 duration_ms 从这里算起。放在最前面（而不是从
         # 第一次模型请求算起）是因为"这一轮花了多久"要含上追加消息、落盘这些开销 ——
         # 它们没被单独埋点，交给 CLI 那行汇总里的"未归因"去吸收，比假装它们不存在诚实。
@@ -766,6 +766,16 @@ class Agent:
             # 哪个字段、什么毛病；这跟「工具运行出错」是两回事。
             return _Outcome(
                 f"参数校验失败：{self._format_args_error(exc)}", "invalid_args",
+                int((self.clock() - started) * 1000),
+            )
+
+        except InvalidArgsError as exc:
+            # 同一件事的另一个来路：**校验方不是 pydantic**。外部工具（MCP）的 schema
+            # 权威在 server 那一侧，参数不合法是 server 回的一句话（见 tools/tool.py）。
+            # 状态分类必须和上面那一支一样 —— 对模型来说都是"我自己能改对"，
+            # 而落进下面那支 "error" 会让它以为工具坏了、白白换策略。
+            return _Outcome(
+                f"参数校验失败：{exc}", "invalid_args",
                 int((self.clock() - started) * 1000),
             )
 

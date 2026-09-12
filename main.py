@@ -35,16 +35,18 @@ from agent_runtime.cli import (
     run_repl,
 )
 from agent_runtime.config import (
+    MCP_FILE,
     PERMISSION_FILE,
     PERMISSION_FILE_NAME,
     ConfigError,
+    McpConfig,
     ModelConfig,
     PermissionConfig,
     WebConfig,
     save_approvals,
 )
 from agent_runtime.models import OpenAICompatibleModel
-from agent_runtime.security import ApprovalMemory, PermissionPolicy, cli_asker
+from agent_runtime.security import ApprovalMemory, PermissionPolicy, TrustGroup, cli_asker
 from agent_runtime.security.commands import format_rule
 from agent_runtime.skills import (
     RUNTIME_DIR_NAME,
@@ -59,6 +61,7 @@ from agent_runtime.state import JsonSessionStore
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.ask import cli_questioner, unavailable_questioner
 from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.mcp import McpToolset
 from agent_runtime.tools.todo import TodoBoard, progress_line, todo_note
 from agent_runtime.tools.webfetch import USER_AGENT, WebFetch
 from agent_runtime.tools.websearch import TavilySearch, WebSearch
@@ -124,6 +127,32 @@ def report_skills(catalog: SkillCatalog, session=None) -> None:
         print(f"[技能] {problem}", file=sys.stderr)
     if session is not None and (line := active_line(session.metadata)):
         print(f"[技能] {line}", file=sys.stderr)
+
+
+def report_mcp(cfg, toolset) -> None:
+    """把这次启动连上的外部 server 说一遍。
+
+    和 `[权限]` / `[技能]` 那几行同一类东西（关于这次运行的既有状态），走 stderr。
+    **每次启动都说，而且说清"它们的工具每次都要审批"**：外部工具默认每条都要问人，
+    而这句话是"为什么它又问我了"唯一的解释；不说的话，用户会以为配置错了。
+
+    工作区里那份 mcp.json **不读**（理由写在 config.McpConfig 上），但它在磁盘上时
+    必须报一句 —— "文件明明在那儿却完全不起作用"和坏技能是同一类症状。
+    """
+    if cfg.servers:
+        print(f"[MCP] {MCP_FILE} 里配了 {len(cfg.servers)} 个 server："
+              f"{'、'.join(server.name for server in cfg.servers)}", file=sys.stderr)
+    for name, count in toolset.counts.items():
+        print(f"[MCP] server {name}：连上了，提供 {count} 个工具"
+              f"（风险一律 high，每次调用都要你批准）", file=sys.stderr)
+
+    # 工作区里那份是**故意不读**的，所以它存在就等于"有人按旧位置写了一份"。
+    ignored = PROJECT_DIR / RUNTIME_DIR_NAME / "mcp.json"
+    if ignored.is_file():
+        print(f"[MCP] 忽略了 {ignored}：server 清单只从用户级 {MCP_FILE} 读。"
+              f"理由是这里的 command 是启动时就要执行的代码，而工作区里的文件可能"
+              f"随仓库一起被 clone 进来（见 config.McpConfig 上面的说明）。"
+              f"要用就把它挪到 {MCP_FILE}", file=sys.stderr)
 
 
 def _check_session_id(session_id: str | None) -> str | None:
@@ -200,6 +229,10 @@ def main() -> int:
         permissions = PermissionConfig.from_file()
         # 联网工具的密钥**不在这一档**：缺了只是少一个工具，不是"什么都干不了"。
         web = WebConfig.from_env()
+        # 外部 MCP server 的**清单**在这一档：文件里写错一个键名就停下。但"清单是空的"
+        # 或"某个 server 起不来"不在这一档 —— 前者是默认状态，后者只是少一批工具
+        # （见下面 connect 那段）。这一条界线就是"用户得先做点事"和"少一个能力"的界线。
+        mcp_cfg = McpConfig.from_file()
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
@@ -285,9 +318,37 @@ def main() -> int:
     except Exception:
         http.close()
         raise
+
+    # 外部 MCP server：连上、列工具、注册进同一个注册表。
+    #
+    # **它为什么不进 create_tool_registry 的参数表**（questioner / todos / web_* 都在
+    # 那儿）：那边的每一个参数都是"一个可以随注册表一起造出来的协作者"，而 MCP 带着
+    # **进程生命周期**（连上 → 每次工具调用 → 关闭），并且它的失败是**每个 server
+    # 各自的**（一个起不来只是少一批工具）。所以它由入口持有，这里只是往注册表里放工具
+    # —— 入口的职责本来就是"把各个部件接起来"。
+    #
+    # 位置也不能再晚：下面那条 `unknown_tools` 会拿"已注册的工具名"去核对权限文件，
+    # 而 mcp__… 这些名字必须已经在里面（否则在 permissions.json 里点名放行一个外部工具
+    # 的人会收到一句"这个工具没有注册，规则不会生效"的假警告）。
+    mcp = McpToolset.connect(
+        mcp_cfg.servers,
+        on_problem=lambda message: print(message, file=sys.stderr),
+    )
+    try:
+        for tool in mcp.tools:
+            tools.register(tool)
+    except Exception:
+        # 注册失败（撞名之类）时**必须把这个进程收掉**再往外抛：它是我们起的，
+        # 而它不在 http 那条清理路径上。
+        mcp.close()
+        http.close()
+        raise
+
+    report_mcp(mcp_cfg, mcp)
+
     print("已注册工具:")
     for tool in tools.all():
-        print(f"  - {tool.name:12} 风险={tool.risk.value}")
+        print(f"  - {tool.name:16} 风险={tool.risk.value}")
 
     unknown = permissions.unknown_tools(tool.name for tool in tools.all())
     if unknown:
@@ -348,12 +409,28 @@ def main() -> int:
             todo_note(metadata),
         )))
 
+    # 审批里那个 a（信任一整个 MCP server 的全部工具）的接线。
+    #
+    # 连接那一层（tools/mcp.py）只报事实 —— "这些工具同属一个 server"；"怎么把它们
+    # 一起放行"是审批那一层的事（security/asker.py 的 TrustGroup）。两边都不认识对方
+    # 的类型，接起来的地方就在这里，和 session_notes 同一条路。
+    def mcp_trust_group(tool_name: str) -> TrustGroup | None:
+        pair = mcp.group(tool_name)
+        if pair is None:
+            return None
+        server, names = pair
+        # 只有一个工具时不提供 a：那个按键的效果和 t 完全一样，而多一个键只会让人
+        # 多读一行提示。
+        if len(names) < 2:
+            return None
+        return TrustGroup(label=f"MCP server {server} 的 {len(names)} 个工具", tools=names)
+
     # 四个注入点，同一个原则：判定留在 Agent 内部，执行交给注入的实现。
     # （提问通道是第五个，但它在上面装配工具时就注入了 —— 它不属于 Agent：Agent 只看见
     # 一次普通的工具调用，ask_user 会不会阻塞在人的输入上，它不知道也不需要知道。）
     agent = Agent(
         model, tools, policy,
-        asker=partial(cli_asker, memory=memory),
+        asker=partial(cli_asker, memory=memory, trust_group=mcp_trust_group),
         memory=memory,
         on_checkpoint=store.save,
         on_event=logs,
@@ -377,6 +454,10 @@ def main() -> int:
         # 会话结束就关掉：连接池里那些 keep-alive 的 socket 不该留到进程退出。
         # （模型那个 client 由 OpenAI SDK 自己管，这里是**我们**建的那个。）
         http.close()
+        # MCP 的 server 是**我们起的子进程**，也必须在这里收掉。顺序放在 http 之后
+        # 不重要，但两件事都要做：漏了它，`npx` 起的 node 会活过这个进程（见
+        # tools/mcp.py 的 _terminate_tree）。
+        mcp.close()
     return 0
 
 

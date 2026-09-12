@@ -19,8 +19,15 @@ from .builtin import (
     WriteFileArgs,
     create_tool_registry,
 )
+from .mcp import (
+    McpConfigError,
+    McpError,
+    McpServer,
+    McpToolset,
+    parse_servers,
+)
 from .text import truncate
-from .tool import RiskLevel, Tool, ToolArgs, ToolRegistry, ToolResult
+from .tool import InvalidArgsError, RiskLevel, Tool, ToolArgs, ToolRegistry, ToolResult
 from .webfetch import Fetched, WebFetch, html_to_text
 
 from .websearch import (
@@ -44,7 +51,12 @@ __all__ = [
     "Findings",
     "GetCurrentTimeArgs",
     "Hit",
+    "InvalidArgsError",
     "ListFilesArgs",
+    "McpConfigError",
+    "McpError",
+    "McpServer",
+    "McpToolset",
     "Questioner",
     "ReadFileArgs",
     "RiskLevel",
@@ -67,6 +79,7 @@ __all__ = [
     "cli_questioner",
     "create_tool_registry",
     "html_to_text",
+    "parse_servers",
     "truncate",
     "unavailable_questioner",
 ]

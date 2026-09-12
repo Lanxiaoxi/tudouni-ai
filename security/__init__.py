@@ -1,4 +1,4 @@
-from .asker import ApprovalAsker, cli_asker
+from .asker import ApprovalAsker, TrustGroup, cli_asker
 from .memory import ApprovalMemory
 from .policy import Decision, PermissionPolicy
 
@@ -7,5 +7,6 @@ __all__ = [
     "ApprovalMemory",
     "Decision",
     "PermissionPolicy",
+    "TrustGroup",
     "cli_asker",
 ]

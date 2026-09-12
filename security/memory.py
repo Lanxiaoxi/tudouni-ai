@@ -95,6 +95,25 @@ class ApprovalMemory:
         self._persist()
         return True
 
+    def grant_all(self, names: Iterable[str]) -> frozenset[str]:
+        """一次记住**一组**工具名，返回这次真正新增的那些。
+
+        目前只有一条路走到这里：审批时按 `a` 信任一整个 MCP server 的全部工具
+        （见 security/asker.py 的 TrustGroup）。它必须单独一个方法，而不是让调用方
+        循环 grant —— 每次 grant 都会落盘一次，一组 12 个工具就是 12 次重写同一个
+        文件，而落盘是"人按了一次键"的副作用，本该只发生一次。
+
+        返回值给审计用：gate 会把它并进"这次批准顺带记住了什么"（问前问后的快照差），
+        所以 12 个名字会一个不少地落进那条 permission 事件里 —— "谁批的"必须看得见。
+        """
+        added = {name for name in names if name not in self._tools}
+        if not added:
+            return frozenset()
+
+        self._tools |= added
+        self._persist()
+        return frozenset(added)
+
     def _persist(self) -> None:
         if self._on_change is None:
             return

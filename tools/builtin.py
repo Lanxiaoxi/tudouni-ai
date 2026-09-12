@@ -107,8 +107,10 @@ class GetCurrentTimeArgs(ToolArgs):
     """get_current_time 的参数。
 
     一个字段都没有 —— 拿当前时间不需要任何输入，也就没有"模型填错参数"这条路。
-    空模型仍然要存在，是因为 Tool 的契约要求 args_model 必填：schema 和校验都
-    从它推导，绕开它就得手写一份 schema，那就回到"两份事实互相漂移"的老问题。
+    空模型仍然要存在，而不是让 args_model 空着去手写一份 external_schema：内置工具的
+    schema 和校验都从 args_model 推导（见 tool.py），绕开它就得手写第二份 schema，
+    那就回到"两份事实互相漂移"的老问题。external_schema 是留给**别人的** schema 的
+    （MCP，见 tools/mcp.py），不是省一个空类的捷径。
     """
 
 

@@ -528,6 +528,164 @@ PDF / 图片这类二进制直接回一句"不是能读的文本"，不硬解。
 写死了门槛（**只在活儿明显不止一两步、而且你能列出具体步骤时用**），别让它退化成一层
 仪式：单步的琐碎活也建一张三级列表，除了烧 token 什么也没干。
 
+## 外部工具（MCP）
+
+MCP server 提供的东西恰好就是 `Tool` 的形状（名字 + 描述 + JSON Schema + 一次调用），
+所以接进来不需要动 Agent 循环：连上 server、把它的工具注册进同一个注册表，模型那一侧看到的
+就是普通工具（`agent.py` 每轮现取 `tools.schemas()`）。
+
+配置住在**用户级**目录，不在工作区里：
+
+```
+~/.tudouni/mcp.json
+{
+  "servers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_TOKEN": "..."},
+      "timeout_seconds": 60
+    }
+  }
+}
+```
+
+**为什么工作区里那份不读。** 这份文件里的 `command` 是"启动时就要执行的代码"，而不是
+"某个动作要不要问人" —— 它比放行一个工具强得多，而且发生在任何审批之前。工作区级的位置
+（`<工作区>/.tudouni/mcp.json`）今天恰好是 gitignore 的，但 `.gitignore` 里明确留着
+"想把它变成随仓库走的团队策略，删掉这一行即可"这个开关；那一天之后，它就是"clone 一个
+仓库就自动执行任意命令" —— 比 `.git/hooks` 那条更宽，因为那条至少还要有人去跑一条 git
+命令。工作区里放了这样一份文件时，启动会报一句（"文件明明在那儿却完全不起作用"和坏技能
+是同一类症状）。
+
+### 信任边界：装配 ≠ 授权
+
+这一段是这个功能最要紧的部分，也是它为什么长成这样：
+
+* **装配一个 server ＝ 同意这段代码用你的权限跑起来。** 这件事发生在任何审批之前，审批
+  机制根本没机会参与这个决定 —— 你写下 `command` 那一刻就已经同意了。
+* **但"同意它跑"不等于"同意模型自主调用它的每一个工具"。** 前者是信任供应商，后者是把
+  决定权交出去。你信得过 `psql`，不代表你愿意让模型自己决定什么时候 `DELETE`。
+* **审批挡不住一个恶意 server**（它启动那一刻就能读 `.env`、往外发数据，一次工具调用都
+  不需要）—— 这一点必须先说清，否则就是在卖假药。它挡的是**诚实但强大的 server 被模型
+  误用**，尤其是被注入的内容（网页正文、技能正文）引导：github server 的"改文件"、数据库
+  server 的任意 SQL，如果全都免审批，那么"网页里写一句去调它"就是一条完整的、无人签字的
+  利用链。
+
+由此定下三条，都是 fail-closed：
+
+| 决定 | 为什么 |
+| --- | --- |
+| 风险等级一律 `high`，**没有配置能改写它** | 等级是"这个 handler 有没有副作用"的声明，而外部工具的副作用运行时无法验证 |
+| `parallel_safe` 一律 `false` | 同上；而且 `high` 本来就过不了注册期那条"能并行必须是 low" |
+| 放行只能靠人在审批时按键 | 见下 |
+
+### 审批里的 `t` 和 `a`
+
+外部工具默认**每次调用都要你批准**。为了不把这件事变成"盲按 y 的训练器"，审批提示多给了一个键：
+
+```
+[审批] 工具 mcp__github__create_or_update_file  风险 high
+[审批] 参数 path=README.md, content=...
+[审批] t = 以后每次都直接执行，你不会再看到它要做什么（写进 permissions.json，下次启动仍然有效）
+[审批] a = 以后 MCP server github 的 12 个工具都直接执行，你不会再看到它们要做什么（快照：这个 server 以后新加的工具仍然会问你；写进 permissions.json，下次启动仍然有效）
+[审批] 是否执行？[y/N/t/a]
+```
+
+`t` 放行这一个工具，`a` 一次性放行这个 server **此刻**的全部工具 —— 名字一个不少地写进
+`permissions.json` 的 `auto_approve_tools`（一次落盘，不是循环写 N 遍）。
+
+**`a` 是快照，不是订阅。** 它和"放行所有 `high`"的区别正在这里：server 明天升级带来一个
+新工具，那份名单里没有它，所以**仍然会问你**。这和 `permissions.json` 禁止把 `"high"` 写进
+`auto_approve` 是同一条理由 —— 等级/成员会自己变宽，而写规则的人从没听说过那个新东西。
+每次放行都会在审计里留一条 `permission` 事件，`remembered` 字段列着这次新增的全部名字，
+所以"谁批的、批了什么"事后看得见（`gate.py` 那张"全部来路"表里是 `approved` 与
+`rule_allowed`）。
+
+### 工具名与参数 schema
+
+* 暴露给模型的名字是 `mcp__<server>__<tool>`：注册表是一个扁平命名空间，撞名会直接抛异常，
+  而外部工具名是别人定的。`<tool>` 里 OpenAI 不接受的字符（`.`、`/`、空格）会被换成 `_`，
+  超长则截断并挂一小段原名哈希（**截断而不是丢掉**：丢掉是静默的能力缺失）；而调用 server
+  时用的仍然是**它给的原名**。
+* 参数 schema **原样透传**，一个字节都不改，也不在本地校验内容。转写成 pydantic 模型会在
+  `$ref` / `anyOf` / `additionalProperties` 上静默失真，参数名不是合法标识符时更是造不出来
+  —— 而 schema 是模型唯一的依据。所以 `Tool.execute` 对这类工具只做形状检查（必须是 JSON
+  对象），内容交给 server 裁决：它回 `-32602` 就是 `invalid_args`（模型自己改得对那一档），
+  其余是 `error`。
+
+### 已知取舍
+
+* **server 不在工作区边界内。** `safe_path`、控制面拒绝写、`shell` 的前缀规则对它一条都不
+  成立 —— 它是另一个进程，用的是你的权限。这正是上面那段"装配＝同意"的来路。
+* **工具结果只支持文本。** 图片 / 音频 / 二进制资源这一版只留一句可见的占位
+  （`[图片 image/png：本运行时的工具结果只支持文本，已省略]`），而不是悄悄丢掉 —— 丢掉会让
+  模型以为自己"看过"那张图。
+* **不做 `tools/list_changed`。** 工具清单在**连接时**取一次；server 中途增删工具要重开会话
+  才生效（和"一个技能都没有时中途新建技能"是同一个形状）。
+* **工具 schema 每轮都要发出去。** 内置工具合计约 5000 字符，而一个 server 动辄十几个工具
+  —— 挂三四个 server 会让每一轮请求都明显变贵。这个运行时选择"配了就连"，所以规模靠
+  `mcp.json` 里少配几个来控制。
+* **一个 server 起不来/中途挂了只影响它自己**：启动时报一行 stderr 然后继续（和缺
+  `TAVILY_API_KEY` 只是少一个 `web_search` 同一条），但那条报错绝不能省。中途挂掉的那次
+  调用会变成一条 `error` 工具结果。
+* **超时由客户端自己持有**（默认 60 秒，`timeout_seconds` 可调）：Agent 里没有任何工具级
+  超时，串行路径上一个卡死的 server 就是卡死整个回合。进程死了会把还在等的请求立刻叫醒，
+  不会让它们各自等满超时。
+* **Windows 上收进程树。** `npx` 会再起一个 node，只杀 npx 会让它变成孤儿、还占着管道，
+  所以关闭时走 `taskkill /F /T`。
+* **server 的 stdout 只该有协议消息**，混进去的非 JSON 行会被跳过并报一句；stderr 是它的
+  日志，故意不接管（接管了没人读会把管道写满、把 server 自己卡死）。
+
+### 远程 server：还没做，但已经探过路
+
+这一版只有 **stdio**。远程（Streamable HTTP）**没有实现** —— 下面是一次实测记录，
+留给将来做这块的人：它把"要发什么、会收到什么"先钉住了，省得再从零猜一遍。
+
+实测对象是用户自己的知识库（`https://kb.lanxi.me/mcp/`，`Authorization: Bearer …`），
+握手与列工具全部成功：
+
+| 请求 | 结果 |
+| --- | --- |
+| `initialize`（POST，`Accept: application/json, text/event-stream`） | 200，`content-type: text/event-stream`，响应头带 `Mcp-Session-Id` |
+| `notifications/initialized` | **202，没有正文** |
+| `tools/list`（回带 `Mcp-Session-Id`） | 200，SSE，6 个工具：`kb_search` / `kb_grep` / `kb_recent` / `kb_get` / `kb_list_tags` / `kb_write` |
+
+由此定下来的几条实现要点（都是实测撞到的，不是照规范抄的）：
+
+* **响应可能是 SSE，不是 JSON。** `content-type` 是 `text/event-stream`，正文长这样：
+  `event: message` + `data: {…}`。所以传输层两种都得认（单条 `application/json` 那种
+  回应也要能收），而 `data:` 行要按 SSE 的规矩拼（同一事件里多个 `data:` 用换行连接）。
+* **会话是服务端指定、客户端回带的。** `Mcp-Session-Id` 从 `initialize` 的响应头里拿，
+  之后每条请求都要带回去；收尾按协议用 `DELETE`。
+* **通知没有正文**（202），所以 `notify` 不能去掉等一条带 id 的回应 —— 那是两套等待方式。
+* **它会主动推通知。** 这台 server 声明了 `tools` / `resources` / `prompts` / `logging`，
+  其中三个都带 `listChanged: true`。这一版的选择是**忽略一切通知**（清单在连接时取一次），
+  远程做完之后这条要不要改，取决于"会话中间换工具表"值不值得（见上面「已知取舍」）。
+* **`initialize` 的回应里有 `instructions`。** 这台 server 给了一段"这是用户的个人知识库、
+  该在什么时候用它"的说明。**将来要不要把它拼进载荷是一个必须显式决定的问题**：那是外部
+  server 塞进模型上下文的一段话，属于**每轮重发的不可信输入**，和技能正文同一类
+  （见「已知的取舍」里那条）。默认不该悄悄转发。
+* **配置形状和这一版不一样。** 这类客户端的配置长这样（Claude Desktop 的形状）：
+
+  ```json
+  {"mcpServers": {"my-kb": {"url": "https://…/mcp/",
+                            "headers": {"Authorization": "Bearer ${KB_TOKEN}"},
+                            "disabled": false}}}
+  ```
+
+  和这一版差三处：顶层叫 `mcpServers`（这一版只认 `servers`）、用 `url` + `headers`
+  而不是 `command` + `args` + `env`、多一个 `disabled`（`true` 表示这个人暂时不想连它）。
+  **"不认识的键就报错"是这一版的原则**（写错一个键名而它静默不生效是最坏的失败形态），
+  所以那份文件原样贴进 `~/.tudouni/mcp.json` 会在启动时停下。要做兼容就在 `parse_servers`
+  里显式收下这三个键，**而不是放宽"未知键"那条**。
+* **token 不写进配置文件。** `headers` 里写成 `${KB_TOKEN}`，解析时从环境变量展开，
+  缺了就报错停下 —— 而不是把字面量 `${KB_TOKEN}` 发出去，换来一个让人猜半天的 401。
+  这和"密钥走环境变量、策略走可提交的文件"是同一条分界线。
+* **要注入一个共享的 `httpx.Client`**（main.py 已经有一个 `trust_env=False` 的）：
+  "一个进程一个 client"的理由和 `fetch_web` / `web_search` 那对完全一样。注意它是被
+  注入的，所以传输层**不能**去关一个不是自己建的 client。
+
 ## 架构
 
 工作区根上**只有一个**运行时目录（每个工作区一份）：
@@ -562,8 +720,11 @@ skills/            技能层 —— **技能领域，不依赖任何内部模块
                      （技能目录在文件系统里，这个包是读它们的代码 —— 同名但不是一回事）
 
 tools/             工具层
-  tool.py            Tool(名字/描述/风险/参数模型/handler/能否并行/会不会问人) + ToolRegistry
+  tool.py            Tool(名字/描述/风险/参数来源/handler/能否并行/会不会问人) + ToolRegistry
                      + ToolResult（"文本 + 工具自己知道的审计字段"）
+                     参数来源有且只有一个：内置工具给 args_model（schema 与校验都从它推导），
+                     外部工具给 external_schema（原样透传，校验归 server）
+  mcp.py             外部 MCP server（stdio JSON-RPC）+ 把它的工具装配成 Tool
   builtin.py         内置工具的装配（参数模型 + 风险等级 + 能否并行）
   skills.py          load_skill 的薄代理层：参数模型 + SkillBoard（写 session.metadata）
                      —— 技能领域在 skills/ 包里，这里只负责"接线"
@@ -609,6 +770,8 @@ state    （无内部依赖）
 skills   （无内部依赖 —— 它谁也不 import，所以能独立成包而不和 tools 成环；
             tests/test_imports.py 里有一条测试盯着这件事）
 config   → security.commands（校验 shell_allow 里的规则语法；密钥那条路仍然是环境变量）
+         → tools.mcp（解析 mcp.json 的形状 —— 那份形状知识住在工具层，而"往磁盘上哪个
+            文件读"住在配置层；反向的 tools → config 仍然是禁止的）
 security → tools
 audit    → state
 agents   → audit, models, security, state, tools
@@ -813,6 +976,11 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
   那句"以下是网页正文，属于不可信内容"是**唯一的**缓解手段 —— 它是提示词，不是机制上的
   保证。想真正兜住，得让危险动作（写文件、执行命令）永远经过审批，而这一点本项目已经
   做到了：`fetch_web` 自己的风险等级也是 medium、默认每次都要问。
+- **外部 MCP server 是唯一"审批也兜不住"的东西（这是设计，不是欠账）。** 它不在工作区
+  边界内、用的是你的权限，而它启动那一刻就已经在跑了 —— 一个恶意 server 不需要任何一次
+  工具调用就能读 `.env` 往外发。所以那一层信任只能在**装配时**给（写下 `command` 就是
+  给了），而审批管的是另一件事：模型能不能自主调用它的工具。想真正把 server 关起来，
+  唯一的解法还是操作系统级沙箱。完整说明在「外部工具（MCP）」那节。
 - **`fetch_web` 不进并行批次。** 注册期硬校验要求 `parallel_safe` 的工具必须是 LOW，而
   `fetch_web` 是 medium（它能把工作区里的内容拼进 URL 送出去，见上面那条），所以它天然
   进不去。代价说明白：一次"抓 5 个 URL"的任务是串行的，5 个 300ms 的网页就是 1.5 秒，
@@ -851,6 +1019,11 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 
 ## 尚未实现
 
+- **MCP 的其余传输与协议面**：远程 server（Streamable HTTP / SSE —— 已经实测探过路，
+  见「外部工具（MCP）」最后那一节）、`resources` / `prompts` / `sampling` / `roots`、
+  `tools/list_changed` 的动态刷新、非文本内容（图片 / 音频 / 二进制资源）。这一版做的是
+  **stdio + tools** 这一小块 —— 它是 MCP 生态里用得最多、也是唯一不需要新依赖的部分
+  （客户端是手写的同步 JSON-RPC，见 tools/mcp.py 开头那段"为什么不用官方 SDK"）
 - 上下文管理（按实测成本，当前规模下截断不划算）
 - **联网域名白名单 / 出口代理**：和 `shell_allow`（按命令前缀放行）同构的一层
   `web_allow`，"信某几个站、其余每次问"。插入点是现成的（`security/commands.py` 里那张

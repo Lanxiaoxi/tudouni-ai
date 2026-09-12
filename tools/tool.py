@@ -10,6 +10,18 @@ JsonSchema = Mapping[str, Any]
 ToolHandler = Callable[..., Any]
 
 
+class InvalidArgsError(ValueError):
+    """参数不合法，但**校验方不是 pydantic**。
+
+    内置工具的参数校验由 args_model 做，失败抛 pydantic.ValidationError；外部工具
+    （MCP）的 schema 权威在 server 那一侧 —— 我们不复制一份校验规则（见 Tool.parameters），
+    所以它的"参数不合法"只能来自 server 回的一句话，而不是一次 model_validate。
+
+    两者对 Agent 是同一件事：模型自己改得对。所以给它一个名字，让 `_run` 那条分岔
+    不必去猜异常是从哪来的（见 agents/agent.py 里紧挨着 ValidationError 的那一支）。
+    """
+
+
 class RiskLevel(str, Enum):
     """工具的风险等级。
 
@@ -77,8 +89,30 @@ class Tool:
     # 必填且没有默认值：加新工具时无法"忘记"声明风险。若给默认值，漏声明的新工具
     # 会静默落到那一档上 —— 默认成 LOW 等于静默放行，是最坏的 fail-open。
     risk: RiskLevel
-    args_model: type[ToolArgs]
+
+    # handler 有两种**调用约定**，取决于 schema 从哪来（见下面 args_model /
+    # external_schema）：
+    #
+    #   内置工具    handler(**kwargs)       —— 参数已经过 pydantic，字段名保证是标识符
+    #   外部工具    handler(args: Mapping)  —— **整个参数对象一次传进来**
+    #
+    # 后者不是风格选择，是 `**` 的硬限制：`handler(**args)` 要求每个参数名都是合法的
+    # Python 标识符，而外部工具的 schema 是别人写的（MCP server 给的），`foo-bar`、
+    # `foo.bar` 都合法。展开就等于凭空多出一条 JSON Schema 里看不见的约束 ——
+    # 模型照着 schema 填，却在 Python 这一层撞墙。
     handler: ToolHandler
+
+    # 参数的**唯一**来源，两者恰好给一个（见 __post_init__）：
+    #
+    #   args_model      内置工具。schema 和校验都从它推导 —— 手写第二份 schema 等于
+    #                   让同一个事实有两个来源，早晚漂移（见 parameters 那段）。
+    #   external_schema 外部工具（MCP）。schema 是 server 给的，**原样透传**，
+    #                   也不在本地校验内容（权威在 server 那一侧）。
+    #
+    # 两个都排在 handler 之后：它们有默认值，而 handler 没有 —— dataclass 不允许
+    # 无默认值的字段跟在有默认值的字段后面。所有构造点都用关键字（没有位置参数）。
+    args_model: type[ToolArgs] | None = None
+    external_schema: JsonSchema | None = None
 
     # 这个工具能不能和其他工具**同时**执行。声明在工具自己身上，而不是在
     # agent.py 里按名字写一张白名单 —— 理由和 risk 一样：知道"它有没有副作用"的
@@ -108,13 +142,38 @@ class Tool:
     # 默认 False 是 fail-closed：漏声明的后果只是"少一条启动期校验"，不是"多问了一次人"。
     interactive: bool = False
 
+    def __post_init__(self) -> None:
+        """"schema 从哪来"必须有且只有一个答案。
+
+        两份来源会漂移，而漂移的形态最难查：模型看到的是 A，执行时按 B 校验。
+        和 args_model 那段"手写第二份 schema"是同一条理由，所以这条约束钉在最里面
+        （构造时）而不是注册处 —— 测试里临时造的 Tool 也要受它约束。
+        """
+        if (self.args_model is None) == (self.external_schema is None):
+            given = "两个都给了" if self.args_model is not None else "两个都没给"
+            raise ValueError(
+                f"工具 {self.name} 必须恰好给出一个 schema 来源："
+                f"args_model（内置工具，参数由 pydantic 校验）或 "
+                f"external_schema（外部工具，schema 与校验都归 server）——现在是{given}。"
+            )
+
     @property
     def parameters(self) -> JsonSchema:
-        """参数 schema 从 args_model 推导，不再手写第二份。
+        """参数 schema。
 
-        手写的 schema 和校验规则是同一个事实的两个来源，早晚会漂移。这里让
-        args_model 成为唯一来源，schema 只是它的一种渲染结果。
+        内置工具从 args_model 推导，不再手写第二份：手写的 schema 和校验规则是同一个
+        事实的两个来源，早晚会漂移。这里让 args_model 成为唯一来源，schema 只是它的
+        一种渲染结果。
+
+        **外部工具原样返回 server 给的 schema**，一个字节都不改。把它"翻译"成 pydantic
+        模型（create_model 那条路）会静默失真：`$ref` / `anyOf` /
+        `additionalProperties` 表达不了，参数名不是合法标识符时更是直接造不出来。
+        而 schema 是模型唯一的依据 —— 失真等于让模型照着一份不存在的契约去调用。
         """
+        if self.external_schema is not None:
+            return dict(self.external_schema)
+
+        assert self.args_model is not None, "__post_init__ 保证了两个来源恰好有一个"
         return self.args_model.model_json_schema()
 
     def to_openai_schema(self) -> JsonSchema:
@@ -138,8 +197,22 @@ class Tool:
     def execute(self, args: Mapping[str, Any]) -> Any:
         """校验参数后再执行。
 
-        校验失败会抛 pydantic.ValidationError，由调用方决定怎么反馈给模型。
+        校验失败会抛 pydantic.ValidationError（内置工具），由调用方决定怎么反馈给模型。
+
+        **外部工具不在这里校验内容。** 它的 schema 权威是 server：本地复制一份规则出来
+        就是两份会漂移的事实，而且本地过得了、server 那边照样可以拒。所以这里只做一个
+        形状检查（参数得是个 JSON 对象），内容原样送进 handler —— server 拒了就是 server
+        说的话，由 tools/mcp.py 翻译成 InvalidArgsError。
         """
+        if self.args_model is None:
+            if not isinstance(args, Mapping):
+                raise InvalidArgsError(
+                    f"参数必须是一个 JSON 对象，实际是 {type(args).__name__}"
+                )
+            # 转成普通 dict 再交出去：handler 拿到的不该是一个还带着上游引用的视图，
+            # 而 server 那边要的本来就是可序列化的 JSON。
+            return self.handler(dict(args))
+
         validated = self.args_model.model_validate(args)
         return self.handler(**validated.model_dump())
 

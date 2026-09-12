@@ -14,7 +14,7 @@ Agent 只知道「我有个东西能问」，不知道它背后是终端、是�
 
 import sys
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 from agent_runtime.security.commands import (
     Rule,
@@ -32,6 +32,26 @@ from agent_runtime.tools.tool import RiskLevel, Tool
 # 问后的快照差把这件事记进审计（见 security/gate.py）。所以既有那些只返回布尔的
 # asker（脚本化的假 asker、无人值守的 lambda）一行都不用改。
 ApprovalAsker = Callable[[Tool, Mapping[str, Any]], bool]
+
+
+class TrustGroup(NamedTuple):
+    """一组可以**一次性**放行的工具（目前只有"MCP 的同一个 server"这一种）。
+
+    为什么要有"一组"这个粒度：外部工具默认每条都要审批（风险 HIGH，见 tools/mcp.py），
+    而一个 MCP server 动辄十几个工具 —— 逐个按 t 是把人训练成盲按 y，比放开更坏。
+
+    但"信任一个 server"**不能**实现成"这个 server 来的工具一律免问"：那样放行面会随
+    server 升级自动变宽（它明天加一个 delete_everything，你的配置文件一个字没改），
+    而 config.py 里禁止 `"high"` 写进 auto_approve 正是同一条理由。所以这里放行的是一份
+    **此刻的名字快照** —— 落进 auto_approve_tools 的那一行看得见、能 diff、能撤销，
+    而 server 以后新加的工具仍然会问（那句提示必须说出来，见 _trust_all_hint）。
+
+    label 是提示里给人看的说法（"MCP server github 的 12 个工具"）—— 这一层不该知道
+    工具名长什么样，那是连接那一层（tools/mcp.py）和 main.py 装配的事。
+    """
+
+    label: str
+    tools: frozenset[str]
 
 # 审批提示里每个参数值的最大预览长度，**按风险分级**。
 #
@@ -88,14 +108,29 @@ def _remember_hint(tool: Tool, target: Rule | str, label: str) -> str:
     return f"{consequence}（写进 {label}，下次启动仍然有效）"
 
 
+def _trust_all_hint(group: TrustGroup, label: str) -> str:
+    """a 那一行的说明 —— 同样必须说清"按下去会记住什么"。
+
+    它比 t 那一行多担一件事：**说清这是快照**。不说的话，人的理解会是"这个 server
+    从此随便用"，而实际发生的是"此刻这 N 个工具进了名单" —— 两者在 server 下次升级
+    时分开（前者以为新工具也放行了，后者知道还会被问）。
+    """
+    return (
+        f"以后 {group.label}都直接执行，你不会再看到它们要做什么"
+        f"（快照：这个 server 以后新加的工具仍然会问你；"
+        f"写进 {label}，下次启动仍然有效）"
+    )
+
+
 def cli_asker(
     tool: Tool,
     arguments: Mapping[str, Any],
     memory: ApprovalMemory | None = None,
+    trust_group: Callable[[str], TrustGroup | None] | None = None,
 ) -> bool:
     """在终端上征求用户批准。
 
-    四个细节都是刻意的：
+    五个细节都是刻意的：
 
     1. **提示写 stderr。** input() 自己的提示语走 stdout，而 stdout 是 Agent 最终
        产出的通道 —— 混进去会污染结果（重定向到文件时最明显）。所以提示一律用
@@ -122,6 +157,11 @@ def cli_asker(
        （`git add` 开头），不是整个 shell；前缀推不出来时（命令行里有重定向、命令替换
        之类，解析器不肯猜）干脆不提供 t —— 一个按键记下"整个 shell 免问"和这个功能的
        初衷正好相反。
+
+    5. **a（信任一整组）只在确实有一组时才给，而且给的是快照。** 目前只有 MCP 的
+       server 有"一组"这个概念（见 TrustGroup）。它不给"这个 server 以后都不用问"，
+       而是把**此刻**这 N 个工具名一次性写进名单：server 下次升级带来的新工具仍然会问。
+       和 t 一样，memory 为 None 时干脆不提供 a —— 答应了却记不住比拒绝更坏。
     """
     # 用 .get 而不是 []：将来加了新的风险等级而这张表忘了配，缺省值是「原样打全」。
     # 多显示一点是安全的失败方向，少显示才是危险的。
@@ -140,14 +180,20 @@ def cli_asker(
             command = command_of(tool.name, arguments)
             target = suggest_prefix(command) if command is not None else None
 
+    # 按 a 该放行哪一组。和 t 同一条规矩：记不住（没有 memory）就不提供这个键 ——
+    # 提示里出现的每一个键都必须是**真的会生效**的。
+    group = trust_group(tool.name) if (memory is not None and trust_group is not None) else None
+
     print(f"[审批] 工具 {tool.name}  风险 {tool.risk.value}", file=sys.stderr)
     print(f"[审批] 参数 {args_preview}", file=sys.stderr)
 
     if target is not None:
         print(f"[审批] t = {_remember_hint(tool, target, memory.label)}", file=sys.stderr)
-        print("[审批] 是否执行？[y/N/t] ", end="", file=sys.stderr, flush=True)
-    else:
-        print("[审批] 是否执行？[y/N] ", end="", file=sys.stderr, flush=True)
+    if group is not None:
+        print(f"[审批] a = {_trust_all_hint(group, memory.label)}", file=sys.stderr)
+
+    keys = "/".join(["y/N", *(["t"] if target is not None else []), *(["a"] if group is not None else [])])
+    print(f"[审批] 是否执行？[{keys}] ", end="", file=sys.stderr, flush=True)
 
     try:
         answer = input()
@@ -164,6 +210,12 @@ def cli_asker(
             memory.grant(target)
         else:
             memory.grant_prefix(target)
+        return True
+
+    if answer == "a" and group is not None:
+        # 一次落盘记住一整组（不是循环 grant：那会重写 N 次文件，见 memory.grant_all）。
+        # gate 的前后快照差会把这一组名字一个不少地记进审计 —— "谁批的"看得见。
+        memory.grant_all(group.tools)
         return True
 
     return answer in {"y", "yes"}
