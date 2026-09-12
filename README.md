@@ -64,13 +64,21 @@ uv run main.py --session demo --history # 看对话历史（不调用模型）
 uv run main.py --session demo --audit   # 看审计轨迹：token、权限裁决、耗时（不调用模型）
 uv run main.py --autopilot              # 这次运行没有人可问：不审批、也不提问（见「权限与审批」）
 uv run main.py --debug                  # 把中间过程打到 stderr
+
+uv run main.py --tui                    # TUI 界面（它自己拉起一个 --runtime-stdio 子进程）
+uv run main.py --runtime-stdio          # 协议子进程：stdout 是 JSONL（一般不由人直接跑）
 ```
+
+**`--tui` 和 `--runtime-stdio` 是一对父子**，人只会用前者。后者留成显式开关是为了可测
+（喂几行 JSON 就能验协议，见 `doc/protocol.md`）。TUI 需要额外装一个依赖
+（`textual`，见「架构」里那条依赖说明）；老 CLI 和 `--runtime-stdio` **都不加载它**。
 
 不带 `--session` 时**每次都是新会话**，但**聊过之后就会落盘**（第一次写盘发生在你说出
 第一句话之后），所以开了不用不会留下空文件。
 
 交互时：提示符和调试信息走 **stderr**，Agent 的回答走 **stdout**。所以
-`uv run main.py > 对话.txt` 拿到的是干净的答案。
+`uv run main.py > 对话.txt` 拿到的是干净的答案。这一条对 TUI 不适用 —— 它的界面自己
+管着终端。
 
 每轮末尾还有一行统计（也走 stderr）：
 
@@ -499,8 +507,8 @@ PDF / 图片这类二进制直接回一句"不是能读的文本"，不硬解。
 
 注入点叫 `session_notes`，注入的是一段"怎么说"的实现（`tools/builtin/todo.py` 的 `todo_note`），
 所以 Agent 自己不知道任务列表长什么样。注意写和读是**两条独立装配的路**（写：注入一个
-`TodoBoard`；读：注入 `todo_note`），只有 `main.py` 两条都接上 —— 少接一条的后果是
-"列表更新了但模型看不见"，而那不会报任何错。
+`TodoBoard`；读：注入 `todo_note`），只有 `runtime/composition.py` 两条都接上 ——
+少接一条的后果是"列表更新了但模型看不见"，而那不会报任何错。
 
 ### 它比进程活得久
 
@@ -692,7 +700,7 @@ MCP server 提供的东西恰好就是 `Tool` 的形状（名字 + 描述 + JSON
 
 ```
 <工作区>/.tudouni/          运行期私有数据，控制面守着它（agent 读得到、写不了）
-  permissions.json            权限策略（config.py）
+  permissions.json            权限策略（runtime/config.py）
   sessions/<id>.json          会话状态（state/store.py）
   logs/<id>.jsonl             审计轨迹（audit/jsonl.py）
   skills/<name>/SKILL.md      技能（skills/）
@@ -701,11 +709,45 @@ MCP server 提供的东西恰好就是 `Tool` 的形状（名字 + 描述 + JSON
 它让"这次运行自己的状态住在哪"变成一个能一眼看完的答案，也让控制面从"点名四个路径"
 变成"守一个目录"——往里加东西不用再改那张表。
 
-```
-main.py            组装：把下面这些接起来（薄入口）+ 那个目录的四个路径常量
-cli.py             参数解析、会话选择、交互循环、历史与审计的展示
-config.py          配置：密钥走环境变量（源码里不留密钥），权限策略走 .tudouni/permissions.json
+目录分三层。**分的依据是"因为什么而变化"，不是抽象层级** —— 这是这个目录列表唯一的
+组织原则，下面每一节的取舍都从它推出来。
 
+```
+── 启动器 ─────────────────────────────────────────────────────────────────
+main.py            只做分派：--tui / --runtime-stdio / 老 CLI 三条路走哪个，
+                   以及"用哪个流把说明打出来"。不装配任何东西
+
+── 三块：装配 / 协议 / 界面（各自只因为一件事而变化）────────────────────────
+runtime/           装配：把内核变成一个能跑的东西。**不认识任何消息，也不渲染**
+  composition.py     Runtime：唯一持有 http / mcp / store / logs / skills / policy /
+                     memory / tools / agent 的地方，有 close()（两个进程级资源）
+                     boot() 只需要磁盘，open_runtime() 才需要密钥
+  channels.py        Channels：人机通道那一包（asker 是"迟一步"的工厂，见那里的
+                     顺序说明）；memory 的造法也在这里，因为只有一处该知道它落哪
+  config.py          配置：密钥走环境变量（源码里不留密钥），权限策略走
+                     .tudouni/permissions.json
+
+protocol/           跨进程契约：runtime 的"远程 API"。**不认识任何界面**
+  messages.py        从 schema 读出来的名字和常量 + v（信封版本）
+  codec.py           一行 JSON ↔ 一个 dict：唯一的编解码器（坏行跳过并计数）
+  state.py           事件 → 状态：那张推导表，纯函数（三个前端共用）
+  channels.py        ProtocolServer：传输循环 + Runtime 持有者 + 人机通道提供者
+  transport_stdio.py Transport：stdin/stdout 那三件"开工前必须做掉"的事
+  serve.py           --runtime-stdio 那个进程的主循环
+  client.py          **前端那一侧的公共层**：起子进程、拆行、回回应。
+                     前端只实现三个回调（on_message / on_permission /
+                     on_question），不需要认识消息种类
+  schema/*.json      形状的权威（机器可读）。TS 类型将来从这里生成，不手抄
+
+frontends/          界面：**各前端之间不共享代码**，只讲协议
+  cli/               老 CLI（含四个"不需要模型"的子命令）+ 它的参数形状（args.py）
+  tui/               Python + Textual
+    app.py             App + 四个协议回调 + 50ms 消息泵（跨线程那个坑见它的注释）
+    widgets.py         会话正文 / 权限面板 / 提问面板 / 状态栏
+    view_state.py      **只放显示状态**：滚动、折叠、焦点 + 纯渲染函数（可单测）
+  ansi/              200 行零依赖客户端 —— 协议的验收工具，**允许被扔掉**
+
+── 内核：八个独立的领域（谁也不认识 runtime / protocol / frontends）──────────
 prompts/           系统提示词（给人读、给人改的文本，不是代码）
   system.zh.md       静态部分；动态那几行由 state/session.py 拼在末尾
 
@@ -753,7 +795,7 @@ tools/             工具层 —— 三类东西，两个子位置
 security/          权限层
   policy.py          PermissionPolicy：纯函数，只裁定 ALLOW / DENY / ASK
   gate.py            关卡：把策略 + asker + memory 变成一次裁决（每条来路分开记）
-  asker.py           询问方式（CLI 版走终端，认 y/N/t；测试版是脚本化的假实现）
+  asker.py           询问方式（CLI 版走终端，认 y/N/t/a；测试版是脚本化的假实现）
   memory.py          人按 t 记住的东西（工具名 / 命令前缀）—— 唯一可变的那份状态
   commands.py        命令行的拆解与规则匹配：纯函数，看不懂就返回"没覆盖"
 
@@ -762,49 +804,80 @@ state/             状态层
   store.py           JsonSessionStore：原子写、id 白名单、容忍未知字段
 
 audit/             审计层
-  events.py          事件构造
+  events.py          事件构造（七个 kind 的公共字段）
   jsonl.py           JsonlSink：只追加的 .jsonl，天然抗崩溃
 
 agents/            编排层
   agent.py           Agent：一个回合的循环（一批工具调用：默认串行，整批只读才并发）
   retry.py           重试策略（只重试暂时性失败）
 
-tests/             全套测试（含"每个模块都能导入"的冒烟测试；时间靠注入的假时钟断言）
+── 其它 ──────────────────────────────────────────────────────────────────
+scripts/verify_tui.py  端到端验收：真 TUI + 真子进程 + 本地 HTTP 桩
+doc/                   design（TUI-design.md）、契约（protocol.md）、输入（TUI.md）
+tests/                 全套测试（含"每个模块都能导入"的冒烟测试；时间靠注入的假时钟断言）
 ```
 
-依赖方向是单向的，无环：
+**内核那八个为什么不平铺成"一个 kernel/"**：它们不是一个东西，是**八个各自变化的
+领域** —— 加一类工具只动 `tools/`、调提示词只动 `prompts/`、改权限粒度只动 `security/`、
+换网关只动 `models/`。合成一个目录不会让读者少理解任何东西，只是换个地方放同样的
+复杂度。反过来那三块（`runtime` / `protocol` / `frontends`）各自**整体**因为一件事变化，
+所以各自是一个目录 —— 这个不对称是有意的。
+
+## 依赖方向
+
+单向、无环、**分层**（下面这张图自带缩进，那三层是真实的偏序，不是排版）：
 
 ```
-models   （无内部依赖）
-tools    （无内部依赖）
-state    （无内部依赖）
-skills   （无内部依赖 —— 它谁也不 import，所以能独立成包而不和 tools 成环；
-            tests/test_imports.py 里有一条测试盯着这件事）
-config   → security.commands（校验 shell_allow 里的规则语法；密钥那条路仍然是环境变量）
-         → tools.mcp（解析 mcp.json 的形状 —— 那份形状知识住在工具层，而"往磁盘上哪个
-            文件读"住在配置层；反向的 tools → config 仍然是禁止的）
-security → tools（只准 `tools.tool` —— 见下面那条测试）
-audit    → state
-agents   → audit, models, security, state, tools（同样只准 `tools.tool`）
-tools    → skills（只有 load_skill 那一条接线；技能领域住在 skills/ 里）
-main     → 全部
+第一层（谁也不 import）  models · state · skills
+                        （skills 独立成包的全部依据就是这条；
+                          tests/test_imports.py 里有一条测试盯着它）
+第二层                  tools    → skills
+                        security → tools（只准 tools.tool）
+                        audit    → state
+                        runtime/ → 上面全部 + tools.mcp
+                        （config 也在这里：它 → security.commands 和 tools.mcp，
+                          后者是**点名例外**，见下）
+第三层                  agents   → audit, models, security, state, tools
+                        runtime/ → agents
+第四层                  protocol/ → runtime/ + agents（只用到类型和异常）
+第五层                  frontends/ → protocol/
+                        main     → 全部
 ```
+
+**内核不认识上层**：`agents` / `models` / `tools` / `state` / `security` / `audit` /
+`skills` 里对 `runtime` / `protocol` / `frontends` 的 import **一条都没有**，由
+`tests/test_imports.py` 盯着。破掉的后果不是"坏了"，而是内核悄悄依赖上某个前端 ——
+那时候 `--list`（一个只读会话文件的子命令）会连带把整个装配层和界面层拖进来。
+
+**前端也不许 import `runtime/` 内部**，唯一例外是 CLI 直连（决策 19，写在
+`doc/TUI-design.md`）。这一条是"前端 = 协议的一个客户端"的全部内容，也是将来加
+Web 前端的前提 —— 所以那个例外被一条单独的测试盯着"例外只有这一个"。
 
 工具层内部也是单向的：`builtin/` 里每个工具 → `tools/tool.py`（契约），没有一个工具
 import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也不反向依赖它。
 
-**这条边界现在由测试盯着**（`tests/test_imports.py` 三条）：
+**这些边界由 `tests/test_imports.py` 七条测试盯着**（"能导入"那条冒烟测试不算在内）：
 
   * `skills/` 不 import 任何内部模块（否则会成环）；
-  * `security/` `agents/` `state/` `audit/` `models/` 只能从 `tools.tool` 认识工具 ——
-    具体工具和外部来源是装配处（`main.py`）的事。以前这条只靠"记得"维持，而它破掉时
-    **什么都不会坏**，只是让每一次权限裁决都顺手拖进 httpx 和整个技能包；
+  * `security/` `agents/` `state/` `audit/` `skills/` `models/` —— 这六个（测试里叫
+    `_KERNEL_PACKAGES`）**除了 `tools.tool` 之外不许从 `tools/` 认识别的东西**。
+    具体工具和外部来源是装配处（`runtime/composition.py`）的事。以前这条只靠"记得"
+    维持，而它破掉时**什么都不会坏**，只是让每一次权限裁决都顺手拖进 httpx 和整个技能包；
   * `tools` 的包出口不许带货：`import agent_runtime.tools.tool` 之后 `sys.modules` 里
-    不该有 httpx / skills。
+    不该有 httpx / skills；
+  * 内核不许 import 那三层（`runtime` / `protocol` / `frontends`）；
+  * `protocol/` 不许 import 任何前端 —— 方向搞反的代价是隐形的：协议里 import 一个
+    TUI widget 也能跑，只是从此 Web 那一侧依赖上了一个终端库；
+  * `frontends/` 不许 import `runtime/`；
+  * `textual` 只准出现在 `frontends/tui/app.py` 和 `widgets.py` 两个文件里 ——
+    这条保证老 CLI 和协议子进程都不加载一个 TUI 框架。
 
-`config.py` 是那条规则的**点名例外**：它要解析 `mcp.json` 的形状，而那份形状知识住在
-`tools/mcp.py`（反向的 `tools → config` 是禁止的）。例外写在测试的 `_EXEMPT_FILES` 里，
-不是靠放宽规则。
+`runtime/config.py` 是第二条的**点名例外**：它要解析 `mcp.json` 的形状，而那份形状知识
+住在 `tools/mcp.py`（反向的 `tools → config` 是禁止的）。**例外写在测试的集合里，不是靠
+放宽规则** —— 而且每一组例外都配了一条"例外只有这几个、而且它们真的存在"的测试
+（`_EXEMPT_FILES` / `_FRONTEND_EXEMPT`），因为一个指向已删除文件的例外会**静默放宽**整条规则。
+`frontends/cli/__init__.py` 在 `_FRONTEND_EXEMPT` 里（决策 19：CLI 直连 runtime），
+那条测试把"唯一例外"钉死，并写明了退出条件 —— 等 CLI 也改成协议客户端，那一项就该删掉。
 
 ## 贯穿全局的三个设计原则
 
@@ -918,13 +991,14 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 和"agent 改一次策略文件"合起来就是一条从一次写文件审批走到 shell 全权的路。
 
 **步数用尽不是答案。** 撞到 `max_steps` 时 `run()` 抛 `StepLimitExceeded`，而不是
-返回一句"任务超过最大执行步数，已停止。" —— 返回值会被 `cli.py` 打进 **stdout**，
+返回一句"任务超过最大执行步数，已停止。" —— 返回值会被 CLI 打进 **stdout**，
 于是 `> 对话.txt` 里那句话跟真答案长得一模一样，用户分不出"答完了"和"被砍断了"。
-它也不算失败：抛之前 `run_finished` 和落盘都已经完成，会话是完好的，`cli.py` 会
-把"接着跑：--session X"说到 stderr。这正是 `--audit` 里那句 `stop_reason=max_steps`
-属于审计、不属于输出的原因。默认步数 **40**：实测把这个项目最典型的长任务
-（"参考现有实现加一个工具"）跑到收尾需要 19 步，20 只剩最后一步的余量，任何一次
-返工都会撞墙。
+它也不算失败：抛之前 `run_finished` 和落盘都已经完成，会话是完好的，CLI 会把
+"接着跑：--session X"说到 stderr。这正是 `--audit` 里那句 `stop_reason=max_steps`
+属于审计、不属于输出的原因。默认步数 **80**（`runtime/composition.py` 的
+`DEFAULT_MAX_STEPS`，`init` 会把它发给前端，所以它只在这一个地方定义）：实测把这个
+项目最典型的长任务（"参考现有实现加一个工具"）跑到收尾需要 19 步，留到 80 是给
+返工和"中间多聊两句"的余量；而步数用尽是**可续的**（会话是完好的），所以宁松不紧。
 
 **成本和"聊了多少轮"关系不大。** 实测一轮 5 步的任务里，一次 `read_file` 返回
 12524 字符，占了整轮成本的 86%。未命中缓存的输入比命中贵约 50 倍，所以
@@ -936,7 +1010,7 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 工具耗时**不含**等人审批（那段时间在 `permission.waited_ms` 里），否则"我看了 30 秒
 才按 y"会显示成"这个工具要 30 秒"；同理**也不含**等人回答提问的时间 —— 但它不能像审批
 那样"本来就没算进去"，因为 `ask_user` 的 handler 整段时间都阻塞在人的输入上，那一段
-已经进了它的 `duration_ms`，所以汇总是**减出来**的（`human_wait_ms`，再由 `cli.py`
+已经进了它的 `duration_ms`，所以汇总是**减出来**的（`human_wait_ms`，再由 CLI
 加回"已解释"那一侧，否则会掉进"未归因"这个错误的名字下面）；重试退避**不属于任何一次
 请求**，不单独记的话"这一轮为什么慢了 3 秒"在日志里根本看不出来。交互循环每轮末尾那句统计里也有一个
 「本轮 X」—— 旁边那几个数（消息数、步数、token）都是**会话累计**，只有它是刚结束的
@@ -1036,8 +1110,15 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
   根就是包本身，uv 无法把它当包安装。`main.py` 因此自己把父目录塞进 `sys.path`，
   `conftest.py` 做同一件事。想彻底解决要把项目根上移一级或改成嵌套布局，代价是
   一次大搬迁 —— 暂时不值得。
-- **`doc/` 里的文件。** `guide.md` 是本项目的分阶段设计文档；`summary.md` 是 Agent
-  自己读 `guide.md` 之后写的摘要 —— 顺便当作"它真的能干活"的样例。
+  **这也是协议子进程不能用 `python -m agent_runtime.main` 的原因**（`-m` 下那句
+  `sys.path` 补丁不生效）：`protocol/client.py` 用绝对路径 + `cwd=仓库根` 起它，
+  和 `protocol/transport_stdio.py` 里那几条一起写在 `doc/protocol.md` 第 1 节。
+- **`doc/` 里的文件。** `guide.md` 是本项目最早那份分阶段设计文档；`summary.md` 是
+  Agent 自己读 `guide.md` 之后写的摘要 —— 顺便当作"它真的能干活"的样例。
+  `TUI.md` 是"给这个项目加一个 TUI"的**初步思路**（外部视角，不知道仓库长什么样），
+  `TUI-design.md` 是结合现有实现重做的那一份（逐条回应前者，并记下拍板的决策），
+  `protocol.md` 是**给写新前端的人看的契约**（讲语义；形状在
+  `protocol/schema/*.json`）。
 - **`tools/builtin/filesystem.py` 里的 `safe_path`。** 它其实是一条安全策略，按职责该住在
   `security/`。留在工具里的原因是它和文件操作绑得太紧，搬走会让两边都变难读。
 - **`get_current_time` 只给本机时区。** 想看任意时区得引入 IANA 时区库（Windows 上

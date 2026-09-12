@@ -162,6 +162,24 @@ subprocess.Popen(
 **收到 `permission_request` / `question_request` 之后，runtime 会一直等你回应。**
 不回应 = 整个会话停在那里（它不会超时 —— 人就在键盘前）。
 
+**这两条和别的消息有一条本质区别：它们要一个回答。** 所以客户端对它们的处理方式是
+"回答"而不是"显示"：
+
+| 你的界面 | 怎么做 |
+|---|---|
+| 行式（ANSI / CLI） | `on_permission` 当场问、当场返回一个 `decision` —— 它就在读线程上，而人就在键盘前 |
+| 图形（TUI） | **返回 `None`**，然后由界面在用户点完按钮之后调 `client.answer_permission(...)` |
+
+**返回 `None` 是"我稍后自己回"，不是"我不回"。** 一个返回 `None` 之后再也没回答的
+界面，会让子进程永远等下去 —— 所以那条路径上"用户关掉面板"必须有明确归宿
+（TUI 里是 `dismiss(None)` → 按**拒绝**处理，fail-closed）。
+
+**兜底答案是个陷阱。** 读线程上返回一个 `deny` 当占位、想"稍后覆盖"，看起来能跑，
+实际必然坏：客户端会把它**立刻**发出去，子进程据此拒绝并继续跑，等用户点 [允许]
+时那条回应已经没人要；更糟的是中间那次拒绝会进审计、记成 `user_denied`
+—— 等于**伪造了一条"用户拒绝过"的记录**。（这是实测踩出来的，见
+`frontends/tui/app.py` 里 `on_permission` 的注释。）
+
 ### 4.1 `permission_request` / `permission_response`
 
 ```json
@@ -267,14 +285,28 @@ gate 都进不去），你这一侧只要别把它显示成"已授权"就行。
 
 ## 8. 写一个新客户端要做什么
 
-按 `protocol/client.py` 的 `ClientHooks` 实现四个回调：
+按 `protocol/client.py` 的 `ClientHooks` 实现三个回调：
 
 ```python
 class MyClient:
-    def on_message(self, message): ...          # init / session_load / event / ui / notice
-    def on_permission(self, request) -> str: ...  # 返回 allow/deny/always/always_group
-    def on_question(self, request) -> tuple[str, str]: ...  # (answered|skipped, text)
+    def on_message(self, message) -> None: ...
+        # init / session_load / event / ui / notice —— 人机交互那两条不走这里
+
+    def on_permission(self, request) -> str | None: ...
+        # 返回 allow / deny / always / always_group；
+        # **或者 None ="我的界面稍后自己回"**（那两条的区别见第 4 节）
+
+    def on_question(self, request) -> tuple[str, str] | None: ...
+        # (answered|skipped, text)；同样可以返回 None
 ```
+
+**那个 `None` 不是可选的便利，是必需的** —— 异步界面（TUI）没法在**读线程**上等人
+点按钮：那会把读线程钉住，而它还要负责收别的消息。返回 `None` 之后，答案由界面在
+用户操作完之后调 `client.answer_permission(...)` / `client.answer_question(...)` 发。
+
+**绝不能用兜底答案代替它。** 客户端会把返回的字符串**立刻**发出去 —— 一个兜底的
+`deny` 会让子进程据此拒绝并继续跑，等用户点 [允许] 时那条回应已经没人要；更糟的是
+中间那次拒绝会进审计、记成 `user_denied`，也就是**伪造了一条"用户拒绝过"的记录**。
 
 然后：
 
@@ -285,7 +317,7 @@ client.user_message("你好")
 client.wait()
 ```
 
-**四个回调，没有别的。** 拼 `permission_response`、加版本号、flush、处理坏行 ——
+**三个回调，没有别的。** 拼 `permission_response`、加版本号、flush、处理坏行 ——
 都在 `ProtocolClient` 里，你不需要认识协议。
 
 非 Python 的客户端（Web 那一侧）读 `schema/*.schema.json` 拿形状、读这份文档拿语义。
