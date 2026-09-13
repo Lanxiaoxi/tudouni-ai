@@ -130,7 +130,7 @@ class Theme:
     danger_soft: str = field(init=False)
     skill: str = field(init=False)
     # 左栏每块左边那条色条的底色。**它是 `line` 的弱化版**，不是 `line` 本身：
-    # 四块各来一条满血的主题描边色会跟正文抢眼睛，而"锚点"该是安静的那一层。
+    # 每块各来一条满血的主题描边色会跟正文抢眼睛，而"锚点"该是安静的那一层。
     # 弱化保留色相（这一套配色的性格还在），只是不再喊。
     rail_bar: str = field(init=False)
 

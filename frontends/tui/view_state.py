@@ -370,6 +370,13 @@ class ViewState:
     todos: list[dict[str, str]] = field(default_factory=list)
     skills: list[dict[str, str]] = field(default_factory=list)
     skill_catalog: list[dict[str, str]] = field(default_factory=list)
+    # 后台任务（`shell_background` 起的那几条）。每项形如
+    # `{"id", "command", "state": "running|uncollected|done|killed", "seconds", "exit_code"}`。
+    #
+    # **它和上面那几块有一个根本区别：它对应的是活着的进程。** 任务列表过期只是信息旧，
+    # 而后台任务过期意味着"我以为已经收掉的服务还在占着端口"。所以它除了左栏那一块，
+    # 还有一个常驻的状态栏徽标（`jobs_badge`）—— 收起上下文栏时那是唯一的出口。
+    jobs: list[dict[str, Any]] = field(default_factory=list)
     # 这个会话的 system 消息里那份 AGENT.md 的去向（`ui_state` 从
     # `session.metadata` 读出来的报告）：每项形如
     # `{"path": "AGENT.md", "lines": 12, "status": "loaded" | "failed", "problem": "…"}`。
@@ -448,6 +455,9 @@ class ViewState:
             而且 `Ctrl+T` 会去展开一个已经不在的 run（它按 run_id 查，查得到旧的那份）；
           * 漏 `todos` / `skills` / `skill_catalog` —— 左栏显示**上一个会话**的任务列表。
             这一条最坏：它看起来完全正常，而用户会以为那些任务是现在这个会话的；
+          * 漏 `jobs` —— 面板上留着上一个会话的后台任务，而**它们的进程已经在上一个
+            会话收尾时被杀掉了**（`Runtime.close()` 收的）。于是界面会一直显示一个
+            早就不存在的服务"在跑"，而用户会照着它去 debug 一个假问题；
           * 漏 `agent` —— 状态栏按上一个会话的 phase 显示"正在跑"或"已答"，而新会话
             一步都没走（协议那边是干净的，所以这个"正在跑"永远不会结束）；
           * 漏 `pending_input` —— 上一句话贴到新会话的第一个回合头上；
@@ -470,6 +480,7 @@ class ViewState:
         self.todos = []
         self.skills = []
         self.skill_catalog = []
+        self.jobs = []
         self.agents_md = []
         self.risk_scope = []
         self.granted_tools = []
@@ -625,6 +636,38 @@ class ViewState:
         if self.autopilot:
             return Line(f"{word} 开", ROLE_WARN)
         return Line(f"{word} 关", ROLE_RULE)
+
+    def jobs_badge(self, compact: bool = False) -> Line | None:
+        """状态栏那一枚后台任务徽标；**一件都不悬着时返回 None**（一格都不占）。
+
+        它为什么必须存在，而不是只靠左栏那一块：**上下文栏默认是收起的**，而收起时
+        宽屏上唯一还提这件事的地方就是这里（窄屏那一行摘要是另一条，见 `rail_summary`）。
+        后台任务和任务列表不一样 —— 任务列表过期只是信息旧，而后台任务是一条**还在
+        占着端口的进程**，它不允许"收起左栏就等于看不见"。
+
+        ## 两个状态用两种颜色，而且说的不是同一件事
+
+          * 只有"在跑"→ 安静那档：有东西在跑是**正常状态**，不值得一路喊；
+          * 有"结果还没收"→ `warn`：那一档的含义是**你（或模型）还有一步没做**，
+            而这一步不做的话，那条命令成没成永远没有答案（见 `jobs.py` 开头第 3 条）。
+
+        `compact=True`（窄屏）只留条数：状态栏右边是 `width: auto`，多出来的每一列
+        都从左段身上扣，而左段被裁成半句正是 F5 那次踩过的坑。
+        """
+        if not self.jobs:
+            return None
+        outstanding = [job for job in self.jobs
+                       if str(job.get("state", "")) in ("running", "uncollected")]
+        if not outstanding:
+            # 全都收过了：留一枚安静的"历史"记号，而不是整格消失 —— 消失之后
+            # "起过又收干净了"和"从来没起过"长得一模一样，而前者是值得知道的事实。
+            return Line(f"后台 {len(self.jobs)} 已收", ROLE_RULE)
+        uncollected = sum(1 for job in self.jobs
+                          if str(job.get("state", "")) == "uncollected")
+        text = f"后台 {len(outstanding)}"
+        if uncollected and not compact:
+            text += f" · {uncollected} 条待收"
+        return Line(text, ROLE_WARN if uncollected else ROLE_PROCESS)
 
     def audit_short(self) -> str:
         """审计路径的短写法：**能省掉工作区前缀就省掉**。
@@ -970,7 +1013,7 @@ def notice_is_redundant(code: str) -> bool:
 
     **`agent_md` 也不在这里**（它读的是工作区那份 AGENT.md，不是左栏那三块）：用户
     问了"启动的时候说一句加载了 xxx/AGENT.md"，而"加载了哪些别人写的说明"和 [技能]
-    那条是同一类事实，该在开场看得见 —— 左栏那四块说的是当前会话的**状态**，而这是
+    那条是同一类事实，该在开场看得见 —— 左栏那几块说的是当前会话的**状态**，而这是
     一次**启动事件**。读失败和被截断那两条尤其必须出现在这里：它们是 warn，左栏没有
     任何一块会显示它们。
     """
@@ -1212,7 +1255,7 @@ def apply_state(state: ViewState, message: dict[str, Any]) -> None:
     它是**面板数据**（左栏那几块），不进对话流：任务列表每更新一次就在流里插一段，
     会把"你问的 + 它答的"冲稀。设计稿把这块放进常驻的左栏，正是为了这个。
     """
-    for key in ("todos", "skills", "risk_scope"):
+    for key in ("todos", "skills", "risk_scope", "jobs"):
         if key in message:
             setattr(state, key, [dict(item) for item in message[key] or []])
     # AGENT.md 那份报告：**它只在开场那一条里有**（会话创建时读一次盘，之后不会变），
@@ -1262,20 +1305,95 @@ def apply_state(state: ViewState, message: dict[str, Any]) -> None:
 # --- 上下文栏（左栏） ----------------------------------------------------------
 
 def rail_blocks(state: ViewState) -> list[tuple[str, str, list[Line]]]:
-    """左栏四块：`(标题, 右侧计数, 行)`。
+    """左栏五块：`(标题, 右侧计数, 行)`。
 
-    四块的数据来源在设计稿的推导表里写死了：任务来自 `todo_write`、技能来自
+    五块的数据来源在设计稿的推导表里写死了：任务来自 `todo_write`、技能来自
     `load_skill`、权限来自 `init.permissions` + `PermissionPolicy`、会话来自
-    `Session` + 审计。**它们此前只有"另开一个终端"的出口**（`--skills` /
-    `--audit` / `--list`），放进栏里之后"agent 为什么这么做""我现在放行了什么"
-    变成常驻可见，而不是翻日志考古。
+    `Session` + 审计、**后台任务来自 `ui(state).jobs`**。它们此前只有"另开一个终端"
+    的出口（`--skills` / `--audit` / `--list`），放进栏里之后"agent 为什么这么做"
+    "我现在放行了什么""我机器上还挂着什么"变成常驻可见，而不是翻日志考古。
+
+    **后台那一块排在最后，不是因为最不重要**，而是因为前面四块是设计稿定下来的
+    顺序（F1 那张图上从上到下就是任务/技能/权限/会话），插在中间会把它们全部挪位 ——
+    而"哪一块在第几行"是用户在两次看之间形成的肌肉记忆。它自己的可见性由状态栏
+    那枚徽标保证（`jobs_badge`），所以排最后不至于被漏掉。
     """
     return [
         _todo_block(state),
         _skill_block(state),
         _permission_block(state),
         _session_block(state),
+        _jobs_block(state),
     ]
+
+
+def _jobs_block(state: ViewState) -> tuple[str, str, list[Line]]:
+    """后台任务那一块。
+
+    **它是这一栏里唯一有"活的进程"含义的一块**（见 `ViewState.jobs`）。所以三种
+    `state` 的记号必须一眼分得开，尤其是 `uncollected`（结果还没收）—— 那一条的含义
+    是"这条命令已经跑完了，而你还不知道它成没成"，正是后台化唯一会静默出错的地方。
+
+    右侧那个计数**不是"共几条"**：那是块头那行 `n` 条里已经有的数。它报的是
+    **还没收场的条数**（在跑 + 结果还没收）—— 因为"还有几件事悬着"才是这一块要回答
+    的问题，而"一共起过 7 条"不是。
+    """
+    jobs = state.jobs
+    if not jobs:
+        return ("后台任务", "", [Line("当前没有后台任务", ROLE_RULE),
+                                 Line("shell_background 起的会在这里", ROLE_RULE)])
+    outstanding = sum(1 for job in jobs if _job_role(job) != ROLE_RULE)
+    lines = [
+        seg((f"{_JOB_MARK.get(str(job.get('state', '')), '·')} ", _job_role(job)),
+            (str(job.get("command", "")), ROLE_PROCESS),
+            (f"  {_job_tail(job)}", ROLE_RULE))
+        for job in jobs
+    ]
+    return ("后台任务", f"{outstanding} / {len(jobs)}", lines)
+
+
+# 后台任务的记号。**四档各有各的形状**，因为它们要回答的问题不同：还在跑的、
+# 跑完了但你还没收结果的（那一档要你动手）、收过的、被收掉的。
+_JOB_MARK = {
+    "running": "◐",
+    "uncollected": "✓",
+    "done": "·",
+    "killed": "—",
+}
+
+
+def _job_role(job: dict[str, Any]) -> str:
+    """这一条的强调色。**只有"结果还没收"那一档值得抢眼睛** —— 其余按安静处理。
+
+    和任务列表那块同一条取向（`in_progress` 用 `waiting`、其余用 `process`）：
+    一栏里同时有五个东西在喊就等于没有东西在喊。
+    """
+    state = str(job.get("state", ""))
+    if state == "uncollected":
+        return ROLE_WAITING
+    if state == "running":
+        return ROLE_PROCESS
+    return ROLE_RULE
+
+
+def _job_tail(job: dict[str, Any]) -> str:
+    """任务名后面那一小段：跑了多久 / 退出了没有 / 还差一步收结果。
+
+    **`uncollected` 那一条必须自己说出"结果还没收"** —— 光有一个 `✓` 记号，
+    读的人会以为这件事已经了了，而它恰恰是这一块里唯一需要动作的一条。
+    """
+    state = str(job.get("state", ""))
+    seconds = job.get("seconds")
+    span = f"{int(seconds)}s" if isinstance(seconds, int) else ""
+    if state == "running":
+        return f"在跑 {span}".strip()
+    if state == "uncollected":
+        code = job.get("exit_code")
+        return f"已结束（退出码 {code}）· 结果还没收"
+    if state == "killed":
+        return "已被收掉"
+    code = job.get("exit_code")
+    return f"已结束（退出码 {code}）· 已收"
 
 
 def _todo_block(state: ViewState) -> tuple[str, str, list[Line]]:
@@ -1391,7 +1509,7 @@ def _session_block(state: ViewState) -> tuple[str, str, list[Line]]:
         window = f"  {tokens_text(state.context_tokens)}" if state.context_tokens else ""
         lines.append(seg((state.model, ROLE_SKILL), (window, ROLE_RULE)))
     # 思考模式**只在关着的时候占一行**。开着是常态（端点的默认行为就是开），为它常驻
-    # 一行会让左栏那四块里的信息密度掉下来 —— 而"关着"是个例外，值得被看见。
+    # 一行会让左栏那几块里的信息密度掉下来 —— 而"关着"是个例外，值得被看见。
     if not state.thinking_on:
         lines.append(seg(("思考 关", ROLE_WARN),
                          (f"  强度 {state.effort}", ROLE_RULE)))
@@ -1432,6 +1550,11 @@ def rail_summary(state: ViewState) -> str:
     否则"收起"就等于"看不见"，而左栏存在的全部理由就是让它们常驻可见。
     """
     parts = ["Ctrl+B 展开上下文栏"]
+    if state.jobs:
+        outstanding = sum(1 for job in state.jobs
+                          if str(job.get("state", "")) in ("running", "uncollected"))
+        parts.append(f"{outstanding} 个后台任务" if outstanding
+                     else f"{len(state.jobs)} 个后台任务（都收过了）")
     if state.todos:
         done = sum(1 for item in state.todos if item.get("status") == "completed")
         parts.append(f"{done}/{len(state.todos)} 个任务")

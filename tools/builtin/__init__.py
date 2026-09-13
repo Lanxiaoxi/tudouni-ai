@@ -39,6 +39,17 @@ from .grep import (
     GrepArgs,
     rg_binary,
 )
+from .jobs import (
+    DOCUMENTED_WAIT_SECONDS,
+    MAX_JOBS,
+    MAX_LIVE_JOBS,
+    MAX_WAIT_SECONDS,
+    JobBoard,
+    JobKillArgs,
+    JobListArgs,
+    JobOutputArgs,
+    ShellBackgroundArgs,
+)
 from .shell import MAX_OUTPUT_CHARS, Shell, ShellArgs, shell_name
 from .skills import LoadSkillArgs, SkillBoard
 from .todo import TodoArgs, TodoBoard
@@ -59,6 +70,7 @@ def create_tool_registry(
     skills: SkillCatalog | None = None,
     skill_metadata: MutableMapping[str, Any] | None = None,
     skill_loader: SkillLoader | None = None,
+    jobs: JobBoard | None = None,
 ) -> ToolRegistry:
     """把内置工具装成一个注册表。
 
@@ -77,6 +89,10 @@ def create_tool_registry(
       * `skills` / `skill_metadata` / `skill_loader` 是**技能**那一组：前两个是"扫到了
         什么"和"加载状态写在哪"，第三个是重扫口。三者都不传就是**不注册** load_skill
         —— 运行时里没有技能这个概念，和 `.tudouni/skills` 目录不存在时一模一样。
+      * `jobs` 是**后台命令**那一张表（起 / 收 / 看 / 杀四个工具共用它）。它和 `todos`
+        一样是按会话的状态，但**它攥着进程**，所以只有它必须在会话结束时被主动收掉
+        （`Runtime.close()` 里调它的 `close()`）。不传就是不注册那四个工具 ——
+        和上面几条同一条路：默认值绝不偏到"看起来能用"那一边。
 
         技能这里比别的协作方多一步：**注册表把造出来的 SkillBoard 留在 `registry.skills`
         上**。因为技能的"写"（工具调用）和"读"（每轮拼在载荷尾部的那段）是两条独立装配
@@ -84,7 +100,7 @@ def create_tool_registry(
         于是技能加载成功了却永远不出现在载荷里（见 tools/tool.py 里那段）。
 
     `web_search` 不注册时那个工具**干脆不出现在 schema 里**，而不是"注册了再返回一句
-    '没配密钥'"：schema 每一轮都要发出去（默认装配的 9 个工具合计约 6000 字符），而模型对
+    '没配密钥'"：schema 每一轮都要发出去（默认装配的 13 个工具合计约 8600 字符），而模型对
     "没有密钥"这件事无能为力 —— 它只会白花一步去调一次。缺密钥该是"用户得先做点事"，
     那句话由 main.py 打到 stderr 上。
 
@@ -230,6 +246,11 @@ def create_tool_registry(
     # 超时那件事不在这里复述：它是 timeout_seconds 这个参数自己的约束，由 schema 的
     # default/minimum/maximum 表达，写在散文里就成了第二份。
     #
+    # 开头那句"什么时候改用 shell_background"是**分工**，和 grep 描述里那句"别用 shell
+    # 去搜"同一条理由：模型才是做选择的那个人，而两个工具的能力在这里重叠。
+    # 它只说"用哪个"，不复述后台那一套纪律 —— 那些（"已启动不等于已成功"）写在
+    # shell_background 自己的描述里，一处就够。
+    #
     # 下面 web_note 那段是**本文件里唯一一处"跨工具的纪律"**，它值得单独说明理由：
     # "不要拿 curl 抓网页"这条规矩写在系统提示词的「## 联网」一节里，而那一节只对
     # **新建**的会话生效（system 消息只在建会话时写一次）；恢复的旧会话每一轮收到的
@@ -256,12 +277,122 @@ def create_tool_registry(
             f"命令是非交互的：需要输入时会立刻读到 EOF。"
             f"输出超过 {MAX_OUTPUT_CHARS} 字符会掐掉中间，头和尾都留着。"
             f"它不受文件工具那条路径限制 —— 命令能碰到工作区之外的路径。"
+            + ("要起一个不会自己结束的东西（服务、watch），或者想让它跑着的时候同时干别的，"
+               "用 shell_background —— 那种命令在这里只会到点被掐掉。"
+               if jobs is not None else "")
             + web_note
         ),
         risk=RiskLevel.HIGH,
         args_model=ShellArgs,
         handler=shell.run,
     ))
+
+    # 后台命令。**它是本文件里唯一一组"互相咬着"的工具**（起 / 收 / 看 / 杀），所以四条
+    # 决定放在一起说。
+    #
+    # 1. **`shell_background` 的风险和 `shell` 完全同档（HIGH）。** 它执行的是任意命令、
+    #    能碰工作区之外的任何东西 —— 唯一的区别只是"什么时候等它"，而那和安全无关。
+    #    好消息是这一套审批**本来就是同步的**（裁决发生在 agent.py 的 `_prepare` 里、
+    #    执行之前），所以"后台"两个字一分安全性都没松掉。命令前缀规则也覆盖它 ——
+    #    前提是 security/commands.py 那张表里有它（已经加了）。
+    #
+    # 2. **另外三个是 LOW，而 `job_kill` 那个 LOW 值得单独说清。** 杀一条自己起的后台
+    #    任务，最坏后果是"白跑了一段"—— 它碰不到任何运行时没创建过的东西，而且重新起
+    #    一条就补回来了。更关键的是**审批提示在这里注定是残缺的**：它只能显示
+    #    `job_id=3`，而"3 是哪条命令"在参数里根本没有 —— 那正是 README 说的"看不全就
+    #    签字等于没审批"。所以给它 MEDIUM 会造出一个**每按一次 y 都没有信息量**的仪式，
+    #    而审批一旦变成仪式就不再是保护（web_search 定 LOW 用的是同一条理由）。
+    #    代价如实说：模型有可能收掉一条你还想要的任务。纪律写进描述里（"只在你确定不要
+    #    那个结果了才收掉它"），而**不是**靠一个显示不出内容的确认框。
+    #
+    # 3. **一个都不能标 `parallel_safe`。** 两个理由各管一半：`shell_background` 和
+    #    `job_kill` 有副作用（起进程、杀进程）；`job_output` / `job_list` 是只读的，但
+    #    `job_output(wait=true)` 会**阻塞**（最长 MAX_WAIT_SECONDS）—— 一个会阻塞的调用
+    #    混进"整批只读、秒级以下"那个假设里，会把并行那一条路的收益变成负数。
+    #    另有一条注册期硬约束在这里也不成立：能并行就必须是 LOW，而这四个里有一个是 HIGH。
+    #
+    # 4. **描述里必须写"已启动不等于已成功"。** 系统提示词对**新建**会话生效，而工具
+    #    描述每一轮都发 —— 恢复的旧会话也一定看得到。这条纪律如果只在提示词里，
+    #    老会话就会把"已启动"读成"已通过"，而那是这个功能唯一会**静默**出错的地方
+    #    （见 tools/builtin/jobs.py 开头那段）。下面几条负面清单同理。
+    if jobs is not None:
+        registry.register(Tool(
+            name="shell_background",
+            description=(
+                f"在后台执行一条 shell 命令（{shell_name()} 语法），**立刻返回**、不等它结束。\n"
+                f"**它返回的是「已启动」，不是结果** —— 在你用 job_output 把结果收回来之前，"
+                f"这条命令成没成你是不知道的，**绝不要说它成功了**。\n"
+                f"什么时候该用：你手上有**不依赖这条命令**的活可以同时干（比如一条要跑几分钟"
+                f"的测试，而你还要写别的东西），或者要起一个**不会自己结束**的东西"
+                f"（后端服务、watch 任务）—— 后者用 shell 是做不到的，它到点会被掐掉。\n"
+                f"只是想让一条命令跑完再继续，就用 shell：后台化会多一次模型往返，"
+                f"而你什么也没省下。\n"
+                f"它不受文件工具那条路径限制 —— 命令能碰到工作区之外的路径，"
+                f"所以每次调用都要人工审批（和 shell 一样）。\n"
+                f"- 收结果 job_output、看状态 job_list、收掉它 job_kill\n"
+                f"- 同一条命令不要重复后台起（那会跑两遍，而且两边都改同一批文件）\n"
+                f"- 它跑着的时候**不要改它当作输入读的文件**（测试、构建、lint 都是这一类）"
+                f"—— 那样出来的结果哪个版本都不是。**服务类任务反过来**：改了代码它才会"
+                f"重载，那正是你要的\n"
+                f"- 要等一个服务「起来了」再往下做，就隔一会儿 job_output(wait=false) 看它的"
+                f"日志（比如那行 listening on 3000）\n"
+                f"- 前端 + 后端这类组合可以**同时起好几条**，各自收各自的；收尾时 job_list "
+                f"核对一遍别落下"
+            ),
+            risk=RiskLevel.HIGH,
+            args_model=ShellBackgroundArgs,
+            handler=jobs.start,
+        ))
+
+        # `job_output` 默认 wait=true，那是刻意的方向：模型调它的时候心里想的就是"结果呢"，
+        # 而在这个工具上"提前返回"的代价最大 —— 交回一段部分输出，模型转手就能把中途那句
+        # `3 passed` 当结论（见 jobs.py 开头第 3 条）。
+        registry.register(Tool(
+            name="job_output",
+            description=(
+                f"取一条后台任务的输出。**它结束了才叫结果** —— 还没结束的话，返回的是"
+                f"「还在跑」加上一段**部分**输出，那不是结果。\n"
+                f"默认会等最多 {DOCUMENTED_WAIT_SECONDS} 秒；知道它要跑更久就自己给"
+                f"wait_seconds（上限 {MAX_WAIT_SECONDS}）。\n"
+                f"看一个不会结束的服务（dev server）跑到哪儿了：wait=false。\n"
+                f"输出超过 {MAX_OUTPUT_CHARS} 字符会掐掉中间，头和尾都留着。"
+                f"任务被终止过的话，这里会说明它是被谁收掉的 —— 那种输出不能当结论用。"
+            ),
+            risk=RiskLevel.LOW,
+            args_model=JobOutputArgs,
+            handler=jobs.output,
+        ))
+
+        # 它回答的是"我有没有忘了收的东西" —— 而那个问题只有模型自己问得出来。所以描述里
+        # 要把**判据**说清楚（"结果还没收"那一档），而不只是说"列出任务"。
+        registry.register(Tool(
+            name="job_list",
+            description=(
+                "列出这次会话里起过的后台任务：在跑的有哪些、哪些**已经结束但结果还没收**、"
+                "哪些收过了。\n"
+                f"同时留着的任务最多 {MAX_JOBS} 个、同时最多 {MAX_LIVE_JOBS} 个在跑；"
+                f"到上限时要先收掉旧的才能起新的。\n"
+                "收尾之前用它核对一遍：标着「结果还没收」的那些，你现在**还不知道**它们成没成。"
+            ),
+            risk=RiskLevel.LOW,
+            args_model=JobListArgs,
+            handler=jobs.list,
+        ))
+
+        registry.register(Tool(
+            name="job_kill",
+            description=(
+                "终止一条后台任务，**整棵进程树一起收**（包括它自己拉起来的子进程）。\n"
+                "只在确定不要那个结果了才用它 —— 它是终止，不是暂停，收掉之后这条命令"
+                "的结果就永远不会有了（要就重新起一条）。\n"
+                "服务、watch 这类不会自己结束的任务，用完就该收掉：它们会一直占着端口和内存，"
+                "而会话结束时也会被收掉。\n"
+                "已经结束的任务不用收，用 job_output 取它的结果。"
+            ),
+            risk=RiskLevel.LOW,
+            args_model=JobKillArgs,
+            handler=jobs.kill,
+        ))
 
     # 提问工具。三条决定：
     #

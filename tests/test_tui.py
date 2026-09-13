@@ -251,6 +251,195 @@ def test_no_denominator_when_the_model_is_not_in_the_table():
     assert "/" not in right.split("·")[0]
 
 
+def test_the_jobs_block_says_what_is_still_hanging():
+    """左栏那块后台任务：**四档各有各的说法**，而"结果还没收"必须自己说出来。
+
+    它是这一栏里唯一对应着**活着的进程**的一块（任务列表过期只是信息旧，而后台任务
+    过期意味着"我以为已经收掉的服务还在占着端口"）。所以：
+
+      * 空态说清它是谁弄出来的（`shell_background`）；
+      * 右侧计数数的是**还没收场的条数**，不是"一共起过几条" —— 那一块要回答的问题
+        是"还有几件事悬着"；
+      * `uncollected`（跑完了、结果还没收）用 `waiting` 那档色，因为它是**唯一需要
+        动手的一档**。
+    """
+    state = view_state.ViewState(session_id="s")
+    title, count, lines = view_state.rail_blocks(state)[4]
+    assert (title, count) == ("后台任务", "")
+    assert [str(line) for line in lines] == [
+        "当前没有后台任务", "shell_background 起的会在这里"]
+
+    state.jobs = [
+        {"id": "1", "command": "npm run dev", "state": "running",
+         "seconds": 45, "exit_code": None},
+        {"id": "2", "command": "pytest -q", "state": "uncollected",
+         "seconds": 12, "exit_code": 0},
+        {"id": "3", "command": "echo hi", "state": "done",
+         "seconds": 1, "exit_code": 0},
+    ]
+    title, count, lines = view_state.rail_blocks(state)[4]
+    assert count == "2 / 3", "悬着的两条，而不是起了三条"
+    text = "\n".join(str(line) for line in lines)
+    assert "npm run dev" in text and "在跑 45s" in text
+    assert "结果还没收" in text
+    assert "已收" in text
+    # 只有"结果还没收"那一档抢眼睛。
+    roles = [role for line in lines for _text, role in line.segments]
+    assert roles.count(view_state.ROLE_WAITING) == 1
+
+
+def test_the_rail_summary_counts_outstanding_jobs(monkeypatch):
+    """收起上下文栏时那一行摘要也得说 —— 它是**窄屏上唯一还提这件事的地方**。"""
+    state = view_state.ViewState(session_id="s")
+    assert "后台" not in view_state.rail_summary(state)
+
+    state.jobs = [{"id": "1", "command": "npm run dev", "state": "running",
+                   "seconds": 3, "exit_code": None}]
+    assert "1 个后台任务" in view_state.rail_summary(state)
+
+    # 全收干净了也要留一句：**"起过又收干净了"和"从来没起过"是两件事**。
+    state.jobs = [{"id": "1", "command": "echo hi", "state": "done",
+                   "seconds": 1, "exit_code": 0}]
+    assert "都收过了" in view_state.rail_summary(state)
+
+
+def test_the_jobs_badge_is_the_one_that_survives_a_collapsed_rail():
+    """状态栏那枚徽标：**一件都不悬着时一格都不占**，悬着时它必须说清几件。
+
+    它存在的理由就是"上下文栏默认收起"—— 那个徽标是收起时唯一常驻的出口（宽屏上
+    连那一行摘要都不显示，见 `app._refresh_chrome`）。
+    """
+    state = view_state.ViewState(session_id="s")
+    assert state.jobs_badge() is None, "没有后台任务时不占格子"
+
+    state.jobs = [{"id": "1", "command": "npm run dev", "state": "running",
+                   "seconds": 3, "exit_code": None}]
+    badge = state.jobs_badge()
+    assert str(badge) == "后台 1"
+    assert badge.role == view_state.ROLE_PROCESS, "只在跑是正常状态，不该喊"
+
+    state.jobs.append({"id": "2", "command": "pytest -q", "state": "uncollected",
+                       "seconds": 9, "exit_code": 0})
+    badge = state.jobs_badge()
+    assert str(badge) == "后台 2 · 1 条待收"
+    assert badge.role == view_state.ROLE_WARN, "待收那一档是有人在等一个动作"
+
+    # 窄屏只留条数：右边是 `width: auto`，多出来的每一列都从左段身上扣。
+    assert str(state.jobs_badge(compact=True)) == "后台 2"
+
+    state.jobs = [{"id": "1", "command": "echo hi", "state": "done",
+                   "seconds": 1, "exit_code": 0}]
+    assert str(state.jobs_badge()) == "后台 1 已收"
+
+
+def test_apply_state_takes_jobs_and_reset_clears_them():
+    """后台任务那份面板数据**按会话走**，所以换会话时必须清掉。
+
+    漏了它的症状是最坏的一种：面板上留着一个**进程已经死了**的服务在"跑"
+    （上一个会话收尾时 `Runtime.close()` 把它杀了），而用户会照着它去查一个假问题。
+    """
+    state = view_state.ViewState(session_id="s")
+    message = {
+        "kind": "state",
+        "jobs": [{"id": "1", "command": "npm run dev", "state": "running",
+                  "seconds": 2, "exit_code": None}],
+    }
+    view_state.apply_state(state, message)
+    assert state.jobs == message["jobs"]
+    # **存的是副本**：那份消息是读线程放进来的，留着它的引用等于把界面状态和
+    # 一条已经处理完的消息绑在一起（`apply_state` 对别的列表也是这么做的）。
+    assert state.jobs[0] is not message["jobs"][0]
+
+    state.reset_for_session()
+    assert state.jobs == []
+    assert state.jobs_badge() is None
+
+
+@pytest.mark.anyio
+async def test_the_background_badge_really_reaches_the_status_bar(monkeypatch):
+    """徽标**真的画进状态栏了** —— `jobs_badge()` 返回一句话不等于它被渲染。
+
+    这条盯的是那句承诺本身："上下文栏收起时也看得见后台任务"。宽屏 + 收起时，
+    状态栏是**唯一**的出口（窄屏那一行摘要要 `narrow and not rail_open` 才显示）。
+    少接一根线，症状是"有任务在跑而界面上一个字都没有"，不会报任何错。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 30)) as pilot:
+        app._inbox.put(("message", _init_message("s")))
+        await _settle(app, pilot)
+
+        bar = app.query_one("#status", widgets_module.StatusBar)
+        _left, right = bar.render_parts(app.state, app.palette, (time.time(), 140))
+        assert "后台" not in str(right), "没有后台任务时一格都不占"
+
+        # 面板默认是收起的 —— 这正是这一条要验的前提。
+        assert app.state.rail_open is False
+
+        app._inbox.put(("message", {
+            "v": 1, "t": "ui", "kind": "state",
+            "jobs": [{"id": "1", "command": "npm run dev", "state": "running",
+                      "seconds": 12, "exit_code": None}],
+        }))
+        await _settle(app, pilot)
+
+        _left, right = bar.render_parts(app.state, app.palette, (time.time(), 140))
+        text = str(right)
+        assert "后台 1" in text
+        assert text.index("后台 1") < text.index("上下文"), \
+            "挨着成本那一段的左边（和 autopilot 徽标同一档：状态在前、账在后）"
+
+
+@pytest.mark.anyio
+async def test_the_tui_asks_for_a_fresh_snapshot_while_a_job_is_outstanding(monkeypatch):
+    """后台任务会在**没人在看的时候**结束 —— 界面得自己去问一次。
+
+    `ui(state)` 只在几条由交互触发的时刻发，所以一段安静时间里一条命令跑完了，
+    面板上还写着"在跑"：那句话是假的，方向和"把已启动当成已成功"相反，但同样是
+    "界面上写着的事实不成立"。
+
+    而它**只在真有东西悬着时才问**，还要节流 —— 没有理由的轮询会把"协议上每条消息
+    都有原因"这件事稀释掉，也把这条消息变成心跳。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 30)) as pilot:
+        app._inbox.put(("message", _init_message("s")))
+        await _settle(app, pilot)
+
+        def polls():
+            return [m for m in app._client.sent if m["t"] == "refresh_state"]
+
+        assert polls() == [], "没有后台任务时一次都不问"
+
+        app._inbox.put(("message", {
+            "v": 1, "t": "ui", "kind": "state",
+            "jobs": [{"id": "1", "command": "npm run dev", "state": "running",
+                      "seconds": 3, "exit_code": None}],
+        }))
+        await _settle(app, pilot)
+        assert polls(), "有东西悬着就该问一次"
+
+        # 节流：紧接着的几帧（50ms 一次 pump）不该再问 —— 间隔是 2 秒。
+        before = len(polls())
+        await _settle(app, pilot)
+        assert len(polls()) == before
+
+        # 全都收干净了就不再问。**这里把节流放开**，好证明"不问"是因为没东西悬着，
+        # 而不是因为还没到下一个间隔。
+        app._inbox.put(("message", {
+            "v": 1, "t": "ui", "kind": "state",
+            "jobs": [{"id": "1", "command": "npm run dev", "state": "done",
+                      "seconds": 3, "exit_code": 0}],
+        }))
+        await _settle(app, pilot)
+        app._last_state_refresh = 0.0
+        await _settle(app, pilot)
+        assert len(polls()) == before
+
+
 def test_the_permission_block_says_only_what_the_runtime_sent():
     """决策 14：**runtime 发什么显示什么**，界面不硬编码一份默认值。
 
@@ -1051,9 +1240,9 @@ async def test_arrows_move_the_cursor_then_fall_back_to_the_log(monkeypatch):
 
 @pytest.mark.anyio
 async def test_each_rail_block_has_a_left_colour_bar(monkeypatch):
-    """左栏每块左边一条色条 —— 眼睛顺着它就能看出"这一栏有四段"。
+    """左栏每块左边一条色条 —— 眼睛顺着它就能看出"这一栏有几段"。
 
-    颜色取**弱化过的主题描边色**（`rail_bar` = `line` 往底色压 30%）：四块各来一条
+    颜色取**弱化过的主题描边色**（`rail_bar` = `line` 往底色压 30%）：每块各来一条
     满血描边色会跟正文抢眼睛，而"锚点"该是安静的那一层。
     """
     from agent_runtime.frontends.tui import widgets as widgets_module
@@ -1067,7 +1256,7 @@ async def test_each_rail_block_has_a_left_colour_bar(monkeypatch):
         await pilot.pause()
 
         blocks = list(app.query(widgets_module.RailBlock))
-        assert len(blocks) == 4, "四块（任务/技能/权限/会话）"
+        assert len(blocks) == 5, "五块（任务/技能/权限/会话/后台任务）"
         expected = _hex_of(app.palette.rail_bar)
         for block in blocks:
             style, color = block.styles.border_left
@@ -1243,6 +1432,11 @@ class FakeClient:
 
     def ask_tools(self) -> None:
         self.sent.append({"t": "tools"})
+
+    def refresh_state(self) -> None:
+        # 后台任务悬着时界面会主动来问一次（见 `app._maybe_refresh_state`）——
+        # 替身要认这条消息，否则那条路一被走到就是 AttributeError。
+        self.sent.append({"t": "refresh_state"})
 
     def send(self, message: dict) -> None:
         """真客户端那一层的出口。**这里只记账**：替身不该去编信封（`v` 那一段）。"""

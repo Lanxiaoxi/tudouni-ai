@@ -262,6 +262,16 @@ class StatusBar(TwoPart):
         # 手写第二份角色到颜色的映射。
         right = Text("  ")
         right.append_text(paint(palette, state.autopilot_badge(narrow)))
+        # 后台任务那枚徽标**只在真有东西悬着时出现**（`jobs_badge` 返回 None 就是
+        # 一格都不占）—— 所以平时这一行和加这个功能之前一模一样。
+        #
+        # 它接在 autopilot 后面、成本那一段前面：左边三格是"接下来还会不会问你 /
+        # 你机器上还挂着什么"，右边那一长串是"这一轮花了多少"。前两者是**状态**，
+        # 后者是**账**，混在一起读不出层次。
+        badge = state.jobs_badge(narrow)
+        if badge is not None:
+            right.append("  ·  ", style=palette.ink4)
+            right.append_text(paint(palette, badge))
         right.append("  ·  " + state.status_right(now, compact=narrow),
                      style=palette.ink4)
         return (left, right)
@@ -1325,7 +1335,7 @@ class RailBlock(Vertical):
         self._data = (title, count, lines)
         text = f"{title} · {count}" if count else title
         # 标题**和正文同一档灰**（`ink4`）、不加粗：它说的是"这一块叫什么"，不是重点
-        # —— 四块标题都加粗发亮的话，这一栏里就有四个东西同时在抢眼睛。
+        # —— 每块标题都加粗发亮的话，这一栏里就有五个东西同时在抢眼睛。
         self._head.update(Text(text, style=palette.ink4))
         self._lines.update(paint_lines(palette, lines))
 
@@ -1334,13 +1344,16 @@ class RailBlock(Vertical):
 
 
 class ContextRail(VerticalScroll):
-    """左栏：**任务 / 已加载技能 / 权限范围 / 本次会话**（设计稿最值钱的加法）。
+    """左栏：**任务 / 已加载技能 / 权限范围 / 本次会话 / 后台任务**（设计稿最值钱的加法）。
 
-    这四块此前只有"另开一个终端"的出口（`--skills` / `--audit` / `--list`），
-    放进栏里之后"agent 为什么这么做""我现在放行了什么"变成常驻可见。
+    这几块此前只有"另开一个终端"的出口（`--skills` / `--audit` / `--list`；后台任务
+    连那个出口都没有 —— 它此前只存在于 `shell_background` 那条工具结果里），
+    放进栏里之后"agent 为什么这么做""我现在放行了什么""我机器上还挂着什么"变成常驻可见。
 
     **它默认收起**（决策 1），而"任务列表从无到有时自动顶开一次、之后听用户的"由
     `app.py` 每次刷新时问 `view_state.should_auto_open` —— 这个控件只负责画。
+    后台任务**不参与那个自动顶开**：起一个服务不该把栏从用户手里抢走，它的可见性由
+    状态栏那枚常驻徽标保证（`view_state.jobs_badge`）。
     """
 
     def __init__(self, palette: theme_mod.Theme, *args: Any, **kwargs: Any):
@@ -1356,7 +1369,7 @@ class ContextRail(VerticalScroll):
                           for title, count, lines in self._blocks])
         if signature != self._signature:
             # **只在内容变了才重建控件**：这个函数每次 pump 都会被调（50ms 一次），
-            # 重建四块会在视觉上闪、也会打断滚动位置。
+            # 重建整栏会在视觉上闪、也会打断滚动位置。
             self._signature = signature
             self.remove_children()
             self._widgets = []

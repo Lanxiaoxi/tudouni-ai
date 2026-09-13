@@ -52,6 +52,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from agent_runtime.process import terminate_tree
 from agent_runtime.tools.tool import InvalidArgsError, RiskLevel, Tool
 
 # 暴露给模型的工具名一律长这样：`mcp__<server>__<tool>`。
@@ -508,27 +509,16 @@ def _resolve_argv(server: McpServer) -> list[str]:
 def _terminate_tree(proc: subprocess.Popen) -> None:
     """强杀，而且**连子进程树一起收**。
 
-    Windows 上 `npx` 会再起一个 node：只杀 npx，那个 node 会变成孤儿继续活着，还占着
-    stdout 管道。`taskkill /T` 是 Windows 上收树的办法。
+    实现搬去了 `agent_runtime/process.py` —— 后台命令（`tools/builtin/jobs.py`）要的是
+    同一件事：Windows 上 `npx` 会再起一个 node、PowerShell 会再起一个子 shell，只杀
+    直接子进程留下的是孤儿，而它们还占着管道。**第四处要出现同一段 taskkill 时，它就该
+    只有一个来源**（tools/text.py 的 truncate 是同一个手法）。
 
-    **它不等**（等待由调用方统一做）：走到这里之前已经给过一次宽限了（关 stdin 之后
-    等 SHUTDOWN_GRACE_SECONDS），所以这里直接上硬的。收不掉也不能让退出流程崩 ——
-    它已经在 finally 里了。
+    这里留的是**门面**：名字没变（`close()` 直接 import 它，测试也是），而 MCP 这条
+    Popen 没带 `start_new_session`，所以 POSIX 那侧 process.py 会认出"它和我们同组"、
+    老老实实退回 `proc.kill()` —— 行为与搬家之前逐字节一致。
     """
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, check=False, timeout=10,
-            )
-            return
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-    try:
-        proc.kill()
-    except OSError:
-        pass
+    terminate_tree(proc)
 
 
 # --- 协议层：一个 server 之上的会话 --------------------------------------

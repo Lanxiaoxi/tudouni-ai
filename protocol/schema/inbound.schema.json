@@ -128,6 +128,25 @@
     },
     "required": ["v", "t"]
   },
+  "refresh_state": {
+    "summary": "请 runtime 回一份面板快照（出站的 `ui` / `kind=state`）。**空消息，没有参数。**",
+    "doc": [
+      "它存在的理由只有一个：**后台任务会在没人在看的时候改变状态**。",
+      "`ui(state)` 本来只在几条固定的时候发（开场、每次 tool_result、回合收尾、",
+      "几条命令之后），而这些时刻全都由**交互**触发 —— 一段没人说话的安静时间里，",
+      "一条两分钟的命令跑完了，面板却还写着「在跑」。",
+      "",
+      "所以这是**前端主动来问一次**，而不是给 runtime 加一个定时器或者监视线程",
+      "（后台任务那套东西刻意做到「零后台线程」，见 tools/builtin/jobs.py）。",
+      "前端只在**自己知道有东西悬着**的时候发它（TUI：`state.jobs` 里有",
+      "`running` / `uncollected`），而且要有节流 —— 它不该变成一个心跳。"
+    ],
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "refresh_state"}
+    },
+    "required": ["v", "t"]
+  },
   "shutdown": {
     "summary": "收摊。**当前这一轮会跑完**，不是打断它。",
     "fields": {

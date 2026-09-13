@@ -48,7 +48,11 @@ _UNSAFE_SUBSTRINGS = ("$(", "`", "${", ">", "<")
 #
 # 写成一张显式的表，而不是"参数名叫 command 就算"：判定要按工具来，而且加一个带命令
 # 的工具时必须在表里出现才会走命令规则 —— 凭空生效的规则比没有规则更难查。
-COMMAND_ARGUMENTS = {"shell": "command"}
+#
+# `shell_background` 在这里有一个具体的后果：**漏了它，同一个前缀规则对"前台跑的"生效、
+# 对"后台跑的"不生效** —— 用户写过 `pytest` 前缀放行，换一条后台命令却仍然被问。
+# 症状是"怎么又问我了"，而原因（少了一行表）从任何输出里都看不出来。
+COMMAND_ARGUMENTS = {"shell": "command", "shell_background": "command"}
 
 
 def _is_windows(windows: bool | None) -> bool:

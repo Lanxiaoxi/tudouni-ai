@@ -320,11 +320,12 @@ def test_init_carries_the_context_window(fake_openai):
 
 
 def test_the_state_snapshot_carries_the_rail_data(fake_openai):
-    """`t:"ui", kind:"state"` 是**左栏那四块的唯一数据来源**。
+    """`t:"ui", kind:"state"` 是**左栏那几块的唯一数据来源**。
 
-    任务列表和已加载技能住在子进程的 `session.metadata` 里，而 TUI 是另一个进程 ——
-    没有这条快照，设计稿里那块最值钱的加法就没有数据（它此前只有 `--skills` /
-    `--audit` / `--list` 三条"另开一个终端"的出口）。
+    任务列表和已加载技能住在子进程的 `session.metadata` 里，而后台任务住在**那张攥着
+    进程的表**里（它连 metadata 都进不去），而 TUI 是另一个进程 —— 没有这条快照，
+    设计稿里那块最值钱的加法就没有数据（它此前只有 `--skills` / `--audit` /
+    `--list` 三条"另开一个终端"的出口，后台任务连那个出口都没有）。
 
     开场那条**带可用技能清单**（要扫目录，所以只发一次），而且它排在 `init` /
     `session_load` 之后。
@@ -342,8 +343,11 @@ def test_the_state_snapshot_carries_the_rail_data(fake_openai):
     first = states[0]
     for key in ("todos", "skills", "risk_scope", "messages", "steps",
                 "granted_tools", "granted_prefixes", "denied_tools",
-                "skill_catalog"):
+                "skill_catalog", "jobs"):
         assert key in first, f"快照少了 {key}"
+    # 还没起过后台任务：那一格在，但是空的（**不是缺字段** —— 缺字段会让前端拿到
+    # `undefined`，而"没有"和"不知道"在界面上是两件事）。
+    assert first["jobs"] == []
 
     # 三个风险等级都在，而且处置是 runtime 算的（界面不认识"默认只有 low"）。
     assert {item["risk"] for item in first["risk_scope"]} == {"low", "medium", "high"}
@@ -1369,6 +1373,32 @@ def test_tools_lists_every_tool_with_its_permission(fake_openai):
     assert rows["shell"]["command"]
     assert rows["read_file"]["command"] is None
     assert rows["read_file"]["external"] is False
+
+
+def test_refresh_state_answers_with_a_fresh_panel_snapshot(fake_openai):
+    """`refresh_state` 是一条**空消息**，回包是又一份 `ui(state)`。
+
+    它存在的理由只有一个：**后台任务会在没人在看的时候改变状态** —— 一条两分钟的
+    命令跑完了，而 `ui(state)` 只在几条由交互触发的时刻发。所以界面得能主动问一次，
+    而不是等下一次工具调用。
+
+    这里钉两件事：**它答的是 `ui(state)`（不是 status/tools）**，以及它和开场那条
+    快照**带同一批键** —— 少一个键就等于让"安静时问来的那一份"和"平时那份"形状不同，
+    而前端只能按同一套代码吃它们。
+    """
+    base, _, _ = fake_openai
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "refresh_state"}, {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    opening = [m for m in kinds(got, "ui") if m.get("kind") == "state"][0]
+    refreshed = [m for m in kinds(got, "ui") if m.get("kind") == "state"][-1]
+    assert refreshed["jobs"] == []
+    assert set(opening) - {"skill_catalog"} <= set(refreshed), \
+        "后续快照和开场那条带同一批键（skill_catalog 只有开场有，那是有意的）"
 
 
 def test_set_model_switches_and_says_so(fake_openai):

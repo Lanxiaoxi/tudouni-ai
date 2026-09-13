@@ -281,6 +281,19 @@ class ProtocolClient:
         """
         self.send({"t": messages.IN_TOOLS})
 
+    def refresh_state(self) -> None:
+        """请 runtime **现在**重算一份面板快照（回包 `ui` / `kind=state`）。
+
+        它存在的理由只有一个：**后台任务会在没人在看的时候改变状态**。`ui(state)`
+        本来只在几条由交互触发的时刻发，而一段安静时间里一条命令跑完了，面板上还写着
+        "在跑" —— 那句话是假的。
+
+        **它不该被当成心跳。** 调用方只在"自己知道有东西悬着"时才发（TUI：`state.jobs`
+        里有 `running` / `uncollected`），而且要节流：这条消息本身不贵，但**没有理由**
+        的轮询会把"协议上每一条消息都有原因"这件事稀释掉。
+        """
+        self.send({"t": messages.IN_REFRESH_STATE})
+
     def shutdown(self) -> None:
         self.send({"t": messages.IN_SHUTDOWN})
 

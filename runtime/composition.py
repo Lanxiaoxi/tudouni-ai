@@ -57,6 +57,7 @@ from agent_runtime.skills import (
     catalog_part,
     skill_note,
 )
+from agent_runtime.process import job_object_problem
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.state import agents_md
 from agent_runtime.state import catalog
@@ -65,6 +66,7 @@ from agent_runtime.state import reasoning
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.builtin.grep import host_triple, rg_binary
+from agent_runtime.tools.builtin.jobs import JOBS_DIR_NAME, JobBoard, job_note, jobs_dir
 from agent_runtime.tools.builtin.todo import TodoBoard, progress_line, todo_note
 from agent_runtime.tools.builtin.webfetch import USER_AGENT, WebFetch
 from agent_runtime.tools.builtin.websearch import TavilySearch, WebSearch
@@ -450,6 +452,11 @@ class Runtime:
     # 插在中间会静默地把它们挪位。
     _http: httpx.Client | None = None
     _mcp: McpToolset | None = None
+    # 后台任务那张表。它和上面两个是同一类东西（进程级、必须显式收掉），但**只有它会
+    # 自己开进程** —— 所以 close() 里收不干净的话，留下的是用户机器上一直在跑的服务。
+    # 类型写成 Any 是因为 `Runtime` 不 import tools 那一层（依赖方向：runtime → tools
+    # 是允许的，但这里只需要"它有个 close()"这一个事实，写死类型没有收益）。
+    _jobs: Any = None
 
     # -- 模型（`/model`）--------------------------------------------------------
 
@@ -870,6 +877,29 @@ class Runtime:
                 f"随仓库一起被 clone 进来（见 config.McpConfig 上面的说明）。"
                 f"要用就把它挪到 {MCP_FILE}"))
 
+        # [后台] 两条，而且必须分开说 —— 它们的补救办法完全不同。
+        #
+        # 第一条：**上一个进程留下了没收掉的任务**。这意味着那次会话不是正常收场的
+        # （关掉了控制台窗口、或者被强杀），于是那几个进程**现在可能还在跑**，而本次
+        # 会话既看不到它们、也管不到它们。为什么不管：要管就得照着记下的 pid 去杀，
+        # 而 pid 会被复用 —— 认错了就是杀掉一个跟我们毫无关系的进程，那比留几个孤儿
+        # 坏得多。所以这里给的是"你自己去看一眼"，而不是一个我们不敢做的动作。
+        if self._jobs is not None and self._jobs.leftovers:
+            out.append(Notice("err", code="jobs", level="warn",
+                text=f"[后台] 上次会话留下了 {self._jobs.leftovers} 个后台任务的输出，"
+                f"已经清掉了。这说明那一次没有正常退出（关掉了窗口、或者进程被强杀），"
+                f"所以**那几个命令可能还在跑**，而它们不在这次会话的管辖里 —— "
+                f"如果端口或 CPU 对不上，自己确认一下。"))
+
+        # 第二条：**收树那层保证没建起来**（Windows 的作业对象）。它是"用户以为自己有"
+        # 的一层，所以静默降级等于骗人 —— 和 mcp.py 里"收不掉也要大声说"同一条。
+        # 没有它不等于一定会泄漏：正常退出、异常、Ctrl+C 都还能走 close()。
+        if (problem := job_object_problem()) is not None:
+            out.append(Notice("err", code="jobs", level="warn",
+                text=f"[后台] Windows 上那层「关掉窗口也把后台任务一起收掉」的保证没建起来"
+                     f"（{problem}）。正常退出仍然会收干净，但**强杀本进程时后台命令可能"
+                     f"变成孤儿**。"))
+
         if with_tools:
             out.append(Notice("out", code="tools", text="已注册工具:"))
             for tool in self.tools.all():
@@ -1037,7 +1067,7 @@ class Runtime:
         return agents_md.from_block(self.session.metadata.get(agents_md.SESSION_KEY))
 
     def ui_state(self, *, with_catalog: bool = False) -> dict[str, Any]:
-        """**面板数据**：左栏（上下文栏）那四块里，会话状态那一半。
+        """**面板数据**：左栏（上下文栏）那几块里，会话状态那一半。
 
         为什么它在装配层而不在协议层：任务列表和已加载技能住在
         `session.metadata` 里，而"用什么键、结构长什么样"是 `tools/builtin/todo.py`
@@ -1096,6 +1126,16 @@ class Runtime:
             "agents_md": agents_md.report_for_display(
                 md, relative_to=project_dir(),
             ),
+            # 后台任务。**这是这一屏里唯一"机器上真的有东西在跑"的一格** ——
+            # 任务列表是模型的主张，权限是配置，会话是记账，只有它对应着活着的进程。
+            #
+            # 快照里的每一行都是 `JobBoard.panel()` 算好的（含"结果还没收"那一档的
+            # 判定），界面照着渲染 —— 和上面 `risk_scope.disposition` 同一条规矩。
+            #
+            # 它**可能随时变**（一条命令自己跑完了），而这条快照本来就在每次
+            # `tool_result` 之后发一份；`panel()` 顺手 `poll()` 一遍，所以"跑完了"
+            # 这件事最迟在下一次工具返回时出现在界面上。
+            "jobs": self._jobs.panel() if self._jobs is not None else [],
         }
         if with_catalog:
             state["skill_catalog"] = [
@@ -1123,11 +1163,22 @@ class Runtime:
 
           * `http`：连接池里那些 keep-alive 的 socket 活到进程退出；
           * `mcp`：**是我们起的子进程** —— 漏了它，`npx` 起的 node 会活过这个进程
-            （见 `tools/mcp.py` 的 `_terminate_tree`）。
+            （见 `tools/mcp.py` 的 `_terminate_tree`）；
+          * `jobs`：**也是我们起的子进程，而且是用户会立刻注意到的那些** ——
+            一个没被收掉的 dev server 还占着端口，下一次启动就会报"端口被占用"，
+            而那时候已经没有任何线索指向"是上一次会话留下的"。
 
         收摊本身失败不该盖住"任务本身"的结果，所以 http 那条吞掉异常并说一声 ——
         和 `McpToolset.close()` 里那条规矩一致。
+
+        **jobs 排在最前面**：它是唯一"不收就会在用户机器上继续跑"的那一个，而上面两个
+        最多是占着内存/句柄。真出意外时，先保住那一个。
         """
+        if self._jobs is not None:
+            try:
+                self._jobs.close()
+            except Exception as exc:  # noqa: BLE001
+                _warn(f"收后台任务时出错：{type(exc).__name__}: {exc}")
         if self._http is not None:
             try:
                 self._http.close()
@@ -1381,6 +1432,18 @@ def open_runtime(
     http = httpx.Client(trust_env=False, headers={"User-Agent": USER_AGENT})
 
     mcp: McpToolset | None = None
+
+    # 后台任务那张表。**它只能在会话定下来之后造**（输出目录带会话 id），而且它是
+    # 这个装配里唯一**攥着进程**的东西 —— 所以它必须被 close() 收掉（见 Runtime.close）。
+    #
+    # 它在 try **外面**：`JobBoard.__init__` 会去清上一次留下的输出文件，而那件事
+    # 不碰任何进程、也不该因为后面装配失败而回滚（清掉是对的，留着才是垃圾）。
+    job_board = JobBoard(
+        project_dir(),
+        jobs_dir(project_dir() / RUNTIME_DIR_NAME, session_id),
+        show_root=f"{RUNTIME_DIR_NAME}/{JOBS_DIR_NAME}/{session_id}",
+    )
+
     try:
         tools = create_tool_registry(
             str(project_dir()),
@@ -1416,6 +1479,9 @@ def open_runtime(
             skills=booted.skill_catalog if booted.skill_catalog.skills else None,
             skill_metadata=session.metadata,
             skill_loader=booted.skill_loader,
+            # 后台命令那一组。和 todos 一样是按会话的状态，但它攥着进程 ——
+            # 所以只有它多一条"会话结束时必须收掉"的义务（见 Runtime.close）。
+            jobs=job_board,
         )
 
         # 外部 MCP server：连上、列工具、注册进同一个注册表。
@@ -1489,7 +1555,7 @@ def open_runtime(
             # 会话状态每轮都要重新贴在请求末尾（当前状态，不是让模型去翻历史找最近
             # 那一版）。注入的是一段"怎么说"的实现：Agent 自己不知道技能和任务列表
             # 长什么样 —— 它只知道"每次请求末尾要把当前会话状态贴上"。
-            session_notes=_session_notes(tools, booted.skill_catalog),
+            session_notes=_session_notes(tools, booted.skill_catalog, job_board),
             debug=debug,
             # autopilot 只管审批那一关：工作区边界、控制面写入、拒绝名单都在它管不着
             # 的地方，所以它不是"关掉权限"，只是"这一轮没人可问"。
@@ -1539,25 +1605,36 @@ def open_runtime(
         mcp_trust_group=mcp_trust_group,
         _http=http,
         _mcp=mcp,
+        _jobs=job_board,
     )
     return runtime
 
 
-def _session_notes(tools: Any, skill_catalog: SkillCatalog) -> Callable[[Any], str]:
-    """载荷尾部那段会话状态：技能目录 + 已加载技能的正文 + 任务列表。
+def _session_notes(
+    tools: Any, skill_catalog: SkillCatalog, jobs: JobBoard | None = None
+) -> Callable[[Any], str]:
+    """载荷尾部那段会话状态：技能目录 + 已加载技能的正文 + 任务列表 + 后台任务。
 
     合成**一条**临时消息（Agent 里 `_status_note` 负责合成，这里只负责"这一段说
     什么"）。顺序是刻意的，而且它只在这一个地方定：先目录（有哪些能用），再正文
-    （现在该按哪份做），最后任务列表（做到哪了）。倒过来的话，模型会先读到一份
-    "还剩什么活"的清单，再读到"该怎么做" —— 而它做决策的瞬间需要的是后者。
+    （现在该按哪份做），然后任务列表（做到哪了），最后后台任务（有哪些还悬着）。
+    倒过来的话，模型会先读到一份"还剩什么活"的清单，再读到"该怎么做" —— 而它做决策
+    的瞬间需要的是后者。
+
+    **后台任务排在最后是有理由的**：它是四段里唯一"不看就会出错"的一段（把一条还在跑
+    的命令当成已经成功，是这个功能唯一会静默出错的地方）。排在末尾意味着它离模型要
+    生成的那个 token 最近 —— 而载荷末尾正是整段对话里单价最贵、也是唯一该变化的位置。
 
     读的必须是 `tools.skills.catalog`（注册表上那个 board）而不是启动时那份快照：
     board 每次读都会重扫目录 —— 所以中途新加的技能下一轮就会出现在清单里，而且和
     "能不能加载"读到的是同一份事实。重扫在这个函数里**只做一次**（读到局部变量再
     分别渲染两段）：它每次读盘都会把每个技能文件读一遍，而它每一步都会被调一次。
 
-    三段都**不进 session.messages**（逐轮变化的东西不持久化，见 `agent._status_note`），
-    所以它必须只读 metadata + 技能目录，不做别的事。
+    四段都**不进 session.messages**（逐轮变化的东西不持久化，见 `agent._status_note`），
+    所以它必须只读 metadata + 技能目录 + 那张任务表，不做别的事。
+
+    `jobs` 是**唯一一个不是从 metadata 读出来的**：它攥着进程，落不了盘。所以它是从
+    装配那一层直接传进来的（和 `tools` 一样），而不是像任务列表那样从 metadata 里取。
     """
     def notes(metadata):
         board = tools.skills
@@ -1566,6 +1643,7 @@ def _session_notes(tools: Any, skill_catalog: SkillCatalog) -> Callable[[Any], s
             catalog_part(metadata, catalog),
             skill_note(metadata, catalog),
             todo_note(metadata),
+            job_note(jobs),
         )))
 
     return notes

@@ -70,6 +70,17 @@ _BAR = 1
 # 贴着边框，读起来像是"下面还有"。
 _PALETTE_MAX_ROWS = len(view_state.COMMANDS) + 3 + 1
 
+# **主动去问面板快照的间隔**（秒）。只在**有后台任务悬着**时才会用到 ——
+# 那些是唯一"会在没人在看的时候改变状态"的东西（一条两分钟的命令跑完了，而面板上
+# 还写着"在跑"，那句话就是假的）。
+#
+# 为什么是 2 秒而不是每次 pump（50ms）：那会变成每秒 20 条空消息的**心跳**，而这条
+# 消息存在的理由只是"安静的时候也有人问一句"。为什么不是 10 秒：一条跑完的命令要
+# 让人盯着假状态看十秒，而它本来就是个真状态。
+#
+# 平时（没有后台任务）这条消息**一次都不会发**，所以它不占任何常态成本。
+_STATE_REFRESH_SECONDS = 2.0
+
 
 def _version() -> str:
     """`pyproject.toml` 里的版本号，读不到就返回空串。
@@ -131,7 +142,7 @@ class TuiApp(App[None]):
     /* --- 主体：左栏 + 会话流 ---------------------------------------------- */
     #body { height: 1fr; }
     /* 滚动条：**设计稿里一条都没有**（沿右边缘取样：x2330→2382 是面板底、2382 就是
-       卡片边，再过去是页面底）。左栏直接不出 —— 那四块内容就那么多，真溢出了还有
+       卡片边，再过去是页面底）。左栏直接不出 —— 那几块内容就那么多，真溢出了还有
        `Ctrl+B` 和一行摘要那条路；会话流留 **1 格**中性滑块，因为长回合里"上面还有"
        这个事实需要一个出口，但它不该是原来那条 2 格宽的金色轨道。
        （Textual 默认 `scrollbar-size-vertical: 2`，滑块色由注册的 Textual 主题从
@@ -156,8 +167,8 @@ class TuiApp(App[None]):
     }
 
     /* 上下文栏的一块：**左边一条色条当视觉锚点**。
-       它是主题的 `line` 色（那正是这一套配色的"描边"角色）—— 四块共用一条竖线，
-       眼睛顺着它就能看出"这一栏有四段"，而不是靠空白去猜。 */
+       它是主题的 `line` 色（那正是这一套配色的"描边"角色）—— 每块共用一条竖线，
+       眼睛顺着它就能看出"这一栏有几段"，而不是靠空白去猜。 */
     .rail-block {
         margin-bottom: 1;
         height: auto;
@@ -465,6 +476,9 @@ class TuiApp(App[None]):
         # `ui state`（`_run_turn` 的 finally），而它可能排在我们那条回应前面 ——
         # 只认"值对上了"才不会把中间那条当成回应（见 `_report_autopilot`）。
         self._autopilot_wanted: bool | None = None
+        # 上一次主动问面板快照的时刻（`_maybe_refresh_state` 的节流）。0 表示还没问过
+        # —— 第一次遇到"有东西悬着"时应该**立刻**问一次，而不是等满一个间隔。
+        self._last_state_refresh = 0.0
         # 收到过多少块**思考链**。它只有一个用途：验收脚本要"等它开始流"——
         # 而 `state.stream_reasoning` 在回合收尾时会被清空，那时候它就答不出
         # "刚才到底流过没有"了。计数器只增不减，所以没有那个歧义。
@@ -602,6 +616,13 @@ class TuiApp(App[None]):
         """
         if not self.is_running:
             return
+        # 后台任务会在**没人在看的时候**改变状态（一条两分钟的命令跑完了），而
+        # `ui(state)` 本来只在几条由交互触发的时刻发 —— 所以这里主动去问一次。
+        #
+        # **只在真的有东西悬着时问，而且要节流**（见 `refresh_state_interval`）：
+        # 没有理由的轮询会把"协议上每一条消息都有原因"稀释掉，而平时（没有后台任务）
+        # 这条消息一次都不会出现。
+        self._maybe_refresh_state()
         while True:
             try:
                 kind, payload = self._inbox.get_nowait()
@@ -628,6 +649,39 @@ class TuiApp(App[None]):
 
     def _log(self) -> widgets.ConversationLog | None:
         return self._widget("#log", widgets.ConversationLog)
+
+    def _maybe_refresh_state(self) -> None:
+        """有后台任务悬着时，隔一会儿主动问一次面板快照。
+
+        ## 它补的是哪个洞
+
+        `ui(state)` 只在几条**由交互触发**的时刻发：开场、每条 `tool_result` 之后、
+        回合收尾、几条命令之后。于是有一段安静时间里面板是**不会更新**的 —— 而
+        **一条后台命令正好会在这段时间里跑完**。面板上那句"在跑"于是变成假话，方向
+        和"把已启动当成已成功"相反，但同样是"界面上写着的事实不成立"。
+
+        ## 判据是"有东西悬着"，不是"有后台任务"
+
+        全都收干净了就不用问了：那张表不会再变。所以平时这条消息一次都不发 ——
+        它不是一个心跳，而是一个**只在有理由的时候**才出现的询问（`state.jobs` 里
+        还有 `running` / `uncollected` 就是那个理由）。
+
+        它**不问"这一轮跑完了没有"**：那是 `run_finished` 那条事件的事，而且回合进行
+        中本来就有 `tool_result` 在推快照。这里只补安静那一段。
+        """
+        if self._client is None:
+            return
+        outstanding = any(
+            str(job.get("state", "")) in ("running", "uncollected")
+            for job in self.state.jobs
+        )
+        if not outstanding:
+            return
+        now = time.monotonic()
+        if now - self._last_state_refresh < _STATE_REFRESH_SECONDS:
+            return
+        self._last_state_refresh = now
+        self._client.refresh_state()
 
     # -- 上下栏（每次 pump 都刷一遍：状态栏要随秒走动） -----------------------
 

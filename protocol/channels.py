@@ -596,6 +596,16 @@ class ProtocolServer:
             self._send_tools()
             return True
 
+        if kind == messages.IN_REFRESH_STATE:
+            # **它不改任何东西，只是把当前那份快照再算一遍发出去。** 处理它的地方在
+            # 读循环那个线程 —— 而 `_state_message()` 本来就会被两个线程调
+            # （`on_event` 走回合线程），所以这里没有引入新的并发形态。
+            #
+            # 它**不带 `skill_catalog`**：那是开场那一条才给的（扫目录有代价），
+            # 和所有后续快照一样保住前端已经拿到的那一份（见 view_state.apply_state）。
+            self.send(self._state_message())
+            return True
+
         if kind == messages.IN_USER_MESSAGE:
             # 上一轮还没走完就先等它 —— 两条回合叠着跑会让事件顺序错乱，
             # 而"顺序"是这条协议唯一的同步手段。

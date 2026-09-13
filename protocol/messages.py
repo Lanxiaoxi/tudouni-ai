@@ -45,7 +45,7 @@ VERSION = 1
 # `_run_turn`）—— 所以"答案"这条老路一直是通的，delta 只是让它更早出现。
 PROTOCOL = 2
 
-# 入站（前端 → runtime）十三种。
+# 入站（前端 → runtime）十四种。
 IN_USER_MESSAGE = "user_message"
 IN_PERMISSION_RESPONSE = "permission_response"
 IN_QUESTION_RESPONSE = "question_response"
@@ -96,12 +96,21 @@ IN_STATUS = "status"
 # **请 runtime 回一份工具清单**（`/tools`）。和 `IN_STATUS` 同一条路：
 # 按需发，答案是 `t:"ui", kind:"tools"`。
 IN_TOOLS = "tools"
+# **请 runtime 回一份面板快照**（出站的 `ui`, kind:"state"）。**空消息，没有参数。**
+#
+# 它和上面两条的"按需"不是一回事，所以值得说清它为什么存在：`ui(state)` 本来只在
+# 几条由**交互**触发的时刻发（开场、每次 tool_result、回合收尾、几条命令之后），
+# 而**后台任务会在没人在看的时候改变状态** —— 一段安静时间里一条两分钟的命令跑完了，
+# 面板却还写着"在跑"，而那句话是假的（和"把已启动当成已成功"是同一类错误，只是方向
+# 相反）。所以让前端来问一次，而不是给 runtime 加定时器或监视线程：后台任务那套东西
+# 刻意做到"零后台线程"。
+IN_REFRESH_STATE = "refresh_state"
 IN_SHUTDOWN = "shutdown"
 
 INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
            IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SET_AUTOPILOT,
            IN_SET_MODEL, IN_SET_THINKING, IN_SET_EFFORT, IN_STATUS, IN_TOOLS,
-           IN_SHUTDOWN)
+           IN_REFRESH_STATE, IN_SHUTDOWN)
 
 # 出站（runtime → 前端）十一种。**`/status` 和 `/tools` 不在这里** —— 它们复用
 # `t:"ui"` 那条通道（多两种 `kind`），因为它们是"给界面看的东西"，性质和面板快照

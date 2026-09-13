@@ -542,6 +542,25 @@ def _stats_note(
     )
 
 
+def _report_jobs(runtime: Runtime) -> None:
+    """把后台任务打一行到 stderr；一个都不挂着就什么都不说。
+
+    和 `_report_todos` 同一条路（行式终端里没有常驻面板，所以每轮重打一遍），但**比它
+    要紧一档**：任务列表忘了更新只是信息旧了，而后台任务忘了收是**用户机器上一个还在
+    跑的进程** —— 它还占着端口，而"端口被占用"这句报错里没有任何线索指向"是上一次
+    会话留下的"。
+
+    数据从 `runtime._jobs`（那张表）现取，不由这里算。表不存在（老路径、测试）就什么都
+    不说 —— 和 `_report_todos` 在没有列表时的行为一致。
+    """
+    board = getattr(runtime, "_jobs", None)
+    if board is None:
+        return
+    line = board.progress_line()
+    if line:
+        print(f"[后台] {line}", file=sys.stderr)
+
+
 def _report_todos(session: Session, prefix: str = "[任务] ") -> None:
     """把当前任务列表打一行到 stderr；没有列表就什么都不说。
 
@@ -855,6 +874,7 @@ def run_repl(runtime: Runtime) -> None:
         # 步数用尽那条路仍然会说"接着跑：--session X"：那里的意思是"这一轮没走完"，
         # 和"你随时可以回来"是两件事，它每次也只在那一种情况下出现。
         _report_todos(session)
+        _report_jobs(runtime)
         print(f"\n（会话 {session_id!r}：{len(session.messages)} 条消息、"
               f"{session.step_count()} 步{_stats_note(sink, session, context_tokens)}。）\n",
               file=sys.stderr)

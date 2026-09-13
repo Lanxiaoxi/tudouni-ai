@@ -127,7 +127,7 @@
       "kind": {
         "type": "string",
         "enum": ["run_finished", "state", "status", "tools"],
-        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/messages/steps/model）；status = `/status` 要的那一屏（回答入站的 status）；tools = `/tools` 的清单（回答入站的 tools）。四种都**不进审计**。"
+        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/jobs/agents_md/messages/steps/model）；status = `/status` 要的那一屏（回答入站的 status）；tools = `/tools` 的清单（回答入站的 tools）。四种都**不进审计**。"
       },
       "answer": {
         "type": "string",
@@ -148,6 +148,14 @@
       "skill_catalog": {
         "type": "array",
         "doc": "**只有 kind=state 有**。这次启动时工作区里**可用**的技能清单：`[{\"name\": \"...\", \"description\": \"...\"}]`。它只在第一条快照里给（目录扫描有代价，而它几乎不变）。"
+      },
+      "jobs": {
+        "type": "array",
+        "doc": "**只有 kind=state 有**。后台任务（`shell_background` 起的那几条）：`[{\"id\": \"...\", \"command\": \"...\", \"state\": \"running|uncollected|done|killed\", \"seconds\": 45, \"exit_code\": 0|null}]`。**没完的排在前面**，`state` 由 runtime 算好（界面照着渲染 —— \"什么样的组合算结果还没收\"不该有第二份定义）。它是这一屏里唯一对应着**活着的进程**的一格。"
+      },
+      "agents_md": {
+        "type": "array",
+        "doc": "**只有 kind=state 有**。这个会话的 system 消息里那份 `AGENT.md` 的去向：`[{\"path\": \"AGENT.md\", \"lines\": 12, \"status\": \"loaded|failed\", \"problem\": \"...\"}]`。**它读会话、不重读盘** —— 恢复旧会话时它说的必须是那份旧提示词里的事。"
       },
       "risk_scope": {
         "type": "array",
