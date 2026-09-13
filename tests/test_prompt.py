@@ -11,6 +11,8 @@
 """
 
 import platform
+from contextlib import contextmanager
+from pathlib import Path
 
 import httpx
 import pytest
@@ -22,6 +24,7 @@ from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.state import session as session_module
 from agent_runtime.state.session import SYSTEM_PROMPT_PATH, load_system_prompt
 from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.builtin.jobs import JobBoard
 from agent_runtime.tools.tool import RiskLevel
 from agent_runtime.tools.builtin.webfetch import WebFetch
 from agent_runtime.tools.builtin.websearch import Findings, Hit, WebSearch
@@ -100,6 +103,21 @@ def overlapping_phrases(text: str, other: str, n: int = MIN_SHARED_PHRASE) -> li
     ]
 
 
+def without_tool_names(text: str, names: list[str]) -> str:
+    """把工具名抠掉再比 —— **工具名不是"被复述的事实"**。
+
+    提示词必须点名工具（"用 grep 别用 shell"），而工具描述里当然也有自己的名字。
+    于是 `shell_background` 这 16 个字本身就够长，会把 12 字那道门槛直接顶穿：
+    " shell_backg"、"shell_backgr"…… 一路报下去，而它们一个字的信息都没重复。
+
+    抠掉是安全的：两边同时少掉同一个名字，不会凭空造出一段新的重合（剩下的碎片
+    比 12 字短得多）。
+    """
+    for name in names:
+        text = text.replace(name, "")
+    return text
+
+
 def test_overlap_checker_rejects_a_pasted_phrase():
     """先证明检查器本身有效 —— 否则下面那条可能是在跑一个永远为真的断言。"""
     pasted = "整个文件会被替换，不是追加"
@@ -117,13 +135,22 @@ def test_prompt_does_not_restate_tool_descriptions():
     删掉重复**不等于删掉信息**：工具描述在请求的 tools 数组里，提示词在 system
     消息里，两者每次都一起发出去。事实只换了个位置，而且换到了模型决定要不要调这
     个工具时更近的地方。
+
+    **量的是 `full_registry()` 而不是 `create_tool_registry(".")`**（后台命令那四个
+    加进来时这里就漏了一次：裸注册表里没有它们，于是新加的那一节提示词**根本没被
+    比对过**）。一条只管一部分工具的检查，和没有这条检查的区别只是"让人以为有"。
     """
     prompt = load_system_prompt()
-    violations = [
-        f"  {tool.name}: {phrase!r}"
-        for tool in create_tool_registry(".").all()
-        for phrase in overlapping_phrases(prompt, tool.description)
-    ]
+    with full_registry() as registry:
+        names = [tool.name for tool in registry.all()]
+        bare_prompt = without_tool_names(prompt, names)
+        violations = [
+            f"  {tool.name}: {phrase!r}"
+            for tool in registry.all()
+            for phrase in overlapping_phrases(
+                bare_prompt, without_tool_names(tool.description, names)
+            )
+        ]
 
     assert not violations, "提示词复述了工具描述：\n" + "\n".join(violations)
 
@@ -150,7 +177,7 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     prompt = load_system_prompt()
 
     # 断言钉的是**事实还在不在**，引用的措辞跟着提示词走。提示词是给人读、给人改的文本，
-    # 「改一次措辞就红一次」的测试只会被顺手改掉，保护不了下面这五件事 —— 而它们没有
+    # 「改一次措辞就红一次」的测试只会被顺手改掉，保护不了下面这几件事 —— 而它们没有
     # 别的地方可住（每一条的理由见 docstring）。
     assert "需要审批的工具由 runtime 拦截并询问用户" in prompt      # 批准机制
     assert "文件工具只能访问工作区" in prompt                      # 权限范围（限定在文件工具）
@@ -170,6 +197,20 @@ def test_prompt_carries_the_rules_no_tool_description_can_carry():
     # 另一半。
     assert "标「已完成」的依据是工具结果" in prompt
     assert "不要念给用户听" in prompt
+    # 后台任务那三条也只能住在这里，而且各自讲的是**两个东西之间**的关系：
+    #
+    #   * 「只在你另有活可干时才划算」是 shell 和 shell_background 之间的取舍 ——
+    #     两边的描述都只会讲自己该什么时候被用（那正是它们各自该干的事）；
+    #   * 「收尾之前过一遍」是**这一轮的收尾**和**机器上还挂着什么**之间的关系 ——
+    #     没有任何一个工具的描述担得起"你这一轮该结束了，先回头看一眼"。
+    #
+    # 而「没收到结果之前不许写成成功」更要紧一档：它是**最终答复**和一条还没收回来的
+    # 命令之间的关系，也是这个功能唯一会静默出错的地方（把"已启动"读成"已通过"）。
+    # 它不放进这里的话，工具描述那份仍然在（每轮都发），但"写最终答复时该守什么"
+    # 这件事就没有第二道防线了。
+    assert "后台只在**你手上另有活可干**时才划算" in prompt
+    assert "一轮收尾之前用 job_list 过一遍" in prompt
+    assert "没收到结果之前，不许把它写成成功" in prompt
 
 
 # --- 提示词里的能力枚举 vs 注册表：两份事实必须对得上 ---------------------
@@ -203,7 +244,14 @@ _CAPABILITY_TOOLS = {
 # ask_user 也在这里：它不碰工作区，所以"文件工具的三种能力"里没有它那一格；
 # 但提示词里确实有它的用法约束（见 test_prompt_carries_the_rules...）。
 # todo_write 同理：它是进度，不是文件操作。
-_NON_FILE_TOOLS = {"get_current_time", "shell", "ask_user", "todo_write"}
+#
+# 后台命令那四个也一样：**它们不是"某一类活"，是"同一种活的另一种干法"**
+# （起一条命令，只是不等它）—— 所以它们不进能力枚举（那枚举回答的是"这件事该用
+# 哪个工具"，而这里回答的是"这条命令该怎么起"），但提示词里确实有它们的纪律。
+_NON_FILE_TOOLS = {
+    "get_current_time", "shell", "ask_user", "todo_write",
+    "shell_background", "job_output", "job_list", "job_kill",
+}
 
 
 def _fake_fetch() -> WebFetch:
@@ -219,15 +267,35 @@ def _fake_search() -> WebSearch:
     return WebSearch(lambda query, max_results: Findings(hits=[Hit("t", "https://x/")]))
 
 
-def registered_tools() -> set[str]:
-    """**装配齐全的那份注册表**，联网工具也在里面。
+@contextmanager
+def full_registry():
+    """**装配齐全的那份注册表**，联网工具和后台命令都在里面。
 
-    刻意不是 `create_tool_registry(".")`：那两个工具默认不注册（缺 provider / 缺密钥
-    就不该出现），而下面三条要量的正是"提示词点名了的能力，注册表里到底有没有对应工具"。
-    拿一份少了两个工具的注册表去量，量出来的"没有对应工具"是假的 —— 它会逼着提示词
-    **不要**提联网，而那恰好是反的。
+    刻意不是 `create_tool_registry(".")`：那几个工具默认不注册（缺 provider / 缺密钥
+    就不该出现；后台命令那一组要一张攥着进程的表），而这个文件里几条测试要量的正是
+    "提示词点名了的能力，注册表里到底有没有对应工具""提示词有没有复述哪个工具的描述"。
+    拿一份少了几个工具的注册表去量，前者的"没有对应工具"是假的（它会逼着提示词
+    **不要**提联网，而那恰好是反的），后者则是**整块提示词根本没被比对过**。
+
+    **反面教训就在这里**：后台命令那四个加进来的时候，量尺没跟着补 `jobs=`，
+    于是"能力枚举 ↔ 注册表"那三条和上面那条"不许复述工具描述"**静默地不再覆盖它们**
+    —— 测试全绿，覆盖没了。所以现在只有这一个地方造注册表，两个消费者共用它。
 
     这里的 backend 是假的、client 走 MockTransport：这一整个文件不该打任何网络。
+    后台那张表**不会真起进程**（这些测试一条命令都不跑），`root` 给的是一个不存在的
+    路径 —— 只为装上工具，不碰磁盘。
+    """
+    board = JobBoard(Path("."), Path("no-such-jobs-dir"))
+    try:
+        yield create_tool_registry(
+            ".", web_fetch=_fake_fetch(), web_search=_fake_search(), jobs=board,
+        )
+    finally:
+        board.close()
+
+
+def registered_tools() -> set[str]:
+    """那份齐全的注册表里的工具名。见 `full_registry` 的 docstring。
 
     **grep 是唯一按平台条件注册的工具**（引擎是随仓库带的 ripgrep，只在支持的平台上
     注册，见 tools/builtin/grep.py 的 `_TRIPLES`）。所以下面三条里凡是带 "搜文本" 的
@@ -235,11 +303,8 @@ def registered_tools() -> set[str]:
     tools/vendor/rg/README.md）和**缺件**（跑 `scripts/fetch_rg.py` 就行）——
     tests/test_grep.py 里那条 gate 测试量的正是这一件事。
     """
-    return {
-        tool.name for tool in create_tool_registry(
-            ".", web_fetch=_fake_fetch(), web_search=_fake_search(),
-        ).all()
-    }
+    with full_registry() as registry:
+        return {tool.name for tool in registry.all()}
 
 
 def test_the_prompt_only_names_capabilities_that_have_a_tool():
@@ -343,6 +408,33 @@ def test_no_web_tools_means_no_web_advice_in_the_shell_description():
 
     assert "fetch_web" not in description
     assert "curl" not in description
+
+
+def test_the_background_rules_also_live_in_the_tool_descriptions():
+    """提示词那一节**只对新建的会话生效**，所以删掉的每条纪律都得在描述里有落点。
+
+    这是上面那段「一条规矩两个落点」的第二个例子（第一个是"不要拿 curl 抓网页"），
+    而这次的方向正好相反、理由却是同一个：`## 后台任务` 那一节原先写的是工具契约的
+    副本（`test_prompt_does_not_restate_tool_descriptions` 逐字指了出来），删掉重复
+    之后，**被删的每一条都必须已经在描述里** —— 否则这次"优化"就是把几条纪律从老会话
+    眼前拿走了：它们的 system 消息里没有新提示词，能看到的只有描述。
+
+    四条落在**不同**的工具描述里（起的那条、看的那条），所以分别核对：
+    """
+    with full_registry() as registry:
+        started = registry.get("shell_background").description
+        listed = registry.get("job_list").description
+        collected = registry.get("job_output").description
+
+    # 只在另有活可干时才划算 —— 否则多绕一次往返。
+    assert "什么也没省下" in started
+    # 跑着的时候别改它当输入读的文件（服务类反过来，描述里也写着）。
+    assert "不要改它当作输入读的文件" in started
+    # 收尾之前过一遍：结果没收的收掉、服务用完就收。
+    assert "收尾" in started and "收尾" in listed
+    # 没收到结果就不算成功 —— 这一条是那个功能唯一会静默出错的地方。
+    assert "绝不要说它成功了" in started
+    assert "它结束了才叫结果" in collected
 
 
 def test_missing_prompt_file_gives_an_actionable_error(workdir):
