@@ -13,16 +13,40 @@ import time
 
 import pytest
 
+from agent_runtime.frontends.tui import theme as theme_mod
+from agent_runtime.frontends.tui import view_state
+from agent_runtime.protocol import state as agent_state
+
+
+def _think_lines(turn) -> list:
+    """回合里那些**思考过程的行**（折叠的块头，或者铺开的块头）。
+
+    **判据是那行文字里有"思考过程"，不能只看 `ROLE_THINK_HEAD`** —— 回合头底下那行
+    `  > 用户说的话` 用的是同一个 role（它和思考块头一样，都是"不抢眼的引导行"）。
+    只看 role 的话，每一条断言都会拿到用户在回合里说的第一句话，而失败信息看起来
+    完全无关（实测踩过）。
+    """
+    out = []
+    for chunk in turn.chunks:
+        for line in getattr(chunk["block"], "lines", []):
+            if "思考过程" in str(line):
+                out.append(line)
+    return out
+
+
+def _think_blocks(turn) -> list:
+    """回合里那些**思考块**（折着或铺着，判据同上）。"""
+    return [chunk for chunk in turn.chunks
+            if any("思考过程" in str(line)
+                   for line in getattr(chunk["block"], "lines", []))]
+
+
 # `run_test()` 是 async 的，而项目里**不装 pytest-asyncio** —— anyio 的 pytest 插件
 # 已经够用（它是 textual 的传递依赖，不额外增加负担）。anyio 默认会跑所有后端
 # （包括 trio，而 trio 没装），所以钉死成 asyncio。
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
-
-from agent_runtime.frontends.tui import theme as theme_mod
-from agent_runtime.frontends.tui import view_state
-from agent_runtime.protocol import state as agent_state
 
 
 # --- 第一层：纯函数 -----------------------------------------------------------
@@ -649,6 +673,12 @@ def test_the_thinking_block_is_a_quote():
     两根一起才像一个块。这条钉的是行那一半：竖线单独一档颜色（`ROLE_QUOTE` →
     主题的 `line`），正文仍是 `ROLE_THINK_BODY`。**折叠/展开两条路径用的是同一个
     构造函数**（`quote_line`）—— 各写一遍的话，反复按 `Ctrl+T` 会长出两种长相。
+
+    **换行会被丢掉**（`thinking_body`）—— 这一条有具体来路：流式收到的思考链是
+    一块一个词、每块自带换行，逐行存的话展开时是**一个词一行**（实测：401 字符的
+    思考过程竖着排了 100 多行）。而**"丢换行"不等于"按空白重新切分"**：
+    分块本身就带着它要的空格（"The" + " user"），拿 `" ".join(text.split())` 去压
+    会把那些空格一起吃掉（"Theuser"，实测踩过）。所以这里断言的是"两行首尾相接"。
     """
     line = view_state.quote_line("先读 view_state。")
     assert str(line).startswith(view_state.QUOTE_BAR)
@@ -660,7 +690,27 @@ def test_the_thinking_block_is_a_quote():
         "kind": "model_call", "run_id": "r1", "status": "ok",
         "duration_ms": 5, "reasoning": "甲\n乙"})
     body = [line for line in lines if line.role == view_state.ROLE_QUOTE]
-    assert [str(line) for line in body] == ["  │ 甲", "  │ 乙"]
+    assert [str(line) for line in body] == ["  │ 甲乙"], \
+        "思考链是一个词一行来的，展开时必须是一段（否则读不了）"
+
+    # 而词与词之间的空格是**分块自己带的**，压平不该碰它。
+    assert view_state.thinking_body("The\n user\n says\n") == [
+        "  │ The user says"]
+
+
+def test_the_folded_thinking_line_has_one_source():
+    """折叠那一行（`▸ 思考过程（N 字符 · Ctrl+T 展开）`）**三个地方要一致**。
+
+    首屏（非流式）、`Ctrl+T` 收起、流式收尾 —— 三处各写一遍的话，展开再折叠之后
+    字数口径能不能对上全靠运气，而那种不一致只有反复按 `Ctrl+T` 才看得见。
+    """
+    folded = view_state.folded_thinking("一二三四五")
+    assert str(folded) == "  ▸ 思考过程（5 字符 · Ctrl+T 展开）"
+    assert folded.role == view_state.ROLE_THINK_HEAD
+
+    expanded = view_state.expanded_thinking_head()
+    assert str(expanded) == "  ▾ 思考过程（展开 · Ctrl+T 收起）"
+    assert expanded.segments[1][1] == view_state.ROLE_RULE
 
 
 def _welcome_text(app) -> str:
@@ -1107,9 +1157,11 @@ class FakeClient:
 
     exit_code = 0
 
-    def __init__(self, hooks, *, session=None, autopilot=False, stderr_to=None):
+    def __init__(self, hooks, *, session=None, autopilot=False, debug=False,
+                 stream=True, stderr_to=None):
         self.hooks = hooks
         self.session = session
+        self.stream = stream
         self.sent: list[dict] = []
         self.started = False
         self.closed = False
@@ -1405,9 +1457,10 @@ async def test_slash_commands_do_not_reach_the_runtime(monkeypatch):
 def _init_message(session_id: str, **overrides) -> dict:
     """一条 `init`。字段照 `protocol/schema/outbound.schema.json`。"""
     return {
-        "v": 1, "t": "init", "protocol": 1,
+        "v": 1, "t": "init", "protocol": 2,
         "session_id": session_id, "resumed": False,
         "model": "fake", "workspace": "C:/w", "max_steps": 80,
+        "stream": False,
         "context_tokens": 1_000_000, "tools": [], "permissions": {},
         "audit_path": f"C:/w/.toudouni/logs/{session_id}.jsonl", "notices": [],
         **overrides,
@@ -1558,6 +1611,317 @@ async def test_resetting_for_a_session_keeps_the_ui_switches(monkeypatch):
             value = getattr(app.state, field)
             assert not value, f"{field} 里还留着上一个会话的东西：{value!r}"
         assert app.state.steps == 0 and app.state.messages == 0
+
+
+# --- 流式（`t:"delta"` / `t:"delta_reset"`）-----------------------------------
+
+def _delta_msg(app, text: str, *, channel: str = "text", step: int = 1,
+               run_id: str = "r1") -> dict:
+    return {
+        "v": 1, "t": "delta", "session_id": app.state.session_id,
+        "run_id": run_id, "step": step, "channel": channel, "text": text,
+        "reset": False,
+    }
+
+
+def _delta(app, text: str, *, channel: str = "text", step: int = 1,
+           run_id: str = "r1") -> None:
+    app._inbox.put(("message", _delta_msg(app, text, channel=channel, step=step,
+                                          run_id=run_id)))
+
+
+def _reset(app, *, step: int = 1, run_id: str = "r1") -> None:
+    app._inbox.put(("message", {
+        "v": 1, "t": "delta_reset", "session_id": app.state.session_id,
+        "run_id": run_id, "step": step,
+    }))
+
+
+@pytest.mark.anyio
+async def test_streamed_text_accumulates_and_renders_as_markdown(monkeypatch):
+    """逐字来的正文进**流式那一版** Markdown 块，而且累计按 `run_id` 记着。
+
+    两件事一起钉，因为它们是"流式这一段真的接上了"的两个必要条件：
+      * 屏幕上有个正文块（`StreamAnswerBlock`，不是一次性的 `AnswerBlock`）；
+      * `state.stream_text` 攒着**这一轮的全文** —— 收尾时就是靠它判断"答案要不要
+        再画一遍"（见下一条）。少了它，那个判据只能退回"收到过 delta 没有"，
+        而那个判据在一轮里一个正文块都没吐的时候是错的。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=True)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "写点东西"})
+        await _settle(app, pilot)
+
+        for piece in ("# 标题\n", "\n正文 **加粗**。\n"):
+            _delta(app, piece)
+            await _settle(app, pilot)
+
+        assert app.state.stream_text == "# 标题\n\n正文 **加粗**。\n"
+        blocks = list(app.query(widgets_module.StreamAnswerBlock))
+        assert len(blocks) == 1, "同一段正文只该有一个流式块"
+        assert not list(app.query(widgets_module.AnswerBlock)), \
+            "流式那段不该用一次性的 AnswerBlock（那个喂不了第二块）"
+
+        # 子控件是异步挂的，等它长出来再断言。
+        #
+        # **每一块 delta 只按它自己那一段解析**（`Markdown.append` 的语义是"接着
+        # 上次解析到的地方往下解析"），所以这里喂的是**整行整块**的片段（标题那条
+        # 自带换行）。一个 `#` 单独来、标题的字下一块才到，解析器只会先看到一个
+        # 段落 —— 那是流式的正常中间态，不是 bug（第一次渲染出来的是"未完成的
+        # Markdown"，收尾时最后一块会把它补齐）。
+        for _ in range(20):
+            if len(blocks[0].children) >= 2:
+                break
+            await pilot.pause()
+        kinds = [type(child).__name__ for child in blocks[0].children]
+        assert "MarkdownH1" in kinds, f"流式正文没被解析成 Markdown：{kinds}"
+        assert "MarkdownParagraph" in kinds, f"段落也该在：{kinds}"
+
+
+@pytest.mark.anyio
+async def test_the_final_answer_is_not_drawn_a_second_time_after_streaming(monkeypatch):
+    """**流过了就不再画第二份。**
+
+    `ui(run_finished)` 照样带完整答案（协议不变、老前端靠它），而流式那一轮里
+    它已经在屏幕上了。再画一遍的话，用户看到的是同一段回答连着出现两次 ——
+    而它看起来像模型说了两遍，不像协议发重了。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=True)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "你好"})
+        _delta(app, "你好，我是 agent。")
+        await _settle(app, pilot)
+
+        app._inbox.put(("message", {
+            "v": 1, "t": "ui", "kind": "run_finished", "run_id": "r1",
+            "answer": "你好，我是 agent。",
+        }))
+        await _settle(app, pilot)
+
+        assert not list(app.query(widgets_module.AnswerBlock)), \
+            "流过的答案不许再画一遍"
+        # 但答案照旧按 run_id 记着（`/history` 那类和 verify 脚本看的是它）。
+        assert app.state.answers["r1"] == "你好，我是 agent。"
+        # 累计清干净了：下一轮不该捡到这一轮的字。
+        assert app.state.stream_text == ""
+
+
+@pytest.mark.anyio
+async def test_a_retry_discards_the_half_written_answer_on_screen(monkeypatch):
+    """`t:"delta_reset"` 把这一步画出来的那半截**整块拿掉**。
+
+    屏幕上留着它、而会话历史里查不到它，是流式这一版最容易让人困惑的状态
+    （"我刚才明明看到它说了那句话"）。所以那条消息到达时界面要真的清掉，
+    而且**只清这一步**：前几步已经定下来的内容不在重试范围内。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=True)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "你好"})
+        _delta(app, "半截的回答")
+        await _settle(app, pilot)
+        assert list(app.query(widgets_module.StreamAnswerBlock))
+
+        _reset(app)
+        await _settle(app, pilot)
+
+        assert not list(app.query(widgets_module.StreamAnswerBlock)), \
+            "重试之前那半截必须从屏幕上消失"
+        assert app.state.stream_text == ""
+
+        # 重试之后新的一段照常画。
+        _delta(app, "完整的回答")
+        await _settle(app, pilot)
+        assert app.state.stream_text == "完整的回答"
+
+
+@pytest.mark.anyio
+async def test_a_reset_for_another_step_or_run_does_not_touch_the_screen(monkeypatch):
+    """reset 的判据是 **(run_id, step) 都要对上**。
+
+    只按 run_id 清的话，第 2 步的重试会把第 1 步那句"我看看文件"也抹掉 ——
+    屏幕上少了内容，而历史上还在。反过来（只按 step）在连开两轮时会清错回合。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=True)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "看看目录"})
+        _delta(app, "我看看。", step=1)
+        await _settle(app, pilot)
+
+        # 别的回合、别的步：都不该动它。
+        _reset(app, step=2)
+        _reset(app, run_id="r-other", step=1)
+        await _settle(app, pilot)
+
+        assert list(app.query(widgets_module.StreamAnswerBlock)), \
+            "不属于这一步的 reset 不该动屏幕上的东西"
+        assert app.state.stream_text == "我看看。"
+
+
+@pytest.mark.anyio
+async def test_think_deltas_go_to_their_own_block(monkeypatch):
+    """思考链走 `reasoning` 通道，落在**带底色的那一块**里，不混进正文。
+
+    两条通道的内容都是字符串，混错的症状是"答案里混进了一段自言自语" ——
+    看起来像模型的问题，不像协议分错了。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=True)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "42?"})
+        _delta(app, "先算一下", channel="reasoning")
+        _delta(app, "答案是 42", channel="text")
+        await _settle(app, pilot)
+
+        turn = app.query_one(widgets_module.ConversationLog).current_turn_block
+        assert turn is not None
+        # `plain` 那一块是回合头底下那行"用户说的话"（`run_started` 画的），
+        # 它不属于讨论范围 —— 这里看的是流式那两块的位置关系。
+        streamed = [chunk["kind"] for chunk in turn.chunks
+                    if chunk["kind"] in ("think", "answer")]
+        assert streamed == ["think", "answer"], f"两块各归各的：{streamed}"
+        assert app.state.stream_reasoning == "先算一下"
+        assert app.state.stream_text == "答案是 42"
+        # 思考链的字不该出现在流式正文块里。
+        assert turn.chunks[-1]["kind"] == "answer"
+        assert "先算一下" not in str(getattr(turn.chunks[-1]["block"], "_markdown", ""))
+
+
+@pytest.mark.anyio
+async def test_think_deltas_do_not_become_one_line_per_word(monkeypatch):
+    """**一个词一行的 bug**（实测踩过，用户看出来的）。
+
+    provider 吐思考链时一块往往就是一个词，而每一块还自带一个换行 ——
+    逐块 `splitlines()` 再 `append()` 的结果是界面上竖着排 100 多行
+    （"The / user / says / ..."）。所以思考链那一块**只有两行**：块头 + 这一段。
+
+    正文那条通道**不能**这么压：它是 Markdown 源文，换行是有意义的语法。
+    两个方向一起钉，免得"修好了思考链、弄坏了正文"。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=True)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "你好"})
+        # 照真实的形状来：一块一个词、每块一个换行，而且**词前那个空格跟着前一块
+        # 走**（真网关就是这样）。
+        for piece in ("The\n", " user\n", " says\n", ' "hi".\n'):
+            _delta(app, piece, channel="reasoning")
+        _delta(app, "# 标题\n", channel="text")
+        await _settle(app, pilot)
+
+        turn = app.query_one(widgets_module.ConversationLog).current_turn_block
+        think = [c for c in turn.chunks if c["kind"] == "think"][0]["block"]
+        assert len(think.lines) == 2, \
+            f"思考链该是「块头 + 一段」，实际 {len(think.lines)} 行：{think.lines!r}"
+        assert str(think.lines[1]) == f"{view_state.QUOTE_BAR}The user says \"hi\"."
+
+        # 正文那一块仍然按 Markdown 源文走（换行没被压掉）。
+        answer = [c for c in turn.chunks if c["kind"] == "answer"][0]["block"]
+        assert "# 标题" in answer._text and "\n" in answer._text
+
+
+@pytest.mark.anyio
+async def test_the_streamed_thinking_is_folded_back_when_the_turn_ends(monkeypatch):
+    """一轮结束：铺开的思考过程**收成折叠那一行**（和没开流式时一样）。
+
+    两个后果都不只是审美：
+      * 不收的话每一轮的思考过程都糊在屏幕上（非流式那一轮是折叠的，两种模式对不上）；
+      * **`Ctrl+T` 会失灵** —— 它按 `ROLE_THINK_HEAD` 那一行找块，而流式那块的行
+        全是 `THINK_BODY`，展开键会从它上面滑过去。
+
+    收完之后**展开仍然拿得到全文**（`state.thinking` 里有一份），而那正是
+    `Ctrl+T` 要读的东西 —— 所以这里连展开也一起点一遍。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=True)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "你好"})
+        for piece in ("先看", "工作区。"):
+            _delta(app, piece, channel="reasoning")
+        await _settle(app, pilot)
+
+        # 收尾：审计那条 `model_call`（带完整 reasoning）+ `run_finished`。
+        _events(app, {"kind": "model_call", "run_id": "r1", "step": 1, "status": "ok",
+                      "duration_ms": 5, "reasoning": "先看工作区。"})
+        _events(app, {"kind": "run_finished", "run_id": "r1", "step": 1,
+                      "stop_reason": "answered", "duration_ms": 6})
+        await _settle(app, pilot)
+
+        turn = app.query_one(widgets_module.ConversationLog).current_turn_block
+        folded = _think_blocks(turn)
+        assert len(folded) == 1, "收尾之后该只剩**一个**思考块（没有两个折叠行）"
+        head = _think_lines(turn)
+        assert len(head) == 1, f"只该有一个折叠块头：{head}"
+        assert "Ctrl+T 展开" in str(head[0])
+        assert f"{len('先看工作区。')} 字符" in str(head[0])
+
+        # `Ctrl+T` 展开：还能拿到全文（`state.thinking` 那份）。
+        # 走的是 App 真正的那条路（`action_toggle_thinking` → 回合块的
+        # `toggle_thinking`），而不是自己去翻控件 —— 否则"键位接错对象"这类
+        # bug 测不出来（那正是设计稿第 4 条改动要修的）。
+        assert app.state.thinking["r1"][0] == "先看工作区。"
+        assert turn.toggle_thinking("先看工作区。") is True
+        body = [line for line in _think_blocks(turn)[-1]["block"].lines
+                if line.role == view_state.ROLE_QUOTE]
+        assert [str(line) for line in body] == [f"{view_state.QUOTE_BAR}先看工作区。"]
+
+
+@pytest.mark.anyio
+async def test_without_streaming_there_is_no_live_think_block(monkeypatch):
+    """`--no-stream` 那条路一个字都不该变：思考过程**只有**审计画的那个折叠行。
+
+    收尾时那个"把流式块收起来"的动作因此必须是**空操作** —— 否则它会把非流式
+    那一轮唯一的思考过程抹掉（或者收出一个重复的折叠行）。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._inbox.put(("message", _init_message("s", stream=False)))
+        _events(app, {"kind": "run_started", "run_id": "r1", "step": 0,
+                      "user_input": "你好"})
+        _events(app, {"kind": "model_call", "run_id": "r1", "step": 1, "status": "ok",
+                      "duration_ms": 5, "reasoning": "想一下。"})
+        _events(app, {"kind": "run_finished", "run_id": "r1", "step": 1,
+                      "stop_reason": "answered", "duration_ms": 6})
+        await _settle(app, pilot)
+
+        turn = app.query_one(widgets_module.ConversationLog).current_turn_block
+        heads = _think_lines(turn)
+        assert len(heads) == 1, f"非流式那条路该只有一个折叠块头：{heads}"
+        assert "4 字符" in str(heads[0])
 
 
 # --- 第三层：设计稿新增的那几件交互 -------------------------------------------

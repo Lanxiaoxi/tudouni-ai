@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from agent_runtime.agents.retry import Attempt, call_with_retry
 from agent_runtime.audit import event
 from agent_runtime.models.base import ChatModel
-from agent_runtime.models.types import ModelFatalError, TokenUsage
+from agent_runtime.models.types import DeltaSink, ModelFatalError, TokenUsage
 from agent_runtime.security.asker import ApprovalAsker
 from agent_runtime.security.gate import check_permission
 from agent_runtime.security.memory import ApprovalMemory
@@ -43,6 +43,18 @@ EventSink = Callable[[dict[str, Any]], None]
 # （tools 无内部依赖）就是这么走的。会话里能被工具层看见的、又要跨回合留存的那一块
 # 正好就是 metadata，所以这个签名既是最小的，也没有把 Session 整体交出去。
 SessionNotes = Callable[[Mapping[str, Any]], str | None]
+
+# 流式增量：模型每吐一块，Agent 调它一次。**它是第六个注入点**，和 asker /
+# questioner / on_event 同一条原则 —— Agent 知道"现在吐出来的是正文还是思考链"，
+# 而"送给谁、怎么送"由注入的实现决定（协议版发 `t:"delta"`，将来 Web 版发 SSE）。
+#
+# 两个参数都是关键字（见 models/types.py 的 DeltaSink）：按位置传一次就会把思考链
+# 和正文对调，而那个错误看起来像"答案里混进了一段自言自语"。
+#
+# 它**不进审计**（`on_event` 那条路）：一次两千 token 的回答是上千块，而
+# `JsonlSink` 每条事件一次 open/write/close —— 抄进去等于把日志变成第二个会话文件。
+# 审计里记的是汇总（`model_call.streamed_chars` / `stream_chunks`）。
+DeltaCallback = DeltaSink
 
 # 计时的时钟。**注入而不是直接调 time.perf_counter**，理由和 retry.py 里 sleep 可注入
 # 一样：时间没法断言。测试里换成一个由假模型/假 handler 推进的假时钟，duration_ms 才能
@@ -139,18 +151,24 @@ class RunCancelled(BaseException):
     和协议循环都接；测试里也是。漏接的后果是整轮异常穿透到顶层 —— 那比静默继续好，
     所以这个方向是对的。
 
-    **什么时候能取消，只有两个安全点**（见 `Agent.run`）：
+    **什么时候能取消，有三个安全点**（见 `Agent.run`）：
 
       * **两步之间** —— messages 一致（上一步的工具结果全 append 完、★ 也落过盘），
-        唯一一个真安全的位置。`should_stop` 就在那里被问。
-      * **不中途取消** —— 模型往返（同步阻塞的一次 `complete()`）和工具执行（同步
-        handler）都打断不了。没有流式就没有天然的打断点，而"停在一个半截状态"会让
-        会话永久损坏（一条带 tool_calls 却没有对应结果的 assistant 消息，API 直接 400，
-        而且此后每一轮都发不出去）。
+        唯一一个"不管有没有流式都成立"的位置。`should_stop` 就在那里被问；
+      * **流式收到下一块之前**（`_DeltaRelay`）—— 只在开了流式时存在。它的安全性
+        和上面那个不同：此刻 assistant 消息**还没有 append**，所以半截正文根本没
+        进历史，同一个位置天然一致；
+      * **中途取消不了的两段**：非流式的那一次 `complete()`（同步阻塞）和工具执行
+        （同步 handler）。工具那一段永远打断不了（没有天然的打断点）；模型那一段
+        在开了流式之后就有了，这就是决策 1 认下的第三笔代价被还掉的地方。
     """
 
     def __init__(self, step: int):
-        super().__init__(f"已在第 {step} 步之后停止。会话是完好的，可以直接接着跑。")
+        # 措辞**故意不说"之后"**：这个异常现在从两个地方抛出来 —— 两步之间
+        # （循环顶部）、以及流式收到下一块之前（`_DeltaRelay`，那是在一步**中途**）。
+        # 两种情况对用户来说是同一件事（"我让它停，它停了，会话还在"），所以
+        # 那句话只承诺真正成立的那部分。具体停在哪由审计里的 step 说。
+        super().__init__("已停止，会话是完好的，可以直接接着跑。")
         self.step = step
 
 
@@ -178,6 +196,126 @@ class StepLimitExceeded(RuntimeError):
         self.tools = list(tools or ())
 
 
+class _DeltaRelay:
+    """把模型吐出来的块转给注入的 `on_delta`，并兼两个职责。
+
+    ## 1. 流式下"随时取消"的那个打断点
+
+    `RunCancelled` 的 docstring 里原本写的是"只有两个安全点"，而**流式让第三个
+    安全点成立**：每收到一块就问一次 `should_stop`。这不是顺手加的 —— 没有它，
+    按 Esc 之后还要等模型把整段回答说完（几秒到几十秒），而用户按那个键的意思
+    正是"别说了"。
+
+    在这里抛是**安全的**：此刻 messages 里什么都没有（assistant 消息要等
+    `complete()` 返回才 append），所以半截正文既不会进历史，也不会留下一条带
+    tool_calls 却没有结果的悬空消息。
+
+    **代价是界面和历史会对不上**：屏幕上出现过的那半句不在会话里，下次
+    `--session` 恢复时它就不见了。这是认下的取舍 —— 另一条路（把半截答案当
+    assistant 消息存下来）更坏：恢复会话时那条被砍断的答案看起来和一次正常的
+    回答一模一样，而模型接下来会拿它当自己说过的话。收尾由
+    `Agent._complete_with_retry` 做（那里离抛出点最近），它保证 `run_finished`
+    和落盘都发生 —— 少了那一步，界面会一直等一条永远不来的事件。
+
+    ## 2. "上一次尝试吐的作废了"那一声
+
+    `reset()` 由 `on_attempt_started` 触发（重试、或者适配层因 400 自己重发）。
+    `_complete_with_retry` 拿 `take_reset_mark()` 决定要不要在审计里留一条
+    `delta_reset`：没有这个标记就发的话，一次**没来得及吐任何字**的重试会在
+    日志里留下一条"清空过正文"，而那句话是假的。
+    """
+
+    __slots__ = ("_sink", "_should_stop", "_step", "_streamed", "_reset_mark")
+
+    def __init__(self, sink: DeltaCallback | None,
+                 should_stop: Callable[[], bool] | None,
+                 step: int) -> None:
+        self._sink = sink
+        self._should_stop = should_stop
+        self._step = step
+        # 从**上一次 reset 之后**到现在吐过东西没有。它是 reset 那一声的判据。
+        self._streamed = False
+        # "有一次吐出去的东西被作废了、而且那件事还没记过账"。见 `take_reset_mark`。
+        self._reset_mark = False
+
+    @property
+    def streaming(self) -> bool:
+        """有没有一个真的 sink。**没有就别把它交给模型层。**
+
+        `call_with_retry` 拿到的是 `None` 还是这个对象，决定了模型层走哪条路
+        （`on_delta=None` = 一次返回完整响应）。而"没有 sink 的空 relay"必须
+        表现得和 `None` 一模一样 —— 不这么做的症状是 `--no-stream` **静默失效**：
+        请求里照样带着 `stream: true`，流也真的流了，只是没有任何人收到 delta
+        （实测踩过这一条：`--no-stream` 下 `init.stream=false` 而请求体里
+        `stream: true`）。
+        """
+        return self._sink is not None
+
+    def text(self, value: str) -> None:
+        self._check_cancelled()
+        if not value or self._sink is None:
+            return
+        self._streamed = True
+        self._sink(text=value)
+
+    def reasoning(self, value: str) -> None:
+        self._check_cancelled()
+        if not value or self._sink is None:
+            return
+        self._streamed = True
+        self._sink(reasoning=value)
+
+    def __call__(self, *, text: str = "", reasoning: str = "",
+                 reset: bool = False) -> None:
+        """模型层调的就是这一个（`models/types.py` 的 `DeltaSink` 契约）。
+
+        **两个参数都必须按关键字传。** 它们是两个字符串，按位置传一次就会把思考链
+        和正文对调，而那个错误在界面上的症状是"答案里混进了一段自言自语" ——
+        看起来像模型的问题，不像调用点写错了。所以这个签名把关键字定死。
+        """
+        if reset:
+            self.reset()
+            return
+        if text:
+            self.text(text)
+        if reasoning:
+            self.reasoning(reasoning)
+
+    def reset(self) -> None:
+        """一次新的尝试开始了：上一次吐出去的东西作废。
+
+        **重复调用是安全的、也是必要的**：一次重试会同时经过 `agents/retry.py`
+        的 `on_retry` 和适配层自己的 `on_attempt_started`（两边说的是同一件事），
+        而界面收到两条 `delta_reset` 的效果和收到一条完全一样 —— 而漏掉一条的
+        后果是屏幕上留着一段错位的半截正文。
+        """
+        if self._streamed:
+            self._reset_mark = True
+        self._streamed = False
+        if self._sink is not None:
+            self._sink(reset=True)
+
+    def take_reset_mark(self) -> bool:
+        """"刚才有一次作废、而且还没记过账"？取一次就清掉。
+
+        **一次重试只该在审计里留一条 `delta_reset`。** 而 `retry` 这个回调在一次
+        重试里会被调**两次**（`call_with_retry` 的 `on_retry` 一次、适配层自己的
+        `on_attempt_started` 又调它一次 —— 那是两个不同层的"我要重来了"），
+        记两次就是同一份事实写两遍，读日志的人会以为重试了两次。
+
+        这个"取一次就清"的记账放在**这个对象里**，不放调用方：调用方那段流程是
+        一个闭包，闭包里改一个外层布尔就得 `nonlocal`，而那个写法一旦漏了就是
+        `UnboundLocalError`（实测踩过，而且它是从"重试"这条路上抛出来的，
+        症状看起来像模型错了）。
+        """
+        marked, self._reset_mark = self._reset_mark, False
+        return marked
+
+    def _check_cancelled(self) -> None:
+        if self._should_stop is not None and self._should_stop():
+            raise RunCancelled(self._step)
+
+
 class Agent:
     def __init__(
         self,
@@ -188,6 +326,7 @@ class Agent:
         memory: ApprovalMemory | None = None,
         on_checkpoint: Checkpoint | None = None,
         on_event: EventSink | None = None,
+        on_delta: DeltaCallback | None = None,
         session_notes: SessionNotes | None = None,
         debug: bool = False,
         clock: Clock = time.perf_counter,
@@ -220,6 +359,18 @@ class Agent:
         # 契约和上面两个完全一样 —— Agent 知道「发生了什么、什么时候发生」，
         # 注入的实现决定「记到哪、什么格式」。所以它也不该自己拼路径、开文件。
         self.on_event = on_event
+
+        # on_delta 可以为空：不传就是**不做流式**（模型层一次返回完整响应，
+        # 也就是加流式之前的行为）。它和 `session_notes` 一样是**第七个注入点**，
+        # 但和前面几个有一处不同 ——
+        # **它没有"不注入时的等价物"**：不注入就是没有流，而不是"永远不说话的流"。
+        # 这和 asker 可以为 None 是同一条：不注入就是没有这个能力。
+        #
+        # 为什么不把它挂在 on_event 上（"事件里多一种 kind 就行了"）：delta 的
+        # 数量级和事件完全不同（一次回答上千块），而 on_event 的实现（JsonlSink）
+        # 是每条一次 open/write/close —— 抄进去等于把审计日志变成第二个会话文件，
+        # 而且它会把"审计 = 一份可以事后完整回放的记录"这件事稀释掉。
+        self.on_delta = on_delta
 
         # session_notes 可以为空：不传就是"没有任何需要每轮重新贴上去的会话状态"。
         #
@@ -393,15 +544,63 @@ class Agent:
         为什么必须补 run_finished：否则日志里只剩一条悬空的 run_started，事后
         分不清这一轮是"模型调用失败了"还是"进程被杀在半路"，而这两种情况的
         处置完全不同。
+
+        ## 这一层还多担一件流式的事：重试/重发前那一声 reset
+
+        `on_retry` 是**审计 + 通知**两件事：记一条 `delta_reset`（这样"屏幕上那段
+        被丢掉了"在日志里查得到），以及把"作废"传给界面（`_DeltaRelay.reset`）。
+        两次尝试之间可能什么都没吐（比如第一次就 401），那时候界面那边照发
+        （它要清的东西本来就没有，无害），但**审计里不记** —— 记了就是一条假的
+        "清空过正文"。
         """
+        relay = _DeltaRelay(self.on_delta, self.should_stop, step)
+
+        def retry() -> None:
+            """一次新的尝试开始了：把上一次吐出去的东西作废。
+
+            审计里只记一次 —— 判据在 `_DeltaRelay.take_reset_mark` 里，因为
+            "这一次重试有没有已经记过账"是那个对象的记账，不是这一段流程的状态
+            （在闭包里改一个外层布尔得 `nonlocal`，漏了就是 `UnboundLocalError`，
+            而它是从"重试"这条路上抛出来的，症状看起来像模型错了 —— 实测踩过）。
+
+            **这个回调在一次重试里会被调两次**：`call_with_retry` 的 `on_retry`
+            一次、适配层自己的 `on_attempt_started` 又调它一次（那是两个不同层的
+            "我要重来了"）。界面那边两次都是对的（清两遍等于清一遍），
+            审计那边靠 `take_reset_mark` 只记一条。
+            """
+            if relay.take_reset_mark():
+                self._emit("delta_reset", session, run_id, step)
+            relay.reset()
+
         try:
             return call_with_retry(
                 self.model, messages, tool_schemas,
                 on_attempt=self._attempt_reporter(session, run_id, step),
+                # 流式那两样原样透传：retry 既不需要认识它们，也不该认识 ——
+                # 它只管"再来一次"，"再来一次对界面意味着什么"是这一层的事。
+                #
+                # **没有 sink 时传 None**（不是传这个空 relay）：模型层是靠
+                # "`on_delta` 是不是 None"选路的，传一个永不发声的 relay 过去
+                # 会让 `--no-stream` 静默失效（请求照样走流式）。`on_retry` 不受
+                # 影响 —— 它只被"重试之前"用，而不流式时重试本来也没什么要作废的。
+                on_delta=relay if relay.streaming else None,
+                on_retry=retry,
                 # 同一个时钟传下去：一次回合里所有 duration_ms 必须出自同一把尺子，
                 # 否则"模型 1.2s + 工具 0.3s"这种加法没有意义。
                 clock=self.clock,
             )
+        except RunCancelled:
+            # **流式让"随时取消"第一次成立**（见 `_DeltaRelay`）：这一次取消发生在
+            # 模型往返**中途**，而它同样要给用户一个交代 —— 收尾那两件事在别处都
+            # 不会发生（`run()` 里那两个安全点都在循环边界上，我们已经不在那儿了）。
+            #
+            # 顺序和其他两处（步数用尽、`run()` 顶部的取消）一字不差：审计和落盘
+            # 都在 raise 之前。此刻 messages 是一致的（assistant 消息还没 append），
+            # 所以这个落盘点安全，而且"半截正文没进历史"这件事也在审计里看得出来
+            # —— 上面那条 `delta_reset` 就是它的痕迹。
+            self._finish_run(session, run_id, step, run_started, "cancelled")
+            self._checkpoint(session)
+            raise
         except Exception as exc:
             self._finish_run(
                 session, run_id, step, run_started,
@@ -427,6 +626,22 @@ class Agent:
             if attempt.response is not None:
                 data["tool_calls"] = len(attempt.response.tool_calls)
                 data.update(self._usage_fields(attempt.response.usage))
+                # 流式的**汇总**（不是每一块 —— 那会让日志变成第二个会话文件）。
+                #
+                # 两个字段各回答一个问题，缺一个就读不出来：
+                #   * `streamed` —— 这一次到底是逐字出现的还是整段蹦出来的。
+                #     没有它，两种情况的记录一模一样（同样 token、同样耗时），
+                #     而"用户报告说没有逐字效果"就只能靠猜；
+                #   * `stream_chunks` —— 报了多少块。有的兼容网关会先缓冲整段再
+                #     一口气吐出来，那时候 `streamed=true` 但块数是 1，一眼就能
+                #     看出"这个网关的流是假的"。
+                #
+                # 只在真的流了的时候写这两个键（和 `reasoning` 同一条规矩）：
+                # 一个恒为 false 的键会让后面做统计的人处处判空。
+                if attempt.response.streamed:
+                    data["streamed"] = True
+                    data["stream_chunks"] = attempt.response.stream_chunks
+                    data["streamed_chars"] = len(attempt.response.content or "")
                 # 思维链**整段**进审计（决策 5）。
                 #
                 # 它是审计里第一个"内容型"字段 —— 在此之前审计只有数字、枚举和

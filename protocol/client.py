@@ -90,7 +90,7 @@ def repo_root() -> Path:
 
 
 def default_argv(session: str | None = None, *, autopilot: bool = False,
-                 debug: bool = False) -> list[str]:
+                 debug: bool = False, stream: bool = True) -> list[str]:
     """起 runtime 子进程的命令行。
 
     **三件事都是踩过才知道的**（完整理由见 `doc/protocol.md` 和
@@ -105,6 +105,10 @@ def default_argv(session: str | None = None, *, autopilot: bool = False,
       3. **绝对路径 + `cwd=仓库根`，不能用 `python -m agent_runtime.main`** ——
          项目是 `package = false`，`agent_runtime` 根本没被安装，`-m` 找不到它。
          `main.py` 里那句 `sys.path.insert` 在当脚本跑时生效、在 `-m` 下不生效。
+
+    `stream` 默认**开**：这个入口只服务界面（TUI / ansi），而界面要的就是逐字。
+    `--no-stream` 显式传一个 `--stream` 过去关掉它 —— **两个方向都写出来**，
+    因为子进程的默认值不需要和父进程的意图一致：这里说了才算。
     """
     argv = [sys.executable, "-u", str(runtime_entrypoint()), "--runtime-stdio"]
     if session is not None:
@@ -113,6 +117,7 @@ def default_argv(session: str | None = None, *, autopilot: bool = False,
         argv.append("--autopilot")
     if debug:
         argv.append("--debug")
+    argv.append("--stream" if stream else "--no-stream")
     return argv
 
 
@@ -126,6 +131,7 @@ class ProtocolClient:
         session: str | None = None,
         autopilot: bool = False,
         debug: bool = False,
+        stream: bool = True,
         stderr_to: Any = None,
     ):
         self.hooks = hooks
@@ -137,11 +143,12 @@ class ProtocolClient:
         self._lock = threading.Lock()
         # 子进程以非 0 退出时的那句话（父进程要把它显示出来，而不是当成崩溃）。
         self.exit_code: int | None = None
-        self._spawn(session, autopilot=autopilot, debug=debug, stderr_to=stderr_to)
+        self._spawn(session, autopilot=autopilot, debug=debug, stream=stream,
+                    stderr_to=stderr_to)
 
-    def _spawn(self, session, *, autopilot, debug, stderr_to) -> None:
+    def _spawn(self, session, *, autopilot, debug, stream, stderr_to) -> None:
         self._process = subprocess.Popen(
-            default_argv(session, autopilot=autopilot, debug=debug),
+            default_argv(session, autopilot=autopilot, debug=debug, stream=stream),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             # stderr **继承**（None）：子进程的 traceback 和 `[warn]` 直接落在终端上。

@@ -36,19 +36,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """假网关。按脚本逐次回话；最后一条会被重复使用。"""
+    """假网关。按脚本逐次回话；最后一条会被重复使用。
+
+    **两种形状都要会**：TUI 默认开流式（`--stream`），请求里带 `stream: true`，
+    那时候要回 SSE（`text/event-stream`，一块一行 `data:`）。只会回 JSON 的假网关
+    曾经掩盖过一整类问题：客户端把 `application/json` 当成一条 SSE 流去迭代，
+    拿到的是一个空回答，而整条链路一个错误都不报。
+    """
 
     scripts: list[dict] = [{"content": "我很好，谢谢。"}]
     calls: list[dict] = []
 
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
-        type(self).calls.append(json.loads(self.rfile.read(length) or b"{}"))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        type(self).calls.append(body)
         index = min(len(type(self).calls) - 1, len(type(self).scripts) - 1)
         step = type(self).scripts[index]
         # `delay` 只有"验中断"那一条用得上：要有一个**正在跑**的回合才按得动 Esc。
         if step.get("delay"):
             time.sleep(step["delay"])
+        if body.get("stream"):
+            self._reply_stream(step)
+        else:
+            self._reply(step)
+
+    def _reply(self, step: dict) -> None:
         payload = {
             "id": "x", "object": "chat.completion", "created": 0, "model": "fake",
             "choices": [{
@@ -61,6 +74,54 @@ class _Handler(BaseHTTPRequestHandler):
         raw = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _reply_stream(self, step: dict) -> None:
+        """SSE。正文拆成几块 —— "逐字"这件事在协议上得是真的。"""
+        base = {"id": "x", "object": "chat.completion.chunk", "created": 0,
+                "model": "fake"}
+        chunks: list[dict] = []
+
+        def add(delta: dict, finish: str | None = None, usage: dict | None = None):
+            chunk = dict(base)
+            chunk["choices"] = (
+                [] if usage is not None
+                else [{"index": 0, "finish_reason": finish, "delta": delta}]
+            )
+            if usage is not None:
+                chunk["usage"] = usage
+            chunks.append(chunk)
+
+        add({"role": "assistant", "content": ""})
+        content = step.get("content") or ""
+        for index in range(0, len(content), 4):
+            add({"content": content[index:index + 4]})
+        # **思考链照真实形状来**：一块一个词、每块自带换行，而且**词前那个空格
+        # 跟着前一块走**（真网关就是这样：`"The\n"` + `" user\n"` + …）。
+        # 这是"一个词一行"那个 bug 的现场 —— 假网关要是只吐一句话，
+        # 或者把空格丢掉，它就永远测不出来。
+        reasoning = step.get("reasoning") or ""
+        for index, word in enumerate(reasoning.split(" ")):
+            if word:
+                add({"reasoning_content": ("" if index == 0 else " ") + word + "\n"})
+        for position, call in enumerate(step.get("tool_calls") or []):
+            function = call.get("function", {})
+            add({"tool_calls": [{"index": position, "id": call.get("id"),
+                                 "function": {"name": function.get("name"),
+                                              "arguments": ""}}]})
+            arguments = function.get("arguments") or ""
+            for index in range(0, len(arguments), 8):
+                add({"tool_calls": [{"index": position,
+                                     "function": {"arguments": arguments[index:index + 8]}}]})
+        add({}, finish="tool_calls" if step.get("tool_calls") else "stop")
+        add({}, usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
+
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+        raw = (body + "data: [DONE]\n\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -130,7 +191,7 @@ async def main() -> int:
             assert app.state.session_id, "init 没到界面上"
             assert app.state.tool_risks, "init 里没有工具清单"
 
-            # --- 2. 一轮对话 ---
+            # --- 2. 一轮对话（流式）---
             app.submit("你好")
             await _drive(app, pilot, lambda: bool(app.state.answers))
             print("=== 一轮对话 ===")
@@ -138,6 +199,71 @@ async def main() -> int:
             assert "我很好，谢谢。" in app.state.answers.values(), \
                 f"答案没到界面上：{app.state.answers}"
             assert app.state.agent.phase == "finished", app.state.agent.phase
+
+            # 流式真的接上了吗 —— 界面上那个块必须是**流式那一版**
+            # （`StreamAnswerBlock`），而不是"整段一次画"的 `AnswerBlock`。
+            # 少了这条，一个"delta 一路丢掉、最后靠 answer 兜底"的实现也能全绿，
+            # 而那正是"看起来有流式、其实没有"的样子。
+            from agent_runtime.frontends.tui import widgets as tui_widgets
+            streamed_blocks = list(app.query(tui_widgets.StreamAnswerBlock))
+            print(f"  流式块 {len(streamed_blocks)} 个  "
+                  f"累计正文 {len(streamed_blocks[0]._text) if streamed_blocks else 0} 字符")
+            assert app.state.stream_enabled, "init.stream 说这次没开流式"
+            assert streamed_blocks, "正文没走流式那条路（界面上没有 StreamAnswerBlock）"
+            assert "我很好，谢谢。" in streamed_blocks[0]._text, \
+                f"逐字收到的正文不完整：{streamed_blocks[0]._text!r}"
+            assert not list(app.query(tui_widgets.AnswerBlock)), \
+                "流过的那份答案被画了第二遍"
+
+            # --- 2b. 思考链（一个词一块，而且每块自带换行）---
+            #
+            # 这条是**为实测踩过的一个 bug 写的**：思考链那一块逐块 `append()` 的
+            # 写法会让界面上出现"一个词一行"（401 字符的思考过程竖着排了 100 多行）。
+            #
+            # **注意它什么时候看**：`run_finished` 一到，那一块就被收成折叠行了
+            # （`TuiApp._close_live_thinking`），所以"流式中"的样子只是一瞬间。
+            # 这里改成看**收尾之后**的样子，判据仍然能抓到那个 bug：
+            # 一个词一行的话，`Ctrl+T` 展开出来的会是一堆 `  │ The` / `  │ user`
+            # （而不是一段）—— 而展开走的是同一份 `state.thinking` 正文。
+            _Handler.scripts.append({
+                "content": "想好了。",
+                "reasoning": "The user says hi. I should respond briefly.",
+            })
+            before_answers = len(app.state.answers)
+            thinking_before = app.thinking_deltas
+
+            app.submit("想想再答")
+            await _drive(app, pilot, lambda: len(app.state.answers) > before_answers)
+            log = app.query_one(tui_widgets.ConversationLog)
+            turn = log.current_turn_block
+            folded = [str(x) for c in turn.chunks
+                      for x in getattr(c["block"], "lines", [])
+                      if "思考过程" in str(x)]
+            print("=== 思考链 ===")
+            print(f"  thinking_deltas={thinking_before}→{app.thinking_deltas} "
+                  f"折叠行={folded}")
+            assert app.thinking_deltas > thinking_before, "思考链没走流式那条路"
+            assert len(folded) == 1 and "Ctrl+T 展开" in folded[0], \
+                f"收尾之后该只剩一个折叠行：{folded}"
+
+            # 展开它（走 App 那条真正的键位路径）：必须是一段，不是一个词一行。
+            run_id = turn.turn.run_id
+            text = app.state.thinking[run_id][0]
+            assert turn.toggle_thinking(text) is True
+            body = [str(x) for b in log._turns
+                    for c in b.chunks
+                    for x in getattr(c["block"], "lines", [])
+                    if getattr(x, "role", "") == tui_widgets.view_state.ROLE_QUOTE]
+            print(f"  展开后 {len(body)} 行：{body[:3]}")
+            assert len(body) == 1, f"思考链成了一个词一行：{body[:5]}"
+            assert "The user says hi" in body[0], \
+                f"词之间的空格被吃掉了：{body[0]!r}"
+            # 收起来（`Ctrl+T` 再按一下）—— 这是这一节检查完之后该有的状态。
+            turn.toggle_thinking(text)
+            after = [str(x) for c in turn.chunks
+                     for x in getattr(c["block"], "lines", []) if "思考过程" in str(x)]
+            print("=== 思考链：收尾之后 ===")
+            print(f"  {after}")
 
             # --- 3. 审批 ---
             _Handler.scripts.append({

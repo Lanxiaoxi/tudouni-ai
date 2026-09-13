@@ -387,10 +387,14 @@ class TuiApp(App[None]):
     ]
 
     def __init__(self, session: str | None = None, *, autopilot: bool = False,
-                 theme_key: str = theme_mod.DEFAULT_THEME):
+                 theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True):
         super().__init__()
         self._session = session
         self._autopilot = autopilot
+        # 要不要让子进程出流。**默认开**（`--tui` 的意义就在这里），`--no-stream`
+        # 能关掉。它只是"我们请求什么"，真正生效与否以 `init.stream` 为准 ——
+        # 界面不拿这个值当事实（见 `view_state.ViewState.stream_enabled`）。
+        self._stream = stream
         self.state = view_state.ViewState()
         # 协议回调往这里放（**任何线程都能放**），界面定时排空它。
         self._inbox: "queue.Queue[tuple[str, Any]]" = queue.Queue()
@@ -409,6 +413,10 @@ class TuiApp(App[None]):
         # `ui state`（`_run_turn` 的 finally），而它可能排在我们那条回应前面 ——
         # 只认"值对上了"才不会把中间那条当成回应（见 `_report_autopilot`）。
         self._autopilot_wanted: bool | None = None
+        # 收到过多少块**思考链**。它只有一个用途：验收脚本要"等它开始流"——
+        # 而 `state.stream_reasoning` 在回合收尾时会被清空，那时候它就答不出
+        # "刚才到底流过没有"了。计数器只增不减，所以没有那个歧义。
+        self.thinking_deltas = 0
         self._register_themes()
         self.theme = theme_key if theme_key in theme_mod.THEMES \
             else theme_mod.DEFAULT_THEME
@@ -493,7 +501,8 @@ class TuiApp(App[None]):
         # `/` 打开的命令面板和输入行是同一个东西的两面：面板默认藏着。
         self.query_one("#palette", widgets.CommandPalette).display = False
         self._client = ProtocolClient(self, session=self._session,
-                                      autopilot=self._autopilot)
+                                      autopilot=self._autopilot,
+                                      stream=self._stream)
         self._client.start()
         # 消息泵。见模块 docstring 第 1 条：**不用 call_from_thread**。
         self.set_interval(0.05, self._pump)
@@ -644,6 +653,10 @@ class TuiApp(App[None]):
             self._on_session_load(message)
         elif kind == messages.OUT_EVENT:
             self._on_event(message)
+        elif kind == messages.OUT_DELTA:
+            self._on_delta(message)
+        elif kind == messages.OUT_DELTA_RESET:
+            self._on_delta_reset(message)
         elif kind == messages.OUT_UI:
             self._on_ui(message)
         elif kind == messages.OUT_SESSIONS:
@@ -652,6 +665,84 @@ class TuiApp(App[None]):
             level = message.get("level", "info")
             self._say(f"[{level}] {message.get('text', '')}",
                       view_state.ROLE_WARN if level == "warn" else view_state.ROLE_NOTICE)
+
+    def _on_delta(self, message: dict[str, Any]) -> None:
+        """一块流式内容。**逐块追加，不重画整段。**
+
+        记账（`view_state.stream_delta`）和排版（`widgets.ConversationLog.add_stream`）
+        分开，和事件那条路一样：前者是纯函数、可单测，后者要碰 DOM。
+
+        **正文块走 Markdown，思考链走行。** 这一点由 `add_stream` 里那个 `kind` 决定，
+        坐标就是 delta 自己的 `channel`（协议按字段名分流，见 `schema/outbound`）。
+        """
+        view_state.stream_delta(self.state, message)
+        channel = message.get("channel")
+        text = message.get("text") or ""
+        kind = {"text": "answer", "reasoning": "think"}.get(channel or "")
+        log = self._log()
+        if log is None or kind is None or not text:
+            return
+        # 那一行怎么排（正文原样、思考链压平换行）是 `view_state.stream_lines` 的
+        # 判断，这里只负责把它递给控件 —— 和事件那条路"渲染是纯函数"同一条规矩。
+        lines = view_state.stream_lines(message)
+        if lines:
+            if kind == "think":
+                self.thinking_deltas += 1
+            log.add_stream(kind, lines[0][1], self.palette, run_id=message.get("run_id", ""))
+
+    def _close_live_thinking(self, run_id: str) -> None:
+        """一轮结束了：把**还在流的思考过程**收成折叠的那一行。
+
+        ## 它为什么必须存在
+
+        流式那一轮的思考过程是**铺开**的（"它正在想"的观感），而一轮收尾之后该回到
+        和非流式一样的形态：`▸ 思考过程（N 字符 · Ctrl+T 展开）`。不收的话有两个
+        具体后果，都不是审美问题：
+
+          * 每一轮的思考过程都糊在屏幕上（非流式那一轮是折叠的，两种模式对不上）；
+          * **`Ctrl+T` 会失灵**：它按 `ROLE_THINK_HEAD` 那一行找折叠块
+            （`TurnBlock.toggle_thinking`），而流式那块的行全是 `THINK_BODY`
+            —— 展开键会从它上面滑过去、去动 `model_call` 画的另一个折叠行。
+
+        ## 为什么判据是 `stream_reasoning`，而正文用 `state.thinking`
+
+        只有**这一轮的思考过程确实是从 delta 画出来的时候**才收：非流式
+        （`--no-stream`、或者网关不支持流式）时屏幕上压根没有流式块，收了就是把
+        `model_call` 画的那个折叠行换成另一行（或者收出一个重复的）。
+
+        而**收进去的那个字符数要用 `state.thinking` 里那一份**（`model_call` 给的
+        完整 reasoning），不用 delta 累计：后者可能被 `streamed_answer` 提前清掉
+        （`ui(run_finished)` 到得比 `run_finished` 早的时候），而且它和审计里那份
+        口径不一致。折叠行上的"N 字符"要和屏幕上展开时能看到的字对得上，
+        所以两边都取同一份。
+        """
+        state = self.state
+        if state.stream_run_id != run_id or not state.stream_reasoning:
+            return
+        text = state.thinking.get(run_id, ("", False))[0] or state.stream_reasoning
+        log = self._log()
+        if log is None:
+            return
+        log.close_stream("think", text)
+
+    def _on_delta_reset(self, message: dict[str, Any]) -> None:
+        """重试 / 重发：把**这一步**画出来的那半截丢掉。
+
+        清哪一块是**算出来的**，不是猜的：正文和思考链各清一次（`discard_stream`
+        只动最后一块、而且必须是流式那一版）。`view_state.delta_reset` 返回"真的
+        清掉了东西没有"，所以一次没吐任何字的重试不会去白动 DOM。
+
+        **不重新画一条提示**：屏幕上本来就是"正文缩回去了"，再补一句"重试中"是
+        噪声 —— `model_call` 那条事件（status=error）已经说过一次重试了。
+        """
+        cleared = view_state.delta_reset(self.state, message)
+        if not cleared:
+            return
+        log = self._log()
+        if log is None:
+            return
+        for kind in ("answer", "think"):
+            log.discard_stream(kind)
 
     def _on_init(self, message: dict[str, Any]) -> None:
         state = self.state
@@ -675,6 +766,11 @@ class TuiApp(App[None]):
         state.workspace = message.get("workspace", "")
         state.audit_path = message.get("audit_path", "")
         state.context_tokens = message.get("context_tokens")
+        # **流式开不开以 runtime 为准**（它是运行期事实，也是 `--stream` 那一侧算出来的）。
+        # 界面自己那个 `self._stream` 只是"我们请求了什么" —— 拿它当事实的话，
+        # 一个不认识这个开关的老 runtime 会让界面等一堆永远不来的 delta，
+        # 而最终那个 `answer` 又因为"以为流过"被丢掉，症状是**答案一片空白**。
+        state.stream_enabled = message.get("stream") is True
         state.resumed = bool(message.get("resumed"))
         state.permissions = dict(message.get("permissions") or {})
         tools = message.get("tools") or []
@@ -762,6 +858,14 @@ class TuiApp(App[None]):
                 # 界面自己数秒（"本轮 1.4s"）—— 纯函数里不取时间，所以起点在这儿记。
                 turn.started_at = time.monotonic()
                 block = log.start_turn(turn, self.palette)
+        elif kind == "run_finished":
+            # **流式那一轮的思考过程在这里收起来。** 它铺了一整轮，而收尾之后该回到
+            # 和非流式一样的折叠形态（见 `_close_live_thinking`）—— 于是屏幕上
+            # 仍然只有一行，两种模式看起来一致。
+            #
+            # 放在这条事件上而不是 `ui(run_finished)`：那条 `ui` 消息的顺序**不保证**
+            # （协议文档明写两条靠 run_id 配对、别去补偿顺序），而这条一定先到。
+            self._close_live_thinking(message.get("run_id", ""))
 
         body: list[view_state.Line] = []
         for line in lines:
@@ -783,10 +887,10 @@ class TuiApp(App[None]):
     def _on_ui(self, message: dict[str, Any]) -> None:
         if message.get("kind") == messages.UI_RUN_FINISHED:
             self.state.agent = agent_state.reduce(self.state.agent, message)
-            # **正文走 Markdown，不走行。** `answer_body` 仍然负责两件事：把答案按
-            # `run_id` 记账（`scripts/verify_tui.py` 和 `/history` 那类东西看它），
-            # 以及"空答案不画"这个判据（模型失败时 `answer` 是空串）。
-            answer = view_state.answer_body(self.state, message)
+            # **正文走 Markdown，不走行。** 判据（"流过了就不画第二份"）在
+            # `view_state.streamed_answer` 里 —— 它是纯函数，而且这一条是流式
+            # 接上之后最容易出错的地方（同一个答案画两遍看起来像模型说了两遍）。
+            answer = view_state.streamed_answer(self.state, message)
             if answer is not None:
                 self._say_answer(answer.text)
             return
@@ -1249,7 +1353,7 @@ class TuiApp(App[None]):
 
 
 def run_tui(session: str | None = None, *, autopilot: bool = False,
-            theme_key: str = theme_mod.DEFAULT_THEME) -> int:
+            theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True) -> int:
     """`main.py --tui` 走这里。
 
     **配置错时子进程会以退出码 2 结束、并把原因打在 stderr 上。** 那一支由界面
@@ -1257,7 +1361,8 @@ def run_tui(session: str | None = None, *, autopilot: bool = False,
     处理"还没起来就失败"，因为它的表现是"界面闪一下就退"，而 stderr 上的原因是
     看得见的。
     """
-    app = TuiApp(session=session, autopilot=autopilot, theme_key=theme_key)
+    app = TuiApp(session=session, autopilot=autopilot, theme_key=theme_key,
+                 stream=stream)
     app.run()
     client = app._client
     return 0 if client is None or client.exit_code in (None, 0) else client.exit_code

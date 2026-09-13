@@ -33,6 +33,18 @@ SCHEMA_DIR = Path(__file__).resolve().parent / "schema"
 # 的情况下演进语义是可能的 —— 而那是迟早的事。
 VERSION = 1
 
+# 这一整轮会话谈定的**语义版本**（`init.protocol`）。它和 `VERSION` 是两件事：
+# `VERSION` 是"这一行的信封长什么样"（每条消息都带，能不能解析），这个是"我们能
+# 对到哪一步话"。分开之后，将来在信封不变的情况下演进语义是可能的 —— 而这件事
+# 已经发生过一次了：
+#
+#   2 = 多两条出站消息 `t:"delta"` / `t:"delta_reset"`，以及 `init.stream`。
+#
+# **不认识 `t:"delta"` 的老客户端什么都不用改**：按协议约定忽略不认识的 `t` 即可，
+# 而 `ui(run_finished).answer` 照旧发一份完整的（见 `protocol/channels.py` 的
+# `_run_turn`）—— 所以"答案"这条老路一直是通的，delta 只是让它更早出现。
+PROTOCOL = 2
+
 # 入站（前端 → runtime）七种。
 IN_USER_MESSAGE = "user_message"
 IN_PERMISSION_RESPONSE = "permission_response"
@@ -66,7 +78,7 @@ INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
            IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SET_AUTOPILOT,
            IN_SHUTDOWN)
 
-# 出站（runtime → 前端）九种。
+# 出站（runtime → 前端）十一种。
 OUT_INIT = "init"
 OUT_SESSION_LOAD = "session_load"
 OUT_EVENT = "event"
@@ -76,11 +88,29 @@ OUT_NOTICE = "notice"
 OUT_SESSIONS = "sessions"
 OUT_PERMISSION_REQUEST = "permission_request"
 OUT_QUESTION_REQUEST = "question_request"
+# **流式增量**：模型正在吐的正文/思考链，一块一条。
+#
+# 为什么不走 `t:"event"`（那样"多一种 kind"就够了）：事件那条流**同时**进审计
+# （`.tudouni/logs/<id>.jsonl`），而一次回答是上千块 —— `JsonlSink` 每条事件一次
+# open/write/close，抄进去等于把审计日志变成第二个会话文件，"事后能完整回放"这件事
+# 也就被稀释了。所以 delta 是一级独立的消息：**只走协议、不进审计**，审计里记的是
+# 汇总（`model_call.streamed` / `stream_chunks` / `streamed_chars`）。
+OUT_DELTA = "delta"
+# **把已经画出来的增量丢掉**：一次重试、或者适配层自己重发（网关拒绝
+# `stream_options`）之前发一条。不丢的话，界面上会是两段回答首尾相接 ——
+# 而它看起来完全像模型"说了两遍"，不像协议出过问题。
+OUT_DELTA_RESET = "delta_reset"
 
 OUTBOUND = (
     OUT_INIT, OUT_SESSION_LOAD, OUT_EVENT, OUT_UI,
     OUT_NOTICE, OUT_SESSIONS, OUT_PERMISSION_REQUEST, OUT_QUESTION_REQUEST,
+    OUT_DELTA, OUT_DELTA_RESET,
 )
+
+# `t:"delta"` 的两条通道。**按字段名分流**，不然思考链会混进正文里
+# （`text` 和 `reasoning` 都是字符串，按位置取值一次就会对调）。
+DELTA_TEXT = "text"
+DELTA_REASONING = "reasoning"
 
 # 审批的三个答案。`always_group` 是**一次性的**（只对那一条请求有效）。
 #

@@ -64,8 +64,10 @@ uv run main.py --session demo --history # 看对话历史（不调用模型）
 uv run main.py --session demo --audit   # 看审计轨迹：token、权限裁决、耗时（不调用模型）
 uv run main.py --autopilot              # 这次运行没有人可问：不审批、也不提问（见「权限与审批」）
 uv run main.py --debug                  # 把中间过程打到 stderr
+uv run main.py --no-stream              # 老 CLI 这一支默认就不流式；写出来只是说得清
 
 uv run main.py --tui                    # TUI 界面（它自己拉起一个 --runtime-stdio 子进程）
+uv run main.py --tui --no-stream        # 关掉逐字输出：答案整段出现（和加流式之前一样）
 uv run main.py --tui --theme 墨绿仪器    # 换配色。14 套：p7 靛夜是默认，也能给名字/序号
 uv run main.py --runtime-stdio          # 协议子进程：stdout 是 JSONL（一般不由人直接跑）
 ```
@@ -80,6 +82,12 @@ TUI 的界面：顶上三条栏（程序 / 会话 / 状态），左边是**上�
 右边是按回合分块的会话流。`/` 打开命令面板，配色能在运行中换（`/theme`），
 **审批也能**（`/autopilot`，状态栏右边常驻一格写着开还是关）。
 键位和 14 套配色的来历见 `doc/TUI-design.md` 第十四节。
+
+**TUI 默认逐字输出**（`--no-stream` 关掉）。模型吐出来的每一块正文都会立刻出现在
+回合流里，而且是**边收边渲染 Markdown**的 —— 标题和代码块是收完之后才定型的，
+中间那几拍看到的是"还没长完的"样子，那是流式的正常形态。代价与边界写在
+`doc/protocol.md` 第 3.8 节：**工具执行期间仍然是安静的**（没有增量可给），
+所以状态栏那一行的转圈照旧要看着它。
 
 **换会话不用退出重来**：`/new` 直接开一个新会话，`/resume` 弹出会话列表面板
 （`↑↓` 选、`Enter` 切、`Esc` 取消），`/resume <id>` 直接切。这三条都是**原地换**——
@@ -746,7 +754,8 @@ runtime/           装配：把内核变成一个能跑的东西。**不认识�
                      .tudouni/permissions.json
 
 protocol/           跨进程契约：runtime 的"远程 API"。**不认识任何界面**
-  messages.py        从 schema 读出来的名字和常量 + v（信封版本）
+  messages.py        从 schema 读出来的名字和常量 + v（信封版本）+ PROTOCOL（语义版本，
+                     现在是 2：流式那两条消息加进来的）
   codec.py           一行 JSON ↔ 一个 dict：唯一的编解码器（坏行跳过并计数）
   state.py           事件 → 状态：那张推导表，纯函数（三个前端共用）
   channels.py        ProtocolServer：传输循环 + Runtime 持有者 + 人机通道提供者
@@ -772,9 +781,13 @@ prompts/           系统提示词（给人读、给人改的文本，不是代�
   system.zh.md       静态部分；动态那几行由 state/session.py 拼在末尾
 
 models/            模型适配层
-  base.py            ChatModel 抽象：complete(messages, tools) -> ModelResponse
-  types.py           ModelResponse / TokenUsage / 三个领域异常
-  openai_compatible.py  OpenAI 兼容实现：把 SDK 的响应结构和异常都归一化掉
+  base.py            ChatModel 抽象：complete(messages, tools, on_delta) -> ModelResponse
+                     （`on_delta` 是**可选**的流式回调；不给就是一次返回完整响应）
+  types.py           ModelResponse / TokenUsage / 三个领域异常 / DeltaSink
+  openai_compatible.py  OpenAI 兼容实现：把 SDK 的响应结构和异常都归一化掉，
+                     外加流式那条路（`_StreamAccumulator` 拼 SSE 增量 —— 按 index
+                     拼 tool_calls、usage 那一块单独认、`stream_options` 被 400
+                     拒绝时降级重发）
 
 skills/            技能层 —— **技能领域，不依赖任何内部模块**（这是它能独立成包的依据）
   loader.py          扫六个约定目录：frontmatter 解析 + 校验 + problems + 优先级合并
@@ -828,7 +841,9 @@ audit/             审计层
   jsonl.py           JsonlSink：只追加的 .jsonl，天然抗崩溃
 
 agents/            编排层
-  agent.py           Agent：一个回合的循环（一批工具调用：默认串行，整批只读才并发）
+  agent.py           Agent：一个回合的循环（一批工具调用：默认串行，整批只读才并发）；
+                     流式那一侧由 `_DeltaRelay` 管（转达 on_delta、在块与块之间问一次
+                     "要不要停"、重试前告诉界面把半截正文丢掉）
   retry.py           重试策略（只重试暂时性失败）
 
 ── 其它 ──────────────────────────────────────────────────────────────────
@@ -904,7 +919,7 @@ import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也
 
 ### 1. 判定留在内部，沟通交给注入的实现
 
-四个注入点，同一条原则：
+七个注入点，同一条原则：
 
 | 注入点 | Agent 知道 | 注入的实现知道 |
 |---|---|---|
@@ -912,12 +927,20 @@ import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也
 | `memory` | 人说过哪些"别再问" | 记住的东西落在哪（`.tudouni/permissions.json` / 只在内存里） |
 | `on_checkpoint` | 什么时候保存是安全的 | 存到哪、什么格式 |
 | `on_event` | 发生了什么 | 记到哪、什么格式 |
+| `on_delta` | 模型正在吐什么（正文 / 思考链） | 送给谁（协议版发 `t:"delta"` / 将来的 Web 发 SSE） |
 
 好处是具体的：权限策略变成纯函数可以单测；多轮循环留在 Agent 外面，所以 Web 版
 （每回合一次 HTTP 请求、根本没有循环）不需要改 Agent。
 
-`session_notes`（任务列表每轮重新贴上去的那一份）是第五个：Agent 只知道"每次请求末尾要
+`on_delta` 和另外几个有一处不同：**它没有"不注入时的等价物"** —— 不注入就是不做
+流式（模型一次返回完整响应）。这一点和 `asker` 可以为 None 是同一条：不注入就是
+没有这个能力，而不是"一个永远不说话的桩"。它**也不走 `on_event`**：delta 一次回答
+上千块，而 `on_event` 的实现（`JsonlSink`）每条一次 open/write/close —— 抄进审计
+等于把日志变成第二个会话文件。审计里记的是汇总（`model_call.streamed_chars` 那三个）。
+
+`session_notes`（任务列表每轮重新贴上去的那一份）是第六个：Agent 只知道"每次请求末尾要
 把当前会话状态贴上"，至于那段状态长什么样、怎么渲染，是 `tools/builtin/todo.py` 的知识。
+表里没列的第七个是 `should_stop`（"要不要停"由外面决定，怎么停在 Agent 里）。
 
 `questioner`（提问通道）是**同一条原则再往下沉一层**：这一层"内部"是工具自己，而不是
 Agent —— 所以它不在上表里，因为 Agent 根本不知道有这回事（它只看见一次普通的工具调用，
@@ -982,6 +1005,74 @@ subprocess 搜索）—— 而 `read_file` 那条路径的 UTF-8 解码是 CPU �
 
 事件顺序仍然只由模型决定：`tool_batch` 记下这一批实际占用的墙上时间（`wall_ms`），
 `tool_result.parallel` 标出它并发了。所以同一个会话跑两次，历史和审计都一样。
+
+## 流式输出
+
+**TUI 默认开，老 CLI 默认关**（`--stream` / `--no-stream` 显式覆盖）。回答从"整段
+蹦出来"变成"逐字出现"，顺带还掉了一笔债：**Esc 现在能停在回答中途**。
+
+它挂在既有的那套东西上，没有第二条事实：
+
+| 层 | 它多出来的东西 |
+|---|---|
+| `models/` | `complete(messages, tools, on_delta)` —— **`on_delta` 是可选的**；不给就是今天那条一次返回的老路，行为逐字节不变 |
+| `agents/agent.py` | 第七个注入点 `on_delta`（见「贯穿全局的三个设计原则」）。`_DeltaRelay` 顺带做两件事：每块之间问一次"要不要停"，以及重试前告诉界面"刚才那半截作废了" |
+| `protocol/` | `t:"delta"` / `t:"delta_reset"` 两条出站消息 + `init.stream`；`init.protocol` 升到 **2**（信封版本 `v` 还是 1）。语义见 `doc/protocol.md` 第 3.8 节 |
+| `frontends/tui/` | 正文块换成 `StreamAnswerBlock`（边收边重新解析 Markdown），思考链有自己的块 |
+| `frontends/ansi/` | 逐字打到 stdout —— 它是协议的验收工具，不能不认这两条新消息 |
+
+**六条不能商量的**：
+
+1. **delta 不进审计。** 一次回答上千块，而 `JsonlSink` 每条事件一次 open/write/close
+   —— 抄进去等于把日志变成第二个会话文件，"事后能完整回放"这件事也就被稀释了。
+   审计里记的是**汇总**：`model_call` 上的 `streamed` / `stream_chunks` / `streamed_chars`
+   （"这个网关到底有没有在流"就是靠后两个看出来的：有的会先缓冲整段再一口气吐出来，
+   那时候 `stream_chunks` 是 1）。
+2. **完整答案照旧发一份。** `ui(run_finished).answer` 一个字节不少 —— 老前端靠它。
+   而流式开着时**前端自己判断这一轮流过没有**：流过就不画（屏幕上已经有了），
+   没流过就画。判据是"累计出来的正文非空"，**不是"收到过 delta 没有"** ——
+   模型直接调工具那一轮一个字都不吐，而那时候 `answer` 正是要画的那份。
+3. **重试/重发之前先让界面把半截丢掉**（`t:"delta_reset"`）。不丢的话屏幕上是两段
+   回答首尾相接 —— 而它看起来像模型说了两遍，不像协议出过问题。判据是
+   `(run_id, step)` 成对，**前几步已经定下来的内容不许被抹掉**（那几句不在重试范围内，
+   抹掉就是在伪造历史）。审计里也记一条 `delta_reset`，但**只在真的吐过东西时才记**
+   —— 一次没来得及出字的失败重试记它就是假的。
+4. **中途取消那半截正文不进历史。** 抛的那一刻 `messages` 是一致的（assistant 消息要
+   等 `complete()` 返回才 append），所以历史里只会留下完整的回答。代价说白：
+   **屏幕上那半句在 `--session` 恢复时查不到**。另一条路（把被砍断的答案存成
+   assistant 消息）更坏 —— 恢复会话时它和一次正常回答长得一模一样，而模型接下来会拿
+   它当自己说过的话。
+5. **`on_delta` 里抛 `BaseException` 必须原样穿透。** 这是"随时能停"唯一的实现方式，
+   而且它靠的是类型（`RunCancelled` 继承 `BaseException`，适配层的 `except Exception`
+   抓不到它）。有一条测试专门盯着"取消不会变成 model_fatal"。
+6. **没有 sink 时传给模型层的必须是 `None`。** 曾经踩过：Agent 永远传一个空 relay
+   过去，于是 `--no-stream` **静默失效** —— 请求里照样带 `stream: true`，流也真的流了，
+   只是没有任何人收到 delta（`init.stream` 说 false，而请求体说 true）。
+
+**两条实测踩出来的实现细节**（都在代码注释里，这里记一句免得被"顺手改回去"）：
+
+- **`tool_calls` 的增量必须按 `index` 拼，不能按到达顺序。** 同一批里两个 `read_file`
+  的增量在流里是交错的；按顺序拼会把两个调用的参数粘成一段，那段 JSON 解不出来 ——
+  而症状是"模型这一步给的工具参数不合法"，看起来像模型的问题；
+- **流式响应默认不带 usage**，必须显式传 `stream_options={"include_usage": true}`。
+  DeepSeek 官方端点支持，别的兼容网关可能直接 400 —— 所以带上试、被明确拒绝
+  （报文里提到 `stream_options`）就丢掉那个参数重发一次，并记住这个
+  `(base_url, model)` 不再带（不然每一轮都要白撞一次）。**降级时在 stderr 大声说一句**：
+  不说的话症状是"这个会话的 token 统计突然全是空的"，没有人会把它和一次 400 联系起来。
+
+**思考链在流式下长什么样**（这一条是用户看出来的 bug，值得记下来）：
+
+provider 吐思考链时**一块往往就是一个词，而且每块自带一个换行**（`"The\n"` +
+`" user\n"` + …）。所以：
+
+- 那一块在流的时候是**一段 prose**（块头 + 一段随宽度重排的话），不是"一个词一行"
+  —— 逐块 `splitlines()` 再 `append()` 的写法会让 400 个字符的思考过程竖着排 100 多行；
+- **"压平换行"不等于 `" ".join(text.split())`**：词与词之间的空格**就在分块里**
+  （`" user"` 那个前导空格属于前一个词），按空白重新切分会把它一起吃掉（`Theuser`），
+  所以要做的只是"把 `\n` 删掉"，不是"重新分词"；
+- **一轮收尾时它收成折叠的那一行**（`▸ 思考过程（N 字符 · Ctrl+T 展开）`），和没开
+  流式时完全一样 —— 不收的话每轮的思考过程都会糊在屏幕上，而且 `Ctrl+T` 会失灵
+  （它按块头那一行找块，而流式那块的行全是正文行）。
 
 ## 几条硬约束
 
@@ -1156,6 +1247,18 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
   **stdio + tools** 这一小块 —— 它是 MCP 生态里用得最多、也是唯一不需要新依赖的部分
   （客户端是手写的同步 JSON-RPC，见 tools/mcp.py 开头那段"为什么不用官方 SDK"）
 - 上下文管理（按实测成本，当前规模下截断不划算）
+- **流式里没做的那几件**（这一版做的是"模型往返逐字出现"，其余照旧）：
+  - **工具执行期间没有增量**：`tool_call` 到 `tool_result` 之间是安静的，所以界面仍然
+    得自己转圈。要给那一段增量，得让每个工具自己报进度（那是一条新的 `Tool` 契约）；
+  - **老 CLI 不逐字**（`frontends/cli/`）：它直连 runtime、不走协议那条 delta 通道，
+    而"在行式终端上逐字打"和"stdout 拿一份干净答案"这两件事要一起想清楚才敢动
+    （现在 `> 对话.txt` 拿到的是整段答案）。想让老 CLI 也逐字，先得回答"半截答案
+    写进文件算不算污染"；
+  - **思考链的"直播"只有一条路**（协议上的 `delta(reasoning)`），而 `--debug` 那边
+    仍然只在模型想完之后打一行。要让它实时，得决定"思考过程的字节要不要进 stderr"——
+    那和"stdout 只留正文"是同一类问题；
+  - **`fetch_web` 不能并发**（见上面那条），而流式对它没有帮助：它慢在网络上，
+    不在生成上。
 - **联网域名白名单 / 出口代理**：和 `shell_allow`（按命令前缀放行）同构的一层
   `web_allow`，"信某几个站、其余每次问"。插入点是现成的（`security/commands.py` 里那张
   `COMMAND_ARGUMENTS` 旁边加一张 URL 参数表、`gate` 里加一支），但匹配语义（子域算不算？

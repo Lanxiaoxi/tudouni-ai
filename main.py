@@ -94,8 +94,12 @@ def main() -> int:
         # "什么算一套配色"的判断不可能分家。认不出就**回默认**，不报错：
         # 配色是个装饰性参数，为它让整个界面起不来是最坏的取舍。
         key = tui_theme.resolve(args.theme) if args.theme else tui_theme.DEFAULT_THEME
+        # 流式默认开，`--no-stream` 关掉。`args.stream` 为 None 表示"没说过"——
+        # 这正是两个前端默认值不同的表达方式（见 `args.py` 里那一对开关的说明）。
+        want_stream = True if args.stream is None else args.stream
         return run_tui(args.session, autopilot=args.autopilot,
-                       theme_key=key or tui_theme.DEFAULT_THEME)
+                       theme_key=key or tui_theme.DEFAULT_THEME,
+                       stream=want_stream)
 
     # ---- `--runtime-stdio`：协议子进程 ----
     #
@@ -106,7 +110,8 @@ def main() -> int:
     # 退出码 2 结束），因为那时候才有 stdout 要被保护。
     if args.runtime_stdio:
         from agent_runtime.protocol.serve import main as serve
-        return serve(args.session, autopilot=args.autopilot, debug=args.debug)
+        return serve(args.session, autopilot=args.autopilot, debug=args.debug,
+                     stream=True if args.stream is None else args.stream)
 
     # 会话 id 的合法性在这里一次查清，早于任何会碰它的东西。--list 不看这个参数，
     # 但传了非法值仍然报错 —— 一个地方查一次，比让三条子命令各自去猜自己会不会
@@ -142,6 +147,17 @@ def main() -> int:
     # 配置错误（缺密钥、permissions.json 写坏、mcp.json 写坏）由 open_runtime 抛
     # ConfigError。它发生在**开出一个 Runtime 之前**，所以不需要收摊。
     print_banner()
+
+    # 老 CLI 这一支不支持流式（它是直连的，走不了协议那条 delta 通道；而"在
+    # 行式终端上逐字打"是另一件事，见 README 里那条已实现范围）。
+    #
+    # **显式传了就说一句**，而不是静默忽略：一个人写下 `--stream` 是想看到逐字，
+    # 而"参数被悄悄吃掉"和"这个参数不存在"在他眼里一模一样 —— 下一次他会以为
+    # 是模型不支持。**这里不改成流式**：那会让 stdout 从"整段答案"变成"边收边写"，
+    # 而 README 把 `> 对话.txt` 拿到一份干净答案写成了契约。
+    if args.stream is True:
+        print("[流式] 老 CLI 不支持逐字输出（它不走协议那条通道）；"
+              "要看逐字请用 --tui。已按 --no-stream 继续。", file=sys.stderr)
 
     session_id, session, resumed = resolve_session(booted.store, args.session)
 

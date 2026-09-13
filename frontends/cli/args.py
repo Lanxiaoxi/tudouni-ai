@@ -58,4 +58,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="TUI 的配色（14 套：p7 靛夜是默认；也能给名字，如 --theme 靛夜）。"
              "运行中还能用 /theme 换",
     )
+    # 流式：**两个方向都写成显式开关**，因为它有两个默认值 —— TUI 默认开、老 CLI
+    # 默认关（见 main.py 那一支）。用 `store_true` + `store_false` 的一对而不是
+    # `BooleanOptionalAction`：后者在 `--help` 里显示成 `--stream | --no-stream`，
+    # 看不出"哪个是默认"，而这个参数的默认值**取决于走哪条路**，说不清就是误导。
+    parser.add_argument(
+        "--stream", dest="stream", action="store_true", default=None,
+        help="让模型逐字输出（TUI 默认开；老 CLI 不支持，传了会忽略并说一句）",
+    )
+    parser.add_argument(
+        "--no-stream", dest="stream", action="store_false", default=None,
+        help="不要逐字输出（老 CLI 默认如此；TUI 上就是答案整段出现）",
+    )
     return parser

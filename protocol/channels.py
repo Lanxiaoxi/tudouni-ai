@@ -72,7 +72,9 @@ class Bootstrap(NamedTuple):
         而不是让协议层 import `composition.session_summaries`**：那会把整个装配层
         （模型 client、httpx、工具注册表）拖进 `protocol/` 的加载路径，而协议层
         只需要"一份清单"这个结果。它和 `runtime_factory` 是同一条规矩的两次应用；
-      * `autopilot` / `debug` —— 进程级的开关，换会话要用同一份。
+      * `autopilot` / `debug` / `stream` —— 进程级的开关，换会话要用同一份。
+        （`stream` 是"这次运行开不开流式"，和 `--stream` / `--no-stream` 同一个值：
+        换会话换的是会话，不是这次运行的形态。）
 
     **它和"会话是谁"是两件事**，所以要分开传：换会话的工厂拿到的必须是同一份
     bootstrap，否则第二个会话会是另一套技能目录、另一个审计目录。
@@ -83,6 +85,7 @@ class Bootstrap(NamedTuple):
     booted: Any                    # runtime.composition.Booted
     autopilot: bool = False
     debug: bool = False
+    stream: bool = True
     session_lister: SessionLister | None = None
 
 
@@ -328,10 +331,28 @@ class ProtocolServer:
         # 不能在 `on_event` 里发。
         self._answer: str = ""
         self._last_run_id: str = ""
+        # 当前这一轮跑到第几步。`t:"delta"` 要带上它 —— 一个回合里可能有好几步
+        # （模型先说要调工具、拿到结果再答），界面按步分块，而"这一步的正文被
+        # 重试作废了"也只能按步说（见 `t:"delta_reset"`）。
+        self._last_step: int = 0
 
         # 当前这一轮的工作线程。**同时只有一个**（新的一条 user_message 会先 join），
         # 所以发给前端的事件流仍然严格有序。
         self._turn_thread: threading.Thread | None = None
+
+        # **两根锁，管的不是一件事。**
+        #
+        #   * `_send_lock` —— 写 stdout。回合跑在 `turn` 线程，而读循环在主线程
+        #     （它会发 `ui(state)` / `notice` / `permission_request`）。一次
+        #     `send` 是"一行 + flush"，两个线程同时写就会交错成半行 JSON，而
+        #     前端那一侧的症状是"协议丢了一行读不懂的输出"。**流式之前侥幸没事**
+        #     （发的只有回合线程）、流式之后是必然 —— 所以从今天起它必须有锁；
+        #   * `_state_lock` —— 下面那三个"顺手记一下"的字段（run_id / step /
+        #     call_id）。读也在主线程（`_state_message()` 会翻 `runtime.agent`），
+        #     写主要在回合线程。**不要用一把锁**：持着发送锁去读状态会让"回合线程
+        #     正在往管道里写"变成"读循环发不出审批面板"，而那个症状是死锁。
+        self._send_lock = threading.Lock()
+        self._state_lock = threading.Lock()
 
         # 取消：`shutdown` 到这里置位，Agent 在下一个安全点退出（见 agents/agent.py）。
         self._stop = threading.Event()
@@ -361,7 +382,23 @@ class ProtocolServer:
     # -- 收发 ------------------------------------------------------------------
 
     def send(self, message: dict[str, Any]) -> None:
-        self.transport.send(message)
+        """写一条出站消息。**加锁**（理由见 `__init__` 里那段）。
+
+        粒度是"一整条消息"而不是"一行字节"：`Transport.send` 落成
+        `write(line)` + `flush()`，两步之间被别人插进来，管道里就是两行交错。
+
+        顺带把"给前端那条流的异常不许打死这一轮"也定在这里：`Transport.send`
+        写的是父进程的管道，父进程没了就是 `BrokenPipeError` —— 那时候该发生的是
+        "读到 EOF 之后收摊"，不是让一次 `todo_write` 的结果变成一条工具执行失败。
+        和 `_emit` 吞审计异常是同一条理由（观测量坏了不影响被观测的过程），
+        只不过这一条必须**大声说**（stderr 还是活的）。
+        """
+        with self._send_lock:
+            try:
+                self.transport.send(message)
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                print(f"[warn] 往前端写一行失败（已忽略）：{type(exc).__name__}: {exc}",
+                      file=sys.stderr)
 
     def wait(self, pending: _Pending) -> Any:
         """阻塞等下一条相关的回应。**由 `serve()` 的循环来唤醒。**
@@ -670,6 +707,7 @@ class ProtocolServer:
         self._answer = ""
         self.current_call_id = ""
         self._last_run_id = ""
+        self._last_step = 0
 
         self._emit_opening()
 
@@ -754,12 +792,15 @@ class ProtocolServer:
         return {
             "v": messages.VERSION,
             "t": messages.OUT_INIT,
-            "protocol": messages.VERSION,
+            "protocol": messages.PROTOCOL,
             "session_id": runtime.session_id,
             "resumed": runtime.resumed,
             "model": runtime.model_cfg.model,
             "workspace": str(runtime.workspace),
             "max_steps": runtime.max_steps,
+            # **这一次运行开不开流式。** 它是运行期事实，不是前端的偏好 ——
+            # 界面按它决定"正文从哪儿来"（见 schema 里那一段）。
+            "stream": bool(getattr(runtime, "stream", False)),
             # 上下文窗口（分母）。**它不是 runtime 猜的** —— 响应里没有这个字段，
             # 所以它来自 config 那张按模型名的表；表里没有就是 None，而界面按
             # "只报用量、不报占比"处理（错的百分比比没有百分比更坏）。
@@ -795,13 +836,25 @@ class ProtocolServer:
         **它不发那条带正文的 `t:"ui"`** —— 那样做会发出一个空串（`on_event` 看到
         `run_finished` 时 `agent.run()` 还没返回）。正文由 `_run_turn` 在拿到返回值
         之后发，见那里的说明。
+
+        **它也不发 `t:"delta"`**：那是另一条流（见 `on_delta`），因为这条流同时
+        进审计，而 delta 的数量级完全不同。
         """
-        # 把当前 call_id 和 run_id 记下来：审批请求要带上"这是哪一次工具调用"
-        # （asker 的签名里没有它），而答案那条 `t:"ui"` 要带上同一个 run_id。
-        if record.get("kind") == "tool_call":
-            self.current_call_id = record.get("call_id", "")
-        if record.get("kind") == "run_started":
-            self._last_run_id = record.get("run_id", "")
+        # 把当前 call_id / run_id / step 记下来：审批请求要带上"这是哪一次工具调用"
+        # （asker 的签名里没有它），而 delta 和答案那两条 `t:"ui"` 要带上同一个
+        # run_id / step。
+        kind = record.get("kind")
+        with self._state_lock:
+            if kind == "tool_call":
+                self.current_call_id = record.get("call_id", "")
+            if kind == "run_started":
+                self._last_run_id = record.get("run_id", "")
+            if kind in ("model_call", "tool_call", "tool_result", "tool_batch"):
+                # 每一步都会经过 `model_call`，所以它就是"现在第几步"的来源。
+                # **`run_started` 不算**：它的 step 是 0（那个回合还没开始跑），
+                # 而模型的第一块 delta 在 `model_call` **之后**才吐出来 ——
+                # 拿 0 当步号会让第一轮的正文被记成"第 0 步"。
+                self._last_step = record.get("step", self._last_step)
 
         self.send({"v": messages.VERSION, "t": messages.OUT_EVENT, **record})
 
@@ -811,6 +864,60 @@ class ProtocolServer:
         # 多发一个几百字节的 dict —— 换的是"左栏在回合进行中也是对的"。
         if record.get("kind") == "tool_result":
             self.send(self._state_message())
+
+    # -- 流式增量 --------------------------------------------------------------
+
+    def on_delta(self, *, text: str = "", reasoning: str = "",
+                 reset: bool = False) -> None:
+        """Agent 的 `on_delta`：把模型吐出来的一块转给前端。
+
+        **它由回合线程调用**（模型往返就在那个线程里），而它写的管道读循环也在写
+        —— 所以真正干活的是 `send` 里那根锁，这里只负责拼消息。
+
+        三种调用，各自的形状不一样：
+          * 正文 / 思考链各是一条 `t:"delta"`（`channel` 字段分流，不靠猜）；
+          * `reset=True` 是**另一条消息种类**（`t:"delta_reset"`）—— 它不带任何正文，
+            混在 delta 里会让"一条消息有两种含义"，而"清空"和"追加"是相反的动作。
+            一次重试会先后经过 `retry.on_retry` 和适配层自己的 `on_attempt_started`，
+            所以**同一条 reset 可能发两次**：前端按"丢掉重来"处理，重复是无害的
+            （漏掉一次才是问题）。
+
+        `run_id` / `step` 取自最近一条事件（`on_event` 记的），**而且 step 要加一** ——
+        这是实测踩出来的：delta 到达时 `model_call` **还没发**（那条事件是模型调用
+        *结束后*才记的账），所以 `_last_step` 还是**上一步**的号，第一轮甚至还是 0
+        （`run_started` 的 step 是 0，而它不算步号，见 `on_event`）。正在吐的这一块
+        永远属于**进行中的那一步** = 上一步 + 1。
+
+        这个算式对三种情况都成立：第一步（0+1）、工具之后的下一步（n+1）、
+        同一步里的重试（`_last_step` 没动过，算出来还是那一步）。
+        """
+        with self._state_lock:
+            run_id, step = self._last_run_id, self._last_step + 1
+
+        if reset:
+            self.send({
+                "v": messages.VERSION, "t": messages.OUT_DELTA_RESET,
+                "session_id": self._session_label(), "run_id": run_id, "step": step,
+            })
+            return
+
+        for channel, value in ((messages.DELTA_TEXT, text),
+                               (messages.DELTA_REASONING, reasoning)):
+            if not value:
+                continue
+            self.send({
+                "v": messages.VERSION, "t": messages.OUT_DELTA,
+                "session_id": self._session_label(), "run_id": run_id, "step": step,
+                "channel": channel, "text": value, "reset": False,
+            })
+
+    def _session_label(self) -> str:
+        """这条消息属于哪个会话。**出错时也要能发出去**（换会话失败、或者
+        runtime 还没接上都不该让一条 delta 抛异常把回合打死）—— 空串就够，
+        前端本来就该按 `init`/`session_load` 认当前会话，不靠这个字段。
+        """
+        runtime = self.runtime
+        return "" if runtime is None else runtime.session_id
 
     # -- 取消 ------------------------------------------------------------------
 

@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -44,7 +45,14 @@ REPO_ROOT = MAIN_PY.parent
 # --- 一个假的 OpenAI 兼容端点 -------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):
-    """只回答 `POST /v1/chat/completions`，按脚本逐次给回复。"""
+    """只回答 `POST /v1/chat/completions`，按脚本逐次给回复。
+
+    **它两种形状都会**：`stream: true` 回 SSE（`text/event-stream`，一块一行
+    `data:`），否则回今天那条一次性的 JSON。协议那一侧默认开流式（`--stream`），
+    所以这条路是**真的被走到**的 —— 而"假网关只会回 JSON"曾经掩盖住一整类问题
+    （客户端把 `application/json` 当成一条 SSE 流去迭代时，得到的是一个空回答，
+    而整条链路一个错误都不报）。
+    """
 
     scripts: list[dict] = []
     calls: list[dict] = []
@@ -56,7 +64,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         index = min(len(type(self).calls) - 1, len(type(self).scripts) - 1)
         step = type(self).scripts[index]
-        self._reply(step)
+        if body.get("stream"):
+            self._reply_stream(step)
+        else:
+            self._reply(step)
 
     def _reply(self, step: dict) -> None:
         payload = {
@@ -82,8 +93,61 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _reply_stream(self, step: dict) -> None:
+        """SSE。形状照着真网关来，尤其是这三条：
+
+          * `tool_calls` 的 `arguments` **一段一段地给**（而且是按 index 交错的），
+            那正是适配层必须按 index 拼的原因；
+          * **usage 在最后一个 chunk 上、而且那个 chunk 的 `choices` 是空数组**；
+          * 每个事件以空行结束（`data: {...}\\n\\n`）。
+        """
+        chunks: list[dict] = []
+        base = {"id": "chatcmpl-fake", "object": "chat.completion.chunk",
+                "created": 0, "model": "fake"}
+
+        def add(delta: dict, finish: str | None = None, usage: dict | None = None) -> None:
+            chunk = dict(base)
+            chunk["choices"] = (
+                [] if usage is not None
+                else [{"index": 0, "finish_reason": finish, "delta": delta}]
+            )
+            if usage is not None:
+                chunk["usage"] = usage
+            chunks.append(chunk)
+
+        add({"role": "assistant", "content": ""})
+        content = step.get("content")
+        if content:
+            # 拆成几块，让"逐字"这件事在协议上是真的（一块 = 一条 `t:"delta"`）。
+            for piece in _pieces(content, 4):
+                add({"content": piece})
+        for index, call in enumerate(step.get("tool_calls") or []):
+            function = call.get("function", {})
+            add({"tool_calls": [{"index": index, "id": call.get("id"),
+                                 "function": {"name": function.get("name"),
+                                              "arguments": ""}}]})
+            for piece in _pieces(function.get("arguments") or "", 8):
+                add({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
+        add({}, finish="tool_calls" if step.get("tool_calls") else "stop")
+        add({}, usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+
+        body = "".join(
+            f"data: {json.dumps(chunk)}\n\n" for chunk in chunks
+        ) + "data: [DONE]\n\n"
+        raw = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def log_message(self, *args):  # 别把每个请求打到 stderr 上
         return
+
+
+def _pieces(text: str, size: int) -> list[str]:
+    """把一段文本切成固定大小的块（最后一块可能更短）。**空文本给空列表。**"""
+    return [text[i:i + size] for i in range(0, len(text), size)] or []
 
 
 @pytest.fixture
@@ -107,7 +171,8 @@ def fake_openai():
 # --- 起子进程 -----------------------------------------------------------------
 
 def run_protocol(inbound: list[dict | str], *, env_extra: dict | None = None,
-                 session: str | None = "proto-test", timeout: float = 60.0):
+                 session: str | None = "proto-test", timeout: float = 60.0,
+                 argv_extra: list[str] | None = None):
     """喂几行给 `--runtime-stdio`，返回 (退出码, stdout 行, stderr 文本)。
 
     `inbound` 里给 dict 会被编成 JSON；给 str 就原样发（用来发坏行）。
@@ -127,6 +192,7 @@ def run_protocol(inbound: list[dict | str], *, env_extra: dict | None = None,
     argv = [sys.executable, str(MAIN_PY), "--runtime-stdio"]
     if session is not None:
         argv += ["--session", session]
+    argv += list(argv_extra or [])
 
     result = subprocess.run(
         argv, input=payload, capture_output=True, encoding="utf-8", errors="replace",
@@ -189,7 +255,11 @@ def test_init_carries_the_handshake(fake_openai):
     for field in messages.required_fields("outbound", "init"):
         assert field in init, f"init 少了 {field}"
 
-    assert init["protocol"] == messages.VERSION
+    # **语义版本，和信封版本（`v`）不是一回事。** 老客户端拿它判断"能不能对上话"：
+    # 版本对不上就该停下，而 `v` 不等于 `VERSION` 是唯一该硬失败的地方（见
+    # `doc/protocol.md` 第 2 节）。流式是 2 加进来的（`delta` / `delta_reset`）。
+    assert init["protocol"] == messages.PROTOCOL
+    assert messages.PROTOCOL >= messages.VERSION
     assert init["session_id"]
     assert init["resumed"] is False
     assert init["max_steps"] > 0
@@ -288,7 +358,8 @@ def test_the_state_snapshot_carries_the_rail_data(fake_openai):
 # —— 所以它必须真的起一个子进程、**不关 stdin**、来回发几条。用进程内的假传输测的话，
 # "进程还活着"这件事根本没被测到（那正是这一组要验的东西）。
 
-def _open_protocol(fake_openai, *, session: str | None = None):
+def _open_protocol(fake_openai, *, session: str | None = None,
+                   argv_extra: list[str] | None = None):
     """起一个 `--runtime-stdio` 子进程，把 stdin 留着。返回 (进程, 读函数, 发函数)。
 
     **和 `run_protocol` 分开**：那个是一次性喂完就等的（一次性输入），而这里要
@@ -313,6 +384,7 @@ def _open_protocol(fake_openai, *, session: str | None = None):
     argv = [sys.executable, str(MAIN_PY), "--runtime-stdio"]
     if session is not None:
         argv += ["--session", session]
+    argv += list(argv_extra or [])
 
     process = subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -644,6 +716,174 @@ def test_one_turn_produces_the_answer_in_the_ui_message(fake_openai):
     assert finished[0]["run_id"] == ui[0]["run_id"]
 
 
+# --- 流式（`t:"delta"` / `t:"delta_reset"`）-----------------------------------
+
+def _deltas(got: list[dict], channel: str = "text") -> list[dict]:
+    return [m for m in kinds(got, "delta") if m.get("channel") == channel]
+
+
+def test_a_streamed_turn_sends_deltas_and_no_second_copy_of_the_answer(fake_openai):
+    """**流式那一轮：正文走 delta，`run_finished` 那条不再画第二遍。**
+
+    两条都要，而它们的理由不同：
+      * delta 必须真的出现 —— 否则"流式开着"这句话在协议上没有任何证据；
+      * 完整答案**不许**在屏幕上出现第二遍 —— 两份都画的话，用户看到的是同一段
+        回答重复一次，而它看起来像模型说了两遍，不像协议发重了。
+
+    它同时钉住了"拼回来的正文和完整答案一致"：适配层和协议各自拼了一遍
+    （一条按 chunk、一条按 message），而它们必须说同一件事。
+    """
+    base, scripts, calls = fake_openai
+    scripts[:] = [{"content": "我先检查一下这个文件，然后改掉那一行。"}]
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "改一下 a.py"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base},
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    # 流式是默认（`--stream`），而且 `init` 把这件事告诉了前端。
+    assert kinds(got, "init")[0]["stream"] is True
+    assert calls[0]["stream"] is True
+    assert calls[0]["stream_options"] == {"include_usage": True}
+
+    streamed = _deltas(got)
+    assert len(streamed) > 1, "假网关把正文切成了好几块，这里该收到好几条 delta"
+    joined = "".join(m["text"] for m in streamed)
+    assert joined == "我先检查一下这个文件，然后改掉那一行。"
+
+    # 每一条 delta 都带 run_id / step，界面靠它把块归到对的回合上。
+    assert {m["run_id"] for m in streamed} == {
+        m["run_id"] for m in got if m.get("t") == "event"
+    } or len({m["run_id"] for m in streamed}) == 1
+    assert all(isinstance(m["step"], int) and m["step"] >= 1 for m in streamed)
+
+    ui = [m for m in kinds(got, "ui") if m.get("kind") == "run_finished"]
+    assert len(ui) == 1
+    # **答案照样发**（协议不变，老前端靠它），只是前端不该再画一遍。
+    assert ui[0]["answer"] == joined
+
+
+def test_no_stream_sends_the_answer_without_any_delta(fake_openai):
+    """`--no-stream`：一个 delta 都没有，答案整段出现在 `t:"ui"` 里。
+
+    这是**老行为**，也是"流式是可选的加速、不是另一种协议"那句话的验收 ——
+    关掉它之后协议上一个字节都不该多。
+    """
+    base, scripts, calls = fake_openai
+    scripts[:] = [{"content": "整段出现。"}]
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "你好"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base},
+        argv_extra=["--no-stream"],
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    assert kinds(got, "init")[0]["stream"] is False
+    assert kinds(got, "delta") == []
+    assert "stream" not in calls[0]
+    ui = [m for m in kinds(got, "ui") if m.get("kind") == "run_finished"]
+    assert ui[0]["answer"] == "整段出现。"
+
+
+def test_deltas_never_enter_the_audit_log(fake_openai):
+    """**delta 不进审计。** 一次回答是上千块，而 `JsonlSink` 每条事件一次
+    open/write/close —— 抄进去等于把审计日志变成第二个会话文件。
+
+    审计里记的是**汇总**：`model_call.streamed` / `stream_chunks` / `streamed_chars`。
+    这条测试两边都查：jsonl 里没有 kind=delta 的行，而那一行汇总在。
+    """
+    base, scripts, _ = fake_openai
+    scripts[:] = [{"content": "审计里只该有汇总。"}]
+
+    session = f"stream-audit-{uuid.uuid4().hex[:8]}"
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "你好"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    # 协议上也没有 kind=delta 的**事件**（delta 是一级消息，不是一种 event）。
+    assert not [e for e in kinds(got, "event") if e.get("kind") == "delta"]
+
+    log = (REPO_ROOT / ".tudouni" / "logs" / f"{session}.jsonl").read_text(
+        encoding="utf-8")
+    logged = [json.loads(ln) for ln in log.splitlines() if ln.strip()]
+    assert not [e for e in logged if e.get("kind") == "delta"], \
+        "delta 抄进审计了 —— 那会让日志随回答长度线性膨胀"
+
+    model_calls = [e for e in logged if e.get("kind") == "model_call" and e.get("status") == "ok"]
+    assert model_calls, "至少要有一条成功的 model_call"
+    assert model_calls[0]["streamed"] is True
+    assert model_calls[0]["stream_chunks"] > 1
+    assert model_calls[0]["streamed_chars"] == len("审计里只该有汇总。")
+    # token 用量照旧在（`stream_options` 换来的）。
+    assert model_calls[0]["prompt_tokens"] == 10
+
+
+def test_streaming_a_tool_turn_keeps_the_tool_events_intact(fake_openai):
+    """带工具的回合：delta 和 tool_call / tool_result 在同一条流上，顺序不能乱。
+
+    模型常在调用工具之前先流一句话（"我看一下"），然后才给 tool_calls。那一句话
+    同样要逐字出来，而**工具事件一条都不能因此丢失或错位** —— 它们的配对靠
+    `call_id`，多插了几十条 delta 之后仍然要对得上（这是"两条流不串味"的流式版）。
+    """
+    base, scripts, _ = fake_openai
+    scripts[:] = [
+        {"content": "我先看一眼。", "tool_calls": [{
+            "id": "call_x", "type": "function",
+            "function": {"name": "list_files", "arguments": json.dumps({"path": "."})},
+        }]},
+        {"content": "看完了。"},
+    ]
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "看看目录"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base},
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    text = "".join(m["text"] for m in _deltas(got))
+    # 两段正文各流一次，而且拼起来是完整的（工具那一轮的内容也在）。
+    assert text == "我先看一眼。看完了。"
+
+    events = kinds(got, "event")
+    calls = [e for e in events if e["kind"] == "tool_call"]
+    results = [e for e in events if e["kind"] == "tool_result"]
+    assert [c["call_id"] for c in calls] == ["call_x"]
+    assert [r["call_id"] for r in results] == ["call_x"]
+    assert results[0]["status"] == "ok"
+
+
+def test_every_stdout_line_is_still_json_while_streaming(fake_openai):
+    """**流式下这条更值钱**：delta 由回合线程发，而读循环同时在发别的
+    （`ui(state)` / `notice`）—— 没有那把锁，两行会交错成半行 JSON，
+    而症状是**前端偶尔丢掉一行**（`test_every_stdout_line_is_json` 那条只跑
+    非流式，所以这条是它的流式版）。
+    """
+    base, scripts, _ = fake_openai
+    scripts[:] = [{"content": "一二三四五六七八九十" * 30}]
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "写长一点"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base},
+    )
+    assert code == 0, err
+    got = parse(lines)          # 任何一行不是 JSON 都会在这里抛
+    assert len(_deltas(got)) > 10
+    assert "".join(m["text"] for m in _deltas(got)) == "一二三四五六七八九十" * 30
+
+
 def test_the_audit_stream_is_forwarded_verbatim(fake_openai):
     """`t:"event"` 就是审计那一行的**原样**。
 
@@ -879,6 +1119,28 @@ def test_the_client_layer_finds_the_runtime_entrypoint():
     argv = client.default_argv("s")
     assert str(entry) in argv
     assert "-u" in argv
+
+
+def test_the_client_asks_for_streaming_by_default():
+    """**`--tui` 起来就是流式的** —— 这条钉的是那个默认值本身。
+
+    它值得一条测试，因为"默认开着"是靠**三层各写一次**拼出来的：
+    `main.py`（`args.stream is None` → True）→ `run_tui(want_stream)` →
+    `TuiApp(stream=)` → `ProtocolClient(stream=)` → 子进程 argv 上的 `--stream`。
+    任何一层把它丢了，症状都是"默认变成不流式"——而那不是崩溃，**没有任何地方会报错**，
+    只是回答又整段蹦出来了（实测踩过一次：Agent 永远传一个空 relay，`--no-stream`
+    静默失效）。
+
+    顺带把两个方向都钉住：`--no-stream` 必须真的传 `--no-stream` 过去，
+    而不是"不传"（子进程的默认值不需要和父进程的意图一致 —— 这里说了才算）。
+    """
+    from agent_runtime.protocol import client
+
+    assert "--stream" in client.default_argv("s")
+    assert "--no-stream" not in client.default_argv("s")
+
+    assert "--no-stream" in client.default_argv("s", stream=False)
+    assert "--stream" not in client.default_argv("s", stream=False)
 
 
 def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai):

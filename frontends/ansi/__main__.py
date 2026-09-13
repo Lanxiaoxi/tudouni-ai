@@ -46,6 +46,12 @@ class AnsiFrontend:
         # 队列，主线程去问。
         self._pending: list[tuple[str, dict]] = []
         self._lock = threading.Lock()
+        # 流式：当前正在打的是哪条通道（`None` = 还没开始 / 上一轮结束了）。
+        # 它只决定"要不要再打一个记号" —— 而**正文块和完整答案不重复打**是
+        # `on_message` 里那条判据的事（见 `_streamed_answer`）。
+        self._delta_channel: str | None = None
+        # 这一轮逐字打过正文没有（用来抑制 `run_finished` 里那份完整答案）。
+        self._streamed_text = False
 
     # -- ClientHooks -----------------------------------------------------------
 
@@ -59,13 +65,27 @@ class AnsiFrontend:
             self._out(f"（会话里有 {count} 条消息）")
         elif kind == messages.OUT_EVENT:
             self._print_event(message)
+        elif kind == messages.OUT_DELTA:
+            self._print_delta(message)
+        elif kind == messages.OUT_DELTA_RESET:
+            # **这条渲染器不实现"擦掉已经打出去的字"**：stdout 是只往前写的，
+            # `\r` / ANSI 擦除会把重定向出去的文件也弄脏。所以它只说一句 ——
+            # 而这正好也是它作为**协议验收工具**的价值：重试这条路走得通、
+            # reset 真的发出来了，在这里看得见。
+            self._out("  ↻ 重试：上面那段正文作废")
         elif kind == messages.OUT_UI:
             # **只有 `run_finished` 那条有正文。** `kind:"state"` 是面板数据快照
             # （任务列表 / 已加载技能），这个 ANSI 渲染器刻意不做面板 —— 它要是也
             # 打进正文，会把"用户问 + agent 答"那条流冲稀（它的 stdout 是要能重定向的）。
             if message.get("kind") == messages.UI_RUN_FINISHED:
                 self._out("")
-                self._out(f"agent> {message.get('answer', '')}")
+                # **流过就不再打第二份**（同一份事实只写一遍）：正文已经在
+                # `t:"delta"` 里逐字打出去了，这里再打一次屏幕上就是两遍 ——
+                # 而它看起来像模型说了两遍，不像协议发重了。
+                if not self._streamed_text:
+                    self._out(f"agent> {message.get('answer', '')}")
+                self._streamed_text = False
+                self._delta_channel = None
                 self._answering.set()
         elif kind == messages.OUT_NOTICE:
             level = message.get("level", "info")
@@ -168,6 +188,26 @@ class AnsiFrontend:
             self._out(f"  · 回合结束：{message.get('stop_reason')}"
                       f"  {message.get('duration_ms')}ms")
 
+    def _print_delta(self, message: dict[str, Any]) -> None:
+        """流式增量：**边收边打**（这个渲染器的全部意义就是"协议真的在流"）。
+
+        两条通道各一块记号，只打一次 —— 和 TUI 那边同一个形状：
+        正文 `agent> `，思考链 `思考> `（它比正文低一级，缩进着）。
+        """
+        channel = message.get("channel")
+        text = message.get("text") or ""
+        if not text:
+            return
+        if channel != self._delta_channel:
+            self._delta_channel = channel
+            if channel == "reasoning":
+                self._out("思考> ")
+            else:
+                self._out("agent> ")
+        if channel == "text":
+            self._streamed_text = True
+        self._out(text)
+
     def _out(self, text: str) -> None:
         print(text, file=sys.stdout, flush=True)
 
@@ -201,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     frontend = AnsiFrontend()
     with ProtocolClient(frontend, session=session) as client:
         frontend._out("输入内容回车发送。空行或 exit 退出。")
-        frontend._out("（每次回车之后，agent 干活期间这里会安静一会儿 —— 没有流式。）")
+        frontend._out("（每次回车之后，正文会逐字打出来；工具调用期间这里会安静一会儿。）")
 
         def read_stdin() -> None:
             while True:

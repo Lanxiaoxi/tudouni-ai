@@ -397,6 +397,13 @@ class Runtime:
     # 一次性开关（用来渲染那条 autopilot 警告）
     autopilot: bool = False
     debug: bool = False
+    # 这一次运行开不开流式（模型逐字吐、界面逐字画）。
+    #
+    # **它是一个"运行期事实"，所以跟着 Runtime 走、并且发给前端**（`init.stream`）：
+    # 界面要据此决定"正文从哪儿来"——开了流式之后逐字那份才是正文，而
+    # `ui(run_finished).answer` 只是同一个答案的第二次出口（前端只用它兜空）。
+    # 界面自己猜（比如"收到过 delta 就算流式"）在**一轮里一个字都没吐**的时候会猜错。
+    stream: bool = False
     # 一个回合最多几步。**默认值和 `Agent.run` 的默认值必须是同一个数** ——
     # `init` 要把它发给前端显示（"第 3/80 步"），而前端显示一个和实际预算不同的数
     # 比不显示更坏。所以它有个具名常量，两处都引它。
@@ -684,8 +691,10 @@ def open_runtime(
     channels: Channels,
     autopilot: bool = False,
     debug: bool = False,
+    stream: bool = False,
     resumed: bool = False,
     should_stop: Callable[[], bool] | None = None,
+    on_delta: Callable[..., None] | None = None,
     model_config: ModelConfig | None = None,
     permission_config: PermissionConfig | None = None,
     web_config: WebConfig | None = None,
@@ -844,12 +853,19 @@ def open_runtime(
         # （提问通道不在这个表里，但它在上面装配工具时就注入了 —— 它不属于 Agent：
         # Agent 只看见一次普通的工具调用，ask_user 会不会阻塞在人的输入上，
         # 它不知道也不需要知道。）
+        #
+        # 流式是第七个：`on_delta` 为 None 就是不流式（模型一次返回完整响应）。
+        # **两个条件都要满足**才有流：`stream` 是这次运行的意图（`--stream` /
+        # `--no-stream`），`on_delta` 是"往哪儿送"（协议版由 ProtocolServer 提供）。
+        # 只看 `stream` 的话，CLI 那个直连的前端会拿到一堆无处可去的回调；
+        # 只看 `on_delta` 的话，`--no-stream` 就再也关不掉了。
         agent = Agent(
             model, tools, policy,
             asker=asker,
             memory=memory,
             on_checkpoint=booted.store.save,
             on_event=booted.logs,
+            on_delta=on_delta if stream else None,
             # 会话状态每轮都要重新贴在请求末尾（当前状态，不是让模型去翻历史找最近
             # 那一版）。注入的是一段"怎么说"的实现：Agent 自己不知道技能和任务列表
             # 长什么样 —— 它只知道"每次请求末尾要把当前会话状态贴上"。
@@ -888,6 +904,7 @@ def open_runtime(
         agent=agent,
         autopilot=autopilot,
         debug=debug,
+        stream=stream,
         resumed=resumed,
         # 审批里那个 `a` 的查询口只有装配期才知道（它要 MCP 的连接），而协议版的
         # asker 在**被调用时**才需要它 —— 所以它跟着装配产物一起出去，

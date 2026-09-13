@@ -11,18 +11,59 @@
 像"模型很慢"。自己管，每一次尝试就是一条可查的事件。
 """
 
+import inspect
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.models.base import ChatModel
-from agent_runtime.models.types import ModelFatalError, ModelResponse, ModelTransientError
+from agent_runtime.models.types import (
+    DeltaSink,
+    ModelFatalError,
+    ModelResponse,
+    ModelTransientError,
+)
 
 
 MAX_ATTEMPTS = 3
 BACKOFF_BASE = 0.5      # 秒
 BACKOFF_CAP = 8.0
+
+
+def _accepts_streaming_kwargs(model: ChatModel) -> bool:
+    """这个模型的 `complete()` 认不认流式那两个参数？
+
+    **这不是为了兼容老代码，而是因为"能不出流"是一个真实且合法的能力。**
+    测试里那些手写的假模型（`tests/fakes.py` 的 ScriptedModel 等）签名就是
+    `complete(messages, tools=None)` —— 它们按同一个契约实现了这个端口，
+    只是没有流。硬把 `on_delta=None` 传进去只会换来一个 TypeError，而那看起来
+    像"重试策略坏了"，不像"这个模型不会流"。
+
+    判据是**签名里有没有那个参数**（而不是"跑一次看看会不会炸"）：后者会把一个
+    真实的 TypeError（比如我们自己传错了参数名）吞成"这个模型不支持流式"。
+
+    结果是按类型缓存的：一次回合要问它好几次，而 `inspect.signature` 不便宜
+    —— 关键路径上每一次模型调用都多花几十微秒，不值得（这条路径的对照物是
+    一次网络往返，但这个缓存是白捡的）。
+    """
+    cached = _STREAMING_KWARGS_CACHE.get(type(model))
+    if cached is not None:
+        return cached
+    try:
+        parameters = inspect.signature(model.complete).parameters
+        # `**kwargs` 也算认（有的实现就是那么写的）。
+        accepts = (
+            "on_delta" in parameters
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        )
+    except (TypeError, ValueError):  # pragma: no cover - 内建/被装饰到取不出签名
+        accepts = False
+    _STREAMING_KWARGS_CACHE[type(model)] = accepts
+    return accepts
+
+
+_STREAMING_KWARGS_CACHE: dict[type, bool] = {}
 
 
 @dataclass(frozen=True)
@@ -53,6 +94,8 @@ def call_with_retry(
     tools: list[dict],
     on_attempt: Callable[[Attempt], None],
     *,
+    on_delta: DeltaSink | None = None,
+    on_retry: Callable[[], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.perf_counter,
 ) -> ModelResponse:
@@ -63,12 +106,42 @@ def call_with_retry(
     clock 也可以注入，而且**上层会把同一个时钟传下来**：一次回合里所有 duration_ms
     必须出自同一个时钟，否则"模型 1.2s + 工具 0.3s"这种加法就是在混用两把尺子。
     （顺带它也是 model_call 的耗时能被精确断言的前提。）
+
+    ## 流式那两笔代价都落在这个文件的签名上
+
+      * `on_delta` 原样透传 —— 这一层**不认识它是什么**，也不需要认识：它只是
+        "把模型吐出来的东西转给谁"；
+      * `on_retry` 在**每一次重试之前**调一次（第一次尝试不调）。它存在的唯一
+        理由是流式：第 1 次尝试可能已经往界面上吐了半截正文，第 2 次会把整段重说
+        一遍 —— 界面必须在第 2 次开始之前把旧的丢掉，否则看到的是两段回答首尾
+        相接。这个决定属于调用方（它才知道"丢掉"意味着往哪儿发什么），所以这里
+        只报一句"我要重试了"。
     """
+    # 流式那两个参数只在对方认的时候才传（见 `_accepts_streaming_kwargs`）。
+    # 循环外算一次：它只和模型的类型有关。
+    streams = (on_delta is not None or on_retry is not None) and _accepts_streaming_kwargs(model)
+
     for number in range(1, MAX_ATTEMPTS + 1):
+        # **重试之前先报一声。** 它必须在这一次尝试**开始之前** —— 调用方靠它把
+        # 上一次吐到界面上的半截正文丢掉，晚了就会和新的一遍混在一起。
+        if number > 1 and on_retry is not None:
+            on_retry()
         started = clock()
 
+        stream_kwargs: dict[str, Any] = {}
+        if streams:
+            stream_kwargs = {
+                "on_delta": on_delta,
+                # 适配层自己重发（今天只有"provider 拒绝 stream_options"那一例）
+                # 时也要走同一条路：那也是"上一次尝试的半截正文作废了"。
+                # **第一次尝试不传** —— 那时候界面上什么都没有，让前端白清一次
+                # 没有意义（注意和 `models/` 那边"每次都调"的口径不同，见
+                # `models/base.py` 里那个参数的说明）。
+                "on_attempt_started": on_retry if number > 1 else None,
+            }
+
         try:
-            response = model.complete(messages=messages, tools=tools)
+            response = model.complete(messages=messages, tools=tools, **stream_kwargs)
         except ModelFatalError as exc:
             on_attempt(Attempt(number, "fatal", _elapsed_ms(started, clock()), error=str(exc)))
             raise

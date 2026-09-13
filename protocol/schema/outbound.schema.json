@@ -14,6 +14,10 @@
       "model": {"type": "string"},
       "workspace": {"type": "string", "doc": "工作区绝对路径（agent 的文件工具能碰的范围）"},
       "max_steps": {"type": "integer"},
+      "stream": {
+        "type": "boolean",
+        "doc": "这一次运行开不开流式。**它是运行期事实，不是你的偏好** —— 开了之后正文会以 `t:\"delta\"` 一块一块地来，而 `ui(run_finished).answer` 仍然会发（同一个答案的第二次出口，见 `delta` 那一条）。**不要自己猜**（比如\"收到过 delta 就算流式\"）：一轮里一个字都没吐的时候那个判据是错的。"
+      },
       "context_tokens": {
         "type": "integer",
         "nullable": true,
@@ -57,10 +61,9 @@
       }
     },
     "required": ["v", "t", "protocol", "session_id", "resumed", "model", "workspace",
-                 "max_steps", "context_tokens", "tools", "permissions", "audit_path",
-                 "notices"]
-  },
-  "session_load": {
+                 "max_steps", "stream", "context_tokens", "tools", "permissions",
+                 "audit_path", "notices"]
+  },  "session_load": {
     "summary": "会话恢复的画面数据。0 或 1 条，紧跟 init。",
     "fields": {
       "v": {"type": "integer", "const": 1},
@@ -80,8 +83,8 @@
       "kind": {
         "type": "string",
         "enum": ["run_started", "model_call", "tool_call", "tool_result",
-                 "permission", "tool_batch", "run_finished"],
-        "doc": "**就是 audit/events.py 那七种**，不新造。"
+                 "permission", "tool_batch", "run_finished", "delta_reset"],
+        "doc": "**就是 audit/events.py 那几种**，不新造。`delta_reset` 是流式加进来的第八种：它记的是\"重试/重发之前，界面上那段增量作废了\"——**审计里没有 delta 的正文**（那会让日志变成第二个会话文件），所以这一条是\"屏幕上出现过的东西后来被丢了\"唯一的痕迹。"
       },
       "session_id": {"type": "string"},
       "run_id": {"type": "string"},
@@ -187,6 +190,35 @@
       "text": {"type": "string"}
     },
     "required": ["v", "t", "level", "code", "text"]
+  },
+  "delta": {
+    "summary": "**流式增量**：模型正在吐的一块。**只走协议，不进审计。**",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "delta"},
+      "session_id": {"type": "string"},
+      "run_id": {"type": "string", "doc": "和这一轮的 `event` 共用；它保证换会话/换轮之后迟到的那一块不会被接到新回合上。"},
+      "step": {"type": "integer", "doc": "这是第几步的正文（**一个回合里可能有好几步**：模型先说要调工具、拿到结果再答）。界面按它分块。"},
+      "channel": {
+        "type": "string",
+        "enum": ["text", "reasoning"],
+        "doc": "`text` = 正文（要显示成答案）；`reasoning` = 思考链（默认折叠着，`model_call.reasoning` 事后给的是完整的一份）。**必须按这个字段分流** —— 两个通道的内容都是字符串，猜错了的症状是\"答案里混进一段自言自语\"。"
+      },
+      "text": {"type": "string", "doc": "**新增的那一段**，不是累计正文。累计是客户端自己的事。"},
+      "reset": {"type": "boolean", "doc": "**保留字段，恒为 false。** 清空走独立的 `t:\"delta_reset\"` —— 那时候没有任何正文可带，混在 delta 里只会让\"一条消息有两种含义\"。"}
+    },
+    "required": ["v", "t", "session_id", "run_id", "step", "channel", "text", "reset"]
+  },
+  "delta_reset": {
+    "summary": "**把已经画出来的增量丢掉。** 重试/重发之前发一条。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "delta_reset"},
+      "session_id": {"type": "string"},
+      "run_id": {"type": "string"},
+      "step": {"type": "integer", "doc": "作废的是哪一步的正文。**按它清、不要清整个回合** —— 前几步已经定下来的内容（比如第 1 步那句'我看看文件'）不该被这一步的重试抹掉。"}
+    },
+    "required": ["v", "t", "session_id", "run_id", "step"]
   },
   "permission_request": {
     "summary": "**要前端回应，而且会一直阻塞。** 审批面板。",

@@ -182,6 +182,20 @@ def real_messages(workdir, monkeypatch):
                                                  options=["a", "b"]))
         captured["question_request"] = transport.sent[-1]
 
+        # 流式那两条：它们是**纯出站**的（前端不回任何东西），所以直接调那一层的
+        # 接口 —— 而它拼出来的形状必须是 schema 里那一份。
+        #
+        # `_last_step` 手工设一下理由：真跑时它由 `model_call` 那类事件记下来，
+        # 而这里没有回合在跑。
+        transport.sent.clear()
+        server._last_step = 1
+        server._last_run_id = "r-schema"
+        server.on_delta(text="一", reasoning="想")
+        captured["delta"] = transport.sent[0]
+        assert [m["channel"] for m in transport.sent] == ["text", "reasoning"]
+        server.on_delta(reset=True)
+        captured["delta_reset"] = transport.sent[-1]
+
         # 编解码往返：一条真消息必须能原样过一遍管道。
         for name, message in captured.items():
             assert codec.decode(codec.encode(message)) == json.loads(
@@ -192,7 +206,8 @@ def real_messages(workdir, monkeypatch):
         runtime.close()
 
 
-@pytest.mark.parametrize("name", ["init", "permission_request", "question_request"])
+@pytest.mark.parametrize("name", ["init", "permission_request", "question_request",
+                                  "delta", "delta_reset"])
 def test_real_messages_match_their_schema(name, real_messages):
     """**两头都钉**：schema 里声明的字段和真实消息的字段必须一致。
 

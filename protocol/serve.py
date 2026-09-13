@@ -82,8 +82,13 @@ def make_session_opener(server: ProtocolServer, booted) -> OpenSession:
             channels=server.channels(),
             autopilot=bool(bootstrap and bootstrap.autopilot),
             debug=bool(bootstrap and bootstrap.debug),
+            stream=bool(bootstrap and bootstrap.stream),
             resumed=resumed,
             should_stop=server.should_stop,
+            # 流式增量：**它必须在这里接，不能像 on_event 那样事后挂** ——
+            # `Agent.__init__` 就把它收下了（它是"Agent 往哪儿吐"的一部分），
+            # 而事后挂上去的那个（`on_event`）能成立只是因为"事件由 Agent 主动发"。
+            on_delta=server.on_delta,
         )
         # 事件要同时进审计（`Runtime.logs`，由 Agent 的 on_event 负责）和协议。
         # 两条出口是**故意的**，而且不违反"同一份事实只写一遍"：审计写的是它自己的
@@ -97,20 +102,25 @@ def make_session_opener(server: ProtocolServer, booted) -> OpenSession:
 
 
 def main(session_id: str | None = None, *, autopilot: bool = False,
-         debug: bool = False) -> int:
-    """跑一个协议会话。返回进程退出码。"""
+         debug: bool = False, stream: bool = True) -> int:
+    """跑一个协议会话。返回进程退出码。
+
+    `stream` 默认**开**（这个入口只服务界面，而界面要的就是逐字）。协议的老客户端
+    收不到伤害：delta 是两条新消息，不认识的 `t` 按协议约定忽略就行，而
+    `ui(run_finished).answer` 照旧发一份完整的。
+    """
     transport = open_stdio()
     server = ProtocolServer(transport)
     booted = boot()
     # bootstrap 要在**第一个 runtime 之前**挂上去：`open_session` 里的 autopilot /
-    # debug 是它读的，而换会话读的是同一份。
+    # debug / stream 是它读的，而换会话读的是同一份。
     #
     # `session_lister` 走同一条路（而不是让 `protocol/channels.py` 自己 import
     # `composition.session_summaries`）：协议层只要"一份清单"这个**结果**，而
     # "怎么从 store 读出来"是装配层的知识。这样一个 import 也不会把整个装配层
     # （模型 client、httpx、工具注册表）拖进协议层的加载路径。
     server.bootstrap = Bootstrap(
-        booted=booted, autopilot=autopilot, debug=debug,
+        booted=booted, autopilot=autopilot, debug=debug, stream=stream,
         session_lister=session_summaries,
     )
 

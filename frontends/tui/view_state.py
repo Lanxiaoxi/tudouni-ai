@@ -378,6 +378,27 @@ class ViewState:
     # **边沿事件**（顶开一次就完），而不是一个持续成立的电平（那会让 Ctrl+B 收起失效）。
     rail_todos_seen: bool = False
 
+    # --- 流式（`t:"delta"` / `t:"delta_reset"`）-------------------------------
+    #
+    # 这三样是**这一轮**的累计：正文、思考链、跑到第几步。它们决定了回合收尾时
+    # "还要不要再画一份完整答案"（见 `streamed_answer`）。
+    stream_text: str = ""
+    stream_reasoning: str = ""
+    stream_step: int = 0
+    # 这份累计属于哪个 run / 哪个会话。**两条判据都要**：只有 run_id 的话，
+    # 换会话之后新会话的 run_id 恰好重名（理论上）就会把旧累计认成自己的；
+    # 只有会话的话，同一个会话里连开两轮会互相串。
+    stream_run_id: str = ""
+    stream_session: str = ""
+    # `run_finished` 那条 `ui` 处理过了吗。它只防"同一条消息被重放时画两遍"。
+    stream_answered: bool = False
+    # **这次运行开不开流式**，来自 `init.stream`（运行期事实，不是界面的偏好）。
+    #
+    # 它在界面上的用处只有一个：**收尾时那行提示说不说"答案只出现了半截"**。
+    # 判据不能是"收到过 delta 没有"—— 一次一个字都没吐的流式回合（比如模型直接
+    # 调工具）没有 delta，而它并不需要任何提示。
+    stream_enabled: bool = False
+
     def reset_for_session(self) -> None:
         """把**属于某一个会话**的东西全清掉，只留下界面自己的开关。
 
@@ -390,7 +411,10 @@ class ViewState:
             这一条最坏：它看起来完全正常，而用户会以为那些任务是现在这个会话的；
           * 漏 `agent` —— 状态栏按上一个会话的 phase 显示"正在跑"或"已答"，而新会话
             一步都没走（协议那边是干净的，所以这个"正在跑"永远不会结束）；
-          * 漏 `pending_input` —— 上一句话贴到新会话的第一个回合头上。
+          * 漏 `pending_input` —— 上一句话贴到新会话的第一个回合头上；
+          * 漏 `stream_*` —— 新会话收到的**第一块 delta** 会被当成本会话累计的一部分
+            （判据是 `stream_session != session_id`，而它只在"会话变了"时才清），
+            于是那一轮的正文会和上一个会话的最后一段拼在一起。
 
         **rail_open / rail_pinned 不清**：那是"我要不要看左栏"，和聊的是哪个会话无关
         —— 换一次会话就把用户手动收起的栏顶开，是最容易被当成 bug 的那种"贴心"。
@@ -416,6 +440,15 @@ class ViewState:
         self.prompt_tokens = None
         self.cached_tokens = None
         self.pending_input = ""
+        # 流式累计属于某一个会话，所以要清。**`stream_session` 也清成空串**：
+        # 留着上一个会话的 id 会让新会话第一块 delta 撞上"会话变了"那条判据 ——
+        # 那是对的，但只在换会话时对；这里直接清干净，让判据只剩 run_id 一条路。
+        self.stream_text = ""
+        self.stream_reasoning = ""
+        self.stream_step = 0
+        self.stream_run_id = ""
+        self.stream_session = ""
+        self.stream_answered = False
 
     # -- 回合 ------------------------------------------------------------------
 
@@ -616,7 +649,12 @@ def render_event(state: ViewState, message: dict[str, Any]) -> list[Line]:
             out.append(_model_line(state, message))
             reasoning = message.get("reasoning")
             if reasoning:
-                out.extend(_thinking_lines(state, message, reasoning))
+                # **流式已经铺过一遍的，不要再画一个折叠行**（见 `_thinking_lines`）。
+                # 判据是"这一轮的思考过程是不是从 delta 来的"，而那个事实记在
+                # `stream_reasoning` 里 —— 它是 delta 累计出来的，不是猜的。
+                live = bool(state.stream_run_id == message.get("run_id", "")
+                            and state.stream_reasoning)
+                out.extend(_thinking_lines(state, message, reasoning, live_block=live))
 
     elif kind == "tool_call":
         index = message.get("tool_index")
@@ -701,27 +739,84 @@ def _model_line(state: ViewState, message: dict[str, Any]) -> Line:
     return seg(*parts)
 
 
+def folded_thinking(text: str) -> Line:
+    """折叠形态的那一行：`  ▸ 思考过程（401 字符 · Ctrl+T 展开）`。
+
+    **四个地方要用它**，所以它必须只有一个来源（实测踩过：折叠这一行在
+    `_thinking_lines`、`TurnBlock.toggle_thinking` 的收起分支、以及流式收尾的
+    `close_stream` 里各写了一遍，于是展开再折叠之后字数口径能不能对上全靠运气）：
+
+      * 事件到达时的首屏（`_thinking_lines`，非流式那条路）；
+      * `Ctrl+T` 把铺开的思考收起来时；
+      * `Ctrl+T` 把折叠的思考展开时那个块头（措辞不同，见 `expanded_thinking_head`）；
+      * 流式那一轮收尾时（`TurnBlock.close_stream`）。
+
+    字符数由调用方 `len()` 出来 —— 不让子进程多发一个 `reasoning_chars`：
+    那是同一份事实的第二个来源，而两侧对"一个字符"的口径未必一致（emoji、代理对），
+    一个"字符数对不上"的 bug 查起来毫无价值。
+    """
+    return seg(
+        ("  ▸ 思考过程", ROLE_THINK_HEAD),
+        (f"（{len(text)} 字符 · Ctrl+T 展开）", ROLE_RULE),
+    )
+
+
+def expanded_thinking_head() -> Line:
+    """展开形态的块头：`  ▾ 思考过程（展开 · Ctrl+T 收起）`。"""
+    return seg(
+        ("  ▾ 思考过程", ROLE_THINK_HEAD),
+        ("（展开 · Ctrl+T 收起）", ROLE_RULE),
+    )
+
+
+def thinking_body(text: str) -> list[Line]:
+    """展开时那一段正文的每一行（带引用竖线）。
+
+    **换行先压平**（`stream_chunk_text` 那条规矩）：流式收到的思考链是一块一个词、
+    每块自带换行，逐块存下来的话展开时会是**一个词一行**（实测：401 字符的思考过程
+    竖着排了 100 多行）。压平之后它是一段随宽度重排的 prose —— 那是思考过程该有的
+    样子。代价是展开后看到的换行和 provider 给的不一样（审计里那份是原样的）。
+    """
+    flat = stream_chunk_text("think", text)
+    return [quote_line(line) for line in (flat.splitlines() or [""])]
+
+
+def record_thinking(state: ViewState, run_id: str, reasoning: str) -> None:
+    """把完整的一份思考过程记下来（`Ctrl+T` 要读它）。**记一次，两处调用。**
+
+    两个来路：`model_call` 那条事件（审计里那一份，模型想完之后才到），
+    以及流式开着时的收尾（`ui(run_finished)` —— 那时候正文是从 delta 来的，
+    但**完整的一份仍然要从这里记**，否则 `Ctrl+T` 展开不出东西）。
+
+    `expanded` 保留用户当前的选择：展开状态是**界面的**，不该因为新数据到了就翻回去。
+    """
+    if not reasoning:
+        return
+    _text, expanded = state.thinking.get(run_id, ("", False))
+    state.thinking[run_id] = (reasoning, expanded)
+
+
 def _thinking_lines(state: ViewState, message: dict[str, Any],
-                    reasoning: str) -> list[Line]:
+                    reasoning: str, *, live_block: bool = False) -> list[Line]:
     """思维链那一段。**默认折叠成一行**（决策 17）。
 
     折叠那行的字符数由这里 `len()` 出来 —— 不让子进程多发一个 `reasoning_chars`：
     那是同一份事实的第二个来源，而两侧对"一个字符"的口径未必一致（emoji、代理对），
     一个"字符数对不上"的 bug 查起来毫无价值。
+
+    `live_block=True` 表示这一轮的思考过程**已经从 delta 铺在屏幕上了**
+    （`stream_lines` 画的），这时候不再画一个折叠行 —— 画了就是同一段内容两遍，
+    而且 `Ctrl+T` 会在两个块之间挑错对象。收尾由 `TuiApp._close_live_thinking`
+    把那一块收成折叠形态，所以最终屏幕上仍然只有一行，和没开流式时一样。
     """
     run_id = message.get("run_id", "")
+    record_thinking(state, run_id, reasoning)
+    if live_block:
+        return []
     expanded = state.thinking.get(run_id, ("", False))[1]
-    state.thinking[run_id] = (reasoning, expanded)
     if expanded:
-        head = seg(
-            ("  ▾ 思考过程", ROLE_THINK_HEAD),
-            ("（展开 · Ctrl+T 收起）", ROLE_RULE),
-        )
-        return [head, *[quote_line(line) for line in reasoning.splitlines()]]
-    return [seg(
-        ("  ▸ 思考过程", ROLE_THINK_HEAD),
-        (f"（{len(reasoning)} 字符 · Ctrl+T 展开）", ROLE_RULE),
-    )]
+        return [expanded_thinking_head(), *thinking_body(reasoning)]
+    return [folded_thinking(reasoning)]
 
 
 def _risk_suffix(state: ViewState, tool: str) -> list[tuple[str, str]]:
@@ -888,6 +983,176 @@ def answer_body(state: ViewState, message: dict[str, Any]) -> Answer | None:
     answer = message.get("answer") or ""
     state.answers[run_id] = answer
     return Answer(answer) if answer else None
+
+
+# --- 流式增量 ------------------------------------------------------------------
+
+# `t:"delta"` 的两条通道 → 界面上的两种块。
+#
+# **按名字映射，不靠"有没有 reasoning 字段"去猜。** 两条通道的内容都是字符串，
+# 猜错一次就把思考链当成了答案，而那看起来像模型在自言自语。
+_STREAM_KIND = {"text": "answer", "reasoning": "think"}
+_STREAM_BODY_ROLE = {"text": ROLE_ANSWER, "reasoning": ROLE_THINK_BODY}
+# 每块流式内容前面那一行记号。**正文那一行是这一屏上"答案开始"唯一的标记**
+# （非流式那边由 `ui(run_finished)` 那条单独画一次），所以它和 `render_event`
+# 里那些行的记号是同一套审美，也放在同一个模块里。
+#
+# 正文用的是 `ROLE_ANSWER` 而不是另立一个角色：流式正文块本身走 Markdown，
+# 这几个字符被包成行内代码（见 `TurnBlock.add_stream`），颜色由 CSS 的
+# `.answer MarkdownBlock > .code_inline` 决定 —— 再立一个角色也没人去用。
+STREAM_HEAD = {
+    "text": ("  ● ", ROLE_ANSWER),
+    "reasoning": ("  ▸ 思考过程", ROLE_THINK_HEAD),
+}
+
+
+def stream_delta(state: ViewState, message: dict[str, Any]) -> None:
+    """`t:"delta"` → 流式记账。**纯记账，不排版**（排版在 `stream_lines`）。
+
+    记的是**累计正文**，不是"收到过 delta 没有"这个布尔：`run_finished` 那一步要
+    拿它和完整答案对一下（见 `streamed_answer`），而"累计"才使得那件事做得成。
+
+    **中途换会话/换轮要清。** 两条判据分开记（会话、run_id）而不是合成一个字段：
+    合起来的话，"同一个会话里开了新一轮"和"换到了另一个会话"会看起来一样，
+    而它们该做的事不同 —— 前者只清累计，后者连流式开关都要重问（`init.stream`）。
+    """
+    run_id = message.get("run_id", "")
+    if state.stream_session != state.session_id or state.stream_run_id != run_id:
+        state.stream_session = state.session_id
+        state.stream_run_id = run_id
+        state.stream_text = ""
+        state.stream_reasoning = ""
+        state.stream_answered = False
+
+    # 步号跟着最近一块走：`delta_reset` 按它定点清（见那里的说明）。**累加过就
+    # 不再回退** —— 乱序到达的旧块不该把"现在第几步"改回上一步。
+    step = message.get("step")
+    if isinstance(step, int) and step >= state.stream_step:
+        state.stream_step = step
+
+    channel = message.get("channel")
+    text = message.get("text") or ""
+    if not text:
+        return
+    if channel == "reasoning":
+        state.stream_reasoning += text
+    elif channel == "text":
+        state.stream_text += text
+
+
+def stream_lines(message: dict[str, Any]) -> list[tuple[str, Line]]:
+    """`t:"delta"` → 往回合流里追加的行。**带块身份**（`("answer", …)` / `("think", …)`）。
+
+    块身份就是控件那侧的块类型（`TurnBlock` 的 `chunks[i]["kind"]`），所以重试/重发
+    要作废这一步的正文时，能**定点**清掉它、而不是把整个回合重画一遍（见
+    `delta_reset`）。
+
+    **这里不产生"块头"那一行**（`● ` / `▸ 思考过程`）：那一行只该出现一次，而
+    "出现过了没有"只有控件知道（它拿着块的清单）。放在这一层的话，每一块都会带上
+    一个头，去重就得在这一层维护一份和控件重复的状态。
+
+    **正文块的每一行都原样保留**（`splitlines()`）：它是 Markdown 源文，
+    换行是有意义的语法。而**思考链不能那么干** —— 见 `stream_chunk_text`。
+    """
+    channel = message.get("channel")
+    text = message.get("text") or ""
+    kind = _STREAM_KIND.get(channel or "")
+    if not text or kind is None:
+        return []
+    role = _STREAM_BODY_ROLE[channel]
+    line = Line(stream_chunk_text(kind, text), role)
+    return [(kind, line)]
+
+
+def stream_chunk_text(kind: str, text: str) -> str:
+    """一块 delta → 喂给控件的那一行。**两条通道的规矩不同，这是实测踩出来的。**
+
+    * **正文**：原样。它是 Markdown 源文（`# `、列表、代码块都靠换行分隔），
+      压平了就不是 Markdown 了；
+    * **思考链**：**换行压成空格**。这一条是必须的 —— provider 吐思考链时，
+      一块 delta 往往就是一个词（"The" / " user" / " says"），而它们各自还带着
+      一个 `\\n`。逐块 `splitlines()` 的结果就是**一个词一行**（实测：界面上
+      400 个字符的思考过程竖着排了 100 多行）。
+
+      **但"压平"不等于 `" ".join(text.split())`** —— 那个写法会把词与词之间的空格
+      一起吃掉（"The" + " user" 变成 "Theuser"，实测踩过）。分块本身带着它要的
+      空格，换行才是那个不该留下的东西：所以这里**只去掉换行本身**，
+      词之间那个空格留在原地（下一块开头的空格也要留着 —— 它属于前一个词）。
+
+      也**不能顺手 `strip()`**：那样每块开头的空格都会被吃掉，而"块边界的那个空格"
+      正是词与词之间唯一的分隔（实测：删掉它之后是 `Theusersays…`）。
+
+    压平之后它是一段会随宽度重排的 prose —— 思考过程本来就是一段自言自语，
+    不是有语法的正文。代价说白：**展开之后看到的换行和 provider 给的不一样**
+    （审计里那份是原样的）。这一条值得，因为"一词一行"是没法读的，
+    而"少了几个换行"只是排版差异。
+    """
+    if kind != "think":
+        return text
+    # 只丢换行，别的一律不动（顺序要紧：先按 `\n` 切、再把各段接起来，
+    # 段与段之间的边界上那个空格就自然留在原地了）。
+    return "".join(text.split("\n"))
+
+
+
+def streamed_answer(state: ViewState, message: dict[str, Any]) -> Answer | None:
+    """`run_finished` 那条 `t:"ui"` → 这一轮还要不要再画一份正文。**纯函数。**
+
+    ## 为什么"流过了就不再画"
+
+    开了流式之后，正文有**两条来路**：逐字那些 `t:"delta"`，以及这一条里的完整
+    `answer`。两份都画的话，屏幕上是同一个答案出现两遍 —— 而它看起来像模型说了
+    两遍，不像协议发重了。设计稿把这条判据写在第五节末尾（"已经通过 delta 累积出
+    正文 → 丢弃 answer"），这里就是那一句的实现。
+
+    ## 三条出口，各自的理由不同
+
+      * **流过**（这一轮真的吐过正文）→ 不画。但答案仍然记进 `state.answers`
+        （`/history` 那类和 `scripts/verify_tui.py` 看的是它），而且把累计清掉
+        —— 下一轮不该捡到上一轮的字；
+      * **没流过** → 画。**这是老行为，一个字没变**：`--no-stream`、模型不支持流式、
+        或者这一步是纯工具调用（一个字都没吐）时，界面拿答案的唯一途径就是这里；
+      * 流过了但答案是空串（被取消、模型失败）→ 也不画：屏幕上那半截由
+        `delta_reset` 或回合收尾负责，这里再补一个空块只会多一条空行。
+
+    **判据是 `stream_text` 本身，不是 `stream_answered`。** 后者只防"同一条消息被
+    重放时画两遍"（协议两端会分别升级，重放不是不可能）；拿它当"流过了"的判据会
+    把"流过但没内容"和"没流过"混成一件事，而前者该画、后者也该画。
+    """
+    run_id = message.get("run_id", "")
+    answer = message.get("answer") or ""
+    state.answers[run_id] = answer
+    state.stream_answered = True
+
+    # 这一轮的流式累计属于这个 run 吗？不是就当没流过 —— 那种情况只会出现在
+    # "上一轮的字还留着、这一轮的 `ui` 先到"这种乱序上，而那时候拿旧累计去
+    # 抑制新答案，结果是**答案永远不显示**。
+    if state.stream_run_id == run_id and state.stream_text:
+        state.stream_text = ""
+        state.stream_reasoning = ""
+        state.stream_run_id = ""
+        return None
+
+    return Answer(answer) if answer else None
+
+
+def delta_reset(state: ViewState, message: dict[str, Any]) -> bool:
+    """`t:"delta_reset"` → 这一步的累计作废。返回"确实清掉了东西没有"。
+
+    返回值给控件用：**没清掉东西就别去动 DOM**（一次没吐任何字的重试也会发一条
+    reset，那时候重画是白工，而且在块还没挂上的时候还可能抛）。
+
+    **按 step 清，不按整个回合清。** 前几步已经定下来的内容（"我看看文件"那种）
+    不该被这一步的重试抹掉 —— 它们不在重试的范围内，屏幕上和历史上都是对的。
+    """
+    if state.stream_run_id != message.get("run_id", ""):
+        return False
+    if message.get("step") != state.stream_step:
+        return False
+    cleared = bool(state.stream_text or state.stream_reasoning)
+    state.stream_text = ""
+    state.stream_reasoning = ""
+    return cleared
 
 
 def apply_state(state: ViewState, message: dict[str, Any]) -> None:

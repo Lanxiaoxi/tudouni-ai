@@ -309,6 +309,37 @@ class LineBlock(Static):
         self.lines.extend(lines)
         self.refresh_text()
 
+    def append_stream(self, text: str) -> None:
+        """流式那一块：把新来的一段**接在上一段后面**（整块就两行：块头 + 这一段）。
+
+        `text` 是**纯文本**（不含引用竖线），这一层只管画。
+
+        为什么不是 `append([Line(text)])`（那样就是一行一块）：provider 吐思考链
+        时一块往往只有一个词，于是界面上是**一个词一行**（实测：401 字符的思考过程
+        竖着排了 100 多行，完全没法读）。这一块代表"一段还在长的话"。
+
+        **接的是上一次剥掉竖线之后的那段文本**，所以这里不能读自己画出来的那一行
+        ——它的开头是 `  │ `，直接接上去会让竖线越堆越多（实测：`  │   │   │ The`）。
+
+        接头处**不补空格**：provider 的分块本身就带着它要的空格
+        （"The" + " user" + " says"），自己补一个就会变成 "The  user"。
+        块内部的换行由调用方压成空格（`view_state.stream_chunk_text` 是"哪些换行
+        该丢"的知识，只有那一处）。
+        """
+        head = self.lines[:1]
+        body = self.lines[1:]
+        prefix = view_state.QUOTE_BAR
+        merged = "".join(
+            str(line)[len(prefix):] if str(line).startswith(prefix) else str(line)
+            for line in body
+        ) + text
+        # **合并之后再压一次换行** —— 这一块是"一段话"，而 provider 每块都带换行
+        # （不压的话它就是"接一条长文本"，末尾那个换行会把下一块顶到新的一行，
+        # 画出来仍然是"一个词一行"，只是行更多了）。
+        self.set_lines([*head,
+                        view_state.quote_line(view_state.stream_chunk_text("think",
+                                                                          merged))])
+
     def set_lines(self, lines: list[view_state.Line]) -> None:
         self.lines = list(lines)
         self.refresh_text()
@@ -353,6 +384,88 @@ class AnswerBlock(Markdown):
         Textual 自己会重算；不像 `LineBlock` 那样要拿新配色再画一遍。它存在的唯一
         理由是"块协议要一致"—— 少了它，`/theme` 会在正文这一块上抛 `AttributeError`。
         """
+        self._palette = palette
+
+
+class StreamAnswerBlock(Markdown):
+    """**正在流的那一段正文。** 和 `AnswerBlock` 共用 CSS 和主题，但走另一条路。
+
+    为什么不是"和 `AnswerBlock` 合并成一个类、加一个 stream 方法"：两者的
+    **记账方式根本不同**。`AnswerBlock` 是"整篇一次解析"（构造时把全文交给
+    Textual，之后不再变），而这里每一块 delta 都要重新解析一次。
+
+    ## 为什么是 `update()` 而不是 `append()`（实测踩过，两次）
+
+    Textual 的 `Markdown.append()` 看起来正是为流式准备的（"接着上次解析到的地方
+    往下解析"），但它有两个在这条路上都会命中的问题：
+
+      1. **控件还没进 DOM 时它会抛 `MountError`。** `append()` 立刻在事件循环上排
+         一个任务，任务里有 `mount_all`；而 `TurnBlock` 的块是"先记账、挂载排队"
+         的（见 `_mount_chunks`），所以第一块内容几乎必然比挂载先到。那个异常发生
+         在一个已经排出去的后台任务里，报出来是一组 `ExceptionGroup`，
+         栈上完全指不到"是哪一块正文"（实测：pytest 用
+         `Multiple exceptions occurred in asynchronous callbacks` 收场）；
+      2. **它和 `_on_mount` 会打架。** `Markdown._on_mount` 里有
+         `await self.update(initial_markdown or "")`，而 `update()` 会
+         `self._markdown = markdown`。于是"挂载前 append 进去的内容"会被这一句
+         **清成空串** —— 症状是流式正文只显示最后一块（实测：`_markdown` 里
+         只剩后半个片段，前半个连痕迹都没有）。
+
+    `update()` 没有"和 `_on_mount` 打架"这个问题（它自己管 `_markdown` 和旧子控件的
+    清理），代价是**每一块都把整段重新解析一遍** —— 那是 O(正文长度)，而它本来就在
+    50ms 一条的节奏上（App 的消息泵），对一次几千字的回答是毫秒级。
+
+    ## 三条"必须等挂载"的实测坑
+
+    `Markdown.update()` 也不是随便什么时候都能调，三件事各踩过一次：
+
+      1. **挂载之前调** → 它排出去的那个任务里有一句 `mount_all`，而控件还没进
+         DOM：`MountError: Can't mount widget(s) before … is mounted`，
+         报出来是一组 `ExceptionGroup`（所以 `_render` 里有 `is_attached` 那道闸）；
+      2. **`is_attached` 为真之后立刻调** → `mount()` 之后它马上就是真的，而挂载
+         消息还没处理完，`Markdown._on_mount` 会用空文档把内容盖掉 ——
+         所以 `TurnBlock._mount_chunks` 用 `call_after_refresh` 补写一次；
+      3. **`render()` 返回空串让 `visualize()` 得到 `None`** → `BLANK = True`
+         是必须的（见 `__init__` 里那段）。
+
+    `_text` 是**唯一的累计**（不从控件里读）：它同时是"有没有东西要作废"的判据
+    （见 `TurnBlock.discard_stream`）。
+    """
+
+    def __init__(self, palette: theme_mod.Theme, **kwargs: Any):
+        self._palette = palette
+        self._text = ""
+        # **`BLANK = True` 是必须的**（实测踩过）：`Widget.render()` 的默认实现
+        # 返回空串，而 `visualize(空串)` 是 `None` —— 于是
+        # `Widget._render_content()` 会拿 `None` 去 `Visual.to_strips()`，
+        # 抛 `'NoneType' object has no attribute 'render_strips'`。
+        # `BLANK` 让渲染走"整块留白"那一支（这一屏的内容全在子控件里，
+        # 本来就是对的），于是永远不去碰那个 `None`。
+        self.BLANK = True
+        super().__init__(None, open_links=False, **kwargs)
+
+    def feed(self, text: str) -> None:
+        """追加一块。**空串直接丢**（白跑一遍解析）。"""
+        if not text:
+            return
+        self._text += text
+        self._render()
+
+    def flush(self) -> None:
+        """把当前累计写进文档（幂等）。**没挂上时是空操作**（见 `_render`）。"""
+        self._render()
+
+    def _render(self) -> None:
+        """把累计交给 Markdown。**没挂上就什么都不做**（挂载前调 `update()` 会抛）。"""
+        if self._text and self.is_attached:
+            self.update(self._text)
+
+    @property
+    def streamed(self) -> bool:
+        return bool(self._text)
+
+    def repaint(self, palette: theme_mod.Theme) -> None:
+        """和 `AnswerBlock.repaint` 同一条规矩：配色在 CSS 里，这里只记个账。"""
         self._palette = palette
 
 
@@ -450,6 +563,111 @@ class TurnBlock(Vertical):
         self.chunks.append({"kind": "answer", "block": block})
         self._mount_chunks()
 
+    # -- 流式（`t:"delta"` / `t:"delta_reset"`） --------------------------------
+
+    def add_stream(self, kind: str, line: view_state.Line) -> None:
+        """往里追加一块流式内容。**带块身份的那一行**由 `view_state.stream_lines` 算好。
+
+        四条约定：
+
+          1. **块头只画一次**（`● ` / `▸ 思考过程`）：判据是"这一回合里已经有这种块了
+             吗"。放在这里而不是调用方，是因为调用方每收到一块才调一次 —— 它没有
+             "以前有没有过"这份记忆，为它维护一份就是第二份事实；
+          2. `kind == "answer"` 走 `StreamAnswerBlock`（Markdown），`think` 走
+             `LineBlock`（带 `sunk` 底）。两者在 `chunks` 里的记账方式一样，所以
+             `_mount_chunks` / `repaint` / `set_head` 那些都不用分情况；
+          3. **只往"紧挨着的同种块"追加**：模型在调用工具之前说的那句话会先流出来，
+             工具行随后插进来 —— 工具行之后若又来一段正文（下一步的），那是新的一块，
+             不该接在旧的那段后面（否则 Markdown 会把两段当一篇解析，列表和标题
+             会互相接管）；
+          4. **思考链是"一段"而不是"一堆行"**：它每来一块就**整段重写那一块**
+             （累计 + 压平换行，见 `view_state.stream_chunk_text`）。逐块
+             `append()` 的写法在这里是错的 —— provider 一块往往只有一个词，
+             于是界面上是**一个词一行**（实测：401 字符的思考过程竖着排了 100 多行）。
+             重写是 O(这一段的长度)，而它在 50ms 一拍的消息泵里。
+        """
+        block = self.chunks[-1] if self.chunks else None
+        same = block is not None and block["kind"] == kind
+        # 正文块还得是**流式**那一版：`AnswerBlock` 是"整篇一次画"的，喂不了。
+        same = same and (kind != "answer"
+                         or isinstance(block["block"], StreamAnswerBlock))
+
+        if same:
+            if kind == "answer":
+                block["block"].feed(str(line))
+            else:
+                block["block"].append_stream(str(line))
+            return
+
+        if kind == "answer":
+            new_block = StreamAnswerBlock(self._palette, classes="answer")
+            # **块头进 Markdown 源文，不进一行 `Line`。** 非流式那边的 `● ` 是
+            # `render_event` 画的一行，而这里不能那么做：Markdown 的行内语法是成对的，
+            # 流到一半时 `**` 还没闭合是常态 —— 把那一段和 `● ` 拼在同一行，
+            # 记号会被当成语法的一部分（`**` 吞掉后面的 ` ` 之类），看起来像"记号
+            # 自己会乱跳"。所以记号独占一行，反引号围起来（免得它自己被解析）。
+            new_block.feed(f"`{view_state.STREAM_HEAD['text'][0].strip()}`\n{line}")
+        else:
+            head_text, head_role = view_state.STREAM_HEAD["reasoning"]
+            new_block = LineBlock(
+                [view_state.Line(head_text, head_role), view_state.quote_line(str(line))],
+                self._palette, classes="think-body",
+            )
+        self.chunks.append({"kind": kind, "block": new_block})
+        self._mount_chunks()
+
+    def close_stream(self, kind: str, text: str) -> bool:
+        """一轮结束了：把还在流的那一块**收成折叠形态**。返回"真收了吗"。
+
+        只对思考链有意义：它流的时候是铺开的正文（那是"它正在想"的观感），
+        而一轮结束之后该回到和非流式那条路一样的形态 —— 一行
+        `▸ 思考过程（N 字符 · Ctrl+T 展开）`（决策 17：默认折叠）。
+
+        **收成折叠形态而不是留着铺开的那一大段**，有两个具体理由：
+
+          * 非流式那一轮的思考过程就是折叠的，两种模式在屏幕上的结果必须一致
+            —— 否则"开了流式"就变成"每一轮的思考过程都糊在脸上"；
+          * `Ctrl+T` 的判据是那一块**有没有 `ROLE_THINK_HEAD` 那一行**
+            （`toggle_thinking` 里按 role 找），而流式那块的行全是 `THINK_BODY`。
+            不收的话，展开键会从那一块上滑过去、去动后面那个审计块。
+
+        收完把块的 kind 改成 `plain`：它从此不再是"正在流的东西"，`Ctrl+T` 展开它、
+        `discard_stream` 也不再碰它（一次重试不该把已经收好的思考过程抹掉）。
+        """
+        for chunk in reversed(self.chunks):
+            if chunk["kind"] != kind:
+                continue
+            if not isinstance(chunk["block"], LineBlock):
+                return False
+            chunk["block"].set_lines([view_state.folded_thinking(text)])
+            chunk["kind"] = "plain"
+            return True
+        return False
+    def discard_stream(self, kind: str) -> bool:
+        """把**最后一块**这种流式块整块拿掉。返回"真拿掉了没有"。
+
+        重试 / 重发之前的那一声（`t:"delta_reset"`）走这里：界面上那半截是错位的，
+        而且**它不会进历史**（半截正文从不落盘），所以留着它就是留一个"屏幕上有、
+        恢复会话时查无此物"的东西。
+
+        **只动最后一块、且只动流式那一版。** 两个理由：
+          * 前几步已经定下来的内容不在重试范围内，抹掉它是在伪造历史；
+          * `AnswerBlock`（整篇一次画的那个）代表"这一轮已经收尾的正文"，
+            拿掉它之后 `ui(run_finished)` 不会再补一份，那就是丢内容。
+        """
+        if not self.chunks:
+            return False
+        last = self.chunks[-1]
+        if last["kind"] != kind:
+            return False
+        if kind == "answer" and not isinstance(last["block"], StreamAnswerBlock):
+            return False
+        self.chunks.pop()
+        block = last["block"]
+        if block.is_attached:
+            block.remove()
+        return True
+
     def _append(self, kind: str, lines: list[view_state.Line]) -> None:
         """同一类连续的行并进最后一块，否则开一块新的。
 
@@ -478,6 +696,23 @@ class TurnBlock(Vertical):
         for chunk in self.chunks:
             if not chunk["block"].is_attached:
                 self._body.mount(chunk["block"])
+        # **挂上之后要把流式块的内容补写一次，而且要在挂载真的走完之后。**
+        # 两个坑叠在一起：
+        #
+        #   1. 挂载之前调 `Markdown.update()` 是不行的 —— 它会立刻在事件循环上排
+        #      一个 `mount_all` 任务，而那时候控件还没进 DOM，抛
+        #      `MountError: Can't mount widget(s) before … is mounted`
+        #      （那个异常发生在已经排出去的任务里，报出来是一组
+        #      `ExceptionGroup`，栈上完全指不到是哪一块正文）；
+        #   2. `is_attached` 在 `mount()` 之后**立刻**就是 True，而挂载消息这时候
+        #      还没被处理，`Markdown._on_mount` 也还没把文档初始化成空串 ——
+        #      在这里写会被它盖掉。
+        #
+        # `call_after_refresh` 落在下一次屏幕刷新之后，正好越过这两条。
+        for chunk in self.chunks:
+            flush = getattr(chunk["block"], "flush", None)
+            if flush is not None:
+                self.call_after_refresh(flush)
 
     def on_mount(self) -> None:
         self._mount_chunks()
@@ -511,10 +746,7 @@ class TurnBlock(Vertical):
                 # 展开着的思考正文：整块收掉，换成一行折叠提示。
                 chunk["kind"] = "plain"
                 block.set_classes("turn-text")
-                block.set_lines([view_state.seg(
-                    ("  ▸ 思考过程", view_state.ROLE_THINK_HEAD),
-                    (f"（{len(text)} 字符 · Ctrl+T 展开）", view_state.ROLE_RULE),
-                )])
+                block.set_lines([view_state.folded_thinking(text)])
                 return True
             index = next((i for i, line in enumerate(block.lines)
                           if line.role == view_state.ROLE_THINK_HEAD), None)
@@ -525,11 +757,8 @@ class TurnBlock(Vertical):
             if lines[:index]:
                 pieces.append(("plain", lines[:index]))
             pieces.append(("think", [
-                view_state.seg(
-                    ("  ▾ 思考过程", view_state.ROLE_THINK_HEAD),
-                    ("（展开 · Ctrl+T 收起）", view_state.ROLE_RULE),
-                ),
-                *[view_state.quote_line(part) for part in text.splitlines()],
+                view_state.expanded_thinking_head(),
+                *view_state.thinking_body(text),
             ]))
             if lines[index + 1:]:
                 pieces.append(("plain", lines[index + 1:]))
@@ -1231,6 +1460,44 @@ class ConversationLog(VerticalScroll):
         if self._welcome is None:
             self._scroll_end()
 
+    def add_stream(self, kind: str, line: view_state.Line,
+                   palette: theme_mod.Theme, *, run_id: str = "") -> None:
+        """流式正文/思考链的一块。**和非流式那条路（`add_answer`）分开。**
+
+        分开是为了让"流到一半"和"已经收尾"在控件那一侧是两种块：`delta_reset` 要
+        拿掉前者、保留后者（见 `TurnBlock.discard_stream`）。合在一起的话，一次重试
+        会把上一轮已经画好的答案也抹掉 —— 那看起来像"答案刚才还在，现在没了"。
+
+        **`run_id` 决定挂到哪个回合上**（缺省才是"最后那一个"）：delta 是异步来的，
+        一个迟到的块可能落在 `run_finished` 之后 —— 按 run_id 找，它就不会挂到下一轮
+        的头上去（那会让下一轮的正文里凭空多出一句话）。
+
+        没有回合块时（理论上只有第一块 delta 挤在 `run_started` 之前）退回
+        `MessageBlock`：宁可少一个回合头，也不要丢内容。
+        """
+        self._palette = palette
+        target = self.turn_block_for(run_id) if run_id else None
+        if target is None:
+            target = self.current_turn_block
+        if target is not None:
+            target.add_stream(kind, line)
+        elif self._current is not None:
+            self._current.add([view_state.Line(str(line), view_state.ROLE_ANSWER)])
+        if self._welcome is None:
+            self._scroll_end()
+
+    def close_stream(self, kind: str, text: str) -> None:
+        """回合收尾：把还在流的那一块收成折叠形态（目前只有思考链需要）。"""
+        current = self.current_turn_block
+        if current is not None:
+            current.close_stream(kind, text)
+
+    def discard_stream(self, kind: str) -> None:
+        """把最后一块这种流式内容拿掉（`t:"delta_reset"`）。没有就当没发生。"""
+        current = self.current_turn_block
+        if current is not None:
+            current.discard_stream(kind)
+
     def add_answer(self, text: str, palette: theme_mod.Theme) -> None:
         """agent 正文 —— **这个前端里唯一走 `AnswerBlock` 的东西**（其余仍是行）。
 
@@ -1260,6 +1527,20 @@ class ConversationLog(VerticalScroll):
     @property
     def current_turn_block(self) -> TurnBlock | None:
         return self._turns[-1] if self._turns else None
+
+    def turn_block_for(self, run_id: str) -> TurnBlock | None:
+        """按 `run_id` 找回合块。
+
+        `current_turn_block` 是"最后那一个"，而流式下**消息晚一拍落地**：
+        `run_finished` 可能在我们还没处理完上一块的 delta 时就到了（实测：一条
+        推理回合的块序列是 `plain, answer, think`，而 `run_finished` 已经在队列里）
+        —— 那时候"找刚才那一轮"只能按 run_id，按"最后那一个"会拿到一个还没开始的
+        空回合。验收脚本和测试都要它。
+        """
+        for block in reversed(self._turns):
+            if block.turn.run_id == run_id:
+                return block
+        return None
 
     def turn_under_viewport(self) -> TurnBlock | None:
         """**光标（视口中心）所在的那个回合** —— `Ctrl+T` 的作用对象。
