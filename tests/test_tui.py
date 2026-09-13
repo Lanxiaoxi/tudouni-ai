@@ -614,6 +614,9 @@ async def test_startup_notices_are_quiet_and_do_not_repeat_the_rail(monkeypatch)
     assert view_state.notice_is_redundant("todos") is True
     assert view_state.notice_is_redundant("mcp") is False
     assert view_state.notice_is_redundant("web") is False
+    # AGENT.md 那条**必须显示**：它说的是"这次启动读到了哪几份项目说明"，是一次启动
+    # 事件而不是左栏那三块的状态；而读失败/被截断那两条只在 notice 里有出口。
+    assert view_state.notice_is_redundant("agent_md") is False
 
     app = _build_app(monkeypatch)
     async with app.run_test(size=(140, 30)) as pilot:

@@ -58,6 +58,7 @@ from agent_runtime.skills import (
     skill_note,
 )
 from agent_runtime.state import JsonSessionStore, Session
+from agent_runtime.state import agents_md
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.builtin.grep import host_triple, rg_binary
@@ -199,17 +200,21 @@ def resolve_session(
 
     **它不打印。** 那两行"继续会话 / 新会话"是呈现，由前端自己发（CLI 打 stdout，
     TUI 显示在界面上）。
+
+    **工作区在这里被交出去**（`project_dir()` 那两处）：新建的会话要拿它去读那份
+    AGENT.md。已经存在的会话不重新读 —— 它的 system 消息在创建时就写定了（和
+    `prompts/system.zh.md` 同一条规矩，见 `Session.new`）。
     """
     if session_id:
         if store.exists(session_id):
             return session_id, store.load(session_id), True
-        return session_id, Session.new(session_id), False
+        return session_id, Session.new(session_id, project_dir()), False
 
     # 只分配一次 id：`store.new_session_id()` 每次调用都会重新取时间戳，所以
     # `Session.new(store.new_session_id())` 这种写法会让"文件名里的 id"和"会话对象
     # 里的 id"在某次跨秒的调用里分开 —— 那种不一致落盘之后是完全看不出来的。
     new_id = store.new_session_id()
-    return new_id, Session.new(new_id), False
+    return new_id, Session.new(new_id, project_dir()), False
 
 
 # 预览截断到多少字符。**它比 `--list` 那条路多一个数**：终端里 `--list` 打一行就够，
@@ -560,6 +565,19 @@ class Runtime:
         if line:
             out.append(Notice("err", code="skills", text=f"[技能] {line}"))
 
+        # [AGENT.md]：工作区里那份项目说明读进来了没有。**和 [技能] 是同一类事实**
+        # ——"agent 手里有哪些别人写的说明"—— 所以形状（`[标签] 一句话`）、流向
+        # （err，和其余启动说明一起给前端）都一样。
+        #
+        # **它读的是 session.metadata，不是现场重读一次盘。** 这条说的是"这个会话的
+        # system 消息里到底注入了什么"，而那份消息在 Session.new() 时就冻结了：
+        # 恢复一个旧会话时重读盘就会报出"加载了 AGENT.md"，而那个会话的提示词里
+        # 其实一个字都没有 —— 这种"通知比事实乐观"的偏差没人查得出来。
+        for level, code, text in agents_md.notices(
+            self.agent_md_report(), relative_to=project_dir(),
+        ):
+            out.append(Notice("err", code=code, text=text, level=level))
+
         # autopilot：它意味着接下来所有需要审批的工具都会**直接执行**，而这件事一旦
         # 忘了自己开着，事后看日志只会觉得"这个项目怎么什么都没问"。所以它必须在
         # 启动时大声说一次，而且**不做成配置项** —— 一次性的决定不该悄悄变成永久默认。
@@ -615,6 +633,16 @@ class Runtime:
         """agent 的文件工具能碰的范围。派生值，不存字段 —— 它完全由"包在哪"决定。"""
         return project_dir()
 
+    def agent_md_report(self) -> agents_md.Report:
+        """这个会话的 system 消息里那份 AGENT.md 的去向（从 `session.metadata` 还原）。
+
+        **它是"读会话"而不是"读盘"**：这份报告在 `Session.new()` 里和 system 消息
+        一起被写下来，所以恢复一个旧会话时它说的就是那份旧提示词里的事。两个消费者
+        （`notices()` 和 `ui_state()`）都从这里取，于是"通知说加载了、而提示词里没有"
+        这种偏差不可能发生 —— 它们本来就读同一份数据。
+        """
+        return agents_md.from_block(self.session.metadata.get(agents_md.SESSION_KEY))
+
     def ui_state(self, *, with_catalog: bool = False) -> dict[str, Any]:
         """**面板数据**：左栏（上下文栏）那四块里，会话状态那一半。
 
@@ -633,6 +661,7 @@ class Runtime:
         from agent_runtime.tools.builtin.todo import load as load_todos
         from agent_runtime.tools.tool import RiskLevel
 
+        md = self.agent_md_report()
         state: dict[str, Any] = {
             "todos": load_todos(self.session.metadata),
             "skills": [dict(entry) for entry in load_entries(self.session.metadata)],
@@ -664,6 +693,16 @@ class Runtime:
             # （见类 docstring：装配完就不再改）。界面按这条显示，于是"界面上写着开、
             # 其实没开"不可能发生 —— 那份事实只有这个来源。
             "autopilot": bool(self.agent.autopilot),
+            # 这个会话的 system 消息里那份 AGENT.md 的去向。
+            #
+            # **它读 session.metadata，不重读盘** —— 理由和 notices 里同一条：这一格
+            # 说的是"这个会话的提示词里到底有什么"，而恢复旧会话时重读盘会报出一份
+            # 提示词里根本没有的说明。
+            #
+            # **`skipped`（没有这个文件）不进这里**：那是常态，左栏不该为它留一行。
+            "agents_md": agents_md.report_for_display(
+                md, relative_to=project_dir(),
+            ),
         }
         if with_catalog:
             state["skill_catalog"] = [

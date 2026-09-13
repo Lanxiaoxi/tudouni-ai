@@ -14,6 +14,38 @@ if str(TESTS_DIR) not in sys.path:
 from fakes import recording_registry  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_workspace(monkeypatch):
+    """把 `Session.new()` 的默认工作区挪到一个空目录。
+
+    **这是新加 AGENT.md 注入之后必须有的隔离**：`Session.new()` 会去工作区读那份文件，
+    而"工作区"默认是 agent_runtime 包目录本身 —— 于是全套测试的 system 消息取决于
+    **跑测试的那台机器上有没有人放了一份 AGENT.md**。那种失败长这样：本机全绿、CI
+    全红，而报错只是某条断言里多了一段文本，没人会往"工作区文件"上想。
+
+    ## 为什么自己建目录，不用 `tmp_path`
+
+    和 `workdir` 同一条理由：`tmp_path` 走系统临时目录，在受限环境里直接
+    `PermissionError`（实测过）。所以这里在 `tests/_tmp` 下建一个、用完就删。
+
+    **两个默认值都要改**：`agents_md.WORKSPACE` 是模块默认（给没传工作区的
+    `Session.new()` 用），`state.session.WORKSPACE` 是同一个名字在 `session` 模块里的
+    出口 —— 只改一处的话，另一处仍然指着包目录，隔离就是假的。
+
+    显式传 `workdir` 的那组测试（tests/test_agent_md.py）不受影响：参数优先。
+    """
+    from agent_runtime.state import agents_md, session as session_module
+
+    path = TESTS_DIR / "_tmp" / f"workspace-{uuid.uuid4().hex[:8]}"
+    path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(agents_md, "WORKSPACE", path)
+    monkeypatch.setattr(session_module, "WORKSPACE", path)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.fixture
 def workdir():
     """一个用完就删的干净目录。

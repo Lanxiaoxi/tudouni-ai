@@ -353,6 +353,14 @@ class ViewState:
     todos: list[dict[str, str]] = field(default_factory=list)
     skills: list[dict[str, str]] = field(default_factory=list)
     skill_catalog: list[dict[str, str]] = field(default_factory=list)
+    # 这个会话的 system 消息里那份 AGENT.md 的去向（`ui_state` 从
+    # `session.metadata` 读出来的报告）：每项形如
+    # `{"path": "AGENT.md", "lines": 12, "status": "loaded" | "failed", "problem": "…"}`。
+    #
+    # **它属于会话，不属于进程** —— 恢复一个旧会话时它说的必须是那份旧提示词里的事
+    # （见 `agents_md.Report`）。`failed` 那几条也在这里，而不是只当成一条 notice：
+    # notice 会随对话滚走，而"我那份 AGENT.md 为什么没生效"是随时会想再看一眼的问题。
+    agents_md: list[dict[str, Any]] = field(default_factory=list)
     messages: int = 0
     steps: int = 0
     risk_scope: list[dict[str, str]] = field(default_factory=list)
@@ -431,6 +439,7 @@ class ViewState:
         self.todos = []
         self.skills = []
         self.skill_catalog = []
+        self.agents_md = []
         self.risk_scope = []
         self.granted_tools = []
         self.granted_prefixes = []
@@ -922,6 +931,12 @@ def notice_is_redundant(code: str) -> bool:
 
     剩下的照样要显示：`mcp` 那条"忽略了工作区里的 mcp.json"、`web` 那条缺密钥、
     `autopilot` 那条警告，**它们没有别的出口** —— 丢进左栏就等于把它们藏起来。
+
+    **`agent_md` 也不在这里**（它读的是工作区那份 AGENT.md，不是左栏那三块）：用户
+    问了"启动的时候说一句加载了 xxx/AGENT.md"，而"加载了哪些别人写的说明"和 [技能]
+    那条是同一类事实，该在开场看得见 —— 左栏那四块说的是当前会话的**状态**，而这是
+    一次**启动事件**。读失败和被截断那两条尤其必须出现在这里：它们是 warn，左栏没有
+    任何一块会显示它们。
     """
     return code in ("permissions", "skills", "todos")
 
@@ -1164,6 +1179,10 @@ def apply_state(state: ViewState, message: dict[str, Any]) -> None:
     for key in ("todos", "skills", "risk_scope"):
         if key in message:
             setattr(state, key, [dict(item) for item in message[key] or []])
+    # AGENT.md 那份报告：**它只在开场那一条里有**（会话创建时读一次盘，之后不会变），
+    # 所以和 `skill_catalog` 用同一条规矩 —— 后来的快照没带它时要保住已经拿到的那份。
+    if "agents_md" in message:
+        state.agents_md = [dict(item) for item in message["agents_md"] or []]
     for key in ("granted_tools", "granted_prefixes", "denied_tools"):
         if key in message:
             setattr(state, key, list(message[key] or []))
@@ -1313,6 +1332,21 @@ def _session_block(state: ViewState) -> tuple[str, str, list[Line]]:
         else:
             lines.append(Line(f"上下文 {used}", ROLE_RULE))
     lines.append(Line(f"审计 {state.audit_dir_short()}", ROLE_RULE))
+    # 这个会话的 system 消息里注入了哪几份 AGENT.md。**放进"本次会话"这一块**（而不是
+    # 新开一块）：它和"这个会话 id 是什么、走了几步"是同一档事实 —— 都由会话创建那一刻
+    # 决定，也都在会话之间各不相同。开场那条 notice 说的是同一次加载，但那一条会随
+    # 对话滚走，而"我这份 AGENT.md 到底生效了没有"是随时会想再看一眼的问题。
+    for item in state.agents_md:
+        name = item.get("path", "?")
+        failed = bool(item.get("failed"))
+        # 截断过的用 `…` 标出来：**它和"读失败"不是一回事**（内容进去了，只是不全），
+        # 所以不能和 failed 共用那个 `!` —— 那会让人以为这份说明整个没生效。
+        mark = "! " if failed else ("… " if item.get("truncated") else "")
+        detail = item.get("reason") if failed else f"{item.get('lines', 0)} 行"
+        lines.append(seg(
+            (f"{mark}{name}", ROLE_WARN if failed else ROLE_RULE),
+            (f"  {detail}" if detail else "", ROLE_RULE),
+        ))
     return ("本次会话", "", lines)
 
 
