@@ -1702,7 +1702,12 @@ class CommandPalette(Vertical):
     一条都没变（决策 15 定下来的那六条还在原位，新增的三条排在末尾）。
 
     候选是**过滤**出来的（前缀匹配，见 `view_state.filter_commands`）：命令一共
-    八条，模糊匹配会让"我打错了"和"它猜对了"长得一样。
+    十三条，模糊匹配会让"我打错了"和"它猜对了"长得一样。
+
+    **面板的高度上限必须装得下全部命令**（见 `app._PALETTE_MAX_ROWS`）：它是屏幕纵向
+    布局里的一行、不是浮层，所以溢出时不会自己滚 —— 只是最后几条**静默消失**（实测：
+    上限写死 12 时，`/tools` `/model` `/thinking` `/effort` 在面板里根本不存在）。
+    `tests/test_tui_palette.py` 盯着这一条。
     """
 
     def __init__(self, palette: theme_mod.Theme, *args: Any, **kwargs: Any):

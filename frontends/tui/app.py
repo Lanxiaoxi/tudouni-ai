@@ -59,6 +59,17 @@ from agent_runtime.protocol.client import ProtocolClient
 # 这个界面最小要 8 行才不至于把会话区挤没。F5 那张 80×45 的图是它的正常形态。
 _BAR = 1
 
+# 命令面板最多几行。**从命令条数算出来，不手写数字。**
+#
+# 手写过一次（`max-height: 12`），而命令从 8 条长到 13 条之后，面板把**最后四条整个
+# 吃掉了** —— 没有滚动条、没有省略号，`/tools` `/model` `/thinking` `/effort` 在面板
+# 里根本不存在（实测：用户截图里 `/status` 就是最后一条）。这不是"有点挤"：面板是发
+# 现命令的**唯一**入口，看不见的命令等于没有。
+#
+# 三行是固定开销：标题 1 + 上下边框各 1。最后再留一行余量 —— 面板顶到上限时那最后一条
+# 贴着边框，读起来像是"下面还有"。
+_PALETTE_MAX_ROWS = len(view_state.COMMANDS) + 3 + 1
+
 
 def _version() -> str:
     """`pyproject.toml` 里的版本号，读不到就返回空串。
@@ -319,14 +330,26 @@ class TuiApp(App[None]):
     .hint-line { width: 1fr; height: auto; }
 
     /* --- 命令面板 --------------------------------------------------------- */
+    /* 高度**从命令条数算出来**（见 `_PALETTE_MAX_ROWS`）：手写过一次 12，而命令长到
+       13 条之后面板把最后四条整个吃掉，且没有任何提示。 */
     #palette {
         height: auto;
-        max-height: 12;
+        max-height: {_PALETTE_MAX_ROWS};
         background: $td-elevated;
         border: round $td-hairline;
         padding: 0 1;
     }
-    #palette-options { height: auto; }
+    /* 兜底：万一哪天命令多到装不下，**滑块是唯一能把它们翻出来的东西**。
+       `overflow-y: auto` 只在真的溢出时才占那一格，所以常态下不付代价。 */
+    #palette-options {
+        height: auto;
+        max-height: {_PALETTE_MAX_ROWS - 3};
+        overflow-y: auto;
+        scrollbar-size-vertical: 1;
+        scrollbar-background: $td-elevated;
+        scrollbar-color: $td-hairline;
+        scrollbar-color-hover: $td-ink4;
+    }
     .palette-title { height: 1; }
     .palette-option { height: 1; }
     .palette-option.selected { background: $td-accent-soft; }
@@ -391,6 +414,18 @@ class TuiApp(App[None]):
     }
     Button { margin-right: 2; min-width: 10; }
     """
+
+    # 面板那个高度**在这里代入**，不能写成 f-string。
+    #
+    # CSS 里有几百对花括号（每条规则一对），而 f-string 要求把它们全部写成 `{{` ——
+    # 那是一次几百处的改动，而且以后每加一条规则都要记得转义（漏一个就是一次
+    # `KeyError`／静默的格式错）。所以只把这一个值替换掉。
+    #
+    # **替换而不是写死**：写死过一次（`max-height: 12`），命令从 8 条长到 13 条之后
+    # 面板把最后四条整个吃掉，而屏幕上没有任何提示（见 `_PALETTE_MAX_ROWS`）。
+    CSS = CSS.replace("{_PALETTE_MAX_ROWS}", str(_PALETTE_MAX_ROWS)).replace(
+        "{_PALETTE_MAX_ROWS - 3}", str(_PALETTE_MAX_ROWS - 3),
+    )
 
     BINDINGS = [
         ("ctrl+c", "quit_app", "退出"),
