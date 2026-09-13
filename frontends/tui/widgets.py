@@ -670,9 +670,13 @@ class BorderedPanel(Static):
 # "框里多/少一条空行"，没有任何报错，也没人会去查是哪儿错了。
 #
 # 两个框的**内容都是 `WelcomeBlock.BOX_LINES` 行**，框高 = 那些行 + 上下 padding 各 1
-# + Textual 给边框留的 2 行 = 12。`height` 写虚一行就会在框底裁掉一行，而画面上看起来
-# 只是"框里少了一行字"。
-WELCOME_BOX_HEIGHT = 12
+# + Textual 给边框留的 2 行 = `10 + 2 + 2 = 14`。少一行就会在框底裁掉一行，而画面上
+# 看起来只是"框里少了一行字"。
+#
+# **这里原先写的是 12** —— 那条算式当时把 padding 那两行漏掉了（`10 + 2` 被当成了
+# `10 + padding + 边框`），而实测的症状正好是"内容区只有 8 行、装不下 10 行正文"，
+# 一条测试因此红着（见 `.welcome-box` 那条 CSS 里的同一个数）。
+WELCOME_BOX_HEIGHT = 14
 # 右栏那个方框的内容宽（列）：`42(框宽) - 2(边框) - 2(padding)`。`_recent_row` 靠它
 # 把"多久以前"和"标题"分成两列，所以它和 CSS 里那个 42 是一对。
 WELCOME_RIGHT_WIDTH = 38
@@ -782,7 +786,11 @@ class WelcomeBlock(Vertical):
         self._palette = palette
         self._payload = payload
         self._now = now
-        if self.body.is_mounted:
+        # **判据是"我自己挂上了没有"，不是 `self.body`。** `mount()` 是排队的，
+        # 刚挂上去那一瞬间 `#welcome-body` 还不存在，去 `query_one` 会抛 `NoMatches`。
+        # 没挂上就只登记、什么都不画 —— 等 `on_mount` / 之后那次 `on_resize` 再画，
+        # 那一趟也才拿得到宽度（见 `_sync_layout` 里"宽度还是 0"那一段）。
+        if self.is_mounted:
             self._sync_layout()
 
     def on_mount(self) -> None:
@@ -975,6 +983,12 @@ def _recent_row(item: dict[str, Any], palette: theme_mod.Theme,
     左边那一列的宽度按"最长的那个时间说法" `12分钟前` 算（`STAMP_WIDTH`），所以四行
     的时间是右对齐的、标题都在同一条竖线上 —— 那点空白就是这一行的列分隔，不用
     `f"{stamp:<8}"`（一个汉字两列，`len` 数不出来）。
+
+    **标题那一列的宽度取奇数（25 列），这是算出来的。** 截断的形态是"若干个整字 +
+    一个 1 列的 `…`"，而全宽字符一次占两列 —— 所以只有**奇数列数**能正好被填满
+    （`12 个汉字 + … = 25`）。写成偶数的话，一个全汉字的标题只能到 23 列（11 个汉字
+    + `…`），整行就比别的行短一列，右边那条竖线看起来"差一点点" —— 而那正是这一行
+    要保证的东西（`test_a_long_title_is_cut_by_columns_not_by_characters` 钉的就是它）。
     """
     when = item.get("modified_at")
     if isinstance(when, (int, float)) and not isinstance(when, bool) and now:
@@ -985,16 +999,20 @@ def _recent_row(item: dict[str, Any], palette: theme_mod.Theme,
     # 还没说过话的会话（preview 是空串）在面板里也写"（还没说过话）"，这里照抄那个
     # 口径：**一行完全空白看起来像渲染坏了**。
     title = str(item.get("preview") or "") or "（还没说过话）"
-    room = WelcomeBlock.RIGHT_WIDTH - STAMP_WIDTH - 2
     row = Text(stamp, style=palette.ink4)
-    row.append(" " * max(1, STAMP_WIDTH - row.cell_len + 2))
-    row.append(_clip_cells(title, room), style=palette.ink2)
+    row.append(" " * max(1, STAMP_WIDTH - row.cell_len + 1))
+    row.append(_clip_cells(title, TITLE_WIDTH), style=palette.ink2)
     return row
 
 
 # "12分钟前" 的显示宽（列）：7 个汉字/数字混排 = 3 + 2 + 2 + 2 ≈ 11，留一位余量。
 # 它是右栏第一列的固定宽 —— 四行的时间因此右对齐、标题因此对齐成一条竖线。
 STAMP_WIDTH = 12
+# 右栏标题那一列的宽（列）：`38 - 12(时间戳) - 1(分隔)` = 25。**取奇数不是随手定的**，
+# 见 `_recent_row` 的 docstring：截断的形态是"若干个整字 + 一个 1 列的 `…`"，而全宽
+# 字符一次占两列 —— 所以只有奇数列数能正好铺满。原先那个 `- 2` 让这一列是 24（偶数），
+# 一个全汉字的标题因此只能到 23 列，四行的右边差一列。
+TITLE_WIDTH = WelcomeBlock.RIGHT_WIDTH - STAMP_WIDTH - 1
 
 
 def _clip_cells(text: str, width: int) -> str:
@@ -1145,12 +1163,19 @@ class ConversationLog(VerticalScroll):
                      version: str, now: float | None = None) -> None:
         self._palette = palette
         if self._welcome is None:
-            # **只挂上去、不塞内容。** 盒子在 `WelcomeBlock.compose()` 里声明（见那里的
-            # 说明：给一个还没挂上的容器挂子控件会抛 `MountError`），所以内容要等这一次
-            # 挂载走完 —— 由 `_sync_layout` 在拿到宽度之后再画。
+            # **挂上去，然后立刻把 state 交给它。** 盒子在 `WelcomeBlock.compose()` 里
+            # 声明（见那里的说明：给一个还没挂上的容器挂子控件会抛 `MountError`），
+            # 所以这一次 `show()` 只登记、不画 —— 画要等挂载走完，由 `_sync_layout`
+            # 在拿到宽度之后做（见 `WelcomeBlock.show` 的判据）。
+            #
+            # 这一句**不能省**：省掉的症状是三个方框只有边框、里面一个字都没有 ——
+            # 因为 `_sync_layout` 第一句就是"没有 state 就返回"，而它此后不会再从别处
+            # 拿到 state（下一次 `show()` 要等到 `sessions` 那份回包，那可能是几百毫秒
+            # 之后，甚至永远不来）。
             block = WelcomeBlock(palette, classes="welcome")
             self.mount(block)
             self._welcome = block
+            block.show(state, palette, version, now=now)
         else:
             self._welcome.show(state, palette, version, now=now)
         # **把会话流拉回顶部**：欢迎屏比别的内容高一截，而 `#log` 自己会滚到底

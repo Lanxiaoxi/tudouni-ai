@@ -263,9 +263,12 @@ class TuiApp(App[None]):
     .welcome-box {
         /* **高度要比"内容行数 + 上下 padding"多两行**：Textual 算边框时会从 `height`
            里再扣掉两行，不够的话就在框底裁掉内容 —— 而画面上看起来只是"框里少了两行
-           字"。两个方框的内容行数本来就定死（`BOX_LINES` 行），所以这个数也是确定的：
-           `WELCOME_BOX_HEIGHT` 记的就是它，有一条测试盯着两处一致。 */
-        height: 12;
+           字"。两个方框的内容行数本来就定死（`BOX_LINES` = 10 行），所以这个数也是确定
+           的：`10(正文) + 2(padding) + 2(边框) = 14` —— `WELCOME_BOX_HEIGHT` 记的就是
+           它，有一条测试盯着两处一致。
+           **这里原先写的是 12**（那条算式把 padding 漏了），症状是内容区只有 8 行、
+           装不下 10 行正文。 */
+        height: 14;
         background: $td-surface;
         /* **边框用交互色，和输入框那两条线同色**（`#input-box` 的 `border-top/bottom`）：
            这一屏上"有边框的东西"是同一类（欢迎屏的三个框、输入框），用同一个颜色才像

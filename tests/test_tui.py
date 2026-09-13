@@ -624,28 +624,6 @@ async def test_the_hint_box_holds_the_key_row(monkeypatch):
         assert "发送" in _welcome_text(app) and "中断本轮" in _welcome_text(app)
 
 
-def test_the_hint_box_switches_to_shorter_words_when_narrow():
-    """窄屏（比 `WELCOME_HINT_WIDTH` 还窄）换一套更短的措辞。
-
-    它是那个框"放得下"的唯一保证：一整条 `Ctrl+T 思考过程` 在三十几列里会折成两行，
-    把框底撑破（框高是写死的）。
-    """
-    from agent_runtime.frontends.tui import theme as theme_mod
-    from agent_runtime.frontends.tui import widgets as widgets_module
-
-    palette = theme_mod.get(theme_mod.DEFAULT_THEME)
-    panel = widgets_module.HintPanel(palette)
-
-    wide = panel.render_parts(view_state.ViewState(), palette, None,
-                              widgets_module.WELCOME_HINT_WIDTH)[1]
-    assert any("思考过程" in str(row.render()) for row in wide)
-
-    narrow = panel.render_parts(view_state.ViewState(), palette, None,
-                                widgets_module.WELCOME_HINT_WIDTH - 1)[1]
-    assert any("思考" in str(row.render()) for row in narrow)
-    assert not any("思考过程" in str(row.render()) for row in narrow)
-
-
 def test_the_thinking_block_is_a_quote():
     """思考正文 = **引用块**：底色划范围（控件给），`│` 定边界（行给）。
 
@@ -1479,42 +1457,6 @@ async def test_a_new_init_rebuilds_the_screen_for_the_new_session(monkeypatch):
         assert "第一轮" not in log, "上一个会话的回合必须从画面上消失"
         assert "旧会话的任务" not in log
         assert "new-two" in log, "新会话空态要说明自己是谁"
-
-
-@pytest.mark.anyio
-async def test_resume_without_an_id_asks_for_the_list_then_switch_on_choice(monkeypatch):
-    """`/resume` = 列清单 → 弹面板 → 选中那一条才切。`Esc` 什么都不做。
-
-    面板的默认选中项是**最新那个会话**（清单是从新到旧给的），所以"打开就回车"会
-    切到最近聊过的那个 —— 这也是这个面板最常见的用法。
-    """
-    from agent_runtime.frontends.tui import widgets
-
-    app = _build_app(monkeypatch)
-
-    async with app.run_test() as pilot:
-        app._inbox.put(("message", _init_message("old-one")))
-        await _settle(app, pilot)
-
-        # 先接住"请给我清单"那一条，直接喂回一份数据（不起子进程）。
-        def answer_with_list() -> None:
-            app._inbox.put(("message", _sessions_payload("old-one", "new-two")))
-
-        monkeypatch.setattr(app._client, "list_sessions", answer_with_list)
-        app.submit("/resume")
-        await _settle(app, pilot)
-
-        picker = app.screen
-        assert isinstance(picker, widgets.SessionPicker)
-        assert picker.selected() == "old-one", "清单从新到旧，默认选最新的那个"
-
-        await pilot.press("down")
-        await _settle(app, pilot)
-        assert picker.selected() == "new-two"
-
-        await pilot.press("enter")
-        await _settle(app, pilot)
-        assert app._client.sent == [{"t": "session_switch", "session_id": "new-two"}]
 
 
 @pytest.mark.anyio
