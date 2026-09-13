@@ -502,15 +502,19 @@ def test_the_todo_block_counts_and_marks_each_item():
 
 # --- 配色与命令面板（纯数据那一半） -------------------------------------------
 
-def test_there_are_fourteen_themes_and_the_default_one_is_indigo_night():
-    """用户的九套色卡（P1–P9）+ 设计稿 F7 的五套候选（A–E），默认 ⑦ 靛夜。"""
+def test_there_are_fourteen_themes_and_the_default_one_is_graphite_amber():
+    """用户的九套色卡（P1–P9）+ 设计稿 F7 的五套候选（A–E），默认 ⑩ 石墨琥珀。"""
     assert len(theme_mod.ORDER) == 14
-    assert theme_mod.DEFAULT_THEME == "P7"
-    palette = theme_mod.get("P7")
-    assert palette.name == "靛夜"
-    # accent **必须是提亮过的那个值**：原色 #463DE8 在 #161616 上只有 2.3:1。
-    assert palette.accent == "#7670EF"
-    assert palette.bg == "#161616"
+    assert theme_mod.DEFAULT_THEME == "A"
+    palette = theme_mod.get("A")
+    assert palette.name == "石墨琥珀"
+    assert palette.accent == "#E0A83E"
+    # ⑦ 靛夜还在，只是不再是启动默认 —— 它的 accent 仍然是提亮过的那个值
+    # （原色 #463DE8 在 #161616 上只有 2.3:1）。
+    indigo = theme_mod.get("P7")
+    assert indigo.name == "靛夜"
+    assert indigo.accent == "#7670EF"
+    assert indigo.bg == "#161616"
 
 
 def test_every_theme_carries_all_roles():
@@ -544,6 +548,7 @@ def test_theme_resolve_accepts_key_number_name_and_nothing_else():
     assert theme_mod.resolve("p7") == "P7"
     assert theme_mod.resolve("P7") == "P7"
     assert theme_mod.resolve("7") == "P7"
+    assert theme_mod.resolve("10") == "A"
     assert theme_mod.resolve("13") == "D"
     assert theme_mod.resolve("靛") == "P7"
     assert theme_mod.resolve("墨绿") == "C"
@@ -2254,7 +2259,7 @@ async def test_theme_command_switches_all_fourteen_live(monkeypatch):
     app = _build_app(monkeypatch)
 
     async with app.run_test() as pilot:
-        assert app.theme == "P7" and app.palette.name == "靛夜"
+        assert app.theme == "A" and app.palette.name == "石墨琥珀"
 
         app.submit("/theme 墨绿")
         await _settle(app, pilot)

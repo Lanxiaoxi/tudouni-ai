@@ -70,7 +70,7 @@ uv run main.py --no-stream              # 老 CLI 这一支默认就不流式；
 
 uv run main.py --tui                    # TUI 界面（它自己拉起一个 --runtime-stdio 子进程）
 uv run main.py --tui --no-stream        # 关掉逐字输出：答案整段出现（和加流式之前一样）
-uv run main.py --tui --theme 墨绿仪器    # 换配色。14 套：p7 靛夜是默认，也能给名字/序号
+uv run main.py --tui --theme 墨绿仪器    # 换配色。14 套：a 石墨琥珀是默认，也能给名字/序号
 uv run main.py --runtime-stdio          # 协议子进程：stdout 是 JSONL（一般不由人直接跑）
 ```
 

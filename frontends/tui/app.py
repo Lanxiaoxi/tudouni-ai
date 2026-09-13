@@ -1410,7 +1410,7 @@ class TuiApp(App[None]):
                 view_state.Line("14 套：", view_state.ROLE_RULE),
                 *[view_state.Line("  " + part, view_state.ROLE_PROCESS)
                   for part in theme_mod.listing().split(" · ")],
-                view_state.Line("换一套：/theme 靛夜  ·  /theme p7  ·  /theme 7",
+                view_state.Line("换一套：/theme 石墨琥珀  ·  /theme a  ·  /theme 10",
                                 view_state.ROLE_RULE),
             ])
             return

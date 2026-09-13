@@ -1536,7 +1536,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("/exit", "退出"),
     Command("/help", "命令与键位"),
     Command("/theme", "换配色", True,
-            "不带参数列出 14 套；/theme 靛夜 或 /theme p7 直接换"),
+            "不带参数列出 14 套；/theme 石墨琥珀 或 /theme a 直接换"),
     Command("/skills", "看全部技能"),
     # **这一条推翻了决策 15 的一部分**（那一版明确不给 `/autopilot`，理由是"它是
     # 一次没有人可问，在有人看着的界面里语义矛盾"）。现在它是"**有人在看着，但他

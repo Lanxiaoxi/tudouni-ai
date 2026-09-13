@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--theme", default=None,
-        help="TUI 的配色（14 套：p7 靛夜是默认；也能给名字，如 --theme 靛夜）。"
+        help="TUI 的配色（14 套：a 石墨琥珀是默认；也能给名字，如 --theme 靛夜）。"
              "运行中还能用 /theme 换",
     )
     # 流式：**两个方向都写成显式开关**，因为它有两个默认值 —— TUI 默认开、老 CLI

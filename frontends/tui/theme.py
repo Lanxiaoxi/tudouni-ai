@@ -44,9 +44,10 @@ F6 的 `11 / 12 / 14` 三档字号在终端里不存在（一个终端只有一�
 
 from dataclasses import dataclass, field
 
-# 默认主题。**用户拍的板**：⑦ 靛夜 —— accent 提亮到 `#7670EF`（原色 `#463DE8`
-# 在 `#161616` 上只有 2.3:1，肉眼几乎看不见），这一格不能退回原色。
-DEFAULT_THEME = "P7"
+# 默认主题。**用户拍的板**：`A 石墨琥珀`（展示序号 10）—— 它取代了此前定的 ⑦ 靛夜。
+# 靛夜那一套本身没动（它的 accent 仍然是提亮过的 `#7670EF`，原色 `#463DE8` 在
+# `#161616` 上只有 2.3:1，肉眼几乎看不见），只是不再是启动默认。
+DEFAULT_THEME = "A"
 
 
 @dataclass(frozen=True)
@@ -222,8 +223,8 @@ _PALETTES: tuple[Palette, ...] = (
             bg="#151320", chrome="#211F2B", surface="#2D2B36", line="#BF5C78",
             ink="#FCF3E7", ink2="#A09997", ink3="#686468",
             accent="#EB6962", warn="#E0A44E", danger="#C93A44", ok="#6FBF8B"),
-    # P7 是默认。`accent` 必须用这个提亮过的值（原色 #463DE8 在 #161616 上 2.3:1）。
-    Palette("P7", "靛夜", "色卡⑦ · 默认", True,
+    # P7 曾经是默认。`accent` 必须用这个提亮过的值（原色 #463DE8 在 #161616 上 2.3:1）。
+    Palette("P7", "靛夜", "色卡⑦", True,
             bg="#161616", chrome="#222222", surface="#2E2E2E", line="#74B5B3",
             ink="#FFFFFF", ink2="#A2A2A2", ink3="#6A6A6A",
             accent="#7670EF", warn="#E8C05A", danger="#D76A7B", ok="#74B5B3"),
@@ -235,7 +236,8 @@ _PALETTES: tuple[Palette, ...] = (
             bg="#2F443A", chrome="#394D44", surface="#43564E", line="#507550",
             ink="#D5D1C7", ink2="#93998F", ink3="#6B776D",
             accent="#A2AF8E", warn="#C9A24E", danger="#E16E66", ok="#769376"),
-    Palette("A", "石墨琥珀", "F7-A", True,
+    # A 是现在的默认（展示序号 10）。
+    Palette("A", "石墨琥珀", "F7-A · 默认", True,
             bg="#131210", chrome="#1A1815", surface="#221F18", line="#342B24",
             ink="#EDE6DA", ink2="#AFA395", ink3="#847968",
             accent="#E0A83E", warn="#E0703A", danger="#C64A3E", ok="#8AA63F"),
