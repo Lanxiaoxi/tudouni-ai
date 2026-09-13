@@ -49,3 +49,19 @@ class ChatModel(ABC):
         `except Exception` 把它变成 ModelFatalError"这件事是类型上保证的。
         """
         raise NotImplementedError
+
+    def switch_model(self, model: str) -> None:
+        """**可选能力**：换一个模型名（`/model`）。
+
+        它不是抽象方法 —— 因为"能不能中途换模型"是**适配器自己的性质**：一个把模型名
+        烘进请求路径、或者一次构造就绑死了模型名的实现做不到，而那种实现照样是一个
+        合法的 `ChatModel`。所以默认实现是抛，调用方（`Agent.switch_model`）先
+        `getattr` 探一下，探不到就如实报"这个适配器不支持换模型"，而不是把沉默的失败
+        记成成功。
+
+        契约只有一条：**换完之后发出的下一个请求用新名字，已经发出去的那一个不受影响。**
+        （`complete()` 每次调用时现读，所以这一点对同步实现是自然成立的。）
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 不支持运行中换模型"
+        )

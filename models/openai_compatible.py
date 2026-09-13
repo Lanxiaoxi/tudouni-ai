@@ -336,6 +336,23 @@ class OpenAICompatibleModel(ChatModel):
         # 降级那条路要拿它们当键（见 `_NO_STREAM_OPTIONS`）。
         self.base_url = base_url
 
+    def switch_model(self, model: str) -> None:
+        """换一个模型名（`/model`）。**同一条 base_url、同一把密钥、同一个 http client。**
+
+        换的只是每次请求 `model=` 那个字段 —— 那正是"选哪个模型"在这里的全部含义。
+        `base_url` 也一并设上（调用方只会传同一个值）：它的用处是**留一个能对账的地方**，
+        见 `runtime/composition.py` 的 `select_model` —— 换到另一个网关上的模型时，那里
+        据此拒绝，而不是把请求悄悄发到一个根本没配密钥的地址上。
+
+        `_NO_STREAM_OPTIONS` 那个降级缓存**不用清**：它的键是 `(base_url, model)`，所以
+        "这个网关的这个模型不吃 stream_options"这件事天然是按模型分开记的。清掉的话，
+        换回一个已知会撞 400 的模型时会白撞一次，而那一次会往界面上吐一段要作废的正文。
+
+        **中途换是安全的**：`complete()` 每次调用时现读 `self.model`，所以换完之后发出
+        去的下一个请求就用新名字，而正在返回的那一个不受影响（它已经发出去了）。
+        """
+        self.model = model
+
     def complete(
         self,
         messages: list[dict[str, Any]],

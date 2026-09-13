@@ -37,6 +37,8 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.protocol import messages
+from agent_runtime.runtime.config import CONTEXT_WINDOWS
+from agent_runtime.state.model import ALIASES, MODEL_CATALOG
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 REPO_ROOT = MAIN_PY.parent
@@ -674,8 +676,11 @@ def test_a_new_turn_clears_a_previous_interrupt():
         session = _Session()
         agent = _Agent()
         logs = _Logs()
-        context_tokens = None
         max_steps = 1
+        # `_state_message` 会读这两个（`/model` 换完模型之后那个百分比的分母跟着变）。
+        # 替身给的是"这个替身没有模型"：`current_model` 为空串，窗口也就无从谈起。
+        current_model = ""
+        context_tokens = None
 
         def ui_state(self, *, with_catalog=False):
             return {"todos": [], "skills": [], "messages": 0, "steps": 0}
@@ -1210,5 +1215,284 @@ def test_bad_lines_are_skipped_and_counted(fake_openai):
     assert code == 0
     parse(lines)
     assert "跳过" in err and "行" in err
+
+
+# --- `/status` `/tools` `/model`（三条新入站消息）--------------------------------
+#
+# **这几条都用自己的一次性会话 id**（`_fresh_session()`），理由不是洁癖：
+# 会话文件是在磁盘上活的，而"换过模型"这件事**跟着会话存**（那正是被测的性质之一）。
+# 共用一个 id 的话，前一条测试 `/model` 选了 pro，后一条的会话就是从 pro 开始的 ——
+# 于是"目录里标着谁"和"这一轮请求发给谁"会随测试顺序变，而失败信息看起来像产品 bug。
+
+def _fresh_session() -> str:
+    """一个不会和别的测试撞车的会话 id（也避开上一次运行留下的文件）。"""
+    return f"proto-{uuid.uuid4().hex[:10]}"
+
+
+def _ui(got: list[dict], kind: str) -> dict:
+    """取 `ui` 里某种 kind 的那一条。**按 kind 取，不能按 t 取** ——
+    `run_finished` / `state` / `status` / `tools` 四种都叫 `t:"ui"`。"""
+    found = [m for m in kinds(got, "ui") if m.get("kind") == kind]
+    assert found, f"没有 kind={kind} 的 ui 消息：{[m.get('kind') for m in kinds(got, 'ui')]}"
+    return found[-1]
+
+
+def test_status_answers_with_the_audit_numbers(fake_openai):
+    """`/status` 的账**从审计日志里数出来**，而且和 `--audit` 是同一套口径。
+
+    走两个进程：第一个跑一轮对话（留下 model_call / tool_result 和一条回答），
+    第二个**什么都不做，只问一次状态**。
+
+    ## 为什么分两次，而不是在同一批入站里紧跟一条 `status`
+
+    因为 `/status` **不 join 正在跑的那一轮**（那正是它最有用的场景：跑着的时候看
+    一眼）。所以"紧跟一条 status"拿到的数字取决于那一轮跑到哪了 —— 一台快机器上
+    模型调用已经好了，慢一点就还没开始。**那样的断言是在测调度，不是在测统计。**
+
+    分两个进程之后，这一条同时钉住了"审计是**跨进程**的事实"：第二个进程什么都没
+    跑过，它报出来的每一个数都只能来自那份 jsonl。
+    """
+    base, scripts, calls = fake_openai
+    scripts[:] = [{"content": "我很好。"}]
+    session = _fresh_session()
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "你好"}, {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+    )
+    assert code == 0, err
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "status"}, {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    status = _ui(got, "status")
+    body = status["status"]
+    # 会话那一组：一眼能认出"这是哪个会话"。**这两个数来自上一轮留下的会话文件。**
+    assert body["session"]["id"] == session
+    assert body["session"]["messages"] == 3      # system + 用户 + 回答
+    assert body["session"]["steps"] == 1
+    # 模型那一组：现在用的那个，加它的窗口。
+    assert body["model"]["current"] == "deepseek-flash"
+    assert body["model"]["window"] == CONTEXT_WINDOWS["deepseek-flash"]
+    # 账那一组：**和网关报的数一致**（假网关固定报 10 输入 / 5 输出，见 `_reply_stream`）。
+    assert body["usage"]["prompt"] == 10
+    assert body["usage"]["completion"] == 5
+    assert body["counters"]["runs"] == 1
+    assert body["counters"]["model_calls"] == 1
+    assert body["counters"]["tool_calls"] == 0
+    # "上一次请求实际发出去多少"是另一个字段（它是**最近一次**，不是累计）。
+    assert status["last_prompt_tokens"] == 10
+    assert status["context_tokens"] == CONTEXT_WINDOWS["deepseek-flash"]
+
+
+def test_status_does_not_wait_for_a_running_turn(fake_openai):
+    """**跑着的时候问状态也答得出来** —— 它不 join 那一轮。
+
+    这是 `/status` 最有用的时刻（"它跑了半天了，花了多少？"），而代价要说清：
+    那一屏里的数字是**发快照那一刻**的真实值，所以这一轮的答案还没落进历史时
+    `messages` 就少一条。这不是 bug，是"不打断也不等待"的必然结果 —— 测试要钉的是
+    "它答了、而且答的是那一刻的真值"，不是某个固定的数。
+    """
+    base, scripts, _calls = fake_openai
+    scripts[:] = [{"content": "我很好。"}]
+    session = _fresh_session()
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "你好"},
+         {"v": 1, "t": "status"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+    )
+    assert code == 0, err
+    body = _ui(parse(lines), "status")["status"]
+    # 用户那句话一定已经在历史里了（它是在回合开始前就落盘的）。
+    assert body["session"]["messages"] >= 2
+    # **而计数是竞态的**：`/status` 不 join 那一轮，所以它可能在回合的第一个事件之前
+    # 就被处理掉（后台线程刚起来、还没来得及发 `run_started`）。两种都算对 —— 这条
+    # 测试钉的是"它答得出来"，不是"它答得多快"。
+    assert body["counters"]["runs"] in (0, 1)
+
+
+def test_status_works_before_any_turn(fake_openai):
+    """一步都没走过时**照样答**（全是 0，而不是一条错误）。
+
+    `summarize([])` 返回的就是零 —— 而"会话确实还没花过钱"和"我们数不出来"在这个
+    问题上的处置是一样的。**关键是不能崩**：这是用户按下第一件事就会试的命令。
+    """
+    base, _, _ = fake_openai
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "status"}, {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+    )
+    assert code == 0, err
+    status = _ui(parse(lines), "status")["status"]
+    assert status["counters"]["runs"] == 0
+    assert status["usage"]["prompt"] == 0
+    assert status["session"]["steps"] == 0
+
+
+def test_tools_lists_every_tool_with_its_permission(fake_openai):
+    """`/tools` 的清单**和 `init.tools` 是同一批工具**，而权限那一列由 runtime 算。
+
+    两处对不上的症状很难查（"启动时列着 shell、`/tools` 里没有它"），所以这里直接
+    拿两条消息比对名字集合。
+    """
+    base, _, _ = fake_openai
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "tools"}, {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    init = kinds(got, "init")[0]
+    listed = _ui(got, "tools")["tools"]
+    assert {row["name"] for row in listed} == {tool["name"] for tool in init["tools"]}
+
+    rows = {row["name"]: row for row in listed}
+    # 默认策略：low 自动放行，medium/high 要问。
+    assert rows["read_file"]["disposition"] == "auto"
+    assert rows["read_file"]["risk"] == "low"
+    assert rows["shell"]["disposition"] == "ask"
+    # `command` 那一格说的是"这个工具的参数量有没有命令行"—— 只有 shell 有，
+    # 而 `/tools` 末尾那句"命令规则只对有命令行的工具生效"靠它。
+    assert rows["shell"]["command"]
+    assert rows["read_file"]["command"] is None
+    assert rows["read_file"]["external"] is False
+
+
+def test_set_model_switches_and_says_so(fake_openai):
+    """`/model` 换模型：**回一条 state 快照 + 一条说明**，而且下一次请求真的用新名字。
+
+    三件事缺一不可：
+      * state 快照（界面按它显示，不许乐观更新）；
+      * 一条 notice（含"上一个是谁、什么时候生效"—— 界面拼不出这两个事实）；
+      * 下一次请求的 `model` 字段变了（**唯一的真凭据**）。
+    """
+    base, scripts, calls = fake_openai
+    scripts[:] = [{"content": "一"}, {"content": "二"}]
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_model", "model": "deepseek-v4-pro"},
+         {"v": 1, "t": "user_message", "text": "你好"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    snapshot = _ui(got, "state")
+    assert snapshot["model"] == "deepseek-v4-pro"
+    assert snapshot["model_window"] == CONTEXT_WINDOWS["deepseek-v4-pro"]
+
+    notices = [m for m in kinds(got, "notice") if m.get("code") == "model"]
+    assert notices, "换模型要回一条说明"
+    assert "deepseek-v4-pro" in notices[-1]["text"]
+    assert notices[-1]["level"] == "info"
+
+    # 真凭据：请求里带的是新模型名。
+    assert calls[-1]["model"] == "deepseek-v4-pro"
+
+
+def test_set_model_rejects_a_name_outside_the_catalog(fake_openai):
+    """目录外的名字**拒绝并说清**，而且**什么都不改**。
+
+    这条同时钉住"前端发什么 runtime 都得先校验"：界面拿到什么发什么，所以一个
+    手写的客户端可以发任何字符串。
+    """
+    base, scripts, calls = fake_openai
+    scripts[:] = [{"content": "一"}]
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_model", "model": "gpt-9"},
+         {"v": 1, "t": "user_message", "text": "你好"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+    )
+    assert code == 0, err
+    got = parse(lines)
+
+    notices = [m for m in kinds(got, "notice") if m.get("code") == "model"]
+    assert notices and notices[-1]["level"] == "warn"
+    assert "目录里没有这个模型" in notices[-1]["text"]
+    assert _ui(got, "state")["model"] == "deepseek-flash"
+    # 请求照旧用旧模型 —— "拒绝了"必须是真的没换。
+    assert calls[-1]["model"] == "deepseek-flash"
+
+
+def test_set_model_with_a_non_string_is_refused_at_the_envelope(fake_openai):
+    """信封那一层只拦"它得是个字符串"（`{"model": {...}}` 会把整个 dict 打给用户看）。"""
+    base, _, _ = fake_openai
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_model", "model": {"id": "x"}},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+    )
+    assert code == 0, err
+    notices = [m for m in kinds(parse(lines), "notice") if m.get("code") == "model"]
+    assert notices and "字符串" in notices[-1]["text"]
+
+
+def test_the_model_choice_survives_a_resume(fake_openai):
+    """换过的模型**跟着会话落盘**：恢复它时还是那个（而不是回到 .env 里那个）。
+
+    这是"只影响当前会话"那句承诺的另一半 —— 它必须在**下一个进程**里也成立，
+    所以这里跑两次子进程，第二次不重新选。
+    """
+    base, scripts, calls = fake_openai
+    scripts[:] = [{"content": "一"}, {"content": "二"}]
+    session = _fresh_session()
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "set_model", "model": "deepseek-v4-pro"},
+         {"v": 1, "t": "user_message", "text": "一"},
+         {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+    )
+    assert code == 0, err
+    assert calls[-1]["model"] == "deepseek-v4-pro"
+
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "user_message", "text": "二"}, {"v": 1, "t": "shutdown"}],
+        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+    )
+    assert code == 0, err
+    got = parse(lines)
+    init = kinds(got, "init")[0]
+    # 启动那一刻就说清楚"这个会话选的是谁"（不说的话，用户会以为它跟着 .env 走）。
+    # **它走 `init.notices`，不是一条 `notice` 消息** —— 那是开场那批说明的统一出口。
+    model_notices = [n for n in init["notices"] if n.get("code") == "model"]
+    assert model_notices, [n.get("code") for n in init["notices"]]
+    assert "deepseek-v4-pro" in model_notices[-1]["text"]
+    # 而且请求真的用新模型 —— 恢复会话不该悄悄回到 .env 那个。
+    assert calls[-1]["model"] == "deepseek-v4-pro"
+
+
+def test_init_carries_the_model_catalog(fake_openai):
+    """`/model` 那张清单**开场就发给前端**（它是常量数据，不随会话变）。
+
+    界面照它渲染、不写死模型名 —— 写死的话，加一个模型要改两个地方，而漏改的那一处
+    只表现为"这个模型选不了"。
+    """
+    base, _, _ = fake_openai
+    code, lines, err = run_protocol(
+        [{"v": 1, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        session=_fresh_session(),
+    )
+    assert code == 0, err
+    catalog = kinds(parse(lines), "init")[0]["model_catalog"]
+
+    ids = [item["id"] for item in catalog["models"]]
+    assert ids == [item.id for item in MODEL_CATALOG]
+    # `current` 由 runtime 标好（它要对账别名折算），界面不自己比字符串。
+    current = [item for item in catalog["models"] if item["current"]]
+    assert len(current) == 1 and current[0]["id"] == "deepseek-flash"
+    # 旧名字**单列**，不混在可选项里。
+    assert {item["id"] for item in catalog["aliases"]} == set(ALIASES)
+    assert all(item["of"] in ids for item in catalog["aliases"])
 
 

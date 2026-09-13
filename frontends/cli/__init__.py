@@ -25,8 +25,10 @@ from agent_runtime.agents import RunCancelled, StepLimitExceeded
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
 from agent_runtime.runtime.composition import Runtime
+from agent_runtime.security.commands import format_rule
 from agent_runtime.skills import SkillLoader
 from agent_runtime.state import JsonSessionStore, Session
+from agent_runtime.state import status as status_summary
 from agent_runtime.tools.builtin.todo import progress_line
 
 # 参数形状住在 frontends/cli/args.py。这里再导出一次，是因为现有调用点（包括
@@ -553,6 +555,157 @@ def _report_todos(session: Session, prefix: str = "[任务] ") -> None:
         print(f"{prefix}{line}", file=sys.stderr)
 
 
+# --- `/status` `/tools` `/model`（老 CLI 这一支）---------------------------------
+#
+# **这三条命令是行式的，不是面板**：老 CLI 里没有常驻栏、也没有浮层，所以答案直接
+# 打到 stderr（和提示符、每轮那句统计同一条线 —— stdout 只留对话正文，README 承诺
+# `> 对话.txt` 拿到的是干净的答案）。
+#
+# 数据全部来自 **runtime**，一行都不自己算：账从审计日志数（`runtime.logs`），
+# 权限判定问策略，模型目录读 `state/model.py`。这一支能直连 runtime（决策 19 的
+# 例外），所以它不需要走协议 —— 但**口径必须和 TUI 一致**，所以两边读的是同一批
+# 接口（`Runtime.status` / `tool_rows` / `model_rows`）。
+
+def _print_status(runtime: Runtime) -> None:
+    """`/status`。和 TUI 那一屏同一份数据，只是排成行。"""
+    summary = status_summary.summarize(list(runtime.logs.read(runtime.session_id)))
+    data = runtime.status(counts=summary["counters"], usage=summary["usage"])
+    session, model = data["session"], data["model"]
+    counters, usage, meta = data["counters"], data["usage"], data["meta"]
+
+    print("状态", file=sys.stderr)
+    # "这次启动：继续/新建"说的是**这次进程怎么开起来的**，不是这个会话有多满 ——
+    # 写成"（继续）"会让"继续一个新会话"读起来自相矛盾，而规模和步数就在下一行。
+    print(f"  会话        {session['id']}"
+          f"（{'这次启动：继续' if session['resumed'] else '这次启动：新建'}）",
+          file=sys.stderr)
+    print(f"  工作区      {session['workspace']}", file=sys.stderr)
+    print(f"  规模        {session['messages']} 条消息 · {session['steps']} 步",
+          file=sys.stderr)
+    current = model["current"] or "—"
+    if model["selected"] and model["selected"] != model["current"]:
+        current += f"（换成 {model['selected']} 的，下一次请求生效）"
+    print(f"  模型        {current}（{model['base_url']}）", file=sys.stderr)
+
+    # 分子是**最近一次请求**（`last_prompt_tokens`），分母是**当前模型**的窗口。
+    # 分母为 0/None 时只报用量 —— 错的百分比比没有百分比更坏（和状态栏同一条规矩）。
+    used = summary["last_prompt_tokens"]
+    if used is None:
+        context = "—（还没成功调用过模型）"
+    elif model["window"]:
+        context = (f"{used}/{model['window']} token"
+                   f"（{used / model['window'] * 100:.1f}%）")
+    else:
+        context = f"{used} token（这个模型的窗口不在目录里，不报占比）"
+    print(f"  上下文      {context}", file=sys.stderr)
+
+    if usage.get("prompt"):
+        rate = f"{usage['cached'] / usage['prompt']:.0%}"
+        print(f"  累计输入    {usage['prompt']} token"
+              f"（命中缓存 {usage['cached']}、命中率 {rate}）", file=sys.stderr)
+        print(f"  累计输出    {usage['completion']} token", file=sys.stderr)
+    else:
+        print("  累计用量    还没有成功调用过模型", file=sys.stderr)
+    print(f"  轮次        {counters.get('runs', 0)} 轮 · "
+          f"{counters.get('model_calls', 0)} 次模型调用 · "
+          f"{counters.get('tool_calls', 0)} 次工具调用"
+          f"（其中审批 {counters.get('permission_waits', 0)} 次、"
+          f"提问 {counters.get('asks', 0)} 次）", file=sys.stderr)
+    print(f"  工具        {meta['tool_count']} 个（/tools 看清单）", file=sys.stderr)
+    print(f"  这次运行    最多 {meta['max_steps']} 步 · "
+          f"{'流式' if meta['stream'] else '非流式'} · "
+          f"{'自动放行' if meta['autopilot'] else '逐条审批'}", file=sys.stderr)
+    print(f"  审计        {meta['audit_path']}", file=sys.stderr)
+
+
+def _print_tools(runtime: Runtime) -> None:
+    """`/tools`。工具名、风险、**会不会问你** —— 三列，和 TUI 那份清单同一个来源。"""
+    rows = runtime.tool_rows()
+    if not rows:
+        print("这次运行一个工具都没注册（缺引擎/密钥时会这样，启动那几行里有原因）",
+              file=sys.stderr)
+        return
+    wording = {"auto": "自动放行", "ask": "需要审批", "deny": "直接拒绝"}
+    width = max(len(row["name"]) for row in rows)
+    print("可用工具", file=sys.stderr)
+    for row in rows:
+        marks: list[str] = []
+        if row["granted"]:
+            marks.append("按过 t")
+        if row["external"]:
+            marks.append("外部")
+        if row["interactive"]:
+            marks.append("会问你")
+        elif row["parallel_safe"]:
+            marks.append("可并发")
+        mark = ("  ·  " + "、".join(marks)) if marks else ""
+        print(f"  {row['name']:<{width}}  {row['risk']:<7}"
+              f"{wording.get(row['disposition'], row['disposition'])}{mark}",
+              file=sys.stderr)
+    prefixes = [format_rule(rule) for rule in sorted(runtime.memory.prefixes())]
+    if prefixes:
+        print(f"  命令规则（按前缀放行，只对 shell 这类有命令行的工具生效）："
+              f"{'、'.join(prefixes)}", file=sys.stderr)
+    print("  改这些去 .tudouni/permissions.json；审批时按 t 会写进去", file=sys.stderr)
+
+
+def _print_models(runtime: Runtime) -> None:
+    """`/model` 不带参数：清单 + 现在用的是哪个。"""
+    rows, aliases = runtime.model_rows()
+    print(f"当前模型：{runtime.current_model or '—'}", file=sys.stderr)
+    width = max(len(row["id"]) for row in rows) if rows else 0
+    for row in rows:
+        mark = "●" if row["current"] else " "
+        window = f" · 上下文 {row['window']}" if row["window"] else ""
+        print(f"  {mark} {row['id']:<{width}}  {row['summary']}"
+              f"   （{row['label']}{window}）", file=sys.stderr)
+        if row["note"]:
+            print(f"      {row['note']}", file=sys.stderr)
+    for alias in aliases:
+        # 旧名字单列：它们是**认下的名字**，不是能选的选项（官方已把对应模型下线，
+        # 请求由新模型提供服务）。列进主清单会摆出两个效果一样的选项。
+        print(f"  认下的旧名字：{alias['id']} → {alias['of']}", file=sys.stderr)
+    print("换一个：/model <名字>（名字要精确，打错不猜）", file=sys.stderr)
+
+
+def _handle_slash_command(runtime: Runtime, line: str) -> bool:
+    """`/` 开头的行：是命令就执行并返回 True，不是就返回 False（当普通输入）。
+
+    **只有这几条**，而且**不做前缀模糊匹配**（`/mod` 不是 `/model`）：这个循环里
+    多认一个前缀的代价是真实的 —— 用户打了一句以 `/` 开头的话（路径、正则）会被
+    当成命令吃掉，而它看起来只是"我这句话没发出去"。
+
+    所以**认不出来的 `/` 开头的行原样当输入发给模型**，而不是回一句"没有这个命令"
+    然后丢掉：丢掉一句用户真的想说的话，比把一次打错字送给模型贵得多（一次往返 vs.
+    一句提示）。代价说白：`/stauts` 会被当成话发给模型，而模型多半会回一句"你是不是
+    想用 /status"。这一支里没有命令面板去兜这个错，所以这个取舍是刻意的。
+
+    它和 TUI 那套 `/` 命令是**各自实现的**，不是同一个注册表：TUI 那套走协议、
+    有面板和浮层，这一支直连 runtime、只有行。两者共享的是**数据口径**
+    （`Runtime.status` / `tool_rows` / `model_rows`），不是交互。
+    """
+    text = line.strip()
+    if not text.startswith("/"):
+        return False
+    command, _, rest = text.partition(" ")
+    rest = rest.strip()
+    if command == "/status":
+        _print_status(runtime)
+    elif command == "/tools":
+        _print_tools(runtime)
+    elif command == "/model":
+        if rest:
+            ok, message = runtime.select_model(rest)
+            print(("[模型] " if ok else "[模型] 没换：") + message, file=sys.stderr)
+            if not ok:
+                _print_models(runtime)
+        else:
+            _print_models(runtime)
+    else:
+        return False
+    return True
+
+
 def run_repl(runtime: Runtime) -> None:
     """多轮对话循环。
 
@@ -568,7 +721,10 @@ def run_repl(runtime: Runtime) -> None:
     agent, session, session_id = runtime.agent, runtime.session, runtime.session_id
     sink, context_tokens = runtime.logs, runtime.context_tokens
 
-    print("输入内容回车发送。空行、exit、quit 或 Ctrl+C 退出。\n")
+    print("输入内容回车发送。空行、exit、quit 或 Ctrl+C 退出。", file=sys.stderr)
+    print("（/status 看状态、/tools 看工具与权限、/model 换模型；"
+          "其他 / 开头的行会原样发给模型）", file=sys.stderr)
+    print(file=sys.stderr)
     while True:
         try:
             # 提示符写 stderr，和 cli_asker 保持一致：stdout 只留给 Agent 的产出，
@@ -581,6 +737,12 @@ def run_repl(runtime: Runtime) -> None:
 
         if not line or line.lower() in {"exit", "quit"}:
             break
+
+        # `/` 命令**在调用模型之前**拦下来：它们是"操作这个会话"，不是"对它说一句话"。
+        # 认不出来的 `/` 开头的行**原样当输入发给模型**（见 `_handle_slash_command`
+        # 里那段：路径和正则也会以 `/` 开头，吃掉它们是最坏的那种"贴心"）。
+        if _handle_slash_command(runtime, line):
+            continue
 
         print(f"\n--- 用户输入: {line} ---\n")
         try:

@@ -19,6 +19,7 @@ from agent_runtime.security.gate import check_permission
 from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.security.policy import PermissionPolicy
 from agent_runtime.state import Session
+from agent_runtime.state.model import SessionModel
 from agent_runtime.tools.tool import InvalidArgsError, Tool, ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
@@ -332,6 +333,7 @@ class Agent:
         clock: Clock = time.perf_counter,
         autopilot: bool = False,
         should_stop: "Callable[[], bool] | None" = None,
+        session_model: SessionModel | None = None,
     ):
         # 前三个是【能力】：每个应用构造一次，长期复用、可以跨会话共享。
         self.model = model
@@ -401,6 +403,61 @@ class Agent:
         # 为 None 表示"这一轮没有取消这回事"（CLI、测试、一次性任务）。这和 asker 可以为
         # None 是同一条：不注入就是没有这个能力，而不是"永远返回 False 的桩"。
         self.should_stop = should_stop
+
+        # 第八个注入点：**这个会话选的是哪个模型**（`/model` 的结果）。
+        #
+        # 为什么它必须进来，而不是让 Agent 直接读 `session.metadata`：读哪个键、块长什么
+        # 样是 `state/model.py` 的知识，而 Agent 该知道的只有两件事 —— "这一轮开头要不要
+        # 留一句'模型换了'"、以及"把'这一轮用过的模型'记下来"。两件事都在这个对象上。
+        #
+        # 为 None 表示"这个 Agent 不关心会话级模型选择"（测试、一次性任务）。代价是
+        # 那种会话里换模型不会在历史里留痕 —— 而那正是 None 的含义，不是漏了什么。
+        self.session_model = session_model
+
+    @property
+    def model_name(self) -> str:
+        """现在这个模型叫什么（`/status` 和"换了模型"那句话都用它）。
+
+        **从适配器上读，不存第二个字段。** 存一份的话，`Agent.model` 和那份副本会在
+        某条路上分家（"换了模型但状态栏还写着旧的"），而那种症状看起来像模型没换成功。
+        适配器不认识 `model` 属性时返回空串（`ChatModel` 的契约里没有它 —— 只有
+        OpenAI 兼容那一支有），调用方按"不知道"处理。
+        """
+        return str(getattr(self.model, "model", "") or "")
+
+    def switch_model(self, name: str) -> bool:
+        """换这个会话用哪个模型。返回"换成了吗"。**选择和生效在这里合成一件事。**
+
+        契约在适配器那一侧（`models/base.py` 的 `ChatModel.switch_model`），因为
+        **能不能中途换是适配器的性质**：一次构造就把模型名绑死、或者把名字烘进请求
+        路径的实现做不到 —— 而那样它照样是一个合法的 `ChatModel`。
+
+        ## 为什么"记下这个选择"也在这里
+
+        换模型是两步：**适配器上换**（下一个请求用新名字）和**会话里记**（下一轮开头
+        留一句"换过"、恢复会话时还是它）。分给两个方法、让调用方记得两步都走，是一条
+        迟早会漏的约定 —— 而漏掉第二步的症状尤其难看：模型确实换了，但历史里一句话
+        都没有，于是后半段那些回答看起来像是同一个模型写的（那是这个功能要解决的
+        那个问题本身）。
+
+        所以顺序钉在这里：**先让适配器换，成功了才记**。反过来的话，一个不支持换模型
+        的适配器会留下一条"选了 pro"的记录，而请求照旧发给 flash。
+
+        **只吞 `NotImplementedError`**（那是"这个能力不存在"的准确信号，基类的默认
+        实现抛的就是它）。别的异常原样穿出去：一个写坏了、自己抛 `TypeError` 的适配器
+        不该被当成"不支持"，那会把一个真 bug 变成一句轻描淡写的提示。
+
+        `self.model` **本身不动**（它还是同一个适配器对象）—— 换的是它内部的端点参数。
+        换对象的话，`Agent` 上所有持有它的东西（重试、审计、统计）都得跟着换一遍，
+        而那条路上漏一个的症状是"界面上写着新模型，请求还发给旧的"。
+        """
+        try:
+            self.model.switch_model(name)
+        except NotImplementedError:
+            return False
+        if self.session_model is not None:
+            self.session_model.select(name)
+        return True
 
     def _emit(self, kind: str, session: Session, run_id: str, step: int, **data: Any) -> None:
         """报告一条审计事件。
@@ -617,6 +674,15 @@ class Agent:
                 "attempt": attempt.number,
                 "duration_ms": attempt.duration_ms,
             }
+            # **这一次用的是哪个模型。** `/model` 能中途换模型，而换完之后"这条回答是谁
+            # 生成的"必须查得出来 —— 会话历史里只有一句 `[model changed: …]`（那是给
+            # 模型读的），而这里每条调用各记一次，所以事后能把一段对话按模型切开。
+            #
+            # 只有适配器报得出名字时才写（`ChatModel` 的契约里没有 `model` 属性）：
+            # 一个恒为空串的键会让读日志的人以为"那次没有模型"，而不是"这个适配器
+            # 不说"。和 `reasoning` / `streamed` 同一条规矩。
+            if self.model_name:
+                data["model"] = self.model_name
             if attempt.error is not None:
                 data["error"] = self._preview(attempt.error, AUDIT_PREVIEW_LIMIT)
             # 退避时长（只在这条失败的尝试还会重试时才有）：不记它的话，"这一轮为什么
@@ -713,6 +779,24 @@ class Agent:
         # 所以同一个 Agent 可以服务多个会话。
         # 系统提示词由 Session.new() 在会话创建时写一次，这里不再插入。
         messages = session.messages
+
+        # **换过模型就先留一句话，再记下"这一轮用的是什么"。**
+        #
+        # 顺序是这个功能唯一的讲究，两条都不能换：
+        #
+        #   * 那句话要在**用户这句话之后、第一个请求之前**进历史 —— 它说的是"从这个点
+        #     开始用谁"，而这个点就是这一轮。插在用户消息之前的话，模型读到的顺序是
+        #     "换了 → 用户说了话"，那也说得通，但和"谁回答了上一轮"就对不上了；
+        #   * `notice()` 要在 `record_use()` **之前**调："上一轮是谁回答的"这个问题的
+        #     答案在 `last_used` 里，而 `record_use()` 当场就把它盖成新的了。
+        #
+        # 判据是"选中的 ≠ 上一轮用过的"，不是"刚刚有人调过 /model"（见 SessionModel）：
+        # 一轮正跑着的时候按 `/model`，那一轮已经用旧模型发出去了，所以这句话留到下一轮。
+        # 换了又换回来时两者相等，于是不留 —— 中间那次没有产生任何回答，说"换过"是假的。
+        if self.session_model is not None and self.session_model.notice_needed():
+            messages.append(self.session_model.notice())
+            self.session_model.record_use()
+        # 用户这句话**排在换模型那句话之后**：见上面第一条。
         messages.append({"role": "user", "content": user_input})
         self._checkpoint(session)
 

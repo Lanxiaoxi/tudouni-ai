@@ -48,7 +48,7 @@ from agent_runtime.runtime.config import (
     save_approvals,
 )
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, TrustGroup
-from agent_runtime.security.commands import format_rule
+from agent_runtime.security.commands import command_parameter, format_rule
 from agent_runtime.skills import (
     RUNTIME_DIR_NAME,
     SkillCatalog,
@@ -59,6 +59,7 @@ from agent_runtime.skills import (
 )
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.state import agents_md
+from agent_runtime.state import model as model_state
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.builtin.grep import host_triple, rg_binary
@@ -376,6 +377,11 @@ class Runtime:
     的需求都该再 `open_runtime()` 一个，而不是就地改 —— 那会让审计里前后两段属于同
     一个 run 却按不同策略放行，而那种不一致事后完全看不出来。
 
+    **唯一的例外是模型，而且它是被记账的例外**（见 `select_model`）：换模型在会话历史里
+    留下一句"从这里开始用谁"，在审计里留下 model_call 的逐条记录，所以"这一次回答是
+    谁生成的"永远答得出来。而"就地换掉权限策略"没有这种痕迹 —— 那才是这条 docstring
+    真正防的东西。
+
     `eq=False`：这个对象持有进程和 socket，它长得不像一个"值"。默认生成的
     `__eq__` 会把两个 Runtime 逐字段比较，包括 httpx client —— 那除了慢没有别的用。
     """
@@ -385,7 +391,6 @@ class Runtime:
     web_cfg: WebConfig
     mcp_cfg: McpConfig
     permissions: PermissionConfig
-    context_tokens: int | None
     # 会话与持久化
     session_id: str
     session: Session
@@ -399,6 +404,14 @@ class Runtime:
     policy: PermissionPolicy
     memory: ApprovalMemory
     agent: Agent
+
+    # `/model` 那张清单（`state/model.py` 的目录）。它排在装配出来的零件之后，
+    # 因为有默认值：加一个模型是改那张表，不该逼每一个构造点都跟着改一行。
+    #
+    # **它是快照，而"现在用的是哪个"不是** —— 后者读 `agent.model_name`（见
+    # `current_model`）。把当前模型也存成字段就有了两份事实，而它们分家的症状是
+    # "状态栏写着 flash，请求发给了 pro"。
+    model_catalog: tuple[Any, ...] = model_state.MODEL_CATALOG
 
     # 一次性开关（用来渲染那条 autopilot 警告）
     autopilot: bool = False
@@ -430,6 +443,218 @@ class Runtime:
     _http: httpx.Client | None = None
     _mcp: McpToolset | None = None
 
+    # -- 模型（`/model`）--------------------------------------------------------
+
+    @property
+    def current_model(self) -> str:
+        """现在真正在用的模型名。**从 Agent 上读，不留第二个字段。**
+
+        空串 = 适配器没报出模型名（`ChatModel` 的契约里没有这个属性）。调用方按
+        "不知道"处理：显示成空、且不报上下文占比。
+        """
+        return self.agent.model_name
+
+    @property
+    def context_tokens(self) -> int | None:
+        """**当前模型**的上下文窗口（分母）。
+
+        它从 `current_model` 派生，**不是一个存下来的字段** —— `/model` 能中途换模型，
+        存字段就意味着换完之后这里还是旧的那个，而症状是状态栏那个百分比按旧窗口算：
+        看起来完全正常，只是数错了。
+
+        目录里没有这个名字时返回 None（`--model` 指向自建网关的模型、或者那个名字
+        已经下线）：只报用量、不报占比，错的百分比比没有百分比更坏。
+        """
+        return model_state.context_window(self.current_model)
+
+    def select_model(self, name: str) -> tuple[bool, str]:
+        """换这个会话用哪个模型。返回 `(换成了吗, 说给用户听的一句话)`。
+
+        ## 三道检查，顺序有意
+
+          1. **名字认不认识** —— 判据是 `state/model.py` 的目录（`/model` 那个清单就是
+             从它渲染的）。不认识就拒绝：接受一个目录外的名字等于让 `/model` 的清单
+             变成一句谎话，而"选了一个它根本没列出来的模型"这件事没有任何地方会报；
+          2. **网关对不对** —— 目录里的模型**共享同一把密钥与同一个 base_url**（见
+             `state/model.py` 那一段）。一个指向自建网关的会话去选 DeepSeek 官方的
+             模型名，请求会发到一个那台网关多半没有的模型上（或者更糟：发到官方端点、
+             而密钥不是官方那把）。这一档里没有"provider"这个概念，所以只能这样挡：
+             配置里的 base_url 和适配器上那个不一致就直接拒绝 —— 那说明装配时就
+             已经分家了，是更该先修的问题；
+          3. **适配器认不认** —— 见 `Agent.switch_model`。
+
+        ## 落盘与生效的时序
+
+        这里**只改内存 + `session.metadata`**：`/model` 之后用户可能一句话都不说就退出，
+        而 `select()` 写的是一个活字典，下一次 checkpoint（或下一个回合开头）自然会带上它。
+        写文件不是这一层的事（`store.save` 由 Agent 的 on_checkpoint 调）。
+
+        模型名一样时**照样走完**并返回"已经是它了"：那是幂等的，而且用户按了两遍
+        `/model flash` 该得到一句"已经是它"，不是一句错误。
+        """
+        wanted = (name or "").strip()
+        if not wanted:
+            return False, "没给模型名。/model 不带参数看清单。"
+
+        known = model_state.get(wanted)
+        if known is None:
+            return False, (
+                f"目录里没有这个模型：{wanted} —— /model 不带参数看清单。"
+                f"（目录是写死的几个名字，不会把任意名字转给网关："
+                f"那样打错一个字母只会在下一次请求时才炸。）"
+            )
+        model_id = known.id
+
+        configured = str(getattr(self.agent.model, "base_url", "") or "")
+        if configured and configured != self.model_cfg.base_url:
+            return False, (
+                f"这个会话的模型端点和配置对不上（{configured} ≠ "
+                f"{self.model_cfg.base_url}），不换 —— "
+                f"否则请求会发到一个没配密钥的地址上。"
+            )
+
+        if self.current_model == model_id:
+            return True, f"已经是 {model_id} 了。"
+
+        previous = self.current_model or "（未知）"
+        if not self.agent.switch_model(model_id):
+            return False, (
+                f"这个会话的模型适配器不支持中途换模型（{type(self.agent.model).__name__}）"
+                f"—— 只能重启时用 DEEPSEEK_MODEL 指定。"
+            )
+
+        # **立刻落盘，不等下一个检查点。** 换模型是用户的一次明确操作，而"会话级选择
+        # 跟着会话走"这句话必须现在就成立：`/model` 之后一句话都不说就退出，是最自然的
+        # 用法之一（我们先告诉过用户"下一次请求生效"，而恢复会话时说"你选的是 flash"
+        # 会是同一份承诺的反面）。
+        #
+        # 此时此刻 messages 是**一致的**（没有人正在跑），所以这个落盘点和 Agent 那些
+        # 检查点一样安全。失败不当成失败：选择还在内存里，这一个会话照用；只是它不会
+        # 跨进程 —— 而那种情况必须说出来（和 `Agent._checkpoint` 那条规矩一致）。
+        try:
+            self.store.save(self.session)
+        except Exception as exc:  # noqa: BLE001
+            _warn(f"换模型之后落盘失败（这一次仍然生效，重开会话会回到配置里那个）："
+                  f"{type(exc).__name__}: {exc}")
+
+        # **没有第三步**：`switch_model` 里已经把"这个会话选的是谁"记进
+        # `session.metadata` 了（那两件事分给两个方法是一条迟早会漏的约定，见那里的
+        # 说明）。这里只剩回报 —— 而回报必须带上"上一个是谁"：那句话里同时有"上面
+        # 那些轮次是谁写的"和"从这里开始是谁"，界面拼不出来（它不知道上一轮用了谁）。
+        return True, f"换成 {model_id}（上一个：{previous}）—— 下一次请求生效。"
+
+    def model_rows(self) -> list[dict]:
+        """`/model` 那张清单：目录 + "现在用的是哪个" + "认下的旧名字"。"""
+        current = model_state.canonical(self.current_model)
+        rows = [
+            {
+                "id": item.id,
+                "label": item.label,
+                "window": item.window,
+                "summary": item.summary,
+                "note": item.note,
+                "current": item.id == current,
+            }
+            for item in self.model_catalog
+        ]
+        # 别名（已下线、仍可调用的旧名字）单列：它们是**认下的名字**，不是能选的选项。
+        # 放进主清单会摆出两个效果完全一样、价钱也一样的选项（官方明确说过旧名字由
+        # V4.1-Flash 提供服务），而"我到底选了哪个"就没有答案了。
+        aliases = [
+            {"id": alias, "of": target}
+            for alias, target in sorted(model_state.ALIASES.items())
+        ]
+        return rows, aliases
+
+    # -- `/status` -------------------------------------------------------------
+
+    def status(self, *, counts: dict | None = None,
+               usage: dict | None = None) -> dict[str, Any]:
+        """`/status` 那一屏要的全部事实。**结构化数据，谁来渲染各管各的。**
+
+        分成四组是**刻意的**：这一屏要显示的东西跨了四个层次（会话 / 模型 / 账 /
+        这次运行的环境），而平铺成一个大字典之后，字段名会在将来某次合并里悄悄撞车
+        （比如"工具清单"和"工具个数"）。
+
+        后两组**由调用方传进来**（`state/status.summarize` 的产物），因为这个函数
+        自己数不出来：账在审计日志里，而"读文件"是调用方的事（协议层从它自己的 sink
+        读、CLI 从 `runtime.logs` 读）。这样这个函数是纯的、可测的，也不会因为日志
+        文件被删掉而失败 —— 而那正是"一次 `/status` 不该让会话出问题"的全部含义。
+
+        `tool_count` 在这里**只给个数**：`/tools` 那条命令要的是完整清单（带权限），
+        它有自己的一条消息（`ui(kind="tools")`）。把清单塞进每一份 status 快照等于
+        每次刷新都重发那几十行，而状态栏并不显示它们。
+        """
+        session_model = self.agent.session_model
+        return {
+            "session": {
+                "id": self.session_id,
+                "resumed": bool(self.resumed),
+                "workspace": str(self.workspace),
+                "messages": len(self.session.messages),
+                "steps": self.session.step_count(),
+            },
+            "model": {
+                # **现在真正在用的那个**（`Agent` 上的适配器说了算），不是配置里那个。
+                "current": self.current_model,
+                # 这个会话**选**的（`/model` 写的那个）。它和 `current` 在换完模型、
+                # 下一次请求之前会暂时不同，而那个差别正是"还没生效"的证据。
+                "selected": session_model.selected if session_model is not None else "",
+                "last_used": session_model.last_used if session_model is not None else "",
+                "since": session_model.selected_since if session_model is not None else 0.0,
+                # 当前模型的窗口（分母）。None = 目录里没有这个名字，只报用量。
+                "window": self.context_tokens,
+                "base_url": self.model_cfg.base_url,
+            },
+            "counters": dict(counts or {}),
+            "usage": dict(usage or {}),
+            "meta": {
+                "max_steps": self.max_steps,
+                "stream": bool(self.stream),
+                "autopilot": bool(self.agent.autopilot),
+                "tool_count": len(self.tools.all()),
+                "audit_path": str(Path(self.logs.directory) / f"{self.session_id}.jsonl"),
+                "permissions": self.non_default_permissions(),
+            },
+        }
+
+    def tool_rows(self) -> list[dict[str, Any]]:
+        """`/tools` 那一屏：每个工具 + 它的权限。
+
+        权限那一栏是**策略自己给出的裁定**，不是界面拼的：`decide()` 是唯一知道
+        "这个工具会不会问我"的地方（按等级放行、点名拒绝两条路都在里面）。这里不
+        假装回答"等级名单 + 点名免问"那两层 —— 那两层要 `ApprovalMemory`，而这一列
+        只要"要不要问"这个总答案，另外两个标记（`granted` / `command`）说明"为什么
+        不用问"。
+
+        `command` 是这个工具的参数里有没有**命令行**（只有 shell 有）。有它的工具才
+        谈得上"按命令前缀放行"那条规则 —— `/tools` 末尾那句提示靠它决定说不说。
+        """
+        from agent_runtime.security.policy import Decision
+
+        granted = set(self.memory.tools())
+        rows: list[dict[str, Any]] = []
+        for tool in self.tools.all():
+            # 空参数问一次即可：`decide` 只看工具名与风险等级（参数要在更细的策略里
+            # 才用得上，见 policy.decide 的说明）。
+            decision = self.policy.decide(tool, {})
+            rows.append({
+                "name": tool.name,
+                "risk": tool.risk.value,
+                "disposition": {
+                    Decision.ALLOW: "auto",
+                    Decision.DENY: "deny",
+                }.get(decision, "ask"),
+                "parallel_safe": bool(tool.parallel_safe),
+                "interactive": bool(tool.interactive),
+                # 外部工具（MCP）。它和内置工具的差别不只是名字：风险一律 high、
+                # 每次都要你按键放行 —— `/tools` 里要看得见这个来源。
+                "external": tool.name.startswith("mcp__"),
+                "granted": tool.name in granted,
+                "command": command_parameter(tool.name),
+            })
+        return rows
+
     # -- 呈现 ------------------------------------------------------------------
 
     def notices(self, *, with_tools: bool = True) -> list[Notice]:
@@ -448,7 +673,7 @@ class Runtime:
         # （错的百分比比没有百分比更坏）。
         if self.context_tokens is None:
             out.append(Notice("err", code="context",
-                text=f"[上下文] 模型 {self.model_cfg.model!r} 不在 config.CONTEXT_WINDOWS 里，"
+                text=f"[上下文] 模型 {self.current_model!r} 不在 state/model.py 的目录里，"
                 f"末尾只报上下文用量、不报占比；把它的窗口长度加进那张表即可。"))
 
         # 缺搜索密钥不是配置错误（不像 DEEPSEEK_API_KEY）：只是不注册那一个工具。
@@ -545,6 +770,17 @@ class Runtime:
         rules = ", ".join(format_rule(rule) for rule in sorted(self.memory.prefixes())) or "（无）"
         out.append(Notice("err", code="permissions",
                           text=f"[权限] 命令规则（按前缀放行）{rules}"))
+
+        # [模型]：**只在"这个会话选过模型"时说**。配置里那个（`.env` 的
+        # `DEEPSEEK_MODEL`）不是新闻 —— 启动横幅和 `init.model` 都写着它，再说一遍
+        # 就是噪音。而"恢复一个会话、它用的是你上次 `/model` 选的那个"必须说出来：
+        # 不说的话，用户会以为模型跟着 `.env` 走，而账单上会是另一回事。
+        if self.agent.session_model is not None and self.agent.session_model.selection is not None:
+            selected = self.agent.session_model.selected
+            where = self.model_cfg.base_url
+            out.append(Notice("err", code="model",
+                text=f"[模型] 这个会话选的是 {selected}（{where}）—— "
+                     f"/model 可以换，/status 看现在这个。"))
 
         # [任务] / [技能]：两者都比进程活得久（存在 session.metadata 里），所以恢复
         # 会话时不说的话，用户看到的会是"它怎么突然开始更新一个我从没见过的列表"。
@@ -813,10 +1049,22 @@ def open_runtime(
     # 这一条界线就是"用户得先做点事"和"少一个能力"的界线。
     mcp_cfg = mcp_config or McpConfig.from_file()
 
+    # 这个会话用哪个模型：**会话级选择优先，配置里那个是兜底**。
+    #
+    # 判据取 "这个会话选过吗" 而不是 "配置里是什么"：`/model` 之后恢复会话的人期待
+    # 还是他选的那个（和任务列表、已加载技能同一条路 —— 它们都住在 session.metadata
+    # 里，所以它们一起过期、一起恢复）。
+    #
+    # 它在这里读、而不是在 Agent 里读：装配期的 `SessionModel` 要拿着它去造适配器
+    # （模型名是构造参数），而 Agent 手上只需要"想用谁 / 上一轮用了谁"那份状态。
+    session_model = model_state.SessionModel.restore(
+        session.metadata, fallback=model_state.default_id(cfg.model),
+    )
+
     model = OpenAICompatibleModel(
         api_key=cfg.api_key,
         base_url=cfg.base_url,
-        model=cfg.model,
+        model=session_model.selected,
         http_client=httpx.Client(),
     )
 
@@ -944,6 +1192,9 @@ def open_runtime(
             # 第六个注入点：**"要不要停"由外面决定，怎么停在 Agent 里。**
             # 为 None 表示"这一轮没有取消这回事"（CLI、测试）。
             should_stop=should_stop,
+            # 第八个注入点：这个会话选的是哪个模型。Agent 用它做两件事 ——
+            # 换过模型时在历史里留一句话、每轮记下"实际用了谁"。
+            session_model=session_model,
         )
     except Exception:
         # 装配失败时**必须把这些收掉**再往外抛：http client 是我们建的，而 MCP 的
@@ -958,7 +1209,6 @@ def open_runtime(
         web_cfg=web,
         mcp_cfg=mcp_cfg,
         permissions=permissions,
-        context_tokens=cfg.context_tokens,
         session_id=session_id,
         session=session,
         store=booted.store,

@@ -783,6 +783,11 @@ class TuiApp(App[None]):
         state.workspace = message.get("workspace", "")
         state.audit_path = message.get("audit_path", "")
         state.context_tokens = message.get("context_tokens")
+        # `/model` 那张清单。**它不随会话变**（目录是常量数据），所以 `reset_for_session`
+        # 不清它 —— 清掉的话，换一个会话之后 `/model` 会摆出一张空清单。
+        catalog = message.get("model_catalog") or {}
+        state.model_catalog = [dict(item) for item in catalog.get("models") or []]
+        state.model_aliases = [dict(item) for item in catalog.get("aliases") or []]
         # **流式开不开以 runtime 为准**（它是运行期事实，也是 `--stream` 那一侧算出来的）。
         # 界面自己那个 `self._stream` 只是"我们请求了什么" —— 拿它当事实的话，
         # 一个不认识这个开关的老 runtime 会让界面等一堆永远不来的 delta，
@@ -916,6 +921,18 @@ class TuiApp(App[None]):
             # "你问的 + 它答的"冲稀。左栏就是它的位置。
             view_state.apply_state(self.state, message)
             self._report_autopilot()
+            return
+        if message.get("kind") == messages.UI_STATUS:
+            # `/status` 的回包。**它进会话流**（不是面板）：那是"看一眼就走"的东西，
+            # 而且它常常是在一轮跑着的时候问的 —— 那时候屏幕上正在滚的东西恰恰是
+            # 你要看的，弹一个层把它盖住是本末倒置。
+            self.state.status = dict(message.get("status") or {})
+            self._say_lines(view_state.render_status(self.state, message))
+            return
+        if message.get("kind") == messages.UI_TOOLS:
+            self.state.tools = [dict(row) for row in message.get("tools") or []]
+            self._say_lines(view_state.render_tools(self.state, message))
+            return
 
     def _report_autopilot(self) -> None:
         """`/autopilot` 的回声：**说的是 runtime 确认之后的那个值**。
@@ -1161,12 +1178,69 @@ class TuiApp(App[None]):
         elif command == "/skills":
             self.push_screen(widgets.SkillsPanel(self.state, self.palette,
                                                  id="skills"))
+        elif command == "/status":
+            self._command_status()
+        elif command == "/tools":
+            self._command_tools()
+        elif command == "/model":
+            self._command_model(rest)
         elif command == "/theme":
             self._command_theme(rest)
         elif command == "/autopilot":
             self._command_autopilot()
         else:
             self._say(f"没有这个命令：{command}（/help）")
+
+    def _command_status(self) -> None:
+        """`/status`：**请 runtime 说，别自己拼。**
+
+        这一屏里的东西分成两类，而它们恰好都在 runtime 手上：会话规模、当前模型、
+        工具个数是它的字段；tokens 和轮次要从**审计日志**里数出来（协议层读一次
+        `runtime.logs`）。界面自己拼的话，第二类就得让前端去读
+        `.tudouni/logs/` —— 那正是 `list_sessions` 立过的规矩：目录布局不是前端该
+        认识的事实（store 明确留着"将来换 SQLite"的余地）。
+
+        所以这里只发一条请求，答案到了由 `_on_ui` 渲染进会话流。
+        """
+        if self._client is None:
+            return
+        self._client.ask_status()
+
+    def _command_tools(self) -> None:
+        """`/tools`：同上，问 runtime 要那份带权限的清单。
+
+        权限那一列**必须由 runtime 给**：哪几个等级自动放行、点名免问了谁、
+        deny_tools 里有什么 —— 三条路都在 `PermissionPolicy` / `ApprovalMemory` 里。
+        界面自己算就是第二份事实，而它漂掉的症状是"这里写着会问我，实际没问"
+        （或者反过来，那是更坏的那个方向）。
+        """
+        if self._client is None:
+            return
+        self._client.ask_tools()
+
+    def _command_model(self, rest: str) -> None:
+        """`/model [名字]`。**不带参数只列清单，不做"轮换到下一个"。**
+
+        和 `/theme` 完全同一条交互（理由也一样：轮换会把"我现在用的是哪个"变成一个
+        必须靠记忆的状态，而列一次清单的成本是零）。
+
+        ## 带参数时不自作聪明
+
+        **认不出来的名字不就近匹配**：`/model flsh` 得到的是"没有这个模型"外加清单。
+        配色选错一眼看得出来，而模型选错只会在账单上体现（Pro 的未命中输入是 Flash
+        的四倍多），所以这里比 `/theme` 更没有理由去猜。
+
+        改名那一半也**不在这里做**（不检查目录、不比较当前值）：目录是 runtime 的
+        知识，请求发出去之后要么回来一条 state 快照（换成/已经是它），要么回来一条
+        notice（没换成，含原因）。界面只负责把两种回包显示出来 —— 和 `/autopilot`
+        不许乐观更新是同一条规矩。
+        """
+        if not rest:
+            self._say_lines(view_state.render_models(self.state))
+            return
+        if self._client is None:
+            return
+        self._client.set_model(rest)
 
     def _command_autopilot(self) -> None:
         """`/autopilot`：切换"不再逐条问审批"那个模式。**开关在 runtime 手里。**
@@ -1278,6 +1352,12 @@ class TuiApp(App[None]):
                  view_state.ROLE_WAITING),
                 (command.hint, view_state.ROLE_PROCESS),
             ))
+            # 带参数那条的用法**另起一行、缩进对齐**（而不是塞进上面那一列）：
+            # 那一列的宽度是从命令名算出来的，塞一段长文案进去会把整张表的对齐撑坏。
+            if command.detail:
+                lines.append(view_state.Line(
+                    f"  {'':<{view_state.COMMAND_NAME_WIDTH}}{command.detail}",
+                    view_state.ROLE_RULE))
         lines.append(view_state.Line("键位：", view_state.ROLE_RULE))
         # **和欢迎屏底下那个「提示」框读的是同一份表**（`widgets.HINT_KEYS_*`）：
         # 两处各写一遍的话，"改了键位、忘了改提示"早晚会发生。

@@ -12,6 +12,10 @@
       "session_id": {"type": "string"},
       "resumed": {"type": "boolean", "doc": "true = 接上了一个已存在的会话"},
       "model": {"type": "string"},
+      "model_catalog": {
+        "type": "object",
+        "doc": "`/model` 那张清单的数据源：`{\"models\": [{\"id\", \"label\", \"window\", \"summary\", \"note\", \"current\"}], \"aliases\": [{\"id\", \"of\"}]}`。**它是数据、不是答案** —— 界面照它渲染即可，别自己写死模型名。`current` 标着现在用的那个；`aliases` 是**认下但不在清单里**的旧模型名（它们仍可调用，由同一个新模型提供服务）。"
+      },
       "workspace": {"type": "string", "doc": "工作区绝对路径（agent 的文件工具能碰的范围）"},
       "max_steps": {"type": "integer"},
       "stream": {
@@ -90,19 +94,23 @@
       "run_id": {"type": "string"},
       "step": {"type": "integer"},
       "ts": {"type": "string"},
+      "model": {
+        "type": "string",
+        "doc": "**只有 `model_call` 有**（适配器报得出模型名时）。它让审计能把一段对话按模型切开 —— `/model` 能中途换模型，而换完之后\"这条回答是谁生成的\"不能只靠会话里那句 `[model changed: …]`（那是给模型读的）。**每一次调用各记一次**，所以换过模型之后同一个 run 里的两条 `model_call` 会带着不同的名字。"
+      },
       "$rest": {"doc": "其余字段随 kind 不同，见 audit/events.py 和各 _emit 调用点。前端必须忽略不认识的 kind 和字段，不许崩。"}
     },
     "required": ["v", "t", "kind", "session_id", "run_id", "step", "ts"]
   },
   "ui": {
-    "summary": "只给界面、不进审计的东西。两种 kind，字段按 kind 取。",
+    "summary": "只给界面、不进审计的东西。四种 kind，字段按 kind 取。",
     "fields": {
       "v": {"type": "integer", "const": 1},
       "t": {"type": "string", "const": "ui"},
       "kind": {
         "type": "string",
-        "enum": ["run_finished", "state"],
-        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/messages/steps）。两种都**不进审计**。"
+        "enum": ["run_finished", "state", "status", "tools"],
+        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/messages/steps/model）；status = `/status` 要的那一屏（回答入站的 status）；tools = `/tools` 的清单（回答入站的 tools）。四种都**不进审计**。"
       },
       "answer": {
         "type": "string",
@@ -154,6 +162,23 @@
       "steps": {
         "type": "integer",
         "doc": "**只有 kind=state 有**。这个会话累计跑了多少步（`Session.step_count()`）。"
+      },
+      "model": {
+        "type": "string",
+        "doc": "**kind=state / status 有**。现在真正在用的模型名。**以 runtime 为准**：`/model` 换完之后它跟着变，界面不在发请求的时候就自己改显示。"
+      },
+      "model_window": {
+        "type": "integer",
+        "nullable": true,
+        "doc": "**只有 kind=state 有**。当前模型的上下文窗口（状态栏那个百分比的分母）。它随 `/model` 变 —— 换模型时也重发一份快照就是为了这个。null = 目录里没有这个名字，界面只报用量、不报占比。"
+      },
+      "status": {
+        "type": "object",
+        "doc": "**只有 kind=status 有**。分组的状态快照：`session`（id/resumed/workspace/messages/steps）、`model`（current/selected/last_used/since/window/base_url）、`counters`（runs/model_calls/model_ok/tool_calls/permission_waits/asks）、`usage`（prompt/cached/miss/completion）、`meta`（max_steps/stream/autopilot/tool_count/audit_path/permissions）。**分组是有意的**：这一屏跨四个层次，平铺之后字段名早晚撞车。"
+      },
+      "tools": {
+        "type": "array",
+        "doc": "**只有 kind=tools 有**。每个工具一条：`[{\"name\": ..., \"risk\": \"low|medium|high\", \"disposition\": \"auto|ask|deny\", \"parallel_safe\": bool, \"interactive\": bool, \"external\": bool, \"granted\": bool, \"command\": \"command\"|null}]`。`disposition` 由 runtime 的策略裁定（和左栏「权限范围」同一个来源）；`granted` = 你按过 `t`；`command` = 这个工具的参数里有命令行（只有 shell 有），按前缀放行的规则只对它有意义。"
       }
     },
     "required": ["v", "t", "kind"]

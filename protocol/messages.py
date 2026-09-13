@@ -45,7 +45,7 @@ VERSION = 1
 # `_run_turn`）—— 所以"答案"这条老路一直是通的，delta 只是让它更早出现。
 PROTOCOL = 2
 
-# 入站（前端 → runtime）七种。
+# 入站（前端 → runtime）十一种。
 IN_USER_MESSAGE = "user_message"
 IN_PERMISSION_RESPONSE = "permission_response"
 IN_QUESTION_RESPONSE = "question_response"
@@ -72,13 +72,31 @@ IN_INTERRUPT = "interrupt"
 # 里记的就是 `approved`（"人按了同意"），而那一刻其实没有人按过任何键 ——
 # 那是**审计谎报**，比多一条消息贵得多。
 IN_SET_AUTOPILOT = "set_autopilot"
+# **换这个会话用哪个模型**（TUI 的 `/model`）。它和 `set_autopilot` 是同一类东西：
+# 一条"用户改了运行中的某个选择"的消息，runtime 处理后回一份 state 快照。
+#
+# 为什么要单开一条（而不是让前端自己挑一个模型名去发请求）：模型名必须过**目录**那道
+# 校验（`state/model.py`），而目录是 runtime 的知识。前端拿到什么就发什么的话，
+# "选了一个它没列出来的模型"会一路走到下一次请求才炸。
+IN_SET_MODEL = "set_model"
+# **请 runtime 回一份状态**（`/status`）。它的答案走 `t:"ui", kind:"status"` —— 
+# 状态是"给界面看的"，和 `ui` 那条通道的性质一致。
+#
+# 为什么不把它塞进每一次 `ui(state)` 快照里：那一屏要读审计日志（几十~几百行），
+# 而快照是每次工具返回都发的。用户按一次 `/status` 读一次文件，那才是对的频率。
+IN_STATUS = "status"
+# **请 runtime 回一份工具清单**（`/tools`）。和 `IN_STATUS` 同一条路：
+# 按需发，答案是 `t:"ui", kind:"tools"`。
+IN_TOOLS = "tools"
 IN_SHUTDOWN = "shutdown"
 
 INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
            IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SET_AUTOPILOT,
-           IN_SHUTDOWN)
+           IN_SET_MODEL, IN_STATUS, IN_TOOLS, IN_SHUTDOWN)
 
-# 出站（runtime → 前端）十一种。
+# 出站（runtime → 前端）十一种。**`/status` 和 `/tools` 不在这里** —— 它们复用
+# `t:"ui"` 那条通道（多两种 `kind`），因为它们是"给界面看的东西"，性质和面板快照
+# 完全一样。加一条出站消息类型意味着两端的信封都要改，而这件事不值得为一个 kind 做。
 OUT_INIT = "init"
 OUT_SESSION_LOAD = "session_load"
 OUT_EVENT = "event"
@@ -125,17 +143,24 @@ ALWAYS_GROUP = "always_group"
 
 DECISIONS = (ALLOW, DENY, ALWAYS, ALWAYS_GROUP)
 
-# `t:"ui"` 的两种 `kind`。**它和 `t:"event"` 是两条通道**：event 是审计的原样转发
+# `t:"ui"` 的四种 `kind`。**它和 `t:"event"` 是两条通道**：event 是审计的原样转发
 # （进 jsonl），ui 只给界面、不进审计。
 #
 #   * `run_finished` —— 这一轮的最终答案（审计里没有正文，所以它是界面唯一的来源）；
-#   * `state` —— 面板数据快照（任务列表 / 已加载技能 / 会话规模）。
+#   * `state` —— 面板数据快照（任务列表 / 已加载技能 / 会话规模 / 当前模型）。
 #     它同样**不进审计**：任务列表的变化在审计里已经有 `tool_call` 那条参数了，
-#     再写一份就是同一份事实的第二个来源。
+#     再写一份就是同一份事实的第二个来源；
+#   * `status` —— `/status` 那一屏（回答入站的 `status`）；
+#   * `tools` —— `/tools` 那份清单（回答入站的 `tools`）。
+#
+# 后两种**只在被问的时候才发**（它们要读审计日志、要遍历工具注册表），而 `state`
+# 是"每次工具返回都补一份"的常驻快照。这个区别就是它们为什么不合并成一种 kind。
 UI_RUN_FINISHED = "run_finished"
 UI_STATE = "state"
+UI_STATUS = "status"
+UI_TOOLS = "tools"
 
-UI_KINDS = (UI_RUN_FINISHED, UI_STATE)
+UI_KINDS = (UI_RUN_FINISHED, UI_STATE, UI_STATUS, UI_TOOLS)
 
 
 def load_schema(name: str) -> dict[str, Any]:

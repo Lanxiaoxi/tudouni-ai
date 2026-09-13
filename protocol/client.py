@@ -231,6 +231,36 @@ class ProtocolClient:
         """
         self.send({"t": messages.IN_SET_AUTOPILOT, "on": bool(on)})
 
+    def set_model(self, model: str) -> None:
+        """换这个会话用哪个模型（TUI 的 `/model`）。
+
+        和 `set_autopilot` 同一条规矩：非阻塞、**不许乐观更新**。真正生效的证据是
+        runtime 回来的那条 `ui` / `kind=state`（里面带 `model`），而名字认不认识由
+        runtime 判（目录是它的知识）—— 认不出来的话回来的是一条 `notice`，界面照着说。
+
+        **一轮正跑着的时候也可以发**：本轮已经用旧模型发出去了，所以本轮不受影响，
+        "模型换了"那句话留到下一轮开头（见 `state/model.py` 的 `SessionModel`）。
+        """
+        self.send({"t": messages.IN_SET_MODEL, "model": str(model)})
+
+    def ask_status(self) -> None:
+        """请 runtime 回一份状态（TUI 的 `/status`）。
+
+        **回包是 `ui` / `kind=status`**，不是一条专门的消息类型：它是"给界面看的
+        东西"，和面板快照同一条通道。要的账（tokens）是 runtime 读审计日志数出来的，
+        所以这条命令**必须走 runtime** —— 前端自己去读 `.tudouni/logs/` 会让目录布局
+        变成前端也认识的一件事实（和 `list_sessions` 那条理由一样）。
+        """
+        self.send({"t": messages.IN_STATUS})
+
+    def ask_tools(self) -> None:
+        """请 runtime 回一份工具清单（TUI 的 `/tools`，回包 `ui` / `kind=tools`）。
+
+        按需发：那份清单有几十行，挂在每一次状态快照上就是白付的带宽和渲染。
+        权限那一列也由 runtime 给（策略是它的知识），前端不做判定。
+        """
+        self.send({"t": messages.IN_TOOLS})
+
     def shutdown(self) -> None:
         self.send({"t": messages.IN_SHUTDOWN})
 

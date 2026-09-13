@@ -374,6 +374,20 @@ class ViewState:
     # 它**不属于某一个会话**（它是整个进程的模式，换会话时 bootstrap 带着它走），
     # 所以 `reset_for_session()` 不清它。
     autopilot: bool = False
+    # `/model` 那张清单（`init.model_catalog`）：`[{"id", "label", "window",
+    # "summary", "note", "current"}]` + 认下的旧名字。
+    #
+    # **它是 runtime 给的数据，界面不写死模型名** —— 写死的话，加一个模型要改两个
+    # 仓库里的地方，而漏改的那一处（界面）只表现为"这个模型选不了"。
+    # 它和 `recent_sessions` 同一条规矩：属于进程（目录不随会话变），
+    # `reset_for_session()` 不清它。
+    model_catalog: list[dict[str, Any]] = field(default_factory=list)
+    model_aliases: list[dict[str, Any]] = field(default_factory=list)
+    # `/status` / `/tools` 的回包。**它们不是常驻状态**：来了就渲染一次进会话流，
+    # 所以这里只存"最近一次问答"。`apply_state` 也读后者：换了模型之后
+    # `ui(state)` 会把它一起送回来，于是状态栏那一行的分母跟着变。
+    status: dict[str, Any] = field(default_factory=dict)
+    tools: list[dict[str, Any]] = field(default_factory=list)
     # 用户刚发出去的那句话。**回显要用它而不是事件里那份预览** ——
     # `run_started.user_input` 是审计的 200 字符预览，而用户敲的字界面本来就有。
     pending_input: str = ""
@@ -932,13 +946,18 @@ def notice_is_redundant(code: str) -> bool:
     剩下的照样要显示：`mcp` 那条"忽略了工作区里的 mcp.json"、`web` 那条缺密钥、
     `autopilot` 那条警告，**它们没有别的出口** —— 丢进左栏就等于把它们藏起来。
 
+    **`model` 也在里面**（这一条是后加的）："这个会话选的是哪个模型"从此常驻在左栏的
+    「本次会话」块里（见 `_session_block` 里那两行）。把同一件事再说一遍进会话流的代价
+    不只是多一行 —— 它会随对话滚走，而这一格是"我上次 `/model` 换的那个到底还生效着
+    吗"唯一能随时看一眼的地方。
+
     **`agent_md` 也不在这里**（它读的是工作区那份 AGENT.md，不是左栏那三块）：用户
     问了"启动的时候说一句加载了 xxx/AGENT.md"，而"加载了哪些别人写的说明"和 [技能]
     那条是同一类事实，该在开场看得见 —— 左栏那四块说的是当前会话的**状态**，而这是
     一次**启动事件**。读失败和被截断那两条尤其必须出现在这里：它们是 warn，左栏没有
     任何一块会显示它们。
     """
-    return code in ("permissions", "skills", "todos")
+    return code in ("permissions", "skills", "todos", "model")
 
 
 def waiting_line(request: dict[str, Any]) -> Line:
@@ -1198,6 +1217,21 @@ def apply_state(state: ViewState, message: dict[str, Any]) -> None:
     # 这一格决定"接下来会不会问你"，猜错的方向必须是"照旧问你"。
     if "autopilot" in message:
         state.autopilot = message["autopilot"] is True
+    # **当前模型和它的窗口一起跟过来。** 这两格由 `ui(state)` 快照带（`_state_message`
+    # 里那两行）而不是只由 `init` 带 —— `/model` 换完之后那个百分比的分母跟着变，
+    # 只更新名字的话，界面会拿新模型的用量去比旧窗口：看起来完全正常，只是数错了。
+    #
+    # 判据用 `in` 而不是取默认值：一份老 runtime 发来的快照没有这两个键，那时候
+    # 保住已经拿到的那份（和 `skill_catalog` / `agents_md` 同一条规矩）。
+    if "model" in message:
+        state.model = str(message["model"] or "")
+    if "model_window" in message:
+        state.context_tokens = message["model_window"]
+    # `/model` 那张清单里的 `current` 标记也要跟着走：不带参数调 `/model` 时它标着
+    # "现在用的是哪个"，而那个标记是 runtime 按当前模型算好的（别名折算也在里面）。
+    current = state.model
+    for item in state.model_catalog:
+        item["current"] = bool(current) and item.get("id") == current
 
 
 # --- 上下文栏（左栏） ----------------------------------------------------------
@@ -1320,6 +1354,17 @@ def _session_block(state: ViewState) -> tuple[str, str, list[Line]]:
         return ("本次会话", "", [Line("还没有会话", ROLE_RULE),
                                  Line("说出第一句话之后才有文件", ROLE_RULE)])
     lines = [Line(state.session_id, ROLE_PROCESS)]
+    # **这个会话在用哪个模型**，常驻在它下面一行。
+    #
+    # 它此前只有两个出口：启动那一条 notice（会随对话滚走）和状态栏——而状态栏那格写
+    # 的是**用量**（`上下文 2k / 1M`），里面那个模型名只在会话头那一行、窄屏还会被收起。
+    # 加了 `/model` 之后这一格变成了"我上次换的那个还生效着吗"唯一能随时看一眼的地方，
+    # 所以它进「本次会话」这一块（和会话 id、规模、审计同一档事实：都由这个会话决定）。
+    if state.model:
+        # 窗口跟着一起说：看用量而不看分母，等于只说了半句话。窗口不在目录里时
+        # **只说名字**（不猜一个分母）。
+        window = f"  {tokens_text(state.context_tokens)}" if state.context_tokens else ""
+        lines.append(seg((state.model, ROLE_SKILL), (window, ROLE_RULE)))
     if state.messages:
         lines.append(Line(f"{state.messages} 条消息 · {state.steps} 步", ROLE_RULE))
     if state.prompt_tokens is not None:
@@ -1421,11 +1466,26 @@ class Command:
     name: str
     hint: str
     takes_arg: bool = False
+    # 带参数时会怎样、有哪几种写法。**只有 `/help` 读它** —— 面板那一行是一句短语
+    # （见下面 `hint` 那段），而"`/model flash` 打错一个字会怎样"这种话面板放不下，
+    # 也不该放：那属于单条命令的详细说明。
+    #
+    # 它和 `takes_arg` 分开是有意的：`takes_arg` 是**功能上的事实**（这条命令收参数），
+    # 而 `detail` 是**文案**。合成一个的话，"参数必须精确、不做模糊匹配"这类只在
+    # `/model` 上成立的规矩就会被硬塞进一个通用字段里。
+    detail: str = ""
 
 
 # 命令集。v1 那六条是决策 15 定下来的，**顺序也照设计稿 F2 的面板**；
-# 后面三条是这一版新增的（面板、技能清单、配色），加在末尾而不是插在中间 ——
-# 那六条的位置是用户已经见过的肌肉记忆。
+# 后面五条是后来加的（面板、技能清单、配色、状态/工具/模型），加在末尾而不是插在
+# 中间 —— 那六条的位置是用户已经见过的肌肉记忆。
+#
+# ## 带参数的那三条：`detail` 是给 `/help` 的，`hint` 仍然是一句短语
+#
+# `/resume` `/theme` `/model` 都收参数，而"参数写错的后果"各不相同（切到一个不存在的
+# 会话 = 开一个新会话；配色名认不出来 = 就近提示；模型名认不出来 = **拒绝**）。
+# 那三句都放不进面板那一列，所以它们进 `detail`，只有 `/help` 读 —— 而 `/help`
+# 是那个"详细说明"本来就该在的地方。
 #
 # **`/list` 在第二期被去掉了**（设计决策，见 doc/TUI-design.md 13.3）：它和
 # "`/resume` 不带参数"说的是同一件事，而两条命令指向同一个出口时，人会先猜哪一条
@@ -1440,17 +1500,29 @@ class Command:
 # （`/help` 末尾那几行、`doc/TUI-design.md`）。
 COMMANDS: tuple[Command, ...] = (
     Command("/new", "开一个新会话"),
-    Command("/resume", "换一个会话", True),
+    Command("/resume", "换一个会话", True,
+            "不带参数弹出会话清单；/resume <id> 直接切过去"),
     Command("/audit", "审计日志在哪"),
     Command("/exit", "退出"),
     Command("/help", "命令与键位"),
-    Command("/theme", "换配色", True),
+    Command("/theme", "换配色", True,
+            "不带参数列出 14 套；/theme 靛夜 或 /theme p7 直接换"),
     Command("/skills", "看全部技能"),
     # **这一条推翻了决策 15 的一部分**（那一版明确不给 `/autopilot`，理由是"它是
     # 一次没有人可问，在有人看着的界面里语义矛盾"）。现在它是"**有人在看着，但他
     # 选择不看每一条**"—— 语义变了所以结论才改，理由留在 app.py 的
     # `_command_autopilot` 和 doc/TUI-design.md 那一节里。
     Command("/autopilot", "自动放行开关"),
+    # 下面三条是**只读**的（`/model` 带参数才会改一个会话级设置）。
+    #
+    # `/status` 和 `/tools` 此前只有"另开一个终端跑 `--audit` / 看启动横幅"这两条
+    # 出口 —— 而"它现在到底在用什么、放行了什么、花了多少"是随时会想看一眼的问题，
+    # 不该需要离开这个界面。
+    Command("/status", "看现在的状态"),
+    Command("/tools", "工具与权限"),
+    Command("/model", "换模型", True,
+            "不带参数列出可选模型；/model deepseek-v4-pro 直接换"
+            "（名字要精确，打错不猜）"),
 )
 
 # 命令名那一列的宽度。**从最长的那条算出来，不手写数字。**
@@ -1463,6 +1535,248 @@ COMMANDS: tuple[Command, ...] = (
 # 从表里算出来之后，下一个更长的命令只会让整列一起右移，不会再出现同一类事故。
 # `+ 3` 是两列之间那个间隙（最短的命令名因此有 9 格，最长的那条有 3 格）。
 COMMAND_NAME_WIDTH = max(len(command.name) for command in COMMANDS) + 3
+
+
+# --- `/status` `/tools` `/model` 的渲染 ----------------------------------------
+#
+# 三条命令的答案**都进会话流**（不弹面板）。理由是同一条：它们是"看一眼就走"的
+# 东西，而弹层会挡住正在读的对话 —— 而 `/status` 最有用的时候恰恰是"它跑着、我想
+# 看一眼花了多少"，那时候屏幕上的东西正是你要看的。
+#
+# 渲染是**纯函数**（给 runtime 给的那份数据，还几行 `Line`），所以它们能被直接单测
+# —— 这个项目里"事件怎么变成给人看的字"一向这么处理（见 `render_event`）。
+
+# 值那一列的左边界。**按终端列数算，不按字符数** —— 标签里"会话"占 4 列而"规模"
+# 占 4 列、"累计输入"占 8 列而"累计输出"占 8 列，但 `f"{'会话':<10}"` 会补 8 个空格、
+# `工作区` 补 7 个，于是值那一列**歪一格**（实测：`会话        2026…` 和
+# `工作区       C:/…` 差一列）。这个文件里唯一的宽度口径是 `cell_len`（见文件头）。
+_LABEL_WIDTH = 10
+
+
+def _kv(label: str, value: str, role: str = ROLE_PROCESS) -> Line:
+    """`模型        deepseek-flash` 这样的一行。标签和值分色。"""
+    pad = max(1, _LABEL_WIDTH - cell_len(label))
+    return seg((f"  {label}{' ' * pad}", ROLE_RULE), (value, role))
+
+
+def workspace_short(path: str, home: str = "") -> str:
+    """把一个绝对路径说短一点（`~` / 相对当前目录）。
+
+    `/status` 那一行是给人扫的，而一长串 `C:\\Users\\谁\\repo\\...` 会把值那一列
+    挤到屏幕外面 —— 而"我在哪个工作区"这个问题只需要认出是哪一个，不需要完整路径。
+    **只做替换、不做解析**：路径不是这里的知识，原样显示永远是对的。
+    """
+    text = (path or "").replace("\\", "/")
+    if home:
+        root = home.replace("\\", "/").rstrip("/")
+        if root and text.lower().startswith(root.lower()):
+            return "~" + text[len(root):]
+    return text or "—"
+
+
+def render_status(state: ViewState, message: dict[str, Any]) -> list[Line]:
+    """`/status` 的回包 → 会话流里那几行。
+
+    ## 它回答四个问题，顺序就是这个顺序
+
+      1. **我在哪个会话里**（id / 工作区 / 多长）；
+      2. **它在用什么**（模型 + 上下文窗口用量）；
+      3. **跑了多少活、花了多少钱**（轮次计数 + token）；
+      4. **这次运行的环境**（步数上限、流式、autopilot、审计写到哪）。
+
+    顺序是刻意的：`/status` 最常被问的是"这是哪个会话、在用什么模型"，而"花了多少"
+    跟着它 —— 把审计路径排在第一位的话，每次都要先跳过一行路径才看到想看的。
+
+    ## 三个数各自的口径，一个都不能混
+
+      * `上下文` 是**上一次请求实际发出去多少**（不是"现在"：下一次请求还要加上
+        这一轮的回答和工具结果，所以它是**下界**）；
+      * `累计输入/输出` 是**整个会话**的（那是钱）；
+      * `轮次` 数的是 `run_started`（用户按了几次回车）。
+    """
+    status = message.get("status") or {}
+    session = status.get("session") or {}
+    model = status.get("model") or {}
+    counters = status.get("counters") or {}
+    usage = status.get("usage") or {}
+    meta = status.get("meta") or {}
+
+    # 会话还没起来（一轮都没跑过）：不编一份空状态出来 —— 那会让人以为
+    # "0 轮 0 调用"是事实，而事实是"还没问过"。
+    if not session:
+        return [Line("（还没有状态：这个会话一步都没走过）", ROLE_RULE)]
+
+    out: list[Line] = [Line("状态", ROLE_RULE)]
+
+    where = workspace_short(str(session.get("workspace", "")))
+    length = f"{session.get('messages', 0)} 条消息 · {session.get('steps', 0)} 步"
+    # **"这次启动：继续/新建"说的是这次进程怎么开起来的，不是这个会话有多满。**
+    # 写成"（继续）"会让"继续一个新会话"读起来自相矛盾（实测：恢复一个从没聊过的
+    # 会话时那一行长这样），而规模和步数就在下面一行，那才是"有多满"的答案。
+    started = "这次启动：继续" if session.get("resumed") else "这次启动：新建"
+    out.append(_kv("会话", f"{session.get('id', '?')}（{started}）"))
+    out.append(_kv("工作区", where))
+    out.append(_kv("规模", length, ROLE_RULE))
+
+    current = str(model.get("current") or "—")
+    selected = str(model.get("selected") or "")
+    # **"想用的"和"在用的"不一样时要写出来。** 那个差别只在一种情况下出现：刚按了
+    # `/model`、下一次请求还没发出去（见 state/model.py 的 SessionModel）。不写的话，
+    # 用户会以为"换了但没生效"是坏了 —— 而它其实是设计好的时序。
+    if selected and selected != current:
+        current = f"{current}（换成 {selected} 的，下一次请求生效）"
+    out.append(_kv("模型", current, ROLE_WAITING if selected and selected != current else ROLE_PROCESS))
+
+    # 上下文那一行：分子是**最近一次请求**，分母是**当前模型**的窗口。
+    # 分母为 None（模型不在目录里）时只报分子 —— 错的百分比比没有百分比更坏。
+    used = message.get("last_prompt_tokens")
+    window = message.get("context_tokens")
+    if used is None:
+        context = "—（还没成功调用过模型）"
+    elif window:
+        context = (f"{tokens_text(used)} / {tokens_text(window)}"
+                   f"（{used / window * 100:.1f}%）")
+    else:
+        context = f"{tokens_text(used)}（这个模型的窗口不在目录里，不报占比）"
+    out.append(_kv("上下文", context))
+
+    if usage.get("prompt"):
+        rate = f"{usage.get('cached', 0) / usage['prompt']:.0%}"
+        out.append(_kv("累计输入", f"{tokens_text(usage.get('prompt'))} token"
+                                   f"（命中缓存 {tokens_text(usage.get('cached'))}、"
+                                   f"命中率 {rate}）"))
+        out.append(_kv("累计输出", f"{tokens_text(usage.get('completion'))} token", ROLE_RULE))
+    else:
+        out.append(_kv("累计用量", "还没有成功调用过模型", ROLE_RULE))
+
+    # 轮次与调用。**"工具调用 N 次"里含被拒绝的那几次** —— 这个数回答的是"跑了多少活"，
+    # 不是"成功了几次"（后者 `--audit` 里逐条看得到）。
+    waits = counters.get("permission_waits", 0)
+    asks = counters.get("asks", 0)
+    tail = ""
+    if waits or asks:
+        tail = f"（其中审批 {waits} 次"
+        tail += f"、提问 {asks} 次）" if asks else "）"
+    out.append(_kv("轮次", f"{counters.get('runs', 0)} 轮 · "
+                           f"{counters.get('model_calls', 0)} 次模型调用 · "
+                           f"{counters.get('tool_calls', 0)} 次工具调用{tail}"))
+
+    flags = [f"最多 {meta.get('max_steps', 0)} 步",
+             "流式" if meta.get("stream") else "非流式"]
+    flags.append("自动放行" if meta.get("autopilot") else "逐条审批")
+    out.append(_kv("这次运行", " · ".join(flags), ROLE_RULE))
+    out.append(_kv("工具", f"{meta.get('tool_count', 0)} 个（/tools 看清单）", ROLE_RULE))
+    out.append(_kv("审计", str(meta.get("audit_path") or "—"), ROLE_RULE))
+    return out
+
+
+# 权限那一列的说法。**"会问你"和"不问"要一眼分得开** —— 这一列的全部价值就是
+# "接下来这条会不会弹审批"。
+_TOOL_DISPOSITION = {
+    "auto": ("自动放行", ROLE_RULE),
+    "ask": ("需要审批", ROLE_WAITING),
+    "deny": ("直接拒绝", ROLE_DENIED),
+}
+
+
+def render_tools(state: ViewState, message: dict[str, Any]) -> list[Line]:
+    """`/tools` 的回包 → 会话流里那几行。
+
+    ## 为什么每一条都显示，而不是只显示"可用"的
+
+    因为**"这个工具存在吗"和"它会不会问我"是两个问题**，而这条命令要一次回答两个。
+    只列自动放行的（用户例子里那种 `✓`）会把拒绝名单藏起来 —— 而"我明明配了
+    deny_tools，它怎么还……"正是最该在这里看见答案的问题。
+
+    ## `external` 单独标出来
+
+    MCP 工具的风险**一律 high、每次都要你按键**（见 README「外部工具」那一节），
+    点名的写法也是全名（`mcp__server__tool`）。不标的话，用户看到一长串
+    `mcp__…` 只会以为名字起得怪。
+    """
+    rows = message.get("tools") or []
+    if not rows:
+        # 一个都没有：`load_skill` / `web_search` / `grep` 都会因为缺件而不注册。
+        # 这不是空清单，而是"这次运行什么都没注册"—— 说清楚，别让屏幕空着。
+        return [Line("这次运行一个工具都没注册（缺引擎/密钥时会这样，启动那几行里有原因）",
+                     ROLE_WARN)]
+
+    out: list[Line] = [Line("工具", ROLE_RULE)]
+    # 名字那一列也按**列数**对齐：`mcp__kb__search` 是 ASCII（一层 `cell_len` 就等于
+    # 字符数），而将来若出现非 ASCII 的工具名，`len()` 会把它算短、整张表跟着歪。
+    width = max(cell_len(str(row.get("name", ""))) for row in rows)
+    for row in rows:
+        name = str(row.get("name", "?"))
+        word, role = _TOOL_DISPOSITION.get(str(row.get("disposition")), ("?", ROLE_RULE))
+        marks: list[str] = []
+        if row.get("granted"):
+            marks.append("按过 t")
+        if row.get("external"):
+            marks.append("外部")
+        if row.get("interactive"):
+            marks.append("会问你")
+        elif row.get("parallel_safe"):
+            marks.append("可并发")
+        out.append(seg(
+            (f"  {name}{' ' * max(2, width - cell_len(name) + 2)}", ROLE_PROCESS),
+            (f"{row.get('risk', '?'):<7}", ROLE_RULE),
+            (word, role),
+            (("  ·  " + "、".join(marks)) if marks else "", ROLE_RULE),
+        ))
+
+    prefixes = message.get("granted_prefixes") or []
+    if prefixes:
+        # 命令前缀规则只对**参数里有命令行**的工具生效（今天只有 shell）。
+        # 那句话必须跟着一起说：不说的话，用户会以为 "git add" 这条规则能放开
+        # read_file。
+        out.append(Line(f"  命令规则（按前缀放行，只对 shell 这类有命令行的工具生效）："
+                        f"{'、'.join(prefixes)}", ROLE_RULE))
+    out.append(Line("  改这些去 .tudouni/permissions.json；审批时按 t 会写进去",
+                    ROLE_RULE))
+    return out
+
+
+def render_models(state: ViewState, rest: str = "") -> list[Line]:
+    """`/model` 不带参数时那张清单。
+
+    ## 为什么打错名字不是"就近匹配一个"
+
+    它的处置和 `/theme` 一致：**认不出来就说认不出来**，然后列出清单。模糊匹配在这里
+    比 `/theme` 更坏 —— 配色选错一眼就看得出来，而模型选错只会在账单上体现
+    （Pro 的未命中输入是 Flash 的四倍多）。所以 `/model flsh` 得到的是"没有这个模型"，
+    不是"猜你想选 flash"。
+
+    `current` 那一格由 runtime 标好（它要对账别名折算），界面不自己比字符串。
+    """
+    if not state.model_catalog:
+        return [Line("（runtime 没给模型清单：这一版协议之前起的子进程？）", ROLE_WARN)]
+    out: list[Line] = [Line(f"当前模型：{state.model or '—'}", ROLE_WAITING), Line("可选：", ROLE_RULE)]
+    width = max(cell_len(str(item.get("id", ""))) for item in state.model_catalog)
+    for item in state.model_catalog:
+        mark = "●" if item.get("current") else " "
+        window = item.get("window")
+        detail = f"{item.get('label', '')}"
+        if window:
+            detail += f" · 上下文 {tokens_text(window)}"
+        model_id = str(item.get("id", ""))
+        out.append(seg(
+            (f"  {mark} {model_id}{' ' * max(2, width - cell_len(model_id) + 2)}",
+             ROLE_WAITING if item.get("current") else ROLE_PROCESS),
+            (item.get("summary", ""), ROLE_PROCESS),
+            (f"   （{detail}）" if detail else "", ROLE_RULE),
+        ))
+        if item.get("note"):
+            out.append(Line(f"      {item['note']}", ROLE_RULE))
+    for alias in state.model_aliases:
+        # 旧名字单独列：它们是**认下的名字**，不是能选的选项（官方已把对应的模型
+        # 下线，请求由新模型提供服务）。列进主清单会摆出两个效果一样的选项。
+        out.append(Line(f"  认下的旧名字：{alias.get('id')} → {alias.get('of')}", ROLE_RULE))
+    out.append(Line("换一个：/model deepseek-flash   ·   /model deepseek-v4-pro", ROLE_RULE))
+    if rest:
+        # 带参数走到这里 = 名字没认出来（`app._command_model` 只在没换成时才调它）。
+        # 那句话由 app 负责说，这里只补一句"清单在上面"。
+        out.append(Line("（清单里没有那个名字）", ROLE_WARN))
+    return out
 
 
 def session_row(item: dict[str, Any], *, conflict: bool = False) -> Line:
@@ -1491,7 +1805,7 @@ def session_row(item: dict[str, Any], *, conflict: bool = False) -> Line:
 def filter_commands(query: str) -> list[Command]:
     """面板里的候选。`/` → 全部；`/re` → 名字以 `re` 开头的那些。
 
-    **只按名字前缀匹配**，不做模糊搜索：命令一共八条，而模糊匹配会让"我打错了"
+    **只按名字前缀匹配**，不做模糊搜索：命令一共十一条，而模糊匹配会让"我打错了"
     和"它猜对了"长得一样 —— 一个按下去不是你想的那条命令的面板比没有面板更坏。
     """
     text = query.strip().lstrip("/").lower()

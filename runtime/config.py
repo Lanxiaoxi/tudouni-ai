@@ -31,6 +31,7 @@ from dotenv import dotenv_values
 
 from agent_runtime.security.commands import Rule, format_rule, parse_rule
 from agent_runtime.skills import RUNTIME_DIR_NAME
+from agent_runtime.state import model as model_state
 from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
 
 
@@ -43,7 +44,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE_FILE = PROJECT_ROOT / ".env.example"
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_MODEL = model_state.DEFAULT_MODEL
 
 # 各模型的上下文窗口（token）。它是**输入侧**的上限：真正发不出去的条件是"输入 + 输出"
 # 超过它，所以占比接近满之前就该有新会话。
@@ -53,15 +54,10 @@ DEFAULT_MODEL = "deepseek-flash"
 # **错的百分比比没有百分比更坏** —— 它会被当成真的。所以 cli 那边只报用量、不报占比，
 # 启动时也会说一句该往哪加。
 #
-# 数据来源：DeepSeek 官方文档「模型 & 价格」的"上下文长度"（当前为 1M）。
-# 旧模型名 deepseek-v4-flash / deepseek-v4-flash-vision-exp 仍然可调用、由 V4.1-Flash
-# 提供服务，窗口与 Flash 相同，所以一并列上。
-CONTEXT_WINDOWS: dict[str, int] = {
-    "deepseek-flash": 1_000_000,
-    "deepseek-v4-flash": 1_000_000,
-    "deepseek-v4-flash-vision-exp": 1_000_000,
-    "deepseek-v4-pro": 1_000_000,
-}
+# **表由 `state/model.py` 的目录派生，这里不抄第二份。** 目录同时是 `/model` 那个清单、
+# "这个名字认不认识"的判据；抄一份的话，往目录里加一个模型而忘了改这里，症状是
+# "`/model` 列出了它，选了之后状态栏却报不出占比"—— 两处都是静默的。
+CONTEXT_WINDOWS: dict[str, int] = model_state.context_windows()
 
 _ENV_API_KEY = "DEEPSEEK_API_KEY"
 _ENV_BASE_URL = "DEEPSEEK_BASE_URL"

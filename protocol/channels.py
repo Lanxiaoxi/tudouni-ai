@@ -45,7 +45,9 @@ from agent_runtime.protocol import codec, messages
 from agent_runtime.protocol.transport_stdio import StdioTransport
 from agent_runtime.runtime.channels import Channels, TrustGroupLookup
 from agent_runtime.runtime.config import ConfigError
+from agent_runtime.security.commands import format_rule
 from agent_runtime.security.memory import ApprovalMemory
+from agent_runtime.state import status as status_summary
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin.ask import ANSWERED, SKIPPED, UNAVAILABLE, Answer, AskUserArgs
 from agent_runtime.tools.tool import Tool
@@ -558,6 +560,25 @@ class ProtocolServer:
             self._set_autopilot(message.get("on") is True)
             return True
 
+        if kind == messages.IN_SET_MODEL:
+            # 模型名**不在这里校验**（认不认识、base_url 对不对都是 runtime 的知识），
+            # 但"它得是个字符串"是信封这一层的事 —— 一个 JSON 对象传进去，那句
+            # "目录里没有这个模型"就会把整个 dict 打给用户看。
+            name = message.get("model")
+            if not isinstance(name, str):
+                self._notice("warn", "model", "[模型] 换模型要一个字符串模型名。/model 看清单。")
+                return True
+            self._set_model(name)
+            return True
+
+        if kind == messages.IN_STATUS:
+            self._send_status()
+            return True
+
+        if kind == messages.IN_TOOLS:
+            self._send_tools()
+            return True
+
         if kind == messages.IN_USER_MESSAGE:
             # 上一轮还没走完就先等它 —— 两条回合叠着跑会让事件顺序错乱，
             # 而"顺序"是这条协议唯一的同步手段。
@@ -767,8 +788,98 @@ class ProtocolServer:
             "t": messages.OUT_UI,
             "kind": messages.UI_STATE,
             **runtime.ui_state(with_catalog=with_catalog),
+            # **当前模型和它的窗口一起进快照。** 光发一个模型名不够：状态栏那个
+            # 百分比的分母是窗口，而它随模型变 —— 换完模型只更新名字的话，界面会
+            # 拿新模型的用量去比旧窗口，而那看起来完全正常，只是数错了。
+            "model": runtime.current_model,
+            "model_window": runtime.context_tokens,
         }
 
+
+    def _set_model(self, name: str) -> None:
+        """换这个会话用的模型（`/model`）。**成败都回话，回话里带证据。**
+
+        ## 为什么请求回合不因它而中断
+
+        一轮正跑着的时候按 `/model` 是**允许**的，而且本轮不受影响：那个回合的请求
+        已经发出去了，模型的回答还在路上。真正被改变的是"下一个请求用谁"。
+
+        这是刻意的，不是偷懒 —— 同一个回合里前后两步由两个模型生成的话，事后**完全
+        看不出来**：审计里两条 model_call 长得一样（同一个 run_id、同一个 step 区间），
+        而会话历史里那段话到底是谁写的就没有答案了。所以那条"模型换了"的说明留到
+        **下一轮开头**（判据是 `selected != last_used`，见 `state/model.py`）。
+
+        代价说白：界面上那条"换成 X 了"的回声在本轮就已经出现，而实际生效在下一轮。
+        所以提示语里写的是"**下一次请求生效**"，而不是"已生效"。
+
+        ## 为什么回一条 state 快照
+
+        和 `_set_autopilot` 同一条规矩：界面按 runtime 说的话显示，不许自己在发请求的
+        时候就先改 —— 那会让"状态栏写着 pro、请求还发给 flash"变成可能。这里的证据
+        尤其重要：**换模型只改一个字符串**，没有任何别的地方会报出"其实没换成"。
+
+        `model_since` 那一格也在这条快照里（`SessionModel.as_state`）：`/status` 要
+        回答"这个会话什么时候换的"，而那个时间点只有选择本身知道。
+        """
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "model", "[模型] 还没有会话，换不了模型。")
+            return
+        ok, message = runtime.select_model(name)
+        # 消息**原样**发出去：那句话里含"上一个是谁""下一次请求生效"这些界面拼不出来的
+        # 事实（拼的话就是第二份知识，而它漂掉的症状是"提示说换了、其实没换"）。
+        self._notice("info" if ok else "warn", "model",
+                     ("[模型] " if ok else "[模型] 没换：") + message)
+        self.send(self._state_message())
+
+    def _send_status(self) -> None:
+        """回一份 `/status`（`ui` / `kind=status`）。**读一次审计日志。**
+
+        日志读失败（文件被删了、权限没了）**不当成失败**：那几笔账是附加信息，而
+        `/status` 的主要用途是"现在是什么状态"。所以那种情况下照发一份 counts/usage
+        为空的快照 —— `state/status.summarize` 对空列表返回的就是零，而界面显示 0
+        比显示一句"读不了日志"更接近事实（会话确实还没花过钱，或者我们数不出来，
+        而两种情况的处置是一样的：继续用）。
+
+        这里**不 join 正在跑的那一轮**：`/status` 是只读的，而"跑着的时候看状态"
+        恰恰是它最有用的时候。
+        """
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "status", "[状态] 还没有会话。")
+            return
+        events = list(runtime.logs.read(runtime.session_id))
+        summary = status_summary.summarize(events)
+        self.send({
+            "v": messages.VERSION,
+            "t": messages.OUT_UI,
+            "kind": messages.UI_STATUS,
+            "status": runtime.status(
+                counts=summary["counters"], usage=summary["usage"],
+            ),
+            # "上一次请求实际发出去多少" —— 状态栏那个占比的分子。它和上面那份
+            # usage 不是一回事（那个是**累计**，这个是**最近一次**），所以单独给。
+            "last_prompt_tokens": summary["last_prompt_tokens"],
+            "context_tokens": runtime.context_tokens,
+        })
+
+    def _send_tools(self) -> None:
+        """回一份工具清单（`ui` / `kind=tools`）。"""
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "tools", "[工具] 还没有会话。")
+            return
+        self.send({
+            "v": messages.VERSION,
+            "t": messages.OUT_UI,
+            "kind": messages.UI_TOOLS,
+            "tools": runtime.tool_rows(),
+            # 命令规则那几条单独给：`/tools` 末尾那句"按前缀放行了什么"要用它，
+            # 而它是**人按 t 记住的东西**，和工具清单不是一个来源。
+            "granted_prefixes": [
+                format_rule(rule) for rule in sorted(runtime.memory.prefixes())
+            ],
+        })
 
     def _notice(self, level: str, code: str, text: str) -> None:
         self.send({
@@ -789,13 +900,20 @@ class ProtocolServer:
 
     def _init_message(self) -> dict[str, Any]:
         runtime = self.runtime
+        rows, aliases = runtime.model_rows()
         return {
             "v": messages.VERSION,
             "t": messages.OUT_INIT,
             "protocol": messages.PROTOCOL,
             "session_id": runtime.session_id,
             "resumed": runtime.resumed,
-            "model": runtime.model_cfg.model,
+            # **现在真正在用的那个**，不是配置里那个：恢复一个换过模型的会话时，
+            # 这两个是不同的值，而界面那一行要显示的是"接下来会用谁"。
+            "model": runtime.current_model,
+            # `/model` 那张清单。**开场就发**（它是常量数据，不随会话变）；
+            # `current` 那一格由 runtime 按当前模型标好 —— 界面不需要知道
+            # "怎么算当前"（那要对账别名折算）。
+            "model_catalog": {"models": rows, "aliases": aliases},
             "workspace": str(runtime.workspace),
             "max_steps": runtime.max_steps,
             # **这一次运行开不开流式。** 它是运行期事实，不是前端的偏好 ——

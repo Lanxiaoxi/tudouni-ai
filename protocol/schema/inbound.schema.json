@@ -58,6 +58,40 @@
     },
     "required": ["v", "t", "on"]
   },
+  "set_model": {
+    "summary": "**换这个会话用哪个模型**（TUI 的 `/model`）。模型名必须在 runtime 那份目录里（`init.model_catalog`），不在就拒绝并回一条 notice。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "set_model"},
+      "model": {
+        "type": "string",
+        "doc": [
+          "要换成哪个模型（目录里的 id）。**它必须是一个精确的名字，不做模糊匹配** ——",
+          "名字打错一个字就换到另一个模型上（或者被静默忽略），而账单上才看得出来。",
+          "runtime 处理后回一条 `ui` / `kind=state`（带 model 字段）加一条 notice：",
+          "界面以 state 那条为准，不在发请求的时候就改显示。",
+          "**一轮正跑着的时候换，本轮不受影响**：那句话留到下一轮开头（见 state/model.py 的 SessionModel）。"
+        ]
+      }
+    },
+    "required": ["v", "t", "model"]
+  },
+  "status": {
+    "summary": "请 runtime 回一份当前状态（出站的 `ui` / `kind=status`）。TUI 的 `/status`、CLI 的 `/status` 用它。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "status"}
+    },
+    "required": ["v", "t"]
+  },
+  "tools": {
+    "summary": "请 runtime 回一份工具清单（出站的 `ui` / `kind=tools`）。TUI 的 `/tools`、CLI 的 `/tools` 用它。**按需发**：那份清单几十行，不该挂在每一次状态快照上。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "tools"}
+    },
+    "required": ["v", "t"]
+  },
   "shutdown": {
     "summary": "收摊。**当前这一轮会跑完**，不是打断它。",
     "fields": {
