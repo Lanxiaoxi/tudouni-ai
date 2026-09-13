@@ -421,12 +421,25 @@ class StreamAnswerBlock(Markdown):
 
       1. **挂载之前调** → 它排出去的那个任务里有一句 `mount_all`，而控件还没进
          DOM：`MountError: Can't mount widget(s) before … is mounted`，
-         报出来是一组 `ExceptionGroup`（所以 `_render` 里有 `is_attached` 那道闸）；
+         报出来是一组 `ExceptionGroup`（所以 `_push` 里有 `is_attached` 那道闸）；
       2. **`is_attached` 为真之后立刻调** → `mount()` 之后它马上就是真的，而挂载
          消息还没处理完，`Markdown._on_mount` 会用空文档把内容盖掉 ——
-         所以 `TurnBlock._mount_chunks` 用 `call_after_refresh` 补写一次；
-      3. **`render()` 返回空串让 `visualize()` 得到 `None`** → `BLANK = True`
-         是必须的（见 `__init__` 里那段）。
+         所以 `TurnBlock._mount_chunks` 用 `call_after_refresh` 补写一次。
+
+    ## `_push` 这个名字是必须的，它原来叫 `_render`
+
+    改名之前那一版叫 `_render`，**正好盖住了 `Widget._render`** —— 而那一个是
+    Textual 的钩子："把我 `render()` 的返回值变成 Visual"。盖住它的后果是
+    `Widget._render_content` 拿到本方法的 `None` 去 `Visual.to_strips()`，抛
+    `'NoneType' object has no attribute 'render_strips'`。
+
+    原作者当时用一个 `BLANK = True` 绕开了那个异常（`render_lines` 在 `BLANK` 时
+    压根不走那条路），代价是**连控件自己的边框一起不画** —— 于是 `.answer` 左边那条
+    竖线在这个块上从来就没画出来过。而这一块恰好是**默认**那条路（TUI 默认开流式），
+    症状是"同一段回答，非流式有竖线、流式没有"，看起来只像"这一版就是没画"。
+
+    所以现在：名字让开（不给 Textual 的钩子添乱），`BLANK` 也去掉 —— 块照旧画
+    自己那一趟（背景、边框、然后子控件在上面），左边那条竖线就有了。
 
     `_text` 是**唯一的累计**（不从控件里读）：它同时是"有没有东西要作废"的判据
     （见 `TurnBlock.discard_stream`）。
@@ -435,13 +448,6 @@ class StreamAnswerBlock(Markdown):
     def __init__(self, palette: theme_mod.Theme, **kwargs: Any):
         self._palette = palette
         self._text = ""
-        # **`BLANK = True` 是必须的**（实测踩过）：`Widget.render()` 的默认实现
-        # 返回空串，而 `visualize(空串)` 是 `None` —— 于是
-        # `Widget._render_content()` 会拿 `None` 去 `Visual.to_strips()`，
-        # 抛 `'NoneType' object has no attribute 'render_strips'`。
-        # `BLANK` 让渲染走"整块留白"那一支（这一屏的内容全在子控件里，
-        # 本来就是对的），于是永远不去碰那个 `None`。
-        self.BLANK = True
         super().__init__(None, open_links=False, **kwargs)
 
     def feed(self, text: str) -> None:
@@ -449,13 +455,13 @@ class StreamAnswerBlock(Markdown):
         if not text:
             return
         self._text += text
-        self._render()
+        self._push()
 
     def flush(self) -> None:
-        """把当前累计写进文档（幂等）。**没挂上时是空操作**（见 `_render`）。"""
-        self._render()
+        """把当前累计写进文档（幂等）。**没挂上时是空操作**（见 `_push`）。"""
+        self._push()
 
-    def _render(self) -> None:
+    def _push(self) -> None:
         """把累计交给 Markdown。**没挂上就什么都不做**（挂载前调 `update()` 会抛）。"""
         if self._text and self.is_attached:
             self.update(self._text)

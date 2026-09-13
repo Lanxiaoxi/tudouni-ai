@@ -2056,6 +2056,65 @@ async def test_the_answer_is_rendered_as_markdown(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_every_answer_gets_a_left_bar_in_the_input_box_colour(monkeypatch):
+    """agent 正文左边那条竖线 —— **流式和非流式两条路都得画出来**。
+
+    这条是**为一个真实的 bug** 写的：`StreamAnswerBlock` 原来把累计文本写进文档的
+    那个方法叫 `_render`，**正好盖住了 `Widget._render`**（Textual 的钩子），于是
+    `Widget._render_content` 拿到 `None`。当时是用一个 `BLANK = True` 绕过去的，
+    而 `BLANK` 让 `render_lines` 直接回空白条 —— **连控件自己的边框一起跳过**。
+
+    所以症状是"同一段回答，非流式有竖线、流式没有"，而流式恰好是**默认**那条路
+    —— 画面上看起来只像"这一版就是没画"。这里量的是**屏幕上的字符**，不是样式表：
+    样式设上了而没画出来，正是那个 bug 的全部内容。
+
+    颜色和输入框上下那两条线是**同一个 token**（`accent`）：这一屏上"结构线"是同一类
+    东西，同一个颜色才像一套。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    def bars(app):
+        """正文块左边那一列上**真的画出来的字**（逐行）。"""
+        strips = app.screen._compositor.render_strips()
+        out = []
+        for block in [*app.query(widgets_module.AnswerBlock),
+                      *app.query(widgets_module.StreamAnswerBlock)]:
+            style, color = block.styles.border_left
+            assert style == "solid"
+            assert _hex_of(color) == _hex_of(app.palette.accent), \
+                (type(block).__name__, _hex_of(color))
+            for y in range(block.region.y, block.region.y + block.region.height):
+                if 0 <= y < len(strips):
+                    out.append(str(strips[y].text)[block.region.x])
+        return out
+
+    # 1) 非流式：`ui(run_finished)` 一条整段答案。
+    plain = _build_app(monkeypatch)
+    async with plain.run_test(size=(100, 30)) as pilot:
+        plain._inbox.put(("message", _init_message("s", stream=False)))
+        _events(plain, {"kind": "run_started", "run_id": "r1", "step": 0,
+                        "user_input": "你好"})
+        plain._inbox.put(("message", {"v": 1, "t": "ui", "kind": "run_finished",
+                                      "run_id": "r1", "answer": "正文一句。\n"}))
+        await _settle(plain, pilot)
+        assert list(plain.query(widgets_module.AnswerBlock)), "非流式该走 AnswerBlock"
+        assert set(bars(plain)) == {"│"}, "非流式那条路的竖线没画出来"
+
+    # 2) 流式（**默认**那条路）：逐块 delta。
+    streamed = _build_app(monkeypatch)
+    async with streamed.run_test(size=(100, 30)) as pilot:
+        streamed._inbox.put(("message", _init_message("s", stream=True)))
+        _events(streamed, {"kind": "run_started", "run_id": "r1", "step": 0,
+                           "user_input": "你好"})
+        for piece in ("正文", "一句", "。\n"):
+            _delta(streamed, piece)
+            await _settle(streamed, pilot)
+        assert list(streamed.query(widgets_module.StreamAnswerBlock)), \
+            "流式该走 StreamAnswerBlock"
+        assert set(bars(streamed)) == {"│"}, "流式那条路的竖线没画出来"
+
+
+@pytest.mark.anyio
 async def test_the_autopilot_command_waits_for_the_runtime_before_showing_it_as_on(monkeypatch):
     """`/autopilot` 只**发请求**，指示灯等 runtime 那条快照 —— 不许乐观更新。
 
