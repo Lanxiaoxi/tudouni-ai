@@ -1919,7 +1919,7 @@ def session_row(item: dict[str, Any], *, conflict: bool = False) -> Line:
 def filter_commands(query: str) -> list[Command]:
     """面板里的候选。`/` → 全部；`/re` → 名字以 `re` 开头的那些。
 
-    **只按名字前缀匹配**，不做模糊搜索：命令一共十四条，而模糊匹配会让"我打错了"
+    **只按名字前缀匹配**，不做模糊搜索：命令一共十三条，而模糊匹配会让"我打错了"
     和"它猜对了"长得一样 —— 一个按下去不是你想的那条命令的面板比没有面板更坏。
     """
     text = query.strip().lstrip("/").lower()

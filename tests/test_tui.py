@@ -1109,7 +1109,7 @@ async def test_the_selected_option_is_marked_and_reversed(monkeypatch):
 
 
 def test_the_command_palette_filters_by_prefix_only():
-    """**只按前缀匹配**：命令一共十四条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
+    """**只按前缀匹配**：命令一共十三条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
     assert [c.name for c in view_state.filter_commands("/")] == \
         [c.name for c in view_state.COMMANDS]
     assert [c.name for c in view_state.filter_commands("/re")] == ["/resume"]
