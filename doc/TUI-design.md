@@ -336,8 +336,17 @@ print(f"  想回来继续它： --session ...")  # cli.py:492  ← stdout
 
 | 文件 | 写模式 | 内容 | 代码 |
 |---|---|---|---|
-| `.tudouni/sessions/<id>.json` | 每次整份重写、`os.replace` 原子替换 | 会话的全部事实（messages + metadata），**唯一的真相来源** | `state/store.py:70` |
+| `.tudouni/sessions/<id>.jsonl` | 只追加（原先：整份重写 + `os.replace`） | 会话的全部事实（messages + metadata），**唯一的真相来源** | `state/store.py:164` |
 | `.tudouni/logs/<id>.jsonl` | 只追加、天然抗崩溃 | 审计轨迹（谁批准了什么、花了多少 token） | `audit/jsonl.py:35` |
+
+> **后面改过一次，但结论没变。** 会话那一层后来从"整份重写"改成了"只追加"
+> （2026-09，见 `state/store.py` 的模块 docstring）：理由是 checkpoint 每步一次，
+> 而整份重写让落盘量变成**步数的平方**（实测 80 步写出去 863MB，放大 41 倍）。
+> 但那次改动**只换了写入模式，没有合并两层** —— 上面这个"不要重做"的判断说的是
+> "别把会话和审计合成一个 JSONL"，而这一条仍然成立。下面列的四项代价里，
+> 只有第二项真的发生了（原子性换成了"半截行跳过"，见 store 那边的说明）；
+> `STATE_VERSION` 保留着，三条子命令一行没改（它们走的是 `store.load` /
+> `list_ids`，那两个签名没动），控制面守的是整个 `.tudouni/` 目录所以也没受影响。
 
 两者的分工不是随手分的：`store.py` 那段注释解释了"写入模式不同，所以放在不同的
 地方、用不同的策略"。**初步思路提议的 JSONL session 会把这两层合成一层**，代价是：

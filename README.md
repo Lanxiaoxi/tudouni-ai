@@ -982,7 +982,7 @@ MCP server 提供的东西恰好就是 `Tool` 的形状（名字 + 描述 + JSON
 ```
 <工作区>/.tudouni/          运行期私有数据，控制面守着它（agent 读得到、写不了）
   permissions.json            权限策略（runtime/config.py）
-  sessions/<id>.json          会话状态（state/store.py）
+  sessions/<id>.jsonl         会话状态（state/store.py）
   logs/<id>.jsonl             审计轨迹（audit/jsonl.py）
   skills/<name>/SKILL.md      技能（skills/）
 ```

@@ -182,7 +182,7 @@ def check_session_id(session_id: str | None) -> str | None:
     return (
         f"非法的 --session：{session_id!r}\n"
         f"  会话 id 只能由字母、数字、下划线、连字符组成，长度 1~64 ——\n"
-        f"  因为它会被拿去拼文件名（{RUNTIME_DIR_NAME}/sessions/<id>.json 和"
+        f"  因为它会被拿去拼文件名（{RUNTIME_DIR_NAME}/sessions/<id>.jsonl 和"
         f" {RUNTIME_DIR_NAME}/logs/<id>.jsonl）。\n"
         f"  用 --list 看一下有哪些现成的 id。"
     )
@@ -306,8 +306,10 @@ def session_summaries(
     loaded: list[tuple[tuple[float, str], dict[str, Any]]] = []
     for session_id in store.list_ids():
         # `store._path` 是"一个 id 对应哪个文件"的**唯一**说法（它同时兜住 id 的
-        # 合法性校验）。自己拼 `directory / f"{id}.json"` 就是同一件事的第二个说法，
+        # 合法性校验）。自己拼 `directory / f"{id}{SUFFIX}"` 就是同一件事的第二个说法，
         # 而它漂掉的那天，症状是"列表里的时间和实际文件对不上"——没人查得出来。
+        # （后缀在这里**不写死**有具体的来路：会话文件从 `.json` 改成 `.jsonl` 那次，
+        # 凡是自己拼后缀的地方都要跟着改，而走 `_path` 的一处都不用动。）
         path = store._path(session_id)
         try:
             session = store.load(session_id)
