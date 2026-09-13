@@ -1256,7 +1256,7 @@ async def test_each_rail_block_has_a_left_colour_bar(monkeypatch):
         await pilot.pause()
 
         blocks = list(app.query(widgets_module.RailBlock))
-        assert len(blocks) == 5, "五块（任务/技能/权限/会话/后台任务）"
+        assert len(blocks) == 6, "六块（任务/技能/权限/会话/后台任务/MCP）"
         expected = _hex_of(app.palette.rail_bar)
         for block in blocks:
             style, color = block.styles.border_left
@@ -1310,13 +1310,14 @@ def test_the_command_palette_filters_by_prefix_only():
     assert view_state.filter_commands("/zz") == []
     # 带了参数就选不出东西 —— 于是回车走的是"整行命令"那条路（`/resume abc`）。
     assert view_state.filter_commands("/resume abc") == []
-    # 设计稿 F2 那五条还在原位，新增的八条排在末尾。
+    # 设计稿 F2 那五条还在原位，新增的排在末尾。
     names = [c.name for c in view_state.COMMANDS]
     assert names[:5] == ["/new", "/resume", "/audit", "/exit", "/help"]
     assert "/theme" in names and "/skills" in names
-    # 五条"看/改当前设置"的命令在末尾，而且**都在面板里** —— 一个"打得出来但面板里
+    # 末尾这几条"看/改当前设置"的命令**都在面板里** —— 一个"打得出来但面板里
     # 看不见"的命令，等于把发现它的成本推给记忆。
-    assert names[-5:] == ["/status", "/tools", "/model", "/thinking", "/effort"]
+    assert names[-6:] == ["/status", "/tools", "/model", "/thinking", "/effort",
+                          "/mcp"]
     # **`/list` 在第二期被去掉了**：它和"`/resume` 不带参数"是同一个出口，而两条
     # 命令指向同一件事时，人要先猜哪一条才对。这条断言钉的就是"别再把它加回来"。
     assert "/list" not in names
@@ -1331,7 +1332,7 @@ def test_commands_with_arguments_explain_them_in_help_not_in_the_palette():
     """
     with_args = [c for c in view_state.COMMANDS if c.takes_arg]
     assert {c.name for c in with_args} == {
-        "/resume", "/theme", "/model", "/thinking", "/effort"}
+        "/resume", "/theme", "/model", "/thinking", "/effort", "/mcp"}
     assert all(c.detail for c in with_args), "带参数的命令要在 /help 里说清怎么用"
     # 不带参数的那些没有 detail —— 空字符串不会被 `_help_lines` 渲染成空行。
     assert all(not c.detail for c in view_state.COMMANDS if not c.takes_arg)
@@ -1432,6 +1433,10 @@ class FakeClient:
 
     def ask_tools(self) -> None:
         self.sent.append({"t": "tools"})
+
+    def mcp(self, action: str, servers: tuple[str, ...] = ()) -> None:
+        self.sent.append({"t": "mcp", "action": action,
+                          "servers": [str(name) for name in servers]})
 
     def refresh_state(self) -> None:
         # 后台任务悬着时界面会主动来问一次（见 `app._maybe_refresh_state`）——

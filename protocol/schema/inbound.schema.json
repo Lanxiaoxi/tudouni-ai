@@ -128,6 +128,55 @@
     },
     "required": ["v", "t"]
   },
+"mcp": {
+  "summary": "看/改 MCP server 的挂载情况（TUI 与 CLI 的 `/mcp`）。答案是出站的 `ui` / `kind=mcp`（一份**全量**清单）。",
+  "doc": [
+    "三个动作共用一条消息，因为它们的回包**完全相同**（一份全量清单）：",
+    "  * `list`   —— 只看。`servers` 这一格忽略。",
+    "  * `load`   —— 连上 `servers` 里点的那些（本地起子进程 / 远程建连接，都要握手并列工具），",
+    "               然后注册进工具注册表。`servers` 为空则什么都不做。",
+    "  * `unload` —— 摘掉它们的工具并断开。**不改配置文件**：`mcp.json` 里那一行还在，",
+    "               下次启动仍然会加载。",
+    "**不做 `all` 这种批量写法**：一次一个，和面板里按一次开关是同一件事。",
+    "`servers` 里的名字必须是清单里已经有的（runtime 按名字找；找不到回一条 notice，",
+    "并把清单一起回给前端 —— 打错名字的下一步就是看着清单重打）。",
+    "**它只由人按键触发**：前端不许在启动、回合结束或收到别的消息时自己发一条 ——",
+    "那会让「配置自己变宽」成为可能，而 `mcp.json` 只读用户级正是要防这件事。",
+    "生效时机：runtime **先等当前这一轮跑完**再改（和 `/new` 同一条语义），",
+    "所以正在执行的那一次工具调用不会被半路抽走。"
+  ],
+  "fields": {
+    "v": {
+      "type": "integer",
+      "const": 1
+    },
+    "t": {
+      "type": "string",
+      "const": "mcp"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "list",
+        "load",
+        "unload"
+      ],
+      "doc": "要做什么。**认不出来的值不当成 `list`**（那会让一次打错的加载看起来像成功），runtime 回一条 notice。"
+    },
+    "servers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "doc": "要动哪几个 server（按 `mcp.json` 里那个名字）。`action=list` 时忽略；`load`/`unload` 时可以是空数组。"
+    }
+  },
+  "required": [
+    "v",
+    "t",
+    "action"
+  ]
+},
   "refresh_state": {
     "summary": "请 runtime 回一份面板快照（出站的 `ui` / `kind=state`）。**空消息，没有参数。**",
     "doc": [

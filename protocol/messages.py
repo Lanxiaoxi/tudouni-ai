@@ -96,6 +96,25 @@ IN_STATUS = "status"
 # **请 runtime 回一份工具清单**（`/tools`）。和 `IN_STATUS` 同一条路：
 # 按需发，答案是 `t:"ui", kind:"tools"`。
 IN_TOOLS = "tools"
+# **看/改 MCP server 的挂载情况**（TUI 和 CLI 的 `/mcp`）。
+#
+# 一条消息带三个动作（`MCP_LIST` / `MCP_LOAD` / `MCP_UNLOAD`），而不是三条 —— 它们
+# 的**回包完全相同**（一份全量清单），分成三条就等于三个 kind、三段两端各自维护的
+# 字段表。`action` 那一格是枚举：认不出来的值当场回一句 notice，不是猜。
+#
+# ## 一条硬约束：它只由人按键触发
+#
+# 它是唯一能改"模型看得到什么工具"的入站消息。所以前端**不许**在启动、回合结束、
+# 或者收到什么消息时顺手自己发一条 —— 那会让"配置自己变宽"变成可能，而那正是
+# `mcp.json` 只读用户级要防的事（见 tools/mcp.py 的模块 docstring）。用户按一次
+# 键 = 一次明确的授权决定，和 `/model` 换模型是同一档。
+IN_MCP = "mcp"
+# 那三个动作。
+MCP_LIST = "list"
+MCP_LOAD = "load"
+MCP_UNLOAD = "unload"
+
+MCP_ACTIONS = (MCP_LIST, MCP_LOAD, MCP_UNLOAD)
 # **请 runtime 回一份面板快照**（出站的 `ui`, kind:"state"）。**空消息，没有参数。**
 #
 # 它和上面两条的"按需"不是一回事，所以值得说清它为什么存在：`ui(state)` 本来只在
@@ -110,7 +129,7 @@ IN_SHUTDOWN = "shutdown"
 INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
            IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SET_AUTOPILOT,
            IN_SET_MODEL, IN_SET_THINKING, IN_SET_EFFORT, IN_STATUS, IN_TOOLS,
-           IN_REFRESH_STATE, IN_SHUTDOWN)
+           IN_MCP, IN_REFRESH_STATE, IN_SHUTDOWN)
 
 # 出站（runtime → 前端）十一种。**`/status` 和 `/tools` 不在这里** —— 它们复用
 # `t:"ui"` 那条通道（多两种 `kind`），因为它们是"给界面看的东西"，性质和面板快照
@@ -161,7 +180,7 @@ ALWAYS_GROUP = "always_group"
 
 DECISIONS = (ALLOW, DENY, ALWAYS, ALWAYS_GROUP)
 
-# `t:"ui"` 的四种 `kind`。**它和 `t:"event"` 是两条通道**：event 是审计的原样转发
+# `t:"ui"` 的五种 `kind`。**它和 `t:"event"` 是两条通道**：event 是审计的原样转发
 # （进 jsonl），ui 只给界面、不进审计。
 #
 #   * `run_finished` —— 这一轮的最终答案（审计里没有正文，所以它是界面唯一的来源）；
@@ -169,16 +188,24 @@ DECISIONS = (ALLOW, DENY, ALWAYS, ALWAYS_GROUP)
 #     它同样**不进审计**：任务列表的变化在审计里已经有 `tool_call` 那条参数了，
 #     再写一份就是同一份事实的第二个来源；
 #   * `status` —— `/status` 那一屏（回答入站的 `status`）；
-#   * `tools` —— `/tools` 那份清单（回答入站的 `tools`）。
+#   * `tools` —— `/tools` 那份清单（回答入站的 `tools`）；
+#   * `mcp` —— `/mcp` 那份清单（回答入站的 `mcp`）。
 #
-# 后两种**只在被问的时候才发**（它们要读审计日志、要遍历工具注册表），而 `state`
-# 是"每次工具返回都补一份"的常驻快照。这个区别就是它们为什么不合并成一种 kind。
+# 后三种**只在被问的时候才发**（它们要读审计日志、要遍历工具注册表、要问 MCP 宿主），
+# 而 `state` 是"每次工具返回都补一份"的常驻快照。这个区别就是它们为什么不合并成
+# 一种 kind。
+#
+# `tools` 和 `mcp` 看起来像同一件事的两半（都是"有哪些工具"），所以为什么是两个
+# kind 要说清：**问的人不同**。`tools` 回答"这个工具会不会问我"（策略与记忆），
+# `mcp` 回答"哪个 server 在跑"（生命周期与连接）。合成一个的话，每次 `/mcp load`
+# 都要把几十行权限清单重发一遍。
 UI_RUN_FINISHED = "run_finished"
 UI_STATE = "state"
 UI_STATUS = "status"
 UI_TOOLS = "tools"
+UI_MCP = "mcp"
 
-UI_KINDS = (UI_RUN_FINISHED, UI_STATE, UI_STATUS, UI_TOOLS)
+UI_KINDS = (UI_RUN_FINISHED, UI_STATE, UI_STATUS, UI_TOOLS, UI_MCP)
 
 
 def load_schema(name: str) -> dict[str, Any]:

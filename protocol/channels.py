@@ -596,6 +596,10 @@ class ProtocolServer:
             self._send_tools()
             return True
 
+        if kind == messages.IN_MCP:
+            self._handle_mcp(message)
+            return True
+
         if kind == messages.IN_REFRESH_STATE:
             # **它不改任何东西，只是把当前那份快照再算一遍发出去。** 处理它的地方在
             # 读循环那个线程 —— 而 `_state_message()` 本来就会被两个线程调
@@ -944,6 +948,92 @@ class ProtocolServer:
                 format_rule(rule) for rule in sorted(runtime.memory.prefixes())
             ],
         })
+
+    # -- MCP 的挂载（`/mcp`）---------------------------------------------------
+
+    def _handle_mcp(self, message: dict[str, Any]) -> None:
+        """看/改 MCP server 的挂载。**先等这一轮跑完再改。**
+
+        ## 为什么先 `_join_turn()`
+
+        和换会话（`_session_switch`）同一条语义，理由也一样具体：工具定义在
+        `Agent.run` 开头取一次快照，而卸载会把工具从注册表里摘掉 —— 如果那一轮
+        正在执行某个工具，半路摘掉它的 server 会让这次调用以 `McpServerDown` 收场。
+        等一轮的代价是几十秒（用户看得见：面板上那行"等当前这一轮跑完…"），换来的是
+        "不会把一个人正在用的工具抽走"。
+
+        `list` 那条**不需要等**（它什么都不改）—— 但判据统一在这里做更省事：一次
+        `join` 在没回合跑时是零成本的（`thread is None` 直接返回）。
+
+        ## 认不出来的动作不当成 `list`
+
+        一次打错字的 `load` 看起来像成功是最坏的失败形态（用户以为挂上了）。所以
+        认不出就回一条 notice，什么都不做。
+        """
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "mcp", "[MCP] 还没有会话。")
+            return
+        host = getattr(runtime, "mcp", None)
+        if host is None:
+            self._notice("warn", "mcp",
+                         "[MCP] 这个 runtime 没有 MCP 宿主，改不了挂载。")
+            return
+
+        action = message.get("action")
+        if action not in messages.MCP_ACTIONS:
+            self._notice(
+                "warn", "mcp",
+                f"[MCP] 认不出这个动作：{action!r}（只有 "
+                f"{' / '.join(messages.MCP_ACTIONS)}）",
+            )
+            return
+
+        raw = message.get("servers")
+        servers = (
+            [name for name in raw if isinstance(name, str)] if isinstance(raw, list)
+            else []
+        )
+
+        notes: list[str] = []
+        if action == messages.MCP_LIST:
+            notes.append("[MCP] 当前挂载情况（配置里改了要重启才生效）")
+        else:
+            self._join_turn()
+            if not servers:
+                notes.append(f"[MCP] {action} 要给出 server 名字，一次一个")
+            for name in servers:
+                if action == messages.MCP_LOAD:
+                    notes.append(host.load(name))
+                else:
+                    notes.append(host.unload(name))
+
+        self._send_mcp(notes)
+
+    def _send_mcp(self, notes: list[str] | None = None) -> None:
+        """回一份 MCP 清单（`ui` / `kind=mcp`）。
+
+        **全量**（不是增量）：面板每次按它重画，所以"这一行现在是什么样"永远只有
+        一个来源。`mcp_servers` 直接来自宿主（每一格的状态、工具数、失败原因都在
+        那里），协议层不认识任何一种状态的含义 —— 和 `tool_rows` 同一条分工。
+
+        顺便把那份清单也放进 `ui(state)` 里发一次：左栏那块读的是 `state`，而
+        `/mcp` 改完之后它必须跟着变（前端不做乐观更新，所以"左栏什么时候变"这件事
+        由这一条消息回答）。
+        """
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "mcp", "[MCP] 还没有会话。")
+            return
+        host = getattr(runtime, "mcp", None)
+        self.send({
+            "v": messages.VERSION,
+            "t": messages.OUT_UI,
+            "kind": messages.UI_MCP,
+            "mcp_servers": host.rows() if host is not None else [],
+            "mcp_notes": list(notes or ()),
+        })
+        self.send(self._state_message())
 
     def _notice(self, level: str, code: str, text: str) -> None:
         self.send({

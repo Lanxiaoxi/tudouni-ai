@@ -120,14 +120,14 @@
     "required": ["v", "t", "kind", "session_id", "run_id", "step", "ts"]
   },
   "ui": {
-    "summary": "只给界面、不进审计的东西。四种 kind，字段按 kind 取。",
+    "summary": "只给界面、不进审计的东西。五种 kind，字段按 kind 取。",
     "fields": {
       "v": {"type": "integer", "const": 1},
       "t": {"type": "string", "const": "ui"},
       "kind": {
         "type": "string",
-        "enum": ["run_finished", "state", "status", "tools"],
-        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/jobs/agents_md/messages/steps/model）；status = `/status` 要的那一屏（回答入站的 status）；tools = `/tools` 的清单（回答入站的 tools）。四种都**不进审计**。"
+        "enum": ["run_finished", "state", "status", "tools", "mcp"],
+        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/jobs/mcp/agents_md/messages/steps/model）；status = `/status` 要的那一屏（回答入站的 status）；tools = `/tools` 的清单（回答入站的 tools）；mcp = `/mcp` 的清单（回答入站的 mcp）。五种都**不进审计**。"
       },
       "answer": {
         "type": "string",
@@ -221,6 +221,27 @@
       "tools": {
         "type": "array",
         "doc": "**只有 kind=tools 有**。每个工具一条：`[{\"name\": ..., \"risk\": \"low|medium|high\", \"disposition\": \"auto|ask|deny\", \"parallel_safe\": bool, \"interactive\": bool, \"external\": bool, \"granted\": bool, \"command\": \"command\"|null}]`。`disposition` 由 runtime 的策略裁定（和左栏「权限范围」同一个来源）；`granted` = 你按过 `t`；`command` = 这个工具的参数里有命令行（只有 shell 有），按前缀放行的规则只对它有意义。"
+      },
+      "mcp_servers": {
+        "type": "array",
+        "doc": [
+          "**只有 kind=mcp 有**。MCP server 的挂载情况，**全量**（不是增量 —— 面板每次按全量重画，",
+          "省掉「增量怎么合并」那一整类 bug）：`[{\"name\": ..., \"state\": \"loaded|unload|failed\",",
+          "\"tools\": 12, \"error\": \"...\", \"where\": \"npx …\"}]`。",
+          "`where` 是给人看的一句话：本地是命令行，远程**只到 `scheme://host`** —— URL 里可能有令牌，",
+          "而这一格会进面板、进快照、进日志。",
+          "三个 state 是**三个不同的问题**：`loaded` 在跑（左栏那块只数这个）、`unload` 配置里有但没跑、",
+          "`failed` 我们试过没成（原因在 `error` 里）。**后两种不能合成一种**：它们的下一步完全不同。"
+        ]
+      },
+      "mcp_notes": {
+        "type": "array",
+        "items": {"type": "string"},
+        "doc": [
+          "**只有 kind=mcp 有**。这一批动作要说的话（一条一句，已经带 `[MCP]` 前缀）。",
+          "**它由 runtime 拼**：`清单里没有 server x` / `没连上（…）` 这类句子里的每个事实",
+          "（谁在跑、为什么没成）只有 runtime 知道，界面自己拼就是第二份事实。前端把它们贴进会话流。"
+        ]
       }
     },
     "required": ["v", "t", "kind"]

@@ -281,6 +281,28 @@ class ProtocolClient:
         """
         self.send({"t": messages.IN_TOOLS})
 
+    def mcp(self, action: str, servers: tuple[str, ...] | list[str] = ()) -> None:
+        """看/改 MCP server 的挂载（TUI 与 CLI 的 `/mcp`，回包 `ui` / `kind=mcp`）。
+
+        `action` ∈ `messages.MCP_ACTIONS`（`list` / `load` / `unload`），`servers` 是
+        要动的那几个名字。**一次一个**：不做 `all` 这种批量写法 —— 它和面板里按一次
+        开关是同一件事，而批量会把"哪几个成了、哪几个没成"揉成一句话。
+
+        ## 两条和别处一样的规矩
+
+          * **非阻塞、不乐观更新。** 这里只写一行，真正生效的证据是回来的
+            `ui(kind=mcp)` 快照（每一格的状态由 runtime 写）。界面在那之前就把
+            "已加载"画上去的话，`npx` 起不来时会变成一句假话；
+          * **只有人按键才发它。** 它是唯一能改"模型看得到什么工具"的入口，所以
+            前端**不许**在启动、回合结束、收到消息时顺手发一条 —— 那会让"配置自己
+            变宽"成为可能（理由写在 `messages.IN_MCP` 那段）。
+        """
+        self.send({
+            "t": messages.IN_MCP,
+            "action": str(action),
+            "servers": [str(name) for name in servers],
+        })
+
     def refresh_state(self) -> None:
         """请 runtime **现在**重算一份面板快照（回包 `ui` / `kind=state`）。
 

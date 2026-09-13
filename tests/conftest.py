@@ -1,6 +1,8 @@
 import shutil
 import sys
+import threading
 import uuid
+from http.server import HTTPServer
 from pathlib import Path
 
 import pytest
@@ -44,6 +46,36 @@ def isolated_workspace(monkeypatch):
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture
+def fake_openai():
+    """起一个**假的 OpenAI 兼容端点**，返回 `(基址, 脚本列表, 收到的请求列表)`。
+
+    ## 为什么它住在 conftest 而不是某一个测试文件里
+
+    它原来在 `tests/test_protocol.py` 里，而那个文件只有自己用。`/mcp` 的端到端
+    （`tests/test_mcp_protocol.py`）也要起真 runtime 子进程，而那个子进程同样必须
+    有一个能回话的网关才起得来 —— 于是那份桩需要被两个文件共用。
+
+    **不是把它复制一份**：模型端点的形状（尤其是 SSE 分块、usage 在最后一块、
+    `tool_calls` 的 arguments 分段给）是这个项目里最容易写歪的一段，两份就会漂，
+    而漂掉的症状是"一个文件的测试绿、另一个红"这种最难查的形态。
+
+    脚本的最后一条会被重复使用（那些测试只关心前几步）。
+    """
+    from test_protocol import _Handler
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    _Handler.scripts = [{"content": "默认回答"}]
+    _Handler.calls = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", _Handler.scripts, _Handler.calls
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 @pytest.fixture

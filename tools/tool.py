@@ -280,6 +280,33 @@ class ToolRegistry:
 
         return self._tools[name]
 
+    def unregister(self, name: str) -> Tool | None:
+        """摘掉一个工具。**不在里面不算错**（返回 None），理由见下。
+
+        它存在的唯一理由是 MCP 的 `/mcp unload`：外部工具是**运行中挂上来的**，
+        所以必须也能摘掉。内置工具没有任何一条路会调它。
+
+        为什么"不在里面"返回 None 而不是抛：这条路的调用方是卸载流程，而它的
+        幂等性是有意义的 —— "把这个 server 的工具摘掉"重复一次不该炸（第一次
+        unload 之后又收到一条 unload，或者两个工具名指向同一批）。真正需要报错的
+        情况（卸载一个不存在的 server）由上游按 server 名判，那里的报错能说出
+        "是哪个 server"，而这里只能说"是哪个工具"。
+        """
+        return self._tools.pop(name, None)
+
+    def unregister_prefix(self, prefix: str) -> list[Tool]:
+        """摘掉所有以 `prefix` 开头的工具，返回被摘掉的那些。
+
+        MCP 的工具名是 `mcp__<server>__<工具>`（见 tools/mcp.py 的 NAME_PREFIX），
+        所以按前缀摘正好等于"把一个 server 的工具全摘掉"，**而且不需要另存一份
+        名单**：名单会漂（server 中途换了工具），而名字就在这里。
+
+        返回 Tool 对象（不是名字）是有用的：调用方要把它们从 trust group 的映射里
+        一起清掉（`runtime.composition.McpHost`），而那一步要的正是这些名字。
+        """
+        names = [name for name in self._tools if name.startswith(prefix)]
+        return [self._tools.pop(name) for name in names]
+
     def all(self) -> list[Tool]:
         """按注册顺序返回所有工具。
 

@@ -377,6 +377,17 @@ class ViewState:
     # 而后台任务过期意味着"我以为已经收掉的服务还在占着端口"。所以它除了左栏那一块，
     # 还有一个常驻的状态栏徽标（`jobs_badge`）—— 收起上下文栏时那是唯一的出口。
     jobs: list[dict[str, Any]] = field(default_factory=list)
+    # MCP server（`ui(state).mcp`，也是 `/mcp` 那条回包的核心）。每项形如
+    # `{"name", "state": "loaded|unload|failed", "tools": 12, "error": "", "where": "npx …"}`。
+    #
+    # **它是这一栏里第二块"机器上真的有东西在跑"**（另一块是后台任务）：stdio 的
+    # server 是我们起的子进程，远程的是一条活着的连接。所以口径和后台任务一样 ——
+    # **数在跑的，不数配了几个**（后者看 `/mcp` 面板；没加载的不占进程，不该在栏里
+    # 抢地方）。
+    #
+    # `state` / `error` / `where` 都**由 runtime 算好**：哪几格组合算"没连上"、给人
+    # 看的那句话怎么写（远程只到 `scheme://host`，不带令牌）都是它的知识。
+    mcp: list[dict[str, Any]] = field(default_factory=list)
     # 这个会话的 system 消息里那份 AGENT.md 的去向（`ui_state` 从
     # `session.metadata` 读出来的报告）：每项形如
     # `{"path": "AGENT.md", "lines": 12, "status": "loaded" | "failed", "problem": "…"}`。
@@ -1255,7 +1266,7 @@ def apply_state(state: ViewState, message: dict[str, Any]) -> None:
     它是**面板数据**（左栏那几块），不进对话流：任务列表每更新一次就在流里插一段，
     会把"你问的 + 它答的"冲稀。设计稿把这块放进常驻的左栏，正是为了这个。
     """
-    for key in ("todos", "skills", "risk_scope", "jobs"):
+    for key in ("todos", "skills", "risk_scope", "jobs", "mcp"):
         if key in message:
             setattr(state, key, [dict(item) for item in message[key] or []])
     # AGENT.md 那份报告：**它只在开场那一条里有**（会话创建时读一次盘，之后不会变），
@@ -1305,18 +1316,24 @@ def apply_state(state: ViewState, message: dict[str, Any]) -> None:
 # --- 上下文栏（左栏） ----------------------------------------------------------
 
 def rail_blocks(state: ViewState) -> list[tuple[str, str, list[Line]]]:
-    """左栏五块：`(标题, 右侧计数, 行)`。
+    """左栏六块：`(标题, 右侧计数, 行)`。
 
-    五块的数据来源在设计稿的推导表里写死了：任务来自 `todo_write`、技能来自
+    六块的数据来源在设计稿的推导表里写死了：任务来自 `todo_write`、技能来自
     `load_skill`、权限来自 `init.permissions` + `PermissionPolicy`、会话来自
-    `Session` + 审计、**后台任务来自 `ui(state).jobs`**。它们此前只有"另开一个终端"
-    的出口（`--skills` / `--audit` / `--list`），放进栏里之后"agent 为什么这么做"
-    "我现在放行了什么""我机器上还挂着什么"变成常驻可见，而不是翻日志考古。
+    `Session` + 审计、**后台任务来自 `ui(state).jobs`**、**MCP 来自 `ui(state).mcp`**。
+    它们此前只有"另开一个终端"的出口（`--skills` / `--audit` / `--list`），放进栏里
+    之后"agent 为什么这么做""我现在放行了什么""我机器上还挂着什么"变成常驻可见，
+    而不是翻日志考古。
 
-    **后台那一块排在最后，不是因为最不重要**，而是因为前面四块是设计稿定下来的
-    顺序（F1 那张图上从上到下就是任务/技能/权限/会话），插在中间会把它们全部挪位 ——
-    而"哪一块在第几行"是用户在两次看之间形成的肌肉记忆。它自己的可见性由状态栏
-    那枚徽标保证（`jobs_badge`），所以排最后不至于被漏掉。
+    **后两块排在最末（后台任务、MCP），不是因为它们最不重要**，而是因为前面四块是
+    设计稿定下来的顺序（F1 那张图上从上到下就是任务/技能/权限/会话），插在中间会把
+    它们全部挪位 —— 而"哪一块在第几行"是用户在两次看之间形成的肌肉记忆。
+
+    它们自己的可见性各有各的保证：后台任务靠状态栏那枚徽标（`jobs_badge`），MCP 靠
+    `/mcp` 那条命令（它是"我配了哪几个"唯一的出口）。所以排最后不至于被漏掉。
+
+    **两块"对应着活东西"的挨在一起**（后台任务、MCP），这不是排版巧合：它们要回答的
+    是同一类问题（"我机器上现在还有什么在跑"），而它们的记号和计数口径也是一套的。
     """
     return [
         _todo_block(state),
@@ -1324,7 +1341,57 @@ def rail_blocks(state: ViewState) -> list[tuple[str, str, list[Line]]]:
         _permission_block(state),
         _session_block(state),
         _jobs_block(state),
+        _mcp_block(state),
     ]
+
+
+# MCP 三个状态各自的记号。**和后台任务那四档同一套思路**（`_JOB_MARK`）：形状不同
+# 就是不同的事，而这三个要回答的问题确实不同 —— 在跑的、配置里有但没跑的、试过没成的。
+_MCP_MARK = {
+    "loaded": "●",
+    "unload": "○",
+    "failed": "✗",
+}
+
+
+def _mcp_block(state: ViewState) -> tuple[str, str, list[Line]]:
+    """MCP server 那一块：**机器上挂着哪几个外部能力**。
+
+    它和「后台任务」并排，因为它们是这一栏里唯一两块**对应着活东西**的：stdio 的
+    server 是我们起的子进程，远程的是一条活着的连接。其余几块是信息（任务列表是
+    模型的主张、权限是配置、会话是记账），过期只是旧；这两块过期意味着"我以为收掉了，
+    其实还在"。
+
+    ## 为什么**只列在跑的**
+
+    口径和后台任务右侧那个计数一致（`n / m`，n = 在跑的）：没加载的 server 不占进程，
+    所以它不该在这块抢地方 —— "我配了哪几个但没开"是 `/mcp` 面板要回答的问题，而面板
+    还能顺手把它们开起来。这里放一份完整清单只会让"这一栏里到底有几个东西是活的"
+    变得要数一遍才知道。
+
+    一个都没在跑时写一句"当前没有挂载 MCP server"，**不列 `unload` 的那些**：那正是
+    这一块和面板的分工。
+
+    **`failed` 那一档不在这个"没在跑"的集合里**（它没连上，当然没在跑）—— 所以它
+    也不进这一块；它的位置是 `/mcp` 面板（面板上带着 `error` 那句话）。这里只数活的。
+    """
+    loaded = [item for item in state.mcp if item.get("state") == "loaded"]
+    if not loaded:
+        return ("后台 MCP", "", [
+            Line("当前没有挂载 MCP server", ROLE_RULE),
+            Line("/mcp 可以看清单并逐个挂载", ROLE_RULE),
+        ])
+    lines = [
+        seg(
+            (f"{_MCP_MARK['loaded']} ", ROLE_ANSWER),
+            (str(item.get("name", "?")), ROLE_PROCESS),
+            (f"  {item.get('tools', 0)} 个工具", ROLE_RULE),
+        )
+        for item in loaded
+    ]
+    # 右侧那个计数报 `在跑的 / 配置里的总数`：分母让"我没开的那几个"也一眼看得见，
+    # 而不会让人以为"配了三个却只挂上一个"是坏了。
+    return ("后台 MCP", f"{len(loaded)} / {len(state.mcp)}", lines)
 
 
 def _jobs_block(state: ViewState) -> tuple[str, str, list[Line]]:
@@ -1555,6 +1622,11 @@ def rail_summary(state: ViewState) -> str:
                           if str(job.get("state", "")) in ("running", "uncollected"))
         parts.append(f"{outstanding} 个后台任务" if outstanding
                      else f"{len(state.jobs)} 个后台任务（都收过了）")
+    # MCP 那一格**只报在跑的**（和左栏那块同一个口径），而且和模型/权限那几格一样，
+    # "没有"时一个字都不写 —— 收起左栏之后这一行的预算是有限的，而"零个 MCP"没有信息量。
+    mounted = sum(1 for item in state.mcp if item.get("state") == "loaded")
+    if mounted:
+        parts.append(f"{mounted} 个 MCP server")
     if state.todos:
         done = sum(1 for item in state.todos if item.get("status") == "completed")
         parts.append(f"{done}/{len(state.todos)} 个任务")
@@ -1685,6 +1757,15 @@ COMMANDS: tuple[Command, ...] = (
     Command("/effort", "思考强度", True,
             "不带参数看现在是哪一档；/effort low、/effort high、/effort max 改它"
             "（端点还接受 minimal/medium/xhigh/ultra 这些等价写法）"),
+    # MCP 那一档。**不带参数弹面板**（和 `/resume` 同一条交互），面板里 ↑↓ 选、
+    # Enter 开关某一个 —— **一次一个**，没有 `all` 这种批量写法：批量会把"哪几个
+    # 成了、哪几个没成"揉成一句话，而那句话正是用户要看的。
+    #
+    # 带参数那两种写法（`/mcp load github`）是给"我已经知道要开哪个"的人的快捷方式，
+    # 也是 CLI 那侧唯一的形状（它没有面板）。两处按的是**同一个入口**，所以不会漂。
+    Command("/mcp", "MCP 服务器开关", True,
+            "不带参数打开面板（↑↓ 选、Enter 开关、Esc 关闭）；"
+            "/mcp load <名字> 或 /mcp unload <名字> 直接改一个"),
 )
 
 # 命令名那一列的宽度。**从最长的那条算出来，不手写数字。**
@@ -1922,6 +2003,73 @@ def render_tools(state: ViewState, message: dict[str, Any]) -> list[Line]:
     return out
 
 
+# MCP 面板里每一行的记号与措辞。**三档各有各的字**，因为它们是三个不同的问题：
+# 在跑的、配置里有但没跑的、试过没连上的（最后一档带原因）。
+_MCP_STATE = {
+    "loaded": ("●", ROLE_ANSWER),
+    "unload": ("○", ROLE_RULE),
+    "failed": ("✗", ROLE_DENIED),
+}
+
+
+def mcp_line(item: dict[str, Any], width: int = 0) -> Line:
+    """MCP 清单里的一行：`● github   12 个工具`。**面板和会话流共用这一份。**
+
+    共用是有意的：两处各写一份的话，"`failed` 那一档显示什么"会漂，而漂掉的症状是
+    "面板里说没连上、流里说未加载"——用户没法判断该信哪个。
+
+    远程的 server 在 `where` 里只有 `scheme://host`（**令牌不在里面**，见
+    `McpServer.where()`），所以那一格可以直接显示。
+    """
+    name = str(item.get("name", "?"))
+    mark, role = _MCP_STATE.get(str(item.get("state")), ("·", ROLE_RULE))
+    pad = " " * max(2, width - cell_len(name) + 2) if width else "  "
+    state = str(item.get("state", ""))
+    if state == "loaded":
+        detail = f"{item.get('tools', 0)} 个工具"
+    elif state == "failed":
+        # **原因跟在后面**：没有它，"没连上"这三个字帮不上任何忙。
+        detail = f"没连上：{item.get('error') or '（没说原因）'}"
+    else:
+        detail = "未加载"
+    return seg(
+        (f"{mark} ", role),
+        (f"{name}{pad}", ROLE_PROCESS),
+        (detail, role if state != "loaded" else ROLE_RULE),
+    )
+
+
+def render_mcp(message: dict[str, Any]) -> list[Line]:
+    """`/mcp` 的回包 → 会话流里那几行。**清单本身在面板和左栏，这里只留痕。**
+
+    ## 为什么这一段不把清单也画一遍
+
+    因为那份清单**已经在两个地方**了：面板（`/mcp` 打开的那一层）和左栏那块
+    「后台 MCP」。在流里再画一份的代价是它随对话滚走 —— 而"我挂了哪几个"恰恰是
+    随时想再看一眼、而不是想往回翻的东西。所以这里只写：
+
+      * 一句话的概况（在跑几个 / 共几个）；
+      * **动作的后果**（`[MCP] server x 挂上了：12 个工具` / `没连上（…）`）——
+        那些是 runtime 拼的句子，**一个字都不改地照贴**（同一条规矩：那句子里
+        "为什么没成"只有它知道）。
+
+    一句话都没有（比如 `ui(mcp)` 是系统自己发的快照）时返回空列表：调用方据此
+    什么都不画。
+    """
+    notes = [str(text) for text in (message.get("mcp_notes") or ())]
+    rows = message.get("mcp_servers") or []
+    if not notes and not rows:
+        return []
+    loaded = [item for item in rows if item.get("state") == "loaded"]
+    out: list[Line] = [Line(
+        f"MCP：{len(loaded)} 个在跑 / 共 {len(rows)} 个（/mcp 打开面板逐个开关）",
+        ROLE_RULE,
+    )]
+    out.extend(Line(text, ROLE_WARN if "没连上" in text else ROLE_PROCESS)
+               for text in notes)
+    return out
+
+
 def render_models(state: ViewState, rest: str = "") -> list[Line]:
     """`/model` 不带参数时那张清单。
 
@@ -2042,7 +2190,7 @@ def session_row(item: dict[str, Any], *, conflict: bool = False) -> Line:
 def filter_commands(query: str) -> list[Command]:
     """面板里的候选。`/` → 全部；`/re` → 名字以 `re` 开头的那些。
 
-    **只按名字前缀匹配**，不做模糊搜索：命令一共十三条，而模糊匹配会让"我打错了"
+    **只按名字前缀匹配**，不做模糊搜索：命令一共十几条，而模糊匹配会让"我打错了"
     和"它猜对了"长得一样 —— 一个按下去不是你想的那条命令的面板比没有面板更坏。
     """
     text = query.strip().lstrip("/").lower()

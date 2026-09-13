@@ -25,6 +25,7 @@ from agent_runtime.agents import RunCancelled, StepLimitExceeded
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
 from agent_runtime.runtime.composition import Runtime
+from agent_runtime.runtime.config import MCP_FILE
 from agent_runtime.security.commands import format_rule
 from agent_runtime.skills import SkillLoader
 from agent_runtime.state import JsonSessionStore, Session
@@ -681,6 +682,72 @@ def _print_tools(runtime: Runtime) -> None:
     print("  改这些去 .tudouni/permissions.json；审批时按 t 会写进去", file=sys.stderr)
 
 
+def _print_mcp(runtime: Runtime) -> None:
+    """`/mcp` 不带参数：挂载情况 + 怎么改。
+
+    **和 TUI 那份面板同一个数据来源**（`runtime.mcp.rows()`）：两边共享的是数据口径，
+    不是交互（TUI 弹面板、这里打行）。口径里有一件事这里必须也说清：这一屏里的
+    `unload` 那些**可能是从没挂过，也可能是刚才卸掉的** —— 而"为什么没连上"只在
+    `failed` 那一档里，跟着 `error` 一起打出来。
+    """
+    host = runtime.mcp
+    if host is None:
+        print("这一版没有 MCP 宿主（不是从 open_runtime 起来的？）", file=sys.stderr)
+        return
+    rows = host.rows()
+    if not rows:
+        print(f"没有配置任何 MCP server（清单在 {MCP_FILE}）", file=sys.stderr)
+        print("配一个 server：本地给 command，远程给 url + headers",
+              file=sys.stderr)
+        return
+    loaded = [row for row in rows if row["state"] == "loaded"]
+    width = max(len(row["name"]) for row in rows)
+    print(f"MCP server：{len(loaded)} 个在跑 / 共 {len(rows)} 个"
+          f"（清单：{MCP_FILE}）", file=sys.stderr)
+    for row in rows:
+        if row["state"] == "loaded":
+            detail = f"{row['tools']} 个工具"
+        elif row["state"] == "failed":
+            detail = f"没连上：{row['error']}"
+        else:
+            detail = "未加载"
+        print(f"  {MCP_MARK.get(row['state'], '·')} {row['name']:<{width}}  {detail}",
+              file=sys.stderr)
+        # 来源那一行**只有未加载时才有用**：在跑的那些已经说了工具数，而这一行
+        # 回答的是"它到底在哪"（本地命令 / 远程主机）。远程那句不带令牌。
+        if row["state"] != "loaded":
+            print(f"      {'':<{width}}  {row['where']}", file=sys.stderr)
+    print("  挂一个：/mcp load <名字>  ·  卸一个：/mcp unload <名字>"
+          "（一次一个，不改配置文件）", file=sys.stderr)
+
+
+# MCP 三个状态在 CLI 里的记号。**和 TUI 那一套是同一套形状**（● 在跑 / ○ 没跑 /
+# ✗ 试过没成），因为它们是同一份数据、同一批含义 —— 两个前端用不同的符号只会让
+# "用户在两个界面之间对不上号"。
+MCP_MARK = {"loaded": "●", "unload": "○", "failed": "✗"}
+
+
+def _mcp_action(runtime: Runtime, action: str, name: str) -> None:
+    """`/mcp load|unload <名字>`：真改，然后把宿主说的那句话原样打出来。
+
+    那句话由 `McpHost` 拼（`[MCP] server x 挂上了：12 个工具` / `没连上（…）`）——
+    **CLI 不自己拼**：它包含"为什么没成"这类只有宿主知道的事实，而两个前端各拼一份
+    就会漂（TUI 那边贴的是同一句话）。
+    """
+    host = runtime.mcp
+    if host is None:
+        print("这一版没有 MCP 宿主，改不了挂载", file=sys.stderr)
+        return
+    if action == "load":
+        message = host.load(name)
+    else:
+        message = host.unload(name)
+    print(message, file=sys.stderr)
+    # 改完再列一遍：`load` 之后"工具数是多少"、`unload` 之后"还剩几个在跑"都是
+    # 紧接着会想知道的事，而再打一次 `/mcp` 只是为了看这两行。
+    _print_mcp(runtime)
+
+
 def _print_models(runtime: Runtime) -> None:
     """`/model` 不带参数：清单 + 现在用的是哪个。
 
@@ -752,6 +819,23 @@ def _handle_slash_command(runtime: Runtime, line: str) -> bool:
         _print_status(runtime)
     elif command == "/tools":
         _print_tools(runtime)
+    elif command == "/mcp":
+        # **两种写法，一个出口**：不带参数只列（`/mcp`），带参数就真改一个
+        # （`/mcp load github`）。**没有 `all`** —— 和 TUI 那条命令一字不差的规矩：
+        # 批量会把"哪几个成了、哪几个没成"揉成一句话，而那句话正是要看的。
+        #
+        # 名字打错时**不猜**（和 `/model` 同一个取向）：挂上一个别的 server 的后果是
+        # "它开始用外面的东西"，比"没挂上"贵得多。所以只认 load / unload 两个字面量。
+        if not rest:
+            _print_mcp(runtime)
+        else:
+            action, _, name = rest.partition(" ")
+            if action in ("load", "unload") and name.strip():
+                _mcp_action(runtime, action, name.strip())
+            else:
+                print(f"认不出这个写法：{rest}（用 /mcp load <名字> 或 "
+                      f"/mcp unload <名字>）", file=sys.stderr)
+                _print_mcp(runtime)
     elif command == "/model":
         if rest:
             ok, message = runtime.select_model(rest)

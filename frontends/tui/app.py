@@ -647,6 +647,24 @@ class TuiApp(App[None]):
         widget = found.first()
         return widget if isinstance(widget, expect) else None
 
+    def _mcp_panel(self) -> "widgets.McpPanel | None":
+        """`/mcp` 那个面板。**开着才有**（`push_screen` 之后它才在屏幕栈上）。
+
+        ## 为什么走 `screen_stack` 而不是 `self.query`
+
+        `push_screen` 把面板挂成**一个 Screen**，而 `App.query` 只在当前那个 Screen
+        里找 —— 面板被压上来之后当前 Screen 就是它，但一旦上面再压了别的（审批、提问），
+        从这里就找不到了。所以从栈顶往下找，找到第一个是它的那一层。
+
+        判据窄一点（具体是这一个类）比"屏幕栈非空"好：栈里随时可能压着欢迎屏、
+        审批面板、会话选择面板，而"重画错了对象"是这个功能里最难发现的 bug 之一
+        （屏幕上什么都没变，看起来像按键没生效）。
+        """
+        for screen in reversed(self.screen_stack):
+            if isinstance(screen, widgets.McpPanel):
+                return screen
+        return None
+
     def _log(self) -> widgets.ConversationLog | None:
         return self._widget("#log", widgets.ConversationLog)
 
@@ -1030,6 +1048,28 @@ class TuiApp(App[None]):
             self.state.tools = [dict(row) for row in message.get("tools") or []]
             self._say_lines(view_state.render_tools(self.state, message))
             return
+        if message.get("kind") == messages.UI_MCP:
+            # `/mcp` 的回包。**两件事一起做**：
+            #
+            #   1. 把清单存进状态（左栏那块读它）——那份清单**同时**跟着
+            #      `ui(state)` 快照来（`state.mcp`），所以面板无论开在哪一条路上都
+            #      拿到的是同一份事实；
+            #   2. 在会话流里留痕（概况 + runtime 拼的那几句后果），并**清掉面板上
+            #      那句"正在等 runtime"** —— 任何一条快照回来都算"等的事结束了"，
+            #      不靠猜是哪一条（猜错会让面板永远停在"正在等"）。
+            #
+            # **它画两份是有意的**：面板是那一屏的正文，而会话流是"我刚才按了什么、
+            # 结果如何"的记录 —— 面板关掉之后那份记录只剩下后者。
+            self.state.mcp = [dict(row) for row in message.get("mcp_servers") or []]
+            self._say_lines(view_state.render_mcp(message))
+            self._settle_mcp_panel()
+            return
+
+    def _settle_mcp_panel(self) -> None:
+        """`/mcp` 面板开着就重画它（并把"正在等 runtime"那行清掉）。"""
+        panel = self._mcp_panel()
+        if panel is not None:
+            panel.show_pending(None)
 
     def _report_autopilot(self) -> None:
         """`/autopilot` 的回声：**说的是 runtime 确认之后的那个值**。
@@ -1289,6 +1329,8 @@ class TuiApp(App[None]):
             self._command_theme(rest)
         elif command == "/autopilot":
             self._command_autopilot()
+        elif command == "/mcp":
+            self._command_mcp(rest)
         else:
             self._say(f"没有这个命令：{command}（/help）")
 
@@ -1406,6 +1448,49 @@ class TuiApp(App[None]):
             return
         self._autopilot_wanted = not self.state.autopilot
         self._client.set_autopilot(self._autopilot_wanted)
+
+    def _command_mcp(self, rest: str) -> None:
+        """`/mcp [load|unload <名字>]`。
+
+        ## 不带参数弹面板，面板**不接管**请求的往返
+
+        面板只负责"用户点了哪个"，真正发那条协议消息的是这里（`mcp_action`）——
+        和 `/resume` 那条分工一模一样（面板 `dismiss` 一个结果，命令那一段发请求）。
+        差别只在面板不关：因为它可以连着按好几次，而每次都走同一条出口。
+
+        ## 带参数时只认两种写法
+
+        `load` / `unload` 两个字面量 + 一个 server 名字。**不做 `all`**（批量会把
+        "哪几个成了、哪几个没成"揉成一句话），也**不做前缀匹配**（打错一个字母挂上
+        另一个 server 的后果是"它开始用外面的东西"）。认不出来就说认不出来，然后
+        打开面板 —— 那是"下一步该干什么"最省事的回答。
+        """
+        if not rest:
+            self.push_screen(widgets.McpPanel(self.state, self.palette, id="mcp"))
+            return
+        action, _, name = rest.partition(" ")
+        if action not in ("load", "unload") or not name.strip():
+            self._say(f"认不出这个写法：{rest}（用 /mcp load <名字> 或 "
+                      f"/mcp unload <名字>）")
+            self.push_screen(widgets.McpPanel(self.state, self.palette, id="mcp"))
+            return
+        self.mcp_action(action, name.strip())
+
+    def mcp_action(self, action: str, name: str) -> None:
+        """发一条 `/mcp` 请求，并且**在屏幕上留一行**。
+
+        **不乐观更新**（和 `/autopilot` 同一条）：那一行说的是"我请 runtime 去做了
+        什么"，而"做成了没有"由回来的快照说（`_on_ui` 里 `kind=mcp` 那一支会把
+        runtime 拼的那句话贴进会话流）。所以这里刻意不用"已挂载/已卸载"这种说法。
+
+        面板开着的时候由它自己显示"正在等 runtime…"（见 `widgets.McpPanel`），
+        所以会话流里那一行只在**命令行写法**下是主要反馈 —— 两个入口共用这一条路，
+        于是"面板点了没反应"和"打命令没反应"不可能是两种毛病。
+        """
+        if self._client is None:
+            return
+        self._say(f"（{action} {name}：正在请 runtime 处理…）", view_state.ROLE_RULE)
+        self._client.mcp(action, (name,))
 
     def _command_resume(self, rest: str) -> None:
         """`/resume [id]`。带 id 直接切，不带就从列表里挑。

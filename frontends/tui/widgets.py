@@ -1721,7 +1721,7 @@ class CommandPalette(Vertical):
     一条都没变（决策 15 定下来的那六条还在原位，新增的三条排在末尾）。
 
     候选是**过滤**出来的（前缀匹配，见 `view_state.filter_commands`）：命令一共
-    十三条，模糊匹配会让"我打错了"和"它猜对了"长得一样。
+    十几条，模糊匹配会让"我打错了"和"它猜对了"长得一样。
 
     **面板的高度上限必须装得下全部命令**（见 `app._PALETTE_MAX_ROWS`）：它是屏幕纵向
     布局里的一行、不是浮层，所以溢出时不会自己滚 —— 只是最后几条**静默消失**（实测：
@@ -2250,10 +2250,188 @@ class SessionPicker(ModalScreen):
         self.dismiss(None)
 
 
+class McpPanel(ModalScreen):
+    """**MCP 服务器开关**（`/mcp` 不带参数时弹这个）。
+
+    它和 `SessionPicker` 是同一族的（`↑↓` 选、`Enter` 执行、`Esc` 关），但有一条
+    **刻意的差别：按 `Enter` 之后面板不关。**
+
+    理由是用法不同：换会话是"选中一条 → 切过去"（一次性决定），而 `/mcp` 常见的
+    用法是"把这两个都开上"—— 按一下就关掉的面板会逼人重打三次 `/mcp`。所以每次
+    `Enter` 只是**发一条请求**，那一行随 runtime 回来的 `ui(kind=mcp)` 就地刷新。
+
+    ## 三条约束
+
+      * **行是从 runtime 的快照画的**（`state.mcp`），界面不做乐观更新。所以我们不
+        会把"正在连"画成"已挂上" —— 而 `npx` 起不来时那句话会是假的；
+      * **请求发出去到快照回来之间那一段，界面上要有字**（`正在等 runtime…`）。
+        起一个 stdio server 要几百毫秒到几秒，而这期间如果屏幕一动不动，人只会以为
+        自己没按到；如果正撞上一轮在跑（runtime 会先等那一轮跑完），那可能是几十秒
+        —— 那就更必须有字。它在**任何一条快照回来时**清掉（不靠猜是哪一条）；
+      * **`Esc` 什么都不做**（`dismiss(None)`）：开关是**立刻生效**的，没有"取消"这个
+        概念 —— 关掉面板不会把已经挂上的 server 摘下来。
+
+    面板上那行字里写着"只影响这次运行，不改 mcp.json"：这是这一屏最容易误解的地方
+    （用户会以为在这里关掉就是永久关了）。
+    """
+
+    BINDINGS = [("escape", "close", "关闭"), ("q", "close", "关闭")]
+
+    def __init__(self, state: view_state.ViewState, palette: theme_mod.Theme,
+                 **kwargs: Any):
+        super().__init__(**kwargs)
+        self.palette = palette
+        self.state = state
+        self._index = 0
+        # "有一件事在等 runtime"：那一条的名字（没有就是 None）。见类 docstring 第 2 条。
+        self._pending: str | None = None
+
+    # -- 数据 ---------------------------------------------------------------
+
+    @property
+    def rows(self) -> list[dict[str, Any]]:
+        return self.state.mcp
+
+    def selected(self) -> dict[str, Any] | None:
+        rows = self.rows
+        if not rows or self._index < 0 or self._index >= len(rows):
+            return None
+        return rows[self._index]
+
+    def show_pending(self, name: str | None) -> None:
+        """记下"有一条在等 runtime"并重画。`None` = 等的事结束了。"""
+        self._pending = name
+        self._paint()
+
+    # -- 画 -----------------------------------------------------------------
+
+    def compose(self):
+        with Modal("mcp-body"):
+            yield Horizontal(
+                Static(Text("◱ MCP 服务器", style=self.palette.ink + " bold")),
+                Static(Text("", style=self.palette.ink4), classes="modal-badge",
+                       id="mcp-count"),
+                classes="modal-head",
+            )
+            if not self.rows:
+                yield Static(Text(
+                    "没有配置任何 MCP server。清单在 ~/.tudouni/mcp.json"
+                    "（服务器地址或要启动的命令都写在那里）。",
+                    style=self.palette.ink4), classes="modal-hint")
+            else:
+                yield Vertical(id="mcp-options")
+            yield Static(Text(
+                "↑↓ 选择  ·  Enter 挂载 / 卸载  ·  Esc 关闭  ·  "
+                "开关只影响这次运行，不改 mcp.json",
+                style=self.palette.ink4), classes="modal-foot",
+                id="mcp-foot")
+
+    def on_mount(self) -> None:
+        self._paint()
+
+    def _paint(self) -> None:
+        count = self.query("#mcp-count")
+        if count:
+            loaded = sum(1 for item in self.rows if item.get("state") == "loaded")
+            count[0].update(Text(f"{loaded} / {len(self.rows)} 在跑",
+                                 style=self.palette.ink4))
+        foot = self.query("#mcp-foot")
+        if foot:
+            # 有件事在等 runtime 时，那行提示**替换**掉键位说明：接一个 stdio server
+            # 要几百毫秒到几秒（`npx` 冷启动更久），而正撞上一轮在跑时可能几十秒 ——
+            # 这期间屏幕一动不动只会让人以为自己没按到。
+            foot[0].update(Text(
+                f"正在等 runtime 处理 `{self._pending}`…"
+                f"（连服务器可能要几秒；撞上一轮在跑就等它跑完）"
+                if self._pending else
+                "↑↓ 选择  ·  Enter 挂载 / 卸载  ·  Esc 关闭  ·  "
+                "开关只影响这次运行，不改 mcp.json",
+                style=self.palette.ink4,
+            ))
+        if not self.rows:
+            return
+        options = self.query_one("#mcp-options", Vertical)
+        options.remove_children()
+        width = max(cell_len(str(item.get("name", ""))) for item in self.rows)
+        for index, item in enumerate(self.rows):
+            selected = index == self._index
+            text = Text()
+            if selected:
+                # 选中那条**不带行内样式**（除了那个块字符）：反白由 CSS 的
+                # `.option.selected` 给（和 SessionPicker 里那条同一个坑）。
+                text.append("▌  ")
+                self._append_row(text, item, width, styled=False)
+            else:
+                text.append("   ")
+                self._append_row(text, item, width, styled=True)
+            options.mount(Static(text, classes=(
+                "option selected" if selected else "option")))
+
+    def _append_row(self, text: Text, item: dict[str, Any], width: int,
+                    *, styled: bool) -> None:
+        row = view_state.mcp_line(item, width)
+        if not styled:
+            text.append(str(row))
+            return
+        for chunk, role in (row.segments or [(str(row), row.role)]):
+            text.append(chunk, style=style_of(self.palette, role))
+
+    # -- 键 -----------------------------------------------------------------
+
+    def _move(self, delta: int) -> None:
+        if not self.rows:
+            return
+        self._index = (self._index + delta) % len(self.rows)
+        self._paint()
+
+    def on_key(self, event: Any) -> None:
+        if event.key == "up":
+            self._move(-1)
+            event.stop()
+        elif event.key == "down":
+            self._move(1)
+            event.stop()
+        elif event.key in ("enter", "space"):
+            self.action_toggle()
+            event.stop()
+
+    def on_click(self, event: Any) -> None:
+        widget = getattr(event, "widget", None)
+        if widget is None or "option" not in getattr(widget, "classes", ()):
+            return
+        for index, child in enumerate(self.query(".option")):
+            if child is widget:
+                self._index = index
+                self._paint()
+                return
+
+    def action_toggle(self) -> None:
+        """把选中的那一个反过来：在跑就卸，没在跑就挂。
+
+        **动作由"它现在是什么状态"决定**，不由用户按了什么键决定 —— 这一屏只有
+        一个键（`Enter`），而 `state` 是 runtime 给的。`failed` 那一档落进"没在跑"
+        这一支，所以**再按一次就是重试**（这正是用户想要的，而且不需要为它多一个键）。
+        """
+        item = self.selected()
+        if item is None:
+            return
+        name = str(item.get("name", ""))
+        action = ("unload" if item.get("state") == "loaded" else "load")
+        emit = getattr(self.app, "mcp_action", None)
+        if emit is None:
+            return
+        emit(action, name)
+        self.show_pending(name)
+
+    def action_close(self) -> None:
+        """`Esc` = **什么都不做**。开关是立刻生效的，没有"取消"这个概念。"""
+        self.dismiss(None)
+
+
 __all__ = [
     "BorderedPanel", "CommandPalette", "ContextRail", "ConversationLog",
     "HINT_KEYS_EXTRA", "HINT_KEYS_FULL", "HINT_KEYS_NARROW", "HintPanel",
-    "LineBlock", "MessageBlock", "Panel", "PermissionPanel",
+    "LineBlock", "McpPanel", "MessageBlock", "Panel", "PermissionPanel",
     "QuestionPanel", "RecentPanel", "SessionBar", "SessionPicker", "SkillsPanel",
     "StartPanel", "StatusBar", "TopBar", "TurnBlock", "TwoPart",
     "WELCOME_BOX_HEIGHT", "WELCOME_HINT_TEXT", "WELCOME_HINT_WIDTH",

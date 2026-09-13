@@ -492,3 +492,231 @@ async def test_a_state_snapshot_carries_the_live_thinking_settings(monkeypatch):
                                     "messages": 1}))
         await _settle(app, pilot)
         assert app.state.thinking_on is False and app.state.effort == "low"
+
+
+# --- `/mcp` ------------------------------------------------------------------
+
+MCP_SNAPSHOT = {
+    "v": 1, "t": "ui", "kind": "mcp",
+    "mcp_servers": [
+        {"name": "github", "state": "loaded", "tools": 12, "error": "",
+         "where": "npx -y @modelcontextprotocol/server-github"},
+        {"name": "kb", "state": "unload", "tools": 0, "error": "",
+         "where": "https://kb.example.com"},
+        {"name": "broken", "state": "failed", "tools": 0,
+         "error": "McpError: 起不来 npx", "where": "npx -y broken"},
+    ],
+    "mcp_notes": ["[MCP] 当前挂载情况（配置里改了要重启才生效）"],
+}
+
+
+def test_the_mcp_rows_spell_out_the_three_states():
+    """三种状态必须是**三行不同的话**，而且 `failed` 带着原因。
+
+    合成两种的话，"我没开它"和"我开了、它坏了"长得一样 —— 而这两种情况下一步完全
+    不同（一个是按一下，一个是去看原因）。这条也钉住"原因不许被吞掉"。
+    """
+    rows = {row["name"]: row for row in MCP_SNAPSHOT["mcp_servers"]}
+    lines = {name: str(view_state.mcp_line(row, 8)) for name, row in rows.items()}
+
+    assert "12 个工具" in lines["github"]
+    assert "未加载" in lines["kb"]
+    assert "没连上" in lines["broken"] and "起不来 npx" in lines["broken"]
+    assert "未加载" not in lines["broken"], "失败不能说成未加载"
+
+
+def test_the_mcp_stream_lines_keep_the_runtimes_own_words():
+    """会话流里那几行：一句概况 + **runtime 拼的后果原样贴**。
+
+    清单本身在面板和左栏，这里不重画（那份清单会随对话滚走，而"我挂了哪几个"是
+    随时想再看一眼的东西）。所以这条钉的是"概况的口径"和"那句话没被改写"。
+    """
+    lines = [str(line) for line in view_state.render_mcp(MCP_SNAPSHOT)]
+    text = "\n".join(lines)
+
+    assert "1 个在跑 / 共 3 个" in text
+    assert "[MCP] 当前挂载情况（配置里改了要重启才生效）" in text
+    # 一条都没有时返回空：系统自己发的快照不该在流里留噪。
+    assert view_state.render_mcp({"mcp_servers": [], "mcp_notes": []}) == []
+
+
+@pytest.mark.anyio
+async def test_the_mcp_command_opens_a_panel_and_toggling_asks_the_runtime(monkeypatch):
+    """`/mcp` 弹面板；在面板里按一下 = **发一条请求**（面板不关、也不乐观更新）。
+
+    三条一起看才算数：命令打开了面板、面板里那一下发的是 `t:"mcp"`（带着选中的
+    那个名字和"该挂还是该卸"）、以及回包之后面板就地重画（不重开、不关掉）。
+
+    方向由**runtime 给的状态**决定，不由用户按了什么键决定 —— 所以"在跑的那一行
+    按一下是卸载、没在跑的那一行按一下是挂载"，而 `failed` 那一档落进"挂载"（也就是
+    重试）。
+    """
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", MCP_SNAPSHOT))
+        await _settle(app, pilot)
+        assert [row["name"] for row in app.state.mcp] == ["github", "kb", "broken"]
+
+        app.submit("/mcp")
+        await _settle(app, pilot)
+        panel = app._mcp_panel()
+        assert panel is not None, "`/mcp` 不带参数要弹面板"
+        assert app._client.sent == [], "开面板本身不发请求"
+
+        # 第一行是 github（在跑）→ 那一下是卸载。
+        panel.action_toggle()
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "mcp", "action": "unload",
+                                        "servers": ["github"]}
+
+        # 回包到了：面板**还在**（不关），而且它读的是新状态。
+        app._inbox.put(("message", {
+            **MCP_SNAPSHOT,
+            "mcp_servers": [
+                {"name": "github", "state": "unload", "tools": 0, "error": "",
+                 "where": "npx -y x"},
+                {"name": "kb", "state": "loaded", "tools": 3, "error": "",
+                 "where": "https://kb.example.com"},
+                {"name": "broken", "state": "failed", "tools": 0,
+                 "error": "McpError: 起不来 npx", "where": "npx -y broken"},
+            ],
+            "mcp_notes": ["[MCP] server github 卸下了（摘掉 12 个工具）"],
+        }))
+        await _settle(app, pilot)
+        assert app._mcp_panel() is not None
+        assert app.state.mcp[0]["state"] == "unload"
+        assert "卸下了" in _log_text(app), "runtime 那句话要进会话流"
+
+        # 现在第一行是"没在跑"→ 那一下是挂载。
+        app._mcp_panel().action_toggle()
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "mcp", "action": "load",
+                                        "servers": ["github"]}
+
+
+@pytest.mark.anyio
+async def test_the_mcp_command_with_an_argument_asks_directly(monkeypatch):
+    """带参数那种写法不弹面板，直接发请求 —— 两条路走的是**同一个出口**。
+
+    （CLI 那一侧只有这一种写法，所以它们必须不可能漂。）
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app.submit("/mcp load github")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "mcp", "action": "load",
+                                        "servers": ["github"]}
+
+        # 认不出来的写法：说一句，并且**把面板打开**（那是"下一步该干什么"最省事的
+        # 回答），而**不发请求**。
+        before = len(app._client.sent)
+        app.submit("/mcp 全部打开")
+        await _settle(app, pilot)
+        assert "认不出这个写法" in _log_text(app)
+        assert len(app._client.sent) == before
+
+
+@pytest.mark.anyio
+async def test_the_mcp_panel_answers_to_real_keystrokes(monkeypatch):
+    """面板的**键位**：`↑↓` 移动、`Enter` 开关选中的那个、`Esc` 只关不做别的。
+
+    ## 为什么这条要按真键
+
+    上一条走的是 `action_toggle()`（直调），它验的是"按下去该发什么"；而**键怎么
+    路由到这个面板**是另一件事 —— `McpPanel` 用的是 `on_key` 而不是 `BINDINGS`
+    （理由和 `QuestionPanel` / `SessionPicker` 一样：没有焦点在可编辑控件上，键直接
+    落到 screen 上；走绑定反而要和 `App` 那一层的 `↑↓`（翻会话流）抢）。这条路
+    只在真按键下才成立，而它坏掉的样子是"面板开着、按什么都没反应"。
+
+    `Esc` 那一条尤其要钉：开关是**立刻生效**的，所以这个面板没有"取消"这个概念 ——
+    关掉它不会把已经挂上的卸下来（那会是一个很难发现的假象：看着像撤销了）。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", MCP_SNAPSHOT))
+        await _settle(app, pilot)
+
+        app.submit("/mcp")
+        await _settle(app, pilot)
+        panel = app._mcp_panel()
+        assert panel is not None
+
+        # 开局选中的是第一行（github，在跑）。
+        rows = list(panel.query(".option"))
+        assert str(rows[0].render()).startswith("▌")
+        assert "● github" in str(rows[0].render())
+        assert "12 个工具" in str(rows[0].render())
+
+        # `↓` 走一行：选中 kb（没在跑），而**整块重画了**（不是只有底色在动）。
+        await pilot.press("down")
+        await _settle(app, pilot)
+        rows = list(panel.query(".option"))
+        assert str(rows[1].render()).startswith("▌")
+        assert "○ kb" in str(rows[1].render())
+        assert "12 个工具" in str(rows[0].render()), "非选中行也要有内容"
+
+        # `Enter` = 开关选中的那个。kb 没在跑 → 挂载。
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "mcp", "action": "load",
+                                        "servers": ["kb"]}
+        # 等回包的这一段，面板上要有字（否则起子进程那几秒看起来像没按到）。
+        assert "正在等 runtime" in str(panel.query("#mcp-foot").first().render())
+        assert app._mcp_panel() is not None, "开关之后面板不关"
+
+        # 空格和 Enter 是一回事（两个键都合手）。
+        await pilot.press("space")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "mcp", "action": "load",
+                                        "servers": ["kb"]}
+
+        # `↑` 回到第一行：现在是 github（在跑）→ 那一下是卸载。
+        await pilot.press("up")
+        await _settle(app, pilot)
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "mcp", "action": "unload",
+                                        "servers": ["github"]}
+
+        # `Esc` 只关面板：**不发任何请求**（"取消"这个概念在这里不存在）。
+        before = len(app._client.sent)
+        await pilot.press("escape")
+        await _settle(app, pilot)
+        assert app._mcp_panel() is None
+        assert len(app._client.sent) == before
+
+
+def test_the_rail_shows_only_the_servers_that_are_running():
+    """左栏那块**只列在跑的**，右侧计数是 `在跑的 / 配置里的总数`。
+
+    "配了哪几个但没开"是 `/mcp` 面板要回答的 —— 放进左栏只会让"这一栏里到底有几个
+    东西是活的"变得要数一遍才知道。而分母留着，"配了三个只挂上一个"就不会看着像坏了。
+    """
+    state = view_state.ViewState()
+    empty = view_state.rail_blocks(state)[-1]
+    assert empty[0] == "后台 MCP" and empty[1] == ""
+    assert "当前没有挂载" in str(empty[2][0])
+
+    # **`ui(mcp)` 和 `ui(state)` 里的那一格名字不同，而且这是刻意的**：前者是
+    # `mcp_servers`（"这一条消息的主题就是它"），后者是 `mcp`（"这一屏里的一格"）。
+    # 界面按前者填 state，左栏读后者 —— 所以这条测试走的是界面那条路。
+    state.mcp = [dict(row) for row in MCP_SNAPSHOT["mcp_servers"]]
+    title, count, lines = view_state.rail_blocks(state)[-1]
+    text = "\n".join(str(line) for line in lines)
+    assert title == "后台 MCP" and count == "1 / 3"
+    assert "github" in text and "12 个工具" in text
+    # 没在跑 / 没连上的那两条**不在这块**（它们在面板里）。
+    assert "kb" not in text and "broken" not in text
+
+
+def test_the_collapsed_rail_summary_counts_mounted_servers():
+    """收起左栏之后那一行摘要里也报在跑几个（和左栏同一口径）。"""
+    state = view_state.ViewState()
+    assert "MCP" not in view_state.rail_summary(state)
+    state.mcp = [dict(row) for row in MCP_SNAPSHOT["mcp_servers"]]
+    assert "1 个 MCP server" in view_state.rail_summary(state)

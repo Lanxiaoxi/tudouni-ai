@@ -46,7 +46,7 @@ from agent_runtime.runtime.config import (
     PermissionConfig,
     WebConfig,
     save_approvals,
-)
+) 
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, TrustGroup
 from agent_runtime.security.commands import command_parameter, format_rule
 from agent_runtime.skills import (
@@ -70,7 +70,17 @@ from agent_runtime.tools.builtin.jobs import JOBS_DIR_NAME, JobBoard, job_note, 
 from agent_runtime.tools.builtin.todo import TodoBoard, progress_line, todo_note
 from agent_runtime.tools.builtin.webfetch import USER_AGENT, WebFetch
 from agent_runtime.tools.builtin.websearch import TavilySearch, WebSearch
-from agent_runtime.tools.mcp import McpToolset
+from agent_runtime.tools.mcp import (
+    NAME_PREFIX,
+    SEPARATOR,
+    HttpChannel,
+    McpChannel,
+    McpServer,
+    McpToolset,
+    StdioChannel,
+    load_server,
+)
+from agent_runtime.tools.tool import ToolRegistry
 
 
 # --- 呈现：这些是数据，不是打印 -------------------------------------------------
@@ -372,6 +382,314 @@ def preview_line(text: str, limit: int = PREVIEW_CHARS) -> str:
 
 # --- 第二段：需要模型和通道 -----------------------------------------------------
 
+# MCP server 的三种状态。**它们回答的是三个不同的问题**，所以要分得开：
+#
+#   * LOADED   —— 它现在是不是在跑（左栏那块只数这个，因为只有它占着东西）；
+#   * UNLOAD   —— 配置里有、这会儿没在跑（可能是从没加载，也可能是刚卸载）；
+#   * FAILED   —— 我们试着加载了，没成（原因在 `error` 那一格）。
+#
+# FAILED 和 UNLOAD 必须是两行话：前者是"我开了、它坏了"，后者是"我没开它"，
+# 而它们的下一步完全不同（一个该去看原因，一个按一下就行）。
+MCP_LOADED = "loaded"
+MCP_UNLOAD = "unload"
+MCP_FAILED = "failed"
+
+
+@dataclass
+class _ServerState:
+    """`McpHost` 里**每个 server 一格**的可变状态。见那三个常量的分工。
+
+    为什么不用一个 `dict[str, dict]`：这三个字段的更新点有六处（加载成功、加载
+    失败、卸载、重读配置新增…），而 dict 写错键名是**静默**的（读出来是 None，
+    而 None 在这里恰好是一个合法的值域）。属性写错名字当场 AttributeError。
+    """
+
+    server: McpServer
+    state: str = MCP_UNLOAD
+    # 只有 `state == MCP_LOADED` 时有意义（工具数）。**它是从那次加载的结果数出来的**，
+    # 不是自己攒的 —— 复用 `load_server` 报上来的那批工具的长度。
+    tools: int = 0
+    # 最近一次失败的那句话（`McpError: …`）。**只由 load 写**，成功一次就清掉，
+    # 而 unload **不清**（见 McpHost.load 里那段："上次为什么没成"在下一次尝试
+    # 之前仍然是对的事实）。
+    error: str = ""
+
+    def row(self) -> dict[str, Any]:
+        return {
+            "name": self.server.name,
+            "state": self.state,
+            "tools": self.tools,
+            "error": self.error,
+            # 给人看的一句话（`command…` 或 `https://host`）。**远程只写出处**：
+            # URL 里可能有令牌，而这一格会进面板、进快照、进日志。
+            "where": self.server.where(),
+        }
+
+
+def mcp_prefix(name: str) -> str:
+    """一个 server 的工具名前缀：`mcp__<名字>__`。见 tools/mcp.py 的 NAME_PREFIX。
+
+    **只在这里拼一次**（`load_server` 造工具名用的是 `exposed_name`，那个要处理
+    净化与截断）。这一份是给"按前缀摘掉"用的，而它必须和 `exposed_name` 的开头
+    逐字一致 —— 两处写着同一个形状，所以有测试钉着它们相等。
+    """
+    return f"{NAME_PREFIX}{name}{SEPARATOR}"
+
+
+class McpHost:
+    """**这一轮会话的 MCP server 宿主**：谁在跑、谁没跑、以及它们的工具。
+
+    ## 它为什么是可变的，而 `Runtime` 是 frozen 的
+
+    `Runtime` 那条"装配完不再改"防的是**就地换掉权限策略**（那会让同一个 run 里
+    前后两段按不同规则放行，而事后看不出来）。MCP 这一格不是那种东西：
+
+      * 它的改动**只有一条入口**（`/mcp`，用户按键），没有"自己变宽"的路；
+      * 它改动的是**模型能看到哪些工具**，而工具列表每一轮开头取一次快照
+        （agents/agent.py）—— 所以改动天然在下一次请求生效；
+      * 它和 `agent.autopilot` 是同一类：`/autopilot` 早就就地改了，理由写在
+        `protocol/channels.py` 的 `_set_autopilot` 里。
+
+    换句话说：**frozen 冻结的是装配的形状，不是装配内部的活状态**。
+
+    ## 注册表是"当前真相"，映射是"挂载时的快照"
+
+    两者刻意分开，因为它们回答两个问题：
+
+      * `tools.all()`（注册表）—— "模型现在能看到什么"。加载/卸载都改它，而它是
+        `Agent` 每一轮取 schema 的地方；
+      * `toolsets`（每个 server 挂载时那一次 `_Loaded`）—— "审批里按 a 该放行哪
+        一批"。它**不随后续加载而变宽**，这正是 `a` 那句提示里"快照"两个字的全部
+        内容（见 `TrustGroup` 和 tools/mcp.py 的 `group()`）。
+
+    ## 谁负责收子进程
+
+    我们起的那些（stdio）在 `close()` 里关掉。远程那些（HTTP）的 `close()` 只是
+    "我不再问了" —— 对面的服务是别人的，我们既没起它也不该关它（见 HttpChannel）。
+    这个区别不需要在这里分岔：`close()` 就是逐个调 `channel.close()`。
+    """
+
+    def __init__(
+        self,
+        servers: tuple[McpServer, ...],
+        tools: ToolRegistry,
+        *,
+        on_problem: Callable[[str], None] | None = None,
+        channel_factory: Callable[[McpServer], McpChannel] | None = None,
+        client: httpx.Client | None = None,
+        config_path: Path | None = None,
+    ):
+        self._tools = tools
+        self._on_problem = on_problem
+        self._client = client
+        # 一个 server 一条通道。**工厂可注入**，所以"加载一个 server"这条路径
+        # 在测试里不需要真起进程（和 `McpToolset.connect` 同一个手法）。
+        self._factory: Callable[[McpServer], McpChannel] = (
+            channel_factory or self._default_channel
+        )
+        self._config_path = config_path if config_path is not None else MCP_FILE
+        # 顺序＝配置里的顺序。**它就是这个宿主的样子**（对外只给一份 rows()）。
+        self._states: dict[str, _ServerState] = {
+            server.name: _ServerState(server) for server in servers
+        }
+        self._toolsets: dict[str, _Loaded] = {}
+        self._tools_by_server: dict[str, tuple[str, ...]] = {}
+        self._closed = False
+
+    # -- 传输 ---------------------------------------------------------------
+
+    def _default_channel(self, server: McpServer) -> McpChannel:
+        """默认那两条通道。**远程那条复用装配层那个 httpx client**（连接池）。
+
+        进程级一个 client 是 `/status` 那种"一个进程一个"的同一取向：连接复用、
+        TLS 握手只付一次。为 None 时（测试、或者没传）HttpChannel 自己造一个并
+        在 close 时收掉。
+        """
+        if server.is_remote:
+            return HttpChannel(server, client=self._client)
+        return StdioChannel(server)
+
+    # -- 看 -----------------------------------------------------------------
+
+    def rows(self) -> list[dict[str, Any]]:
+        """`/mcp` 和左栏那块要的那份清单。**顺序＝配置里的顺序**。
+
+        每一格见 `_ServerState.row()`。`tools` 在非 LOADED 时是 0 —— 不是"忘了
+        数"，而是"它这会儿没有工具在注册表里"，而那一格显示出来会被读成别的意思。
+        """
+        return [state.row() for state in self._states.values()]
+
+    def loaded_names(self) -> list[str]:
+        """现在在跑的那些（左栏那个 `n / m` 的分子）。"""
+        return [name for name, state in self._states.items()
+                if state.state == MCP_LOADED]
+
+    def group(self, tool_name: str) -> tuple[str, frozenset[str]] | None:
+        """审批里那个 `a` 的查询口：给工具名，回答它属于哪一组。
+
+        **只认当前真挂着的那些**，所以一个刚被卸载的 server 不会再给出"这一组"
+        （那会让提示里写"以后 MCP server github 的 12 个工具都直接执行"，而其中
+        三个已经不存在了）。卸载时同步清掉，见 `unload()`。
+        """
+        for toolset in self._toolsets.values():
+            pair = toolset.groups.get(tool_name)
+            if pair is not None:
+                return pair
+        return None
+
+    # -- 改 -----------------------------------------------------------------
+
+    def load(self, name: str) -> str:
+        """连一个 server 并把它注册进注册表。返回一句给人看的话（成败都有）。"""
+        # **幂等那一条排在最前面，而且它不重读配置。** 顺序是有理由的：已经挂着的那
+        # 一个不需要任何新信息（它就在跑），而"我刚往 mcp.json 里加了一个"这种情况
+        # 必然会让下面的 `_find` 落空 —— 所以重读放在那之后，正好只服务"认不出这个名字"
+        # 这一条路。顺带：配置文件此刻是坏的也不影响这里（重读只发生在它之后）。
+        state = self._find(name)
+        if state is not None and state.state == MCP_LOADED:
+            # **幂等**：连着按两下不该起两个进程、更不该在注册表上撞名。
+            return self._say(
+                f"server `{name}` 已经挂上了（{state.tools} 个工具），没有重复加载",
+                level="info",
+            )
+
+        # 名字不认得（或者认得但没在跑）时重读一次配置：这是"我刚往 mcp.json 里加了
+        # 一个新 server，不想重启"那条路的全部实现。重读失败只是少认一个新名字 ——
+        # 它报一句，然后照常往下走。
+        self._reread()
+        state = self._find(name)
+
+        if state is None:
+            return self._say(f"清单里没有 server `{name}`：{self._known_names()}")
+
+        outcome = load_server(state.server, self._factory, on_problem=self._on_problem)
+        if outcome.error:
+            state.state = MCP_FAILED
+            state.tools = 0
+            state.error = outcome.error
+            return self._say(
+                f"server `{name}` 没连上（{outcome.error}）；再按一次是重试",
+                level="warn",
+            )
+
+        prefix = mcp_prefix(name)
+        # 同一个前缀下已经有东西 ⇒ 注册表里是**上一轮的残留**（正常路径不可能，
+        # 因为 unload 会摘干净；但 `close()` 之后再 load、或者外部直接改注册表都
+        # 走得到）。先摘掉再注册，否则 `register` 会撞名抛一个没人看得懂的
+        # `Tool already exists`。
+        self._tools.unregister_prefix(prefix)
+        for tool in outcome.tools:
+            self._tools.register(tool)
+
+        state.state = MCP_LOADED
+        state.error = ""
+        state.tools = len(outcome.tools)
+        self._toolsets[name] = outcome
+        self._tools_by_server[name] = tuple(tool.name for tool in outcome.tools)
+        return self._say(
+            f"server `{name}` 挂上了：{state.tools} 个工具"
+            f"（风险一律 high，每次调用都要你批准）"
+        )
+
+    def unload(self, name: str) -> str:
+        """摘掉一个 server 的工具并断开它。返回一句给人看的话。
+
+        **不动配置**：`~/.tudouni/mcp.json` 里那一行还在，所以下一次启动照旧会加载
+        它 —— 这也是面板底下那行字要说的事。想让它永久不加载就改那份文件。
+        """
+        state = self._find(name)
+        if state is None:
+            return self._say(f"清单里没有 server `{name}`：{self._known_names()}")
+        if state.state == MCP_UNLOAD and not state.error:
+            return self._say(f"server `{name}` 本来就没在跑", level="info")
+
+        removed = len(self._tools_by_server.get(name, ()))
+        self._forget(name)
+        state.state = MCP_UNLOAD
+        state.tools = 0
+        # `error` **不清**：如果上一次加载失败过，那句"为什么"在下一次尝试之前
+        # 仍然是对的事实。清掉它，用户再打开面板就只能看见一个光秃秃的 unload。
+        return self._say(
+            f"server `{name}` 卸下了（摘掉 {removed} 个工具）；"
+            f"配置里那一行还在（下次启动不会自己挂上 —— 启动时不自动挂，要用就再 load 一次）"
+        )
+
+    def close(self) -> None:
+        """收摊：**把挂着的通道全关掉**（stdio 那些是我们起的子进程）。
+
+        幂等。逐个关、失败只报一行（和 `McpToolset.close()` 一字不差的取向）：
+        收摊失败不该盖住"任务本身"的结果。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        for name in list(self._toolsets):
+            self._forget(name)
+        # 挂载时失败的那些也会留下通道（`load_server` 已经在它那一侧关掉了），
+        # 所以这里没有第三类要收的东西。
+
+    # -- 内部 ---------------------------------------------------------------
+
+    def _find(self, name: Any) -> _ServerState | None:
+        return self._states.get(name) if isinstance(name, str) else None
+
+    def _known_names(self) -> str:
+        if not self._states:
+            return f"（{self._config_path.name} 里一个 server 都没配）"
+        return "、".join(self._states)
+
+    def _forget(self, name: str) -> None:
+        """把一个 server 从"挂着"变成"没挂着"：摘工具、关通道、清映射。
+
+        **顺序要紧**：先摘注册表（模型不再看得到），再关通道（这时候可能还有一次
+        调用在飞 —— 它会以 `McpServerDown` 收场，而那是一条明确的错误，不是静默）。
+        """
+        self._tools.unregister_prefix(mcp_prefix(name))
+        self._tools_by_server.pop(name, None)
+        toolset = self._toolsets.pop(name, None)
+        if toolset is None or toolset.connection is None:
+            return
+        try:
+            toolset.connection.channel.close()
+        except Exception as exc:  # noqa: BLE001 - 收摊失败不往上抛
+            _warn(f"关闭 MCP server `{name}` 时出错：{type(exc).__name__}: {exc}")
+
+    def _reread(self) -> None:
+        """重读配置文件，**只新增**（不认识删除）。
+
+        为什么不处理删除：删掉一个正在跑的 server 该做什么没有唯一答案（立刻断？
+        等这一轮？），而"用户改了文件想立刻生效"的诉求几乎总是**加一个新的**。
+        真正的删除走"卸载 + 改文件"，那两件事用户都做得了。
+        """
+        try:
+            fresh = McpConfig.from_file(self._config_path)
+        except Exception as exc:  # noqa: BLE001 - 文件被改坏只该少认一个新名字
+            # **走 `on_problem` 而不是直接 `_warn`**：那条通道是调用方注入的，装配期
+            # 它落到 stderr，而注入一个收集列表的测试能因此断言"这句话说出来了"。
+            self._say(
+                f"重读 {self._config_path.name} 时出错（这一次的新增认不出来）："
+                f"{type(exc).__name__}: {exc}",
+                level="warn",
+            )
+            return
+        for server in fresh.servers:
+            if server.name not in self._states:
+                self._states[server.name] = _ServerState(server)
+
+    def _say(self, text: str, *, level: str = "info") -> str:
+        """把一句话同时交给"报问题"那条通道（前端会显示成一条 notice）并返回它。
+
+        **返回值和副作用是同一句话**：调用方（协议层）要把它放进回包，而
+        `on_problem` 那条路是给**装配期**用的（那时候还没有前端可回话）。
+        """
+        text = f"[MCP] {text}"
+        if self._on_problem is not None:
+            self._on_problem(text)
+        elif level == "warn":
+            print(text, file=sys.stderr)
+        return text
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class Runtime:
     """装配好的一个运行时。
@@ -451,12 +769,29 @@ class Runtime:
     # 需要显式收掉的进程级资源。**排在最后**：前面那些字段有位置参数的调用点，
     # 插在中间会静默地把它们挪位。
     _http: httpx.Client | None = None
-    _mcp: McpToolset | None = None
+    # MCP server 的宿主（谁在跑、谁没跑、它们的工具）。**它是可变的**，理由写在
+    # `McpHost` 的类 docstring 里（frozen 冻结的是装配的形状，不是里面的活状态）。
+    # 名字仍然是 `_mcp`：它在每一处读起来都是"这次装配拿到的那个 MCP 那一半"，
+    # 而改名会让 diff 里多出一堆无关的行。
+    _mcp: McpHost | None = None
     # 后台任务那张表。它和上面两个是同一类东西（进程级、必须显式收掉），但**只有它会
     # 自己开进程** —— 所以 close() 里收不干净的话，留下的是用户机器上一直在跑的服务。
     # 类型写成 Any 是因为 `Runtime` 不 import tools 那一层（依赖方向：runtime → tools
     # 是允许的，但这里只需要"它有个 close()"这一个事实，写死类型没有收益）。
     _jobs: Any = None
+
+    # -- MCP（`/mcp`）-----------------------------------------------------------
+
+    @property
+    def mcp(self) -> "McpHost | None":
+        """MCP 宿主：谁在跑、谁没跑、它们的工具。`/mcp` 那条命令改的就是它。
+
+        **它是这个 frozen dataclass 上唯一一个"活的对象"**，理由写在 `McpHost` 的
+        类 docstring 里（frozen 冻结的是装配的形状，不是里面的活状态）。做成属性而
+        不是让协议层去读 `_mcp`：那个下划线是"装配期的字段"那个约定，而这一格从
+        `/mcp` 落地那天起就是**运行时接口**了。
+        """
+        return self._mcp
 
     # -- 模型（`/model`）--------------------------------------------------------
 
@@ -853,18 +1188,26 @@ class Runtime:
                     f"grep 未注册（搜文本只能走 shell，每次都要审批）。"
                     f"跑 `uv run python scripts/fetch_rg.py` 补上。"))
 
-        # [MCP]：**每次启动都说，而且说清"它们的工具每次都要审批"** —— 外部工具默认
-        # 每条都要问人，而这句话是"为什么它又问我了"唯一的解释；不说的话，用户会以为
-        # 配置错了。
+        # [MCP]：**配了几个和挂了几个是两件事**，而这句话必须把两者都说清。
+        #
+        # 说"配了 N 个"就完事的话，用户会以为它们已经在跑了（而那正是"为什么它没
+        # 按我配的做"最常见的误读）；反过来说"挂了 N 个"又会让人以为配置文件没读到。
+        # 所以：清单那一句带上"都还没挂载 + 去哪儿挂"，而真正挂上的那些逐条另说
+        # （连同"每次调用都要你批准"那句解释）。
         if self.mcp_cfg.servers:
             out.append(Notice("err", code="mcp",
                 text=f"[MCP] {MCP_FILE} 里配了 {len(self.mcp_cfg.servers)} 个 server："
-                f"{'、'.join(server.name for server in self.mcp_cfg.servers)}"))
+                f"{'、'.join(server.name for server in self.mcp_cfg.servers)}"
+                f"（都还没挂载 —— /mcp 看清单并逐个挂上）"))
         if self._mcp is not None:
-            for name, count in self._mcp.counts.items():
-                out.append(Notice("err", code="mcp",
-                    text=f"[MCP] server {name}：连上了，提供 {count} 个工具"
-                    f"（风险一律 high，每次调用都要你批准）"))
+            # 逐行由**当前状态**说，而不是启动时那一份快照：`/mcp` 能中途挂载和卸载，
+            # 而这几行会在下一次 `ui(state)` 快照里跟着变。`notices()` 只在启动时
+            # 被调一次（CLI 那条路），所以它读到的就是装配那一刻的事实。
+            for row in self._mcp.rows():
+                if row["state"] == MCP_LOADED:
+                    out.append(Notice("err", code="mcp",
+                        text=f"[MCP] server {row['name']}：连上了，提供 {row['tools']} 个工具"
+                        f"（风险一律 high，每次调用都要你批准）"))
 
         # 工作区里那份 mcp.json 是**故意不读**的（理由写在 config.McpConfig 上），
         # 所以它存在就等于"有人按旧位置写了一份"。这和坏技能是同一类症状：
@@ -1136,6 +1479,13 @@ class Runtime:
             # `tool_result` 之后发一份；`panel()` 顺手 `poll()` 一遍，所以"跑完了"
             # 这件事最迟在下一次工具返回时出现在界面上。
             "jobs": self._jobs.panel() if self._jobs is not None else [],
+            # MCP server。**和后台任务并列的"机器上真在跑的东西"**（左栏那一块读的
+            # 就是它）：stdio 那些是我们起的子进程，远程那些是一条活着的连接。
+            #
+            # 它跟着这条快照走是有意的 —— `/mcp` 的开关要能立刻反映到左栏，而这条
+            # 快照在每次工具返回、每次 `/status`、每次 `/mcp` 之后都会发一份。所以
+            # "我按了开关，界面什么时候变"这件事不需要单独的通道。
+            "mcp": self._mcp.rows() if self._mcp is not None else [],
         }
         if with_catalog:
             state["skill_catalog"] = [
@@ -1163,13 +1513,14 @@ class Runtime:
 
           * `http`：连接池里那些 keep-alive 的 socket 活到进程退出；
           * `mcp`：**是我们起的子进程** —— 漏了它，`npx` 起的 node 会活过这个进程
-            （见 `tools/mcp.py` 的 `_terminate_tree`）；
+            （见 `tools/mcp.py` 的 `_terminate_tree`）。远程那些（HTTP）不带子进程，
+            但它们的连接同样要放掉，而那是同一个 `McpHost.close()` 里的事；
           * `jobs`：**也是我们起的子进程，而且是用户会立刻注意到的那些** ——
             一个没被收掉的 dev server 还占着端口，下一次启动就会报"端口被占用"，
             而那时候已经没有任何线索指向"是上一次会话留下的"。
 
         收摊本身失败不该盖住"任务本身"的结果，所以 http 那条吞掉异常并说一声 ——
-        和 `McpToolset.close()` 里那条规矩一致。
+        和 `McpHost.close()` 里那条规矩一致。
 
         **jobs 排在最前面**：它是唯一"不收就会在用户机器上继续跑"的那一个，而上面两个
         最多是占着内存/句柄。真出意外时，先保住那一个。
@@ -1431,7 +1782,10 @@ def open_runtime(
     # 一个 client 传进来。
     http = httpx.Client(trust_env=False, headers={"User-Agent": USER_AGENT})
 
-    mcp: McpToolset | None = None
+    # MCP server 的宿主。**构造是纯的**（只把配置变成几格状态，不碰进程），
+    # 真正连由下面的 `load()` 逐个做 —— 那条路和 `/mcp load` 走的是**同一个方法**，
+    # 所以"装配期怎么连一个 server"和"运行中怎么连一个"不可能漂。
+    mcp: McpHost | None = None
 
     # 后台任务那张表。**它只能在会话定下来之后造**（输出目录带会话 id），而且它是
     # 这个装配里唯一**攥着进程**的东西 —— 所以它必须被 close() 收掉（见 Runtime.close）。
@@ -1484,20 +1838,32 @@ def open_runtime(
             jobs=job_board,
         )
 
-        # 外部 MCP server：连上、列工具、注册进同一个注册表。
+        # 外部 MCP server：**配置里的都列出来，但一个都不挂**。
         #
-        # **它为什么不进 create_tool_registry 的参数表**（questioner / todos / web_*
-        # 都在那儿）：那边的每一个参数都是"一个可以随注册表一起造出来的协作者"，
-        # 而 MCP 带着**进程生命周期**（连上 → 每次工具调用 → 关闭），并且它的失败是
-        # **每个 server 各自的**（一个起不来只是少一批工具）。所以它由 Runtime 持有，
-        # 这里只是往注册表里放工具。
+        # ## 为什么不在启动时自动挂上
+        #
+        # 这一条是刻意的，而且是这个功能里最要紧的一个决定：挂上一个 server ＝
+        # 同意那段代码用你的权限跑起来（本地 stdio 那档）或者把工作区里的数据发给
+        # 它（远程那档）—— 那件事**发生在任何审批之前**。自动挂载等于"读一下配置
+        # 文件就等于授权"，而配置文件是可以被别的东西改的（编辑器、脚本、哪天
+        # 工作区级那份解禁了还会随仓库 clone 进来）。
+        #
+        # 所以挂载这件事**只有一条入口：人在 `/mcp` 里按一下**（TUI 面板或
+        # `/mcp load <名字>`）。代价是每次新会话要多按一下 —— 换来的是"配置自己
+        # 变宽"从此不可能，而那正是 config.py 把 `mcp.json` 钉死在用户级目录要防的
+        # 同一件事。
+        #
+        # ## 那为什么还要在这里造宿主
+        #
+        # 因为清单要在（`/mcp` 面板、左栏那块、启动那几行通知都读它），而且宿主是
+        # Runtime 持有的那一个 —— 换会话时它跟着一起换（旧的一并被 close 掉）。
         #
         # 位置也不能再晚：下面那条 `unknown_tools` 会拿"已注册的工具名"去核对权限
-        # 文件，而 mcp__… 这些名字必须已经在里面（否则在 permissions.json 里点名放行
+        # 文件，而 mcp__… 这些名字必须在里面（否则在 permissions.json 里点名放行
         # 一个外部工具的人会收到一句"这个工具没有注册，规则不会生效"的假警告）。
-        mcp = McpToolset.connect(mcp_cfg.servers, on_problem=_warn)
-        for tool in mcp.tools:
-            tools.register(tool)
+        # 所以那些名字是**挂载时**才进来的 —— 也就是说，没挂载的 server 的工具
+        # 在权限文件里会被报成"没注册"。那是**对的**：它这会儿确实没注册。
+        mcp = McpHost(mcp_cfg.servers, tools, on_problem=_warn, client=http)
 
         # 只自动放行名单里列出的等级，其余一律弹审批（缺省 low）。
         policy = PermissionPolicy(
@@ -1518,6 +1884,10 @@ def open_runtime(
         # 一起放行"是审批那一层的事（security/asker.py 的 TrustGroup）。两边都不认识
         # 对方的类型，接起来的地方就在这里。
         def mcp_trust_group(tool_name: str) -> TrustGroup | None:
+            # **从宿主上现取**，而不是捕获装配那一刻的注册表快照：`/mcp load` 之后
+            # 新挂上的工具必须也能按 a 放行，而 `/mcp unload` 之后那一组必须消失
+            # （否则提示里会写"以后 MCP server github 的 12 个工具都直接执行"，
+            # 而其中三个已经摘掉了）。
             pair = mcp.group(tool_name)
             if pair is None:
                 return None

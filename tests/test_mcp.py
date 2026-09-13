@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from agent_runtime.agents import Agent
+from agent_runtime.runtime.composition import MCP_UNLOAD
 from agent_runtime.runtime.config import ConfigError, McpConfig
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import ApprovalMemory, PermissionPolicy, TrustGroup
@@ -606,9 +607,44 @@ def test_parse_servers_reads_the_shape():
     ),)
 
 
+def test_parse_servers_reads_a_remote_one():
+    """远程那一档：`url` + `headers`，而 `is_remote` 是**从形状推出来的**。
+
+    不给 `"transport": "http"` 这种开关是有意的：那样就有两个可以互相矛盾的地方
+    （写了 http 却给了 command 该听谁的），而"哪个字段存在"已经足够确定。
+    """
+    servers = parse_servers({"servers": {"remote": {
+        "url": "https://example.com/mcp",
+        "headers": {"Authorization": "Bearer t"},
+        "timeout_seconds": 30,
+    }}})
+
+    assert servers == (McpServer(
+        name="remote", url="https://example.com/mcp",
+        headers={"Authorization": "Bearer t"}, timeout_seconds=30.0,
+    ),)
+    assert servers[0].is_remote is True
+    assert parse_servers({"servers": {"a": {"command": "x"}}})[0].is_remote is False
+
+
+def test_a_remote_server_does_not_leak_its_token_into_the_display_name():
+    """`where()` 是给面板/通知看的那句话，**它不能带令牌**。
+
+    URL 里带凭据（`?key=…`）是常见的写法，而这句话会进快照、进日志、进面板 ——
+    所以它只留 `scheme://host`。
+    """
+    server = parse_servers({"servers": {"r": {
+        "url": "https://example.com/mcp?key=SECRET",
+    }}})[0]
+
+    assert server.where() == "https://example.com"
+    assert "SECRET" not in server.where()
+
+
 def test_parse_servers_defaults():
     servers = parse_servers({"servers": {"a": {"command": "x"}}})
     assert servers[0].args == () and servers[0].env == {}
+    assert servers[0].headers == {} and servers[0].url == ""
     assert servers[0].timeout_seconds > 0
 
 
@@ -622,8 +658,20 @@ def test_an_empty_config_means_no_servers():
     ({"servers": {"a": {"command": "x", "typo": 1}}}, "不认识的键"),
     ({"servers": {"a b": {"command": "x"}}}, "不合法"),
     ({"servers": {"": {"command": "x"}}}, "不合法"),
-    ({"servers": {"a": {}}}, "缺 command"),
-    ({"servers": {"a": {"command": "  "}}}, "缺 command"),
+    # **恰好一种连接方式**：两个都没给、两个都给了，都是"看不见的错配"。
+    ({"servers": {"a": {}}}, "恰好给出一种连接方式"),
+    ({"servers": {"a": {"command": "  "}}}, "恰好给出一种连接方式"),
+    ({"servers": {"a": {"command": "x", "url": "https://e.test/mcp"}}}, "两个都给了"),
+    # 远程那几格自己的毛病。
+    ({"servers": {"a": {"url": "example.com/mcp"}}}, "完整的 http"),
+    ({"servers": {"a": {"url": "ftp://example.com/mcp"}}}, "完整的 http"),
+    ({"servers": {"a": {"url": "https://e.test/mcp", "args": ["-y", "x"]}}}, "只对本地"),
+    ({"servers": {"a": {"url": "https://e.test/mcp", "env": {"K": "v"}}}}, "只对本地"),
+    ({"servers": {"a": {"url": "https://e.test/mcp", "headers": {"K": 1}}}},
+     "headers 必须是"),
+    ({"servers": {"a": {"url": "https://e.test/mcp", "headers": {"头": "v"}}}},
+     "只能是 ASCII"),
+    # 本地那几格。
     ({"servers": {"a": {"command": "x", "args": "-y"}}}, "args 必须是字符串数组"),
     ({"servers": {"a": {"command": "x", "args": [1]}}}, "args 必须是字符串数组"),
     ({"servers": {"a": {"command": "x", "env": {"K": 1}}}}, "env 必须是"),
@@ -769,11 +817,21 @@ def test_the_servers_stderr_noise_does_not_break_the_channel():
 def test_exposed_name_matches_the_documented_shape():
     assert exposed_name("github", "create_file") == "mcp__github__create_file"
 
-def test_open_runtime_wires_mcp_tools_and_closes_them(workdir, capsys):
-    """装配那一层：读配置 → 连 server → 注册工具 → 报告 → 关掉。
+def test_open_runtime_lists_mcp_servers_but_does_not_mount_them(workdir, capsys):
+    """装配那一层：**读配置 → 列出来 → 但一个都不挂**（挂载要人按一下）。
 
-    这是**唯一**能证明"配了 mcp.json 之后真的能用"的地方：协议、工具构造、审批各自
-    都有单测，但它们之间的接线、以及"谁来关这些子进程"，只有真的走一遍装配才看得见。
+    ## 为什么"不挂"是这里的主角
+
+    挂上一个 server ＝ 同意那段代码用你的权限跑起来，而那件事发生在**任何审批之前**。
+    所以"读一下配置文件就等于授权"是这一整块最不能出现的行为：那样一份被别的东西
+    改过（或者哪天随仓库 clone 进来）的 `mcp.json` 就能在启动时执行任意代码。这条
+    测试钉的就是那句话 —— 装配完之后注册表里**一个 `mcp__` 都没有**。
+
+    ## 然后走一遍真正的挂载
+
+    接着调 `runtime.mcp.load(...)`（`/mcp load` 走的正是这个方法，一条路两个入口），
+    于是工具进注册表、notices 里有那两句话、`Runtime.close()` 收掉子进程 —— 那三件
+    事只有真的走一遍装配才看得见。
 
     第零期之后它从"跑 `main()` 并 monkeypatch `main` 的全局量"改成**直接调
     `open_runtime()` 并注入配置**：装配搬进了 `runtime/composition.py`，会话目录、
@@ -784,7 +842,12 @@ def test_open_runtime_wires_mcp_tools_and_closes_them(workdir, capsys):
     from unittest import mock
 
     from agent_runtime.runtime.channels import cli_channels
-    from agent_runtime.runtime.composition import boot, open_runtime, resolve_session
+    from agent_runtime.runtime.composition import (
+        McpHost,
+        boot,
+        open_runtime,
+        resolve_session,
+    )
     from agent_runtime.runtime.config import (
         McpConfig,
         ModelConfig,
@@ -796,7 +859,7 @@ def test_open_runtime_wires_mcp_tools_and_closes_them(workdir, capsys):
     session_id, session, _resumed = resolve_session(booted.store, None)
 
     closed: list[bool] = []
-    real_close = McpToolset.close
+    real_close = McpHost.close
 
     def recording_close(self):
         closed.append(True)
@@ -805,7 +868,7 @@ def test_open_runtime_wires_mcp_tools_and_closes_them(workdir, capsys):
     # 手工 start/stop 而不是 `with`：patch 必须罩住 open_runtime **和** close 两段。
     # 用 `with` 把它只套在 open_runtime 上过一次（这次的错），结果是 patch 在关闭之前
     # 就退出了 —— 断言恒为 `[]`，也就是"谁来关这些子进程"这件事根本没被验到。
-    patcher = mock.patch.object(McpToolset, "close", recording_close)
+    patcher = mock.patch.object(McpHost, "close", recording_close)
     patcher.start()
     try:
         runtime = open_runtime(
@@ -824,16 +887,27 @@ def test_open_runtime_wires_mcp_tools_and_closes_them(workdir, capsys):
         )
 
         try:
+            # 1) 开局：清单里有它，注册表里没有它。
+            rows = runtime.mcp.rows()
+            assert [row["name"] for row in rows] == ["fake"]
+            assert rows[0]["state"] == MCP_UNLOAD
+            assert not [tool for tool in runtime.tools.all()
+                        if tool.name.startswith("mcp__")]
+
+            start = "\n".join(n.text for n in runtime.notices() if n.stream == "err")
+            assert "配了 1 个 server：fake" in start
+            assert "都还没挂载" in start
+
+            # 2) 人按了一下（`/mcp load fake`）：工具这才进注册表。
+            runtime.mcp.load("fake")
             tool = runtime.agent.tools.get("mcp__fake__echo")
             assert tool.risk == RiskLevel.HIGH
-
             # 外部工具一律 HIGH ⇒ 进不了并行批次，也过不了注册期那条校验。
             assert not tool.parallel_safe
 
             notices = runtime.notices()
             err = "\n".join(n.text for n in notices if n.stream == "err")
             out = "\n".join(n.text for n in notices if n.stream == "out")
-
             assert "server fake：连上了，提供 5 个工具" in err
             assert "每次调用都要你批准" in err
             # "已注册工具"那份清单里也有它（那是人核对权限文件时对照的那一份）。
