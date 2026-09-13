@@ -41,6 +41,8 @@ __pycache__/
 pytest-cache-files-*/
 tests/_tmp/
 .pytest-tmp/
+# 性能分析脚本的临时工作区（scripts/perf_*.py 建的假工作区、假会话、假日志）
+.perf-tmp/
 
 # ---- 编辑器与系统 ----
 .vscode/
