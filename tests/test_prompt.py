@@ -228,6 +228,12 @@ def registered_tools() -> set[str]:
     **不要**提联网，而那恰好是反的。
 
     这里的 backend 是假的、client 走 MockTransport：这一整个文件不该打任何网络。
+
+    **grep 是唯一按平台条件注册的工具**（引擎是随仓库带的 ripgrep，只在支持的平台上
+    注册，见 tools/builtin/grep.py 的 `_TRIPLES`）。所以下面三条里凡是带 "搜文本" 的
+    失败，先分清两种情况再动手：**没支持这个平台**（要加一行代码，见
+    tools/vendor/rg/README.md）和**缺件**（跑 `scripts/fetch_rg.py` 就行）——
+    tests/test_grep.py 里那条 gate 测试量的正是这一件事。
     """
     return {
         tool.name for tool in create_tool_registry(

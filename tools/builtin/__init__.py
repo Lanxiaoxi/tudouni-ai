@@ -1,9 +1,9 @@
 """内置工具的装配。
 
 **这个文件里只有装配。** 每个工具的参数模型住在它自己的文件里、和它的 handler 同居
-（filesystem.py / shell.py / clock.py / webfetch.py / websearch.py / todo.py / ask.py /
-skills.py）—— 参数模型与行为是同一个事实的两面，而这里是唯一需要同时看见它们的地方。
-这里声明的是**另外两件事**：风险等级，以及能不能和其他工具同时执行。
+（filesystem.py / grep.py / shell.py / clock.py / webfetch.py / websearch.py / todo.py /
+ask.py / skills.py）—— 参数模型与行为是同一个事实的两面，而这里是唯一需要同时看见它们
+的地方。这里声明的是**另外两件事**：风险等级，以及能不能和其他工具同时执行。
 
 为什么放在 tools/ 而不是入口：它描述的是「这个项目自带哪些工具」，属于工具层
 的知识。放在入口里会有一个具体代价 —— 测试为了拿到一个工具注册表，不得不
@@ -31,6 +31,13 @@ from .filesystem import (
     ListFilesArgs,
     ReadFileArgs,
     WriteFileArgs,
+)
+from .grep import (
+    MAX_FILES as GREP_MAX_FILES,
+    MAX_MATCHES_PER_FILE as GREP_MAX_MATCHES_PER_FILE,
+    Grep,
+    GrepArgs,
+    rg_binary,
 )
 from .shell import MAX_OUTPUT_CHARS, Shell, ShellArgs, shell_name
 from .skills import LoadSkillArgs, SkillBoard
@@ -77,7 +84,7 @@ def create_tool_registry(
         于是技能加载成功了却永远不出现在载荷里（见 tools/tool.py 里那段）。
 
     `web_search` 不注册时那个工具**干脆不出现在 schema 里**，而不是"注册了再返回一句
-    '没配密钥'"：schema 每一轮都要发出去（现在 8 个工具合计约 5000 字符），而模型对
+    '没配密钥'"：schema 每一轮都要发出去（默认装配的 9 个工具合计约 6000 字符），而模型对
     "没有密钥"这件事无能为力 —— 它只会白花一步去调一次。缺密钥该是"用户得先做点事"，
     那句话由 main.py 打到 stderr 上。
 
@@ -159,6 +166,49 @@ def create_tool_registry(
         handler=fs.list_files,
         parallel_safe=True,
     ))
+
+    # 搜文本。四条决定：
+    #
+    # 1. **风险 LOW，而且它正是这条工具存在的理由。** 不注册它的话，模型要搜文本只能
+    #    起一条 shell 命令 —— 那是 HIGH、每一次都要人工审批，「按正则搜一下」这种极其
+    #    常规的只读动作就得先把命令念给用户听。它的路径走 FileSystem.safe_path，和
+    #    read_file / list_files 是同一条边界，所以担得起 LOW（见 tools/builtin/grep.py
+    #    开头那段）。
+    # 2. **并行安全。** 判定标准只有一条 —— handler 有没有副作用：它是"起一个只读的
+    #    子进程、读它的 stdout"，不写工作区、不碰共享状态（子进程自己也不写）。所以
+    #    一批 read_file + grep 能真并发，而这恰恰是搜索最想要的（它花的是等磁盘的时间，
+    #    不是持有 GIL 的时间）。
+    # 3. **找不到引擎就不注册**（rg_binary() 为 None）。这跟缺 TAVILY_API_KEY 不注册
+    #    web_search 是同一条路，理由也一样：schema 每一轮都要发出去，而"我这儿没有
+    #    rg 这个可执行文件"是模型无论如何处理不了的事 —— 它只会白花一步去调一次。
+    #    缺引擎是**装配问题**，说给用户听：runtime/composition.py 的 notices() 里那句。
+    # 4. **描述里必须写"我回答哪儿有、不回答那儿是什么"和"别用 shell 搜"。** 前者是它
+    #    和 read_file 的分工（不写清，模型会把命中行当正文用，然后据此下结论）；后者和
+    #    ask_user / todo_write 那些负面清单同一个理由：提示词只对**新建**的会话生效，
+    #    而工具描述每一轮都发，恢复的旧会话也一定看得到。用 shell 去搜的代价是具体的
+    #    —— 每次都要人工审批。
+    #
+    # 描述里的数目字都是从 grep.py 的常量插值来的，不手抄第二份：参数在一处改、说明书
+    # 跟着变，和 tool.py 里「schema 由 args_model 推导」是同一条原则。方言那一句不在
+    # 这里重复 —— 它是 pattern 这个参数自己的约束，由 GrepArgs 的字段描述表达，写在散文
+    # 里就成了第二份（而且改的时候只会改一处）。
+    if rg_binary() is not None:
+        registry.register(Tool(
+            name="grep",
+            description=(
+                "在工作区里按正则递归搜文本，返回**命中的文件、行号和那一行**。"
+                "它只回答「哪儿有」，不替你读正文：想知道「那儿是什么」要 read_file。\n"
+                f"默认最多列 {GREP_MAX_FILES} 个有命中的文件、每个文件 {GREP_MAX_MATCHES_PER_FILE} 条命中；"
+                "有命中的文件更多时只列最前面的那些，但会告诉你一共有几个路径命中。"
+                "隐藏路径排在后面，不跳过任何文件（.gitignore 和 .venv 里的也照样搜）。\n"
+                "搜文本用这个工具，不要拿 shell 去起 Select-String / findstr / rg —— "
+                "那条路每次都要人工审批。"
+            ),
+            risk=RiskLevel.LOW,
+            args_model=GrepArgs,
+            handler=Grep(workspace),
+            parallel_safe=True,
+        ))
 
     # 风险定 LOW：它只读时钟、没有副作用、不碰工作区，放行不需要问人 ——
     # 和 read_file / list_files 同档，也就落在 main.py 的 auto_approve 里。

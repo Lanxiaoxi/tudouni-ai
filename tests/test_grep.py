@@ -1,22 +1,33 @@
-"""grep 工具的实现。
+"""grep 工具的实现（引擎是随仓库带的 ripgrep）。
 
-**它已经取消注册**：不再出现在 create_tool_registry 里，模型看不到它、也不会被
-调用。这里保留的是 tools/builtin/grep.py 本身的实现测试 —— 那艘船还在，只是没挂在这条
-装配线上。
+**它已经注册了**（见 `create_tool_registry`），所以这个文件守的是两件事：
 
-实现层的契约没变：路径走 FileSystem.safe_path（只在工作区内）；结果里的路径要能
-直接喂给 read_file；行号要对、没匹配到要说清楚、正则写错要指出是正则的错、超长
-输出要截断但保留头尾、二进制/超大文件要跳过。
+  1. **实现层的契约**（换引擎不该动它）：路径走 `FileSystem.safe_path`（只在工作区内）；
+     结果里的路径要能直接喂给 read_file；行号要对；没匹配到要说清楚读了多少个文件；
+     正则写错要指出是正则的错；超长输出要截断但保留头尾。
+  2. **这次换引擎新引入的那几条**：不筛任何文件（ripgrep 的默认行为恰好就是筛）、
+     pattern 永远不会被当成旗标、引擎的配置文件读不进来、超时是响的、
+     以及"这台机器上引擎真的在仓库里"。
+
+第 2 组里前三条都是**实测出来的**，不是照着文档写的：`--needle--` 会被当成旗标
+（`unrecognized flag`）、`RIPGREP_CONFIG_PATH` 会被读取（往里写 `--files-with-matches`
+输出形状立刻就变）、`--pre=COMMAND` 会真的去 spawn 那个命令。它们决定了 argv 长什么样。
 """
 
 import pytest
 
+from agent_runtime.tools.builtin import grep as grep_module
+from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.builtin.filesystem import FileSystem
 from agent_runtime.tools.builtin.grep import (
     MAX_LINE_CHARS,
+    MAX_MATCHES_PER_FILE,
     _truncate,
     grep,
+    host_triple,
+    rg_binary,
 )
+from agent_runtime.tools.tool import RiskLevel
 
 
 @pytest.fixture
@@ -28,6 +39,96 @@ def tree(workdir):
     sub.mkdir()
     (sub / "b.py").write_text("x = 1\n# TODO: also\n", encoding="utf-8")
     return workdir
+
+
+# --- 引擎本身：它在不在、注册成了什么 --------------------------------
+
+def test_the_engine_is_vendored_for_this_platform():
+    """受支持的平台上，引擎必须真的在仓库里 —— 它是"不对外有依赖"那句话的兑现。
+
+    这条红了不代表代码坏了，代表**这份检出是缺件的**：`tools/vendor/rg/` 里少了本机
+    平台那一份。补它的命令在断言里。
+    """
+    if host_triple() is None:
+        pytest.skip("这个平台不在 tools/builtin/grep.py 的 _TRIPLES 里")
+    assert rg_binary() is not None, (
+        "tools/vendor/rg/ 里没有本机平台的 ripgrep：跑 "
+        "`uv run python scripts/fetch_rg.py` 补上（见 tools/vendor/rg/README.md）"
+    )
+
+
+def test_missing_engine_returns_text_not_an_exception(workdir, monkeypatch):
+    """引擎不在了也要**返回文本**，而且要说清去哪儿补。
+
+    走到这个分支说明注册表是在引擎还在的时候造的、之后文件没了（正常装配下
+    create_tool_registry 压根不会注册它）。抛异常会被记成"工具故障"，而模型对这个
+    分支能做的只有一件事：把"环境不完整"这句话转述给用户。
+    """
+    monkeypatch.setattr(grep_module, "rg_binary", lambda: None)
+
+    result = grep(str(workdir), "whatever")
+
+    assert "fetch_rg.py" in result
+    assert "找不到" in result or "不在" in result
+
+
+def test_registered_as_low_risk_and_parallel_safe(workdir):
+    """LOW 是它敢存在的理由，parallel_safe 是它比 shell 值钱的地方。
+
+    LOW：搜文本是极其常规的只读动作，每次都要人工审批才是错配（见模块 docstring）。
+    parallel_safe：它不写工作区、不碰共享状态 —— 一批 read_file + grep 能真并发，
+    而搜索花的是等磁盘的时间。
+    """
+    tool = create_tool_registry(str(workdir)).get("grep")
+
+    assert tool.risk is RiskLevel.LOW
+    assert tool.parallel_safe is True
+
+
+def test_grep_args_field_names_reach_the_handler(workdir):
+    """注册表到 handler 之间那条缝：字段名没人钉住。
+
+    这里有**两份**独立的事实 —— GrepArgs 的字段名，和 grep() 的参数名 —— 而它们只在
+    `Grep.__call__` 的 `**arguments` 展开时相遇。名字一漂移（include 改名、max_files
+    写成 maxFiles），真实会话里会抛 TypeError 变成"工具执行失败"，而 test_prompt.py
+    那几条（测注册表元数据）和上面这条（测 risk）都还是绿的。
+    """
+    (workdir / "a.py").write_text("TODO: fix\n", encoding="utf-8")
+    (workdir / "b.txt").write_text("TODO: fix\n", encoding="utf-8")
+
+    result = create_tool_registry(str(workdir)).get("grep").execute(
+        {"pattern": "TODO", "path": ".", "include": "*.py", "ignore_case": False,
+         "max_files": 5}
+    )
+
+    assert "a.py" in result
+    assert "b.txt" not in result      # include 真的到了 handler
+
+
+# --- 不筛任何文件：换引擎之后最容易悄悄坏掉的一条 ----------------------
+
+def test_nothing_is_filtered(workdir):
+    """**ripgrep 的默认行为恰好就是"筛"**，所以这一条是 `--no-ignore*` / `--hidden`
+    那串旗标的看门测试。少一个，被 `.gitignore` 掉的、藏在点目录里的就静默消失了 ——
+    而"静默漏搜"正是这个工具最不能有的失败形态（模型无法与"真的不存在"区分开）。
+
+    三处都要在：`.gitignore` 点名的文件、隐藏目录里的文件、以及 `.git` 自己（第三方
+    源码和运行期数据都在这一类里，见模块 docstring 里那段"值不值得搜"）。
+    """
+    (workdir / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    (workdir / "ignored.py").write_text("needle\n", encoding="utf-8")
+    hidden = workdir / ".venv"
+    hidden.mkdir()
+    (hidden / "v.py").write_text("needle\n", encoding="utf-8")
+    git = workdir / ".git"
+    git.mkdir()
+    (git / "config").write_text("needle\n", encoding="utf-8")
+
+    result = grep(str(workdir), "needle")
+
+    assert "ignored.py" in result        # .gitignore 说的话不算数
+    assert ".venv/v.py" in result        # 点目录不是过滤条件
+    assert ".git/config" in result       # .git 也不是
 
 
 # --- 递归 + 行号 --------------------------------------------------------
@@ -96,23 +197,78 @@ def test_missing_path_is_returned_not_raised(tree):
 
 
 def test_no_match_is_a_clear_message(tree):
-    """没匹配到是正常结果，不是故障 —— 而且要说清**到底读了多少个文件**。
+    """没匹配到是正常结果，不是故障 —— 而且要说清**到底搜了多少个文件**。
 
-    这个数字不是装饰：模型要靠它区分"真的不存在"和"我没读到那儿"（后者在字节上限
-    触发时会变得更要紧）。
+    这个数字不是装饰：模型要靠它区分"真的不存在"和"我没搜到那儿"。它现在来自引擎
+    末尾那条 summary（`searches`），而不是我们数出来的 —— 引擎把二进制文件也算作
+    搜过，自己数会漏掉那些。
     """
     result = grep(str(tree), "zzz-nope")
 
     assert "没有匹配" in result
-    assert "读了 3 个文件" in result      # a.py / notes.txt / pkg/b.py
+    assert "搜了 3 个文件" in result      # a.py / notes.txt / pkg/b.py
 
 
 def test_invalid_regex_blames_the_regex(tree):
-    """正则语法错是**调用方自己**写错了，得让它知道改的是 pattern，不是 path。"""
+    """正则语法错是**调用方自己**写错了，得让它知道改的是 pattern，不是 path。
+
+    引擎的原话（带 caret 示意图）一并交回去：模型要改的就是那个 pattern，而
+    "unclosed group" 这种话比我们转述一句"正则无效"有用得多。
+    """
     result = grep(str(tree), "a(")
 
     assert "正则表达式无效" in result
     assert "a(" in result
+    assert "regex parse error" in result
+
+
+# --- 注入面：这三条是 argv 长成那样的全部理由 --------------------------
+
+def test_pattern_is_never_taken_as_a_flag(workdir):
+    """pattern 只走 `-e`。
+
+    不这么做的话，模型写一个 `--pre=...` 就能让引擎去执行一条命令 —— 一次**绕过
+    shell 审批**的命令执行（shell 是 HIGH，每次都要人看一眼）。这条测试钉的是
+    "pattern 永远只是一个正则"：那个文本被当成正则去搜，而不是被当成旗标。
+    """
+    (workdir / "dash.txt").write_text("--pre=calc.exe\n", encoding="utf-8")
+
+    result = grep(str(workdir), "--pre=calc.exe")
+
+    assert "dash.txt" in result
+    assert "1:--pre=calc.exe" in result      # 当作正则命中，而不是 unrecognized flag
+
+
+def test_engine_config_file_is_not_read(workdir, monkeypatch):
+    """引擎会读 `RIPGREP_CONFIG_PATH` 指向的文件（实测过），`--no-config` 是那道闸。
+
+    少了它，一个外部配置文件就能改掉这次调用的形状 —— 实测往里写一句
+    `--files-with-matches`，输出就从"文件:行号:内容"变成只剩文件名。配置文件里同样
+    能塞 `--pre`，所以这不是"输出好看不好看"的问题。
+    """
+    config = workdir / "rgrc"
+    config.write_text("--files-with-matches\n", encoding="utf-8")
+    (workdir / "a.txt").write_text("needle\n", encoding="utf-8")
+    monkeypatch.setenv("RIPGREP_CONFIG_PATH", str(config))
+
+    result = grep(str(workdir), "needle")
+
+    assert "1:needle" in result          # 行号和行内容都还在 → 配置没生效
+
+
+def test_timeout_is_loud_and_returns_nothing(workdir):
+    """超时是唯一"什么都不返回"的分支，而且是故意的。
+
+    返回半份命中而不说清，等于让模型把"被我掐断了"读成"就这么多" —— 那是这个工具
+    最不能有的失败形态。说清超时，它就知道该缩小 path 或者加 include。
+    """
+    (workdir / "a.txt").write_text("needle\n", encoding="utf-8")
+
+    result = grep(str(workdir), "needle", timeout_seconds=0.000001)
+
+    assert "超过了" in result
+    assert "没有任何结果" in result
+    assert "include" in result           # 说清下一步该怎么办
 
 
 # --- 结果上限 -----------------------------------------------------------
@@ -121,7 +277,7 @@ def test_max_files_bounds_the_list_but_still_counts_the_rest(workdir):
     """名单要截，但**数目不能截** —— 得说清"还有几个路径里也有命中"。
 
     这是让"没匹配到 ≠ 不存在"成立的地方：只列 2 个却不提还有 3 个，模型会以为全项目
-    就只有 2 处。
+    就只有 2 处。数目来自引擎的 summary，所以名单截在哪儿都不影响它。
     """
     for i in range(5):
         (workdir / f"f{i}.py").write_text("needle\n", encoding="utf-8")
@@ -139,6 +295,9 @@ def test_hidden_paths_do_not_crowd_out_project_files(workdir):
     这条替代了早先"过滤掉隐藏目录"那版设计：排序能解决同一个问题，而且不删任何东西。
     实测过的形状是：整个工作区 4629 个文件里 4232 个在 .venv，字母序里 `.venv` 排最
     前，于是名额全被它占掉、项目源码一个都进不来。
+
+    换引擎之后它更要紧了：ripgrep 是并行搜的，交回来的顺序本来就不保证 —— 名额截到
+    哪几个如果跟着到达顺序走，同一次搜索会有不同结果。排序必须由我们这一侧定。
     """
     hidden = workdir / ".venv"
     hidden.mkdir()
@@ -156,30 +315,32 @@ def test_hidden_paths_do_not_crowd_out_project_files(workdir):
     assert ".venv/v0.py" in wider
 
 
-def test_total_bytes_cap_stops_reading_and_says_so(workdir):
-    """字节上限是唯一按**成本**设的那道，它停了要说清"哪些根本没被检查"。
+def test_per_file_match_cap_says_so(workdir):
+    """每个文件的命中条数有上限，而且**到顶了要说**：不然模型会把"列了 20 条"
+    读成"这个文件就 20 处"。
 
-    注意它停的是"检查"，跟 max_files 停"列名单"是两件事 —— 所以措辞也不同。
+    上限多要一条（`--max-count = 上限 + 1`）正是为了分清"正好 20 条"和"还有更多"
+    —— 只要 20 条的话，两种情况的输出一模一样。
     """
-    for i in range(10):
-        (workdir / f"f{i}.py").write_text("x" * 2000, encoding="utf-8")
+    (workdir / "many.txt").write_text(
+        "".join(f"needle {i}\n" for i in range(MAX_MATCHES_PER_FILE + 5)), encoding="utf-8"
+    )
 
-    result = grep(str(workdir), "needle", max_total_bytes=5000)
+    result = grep(str(workdir), "needle")
 
-    assert "没有匹配" in result
-    assert "读了 3 个文件" in result                  # 5000 / 2000 → 第 4 个之前就停了
-    assert "另有 7 个候选文件根本没被检查" in result
-    assert "5000 字节" in result                      # 小于 1 MB 时不许说"0 MB"
+    assert f"({MAX_MATCHES_PER_FILE} 处命中)" in result
+    assert f"命中已到 {MAX_MATCHES_PER_FILE} 条上限" in result
 
 
 def test_symlinks_are_not_followed(workdir):
     """符号链接不跟着走 —— 它可能指到工作区外面，也可能指成环。
 
-    这是**唯一**一类被排除的东西，而且理由不是"值不值得搜"，是"能不能安全地走"
-    （见模块 docstring）。所以它必须被数出来、说出来，而不是悄悄消失。
+    这是**唯一**一类被排除的东西，而且理由不是"值不值得搜"，是"能不能安全地走"。
+    引擎默认也不跟（`-L` 才跟），所以这条在两个引擎下都成立。
 
-    有些机器不让建符号链接（Windows 需要开发者模式或管理员），那就跳过 —— 假装通过
-    比不写更糟。
+    注意这里**不再断言"跳过 N 个符号链接"那句注脚**：引擎不报它跳过了谁（summary
+    里只有"搜了几个文件、几个有命中"）。这是换引擎付的代价，写在模块 docstring 里 ——
+    要把它数出来就得自己再走一遍目录树，而那趟走路正是引擎帮我们省掉的东西。
     """
     outside = workdir.parent / "outside-secret.txt"
     outside.write_text("NEEDLE\n", encoding="utf-8")
@@ -192,9 +353,19 @@ def test_symlinks_are_not_followed(workdir):
     try:
         result = grep(str(workdir), "NEEDLE")
         assert "NEEDLE" not in result                # 没有跟着链接走到工作区外面
-        assert "跳过 1 个符号链接" in result
     finally:
         outside.unlink(missing_ok=True)
+
+
+def test_binary_files_are_not_searched_as_text(workdir):
+    """二进制文件不该把里面的字节当文本报出来。"""
+    (workdir / "one.py").write_text("needle\n", encoding="utf-8")
+    (workdir / "blob.bin").write_bytes(b"\xff\xfe\x00\x01needle")
+
+    result = grep(str(workdir), "needle")
+
+    assert "one.py" in result
+    assert "blob.bin" not in result
 
 
 def test_long_lines_are_clipped(workdir):
@@ -217,14 +388,3 @@ def test_truncation_keeps_both_ends():
 
 def test_short_output_is_untouched():
     assert _truncate("短") == "短"
-
-
-def test_binary_and_oversized_files_are_skipped_and_counted(workdir):
-    (workdir / "one.py").write_text("needle\n", encoding="utf-8")
-    (workdir / "blob.bin").write_bytes(b"\xff\xfe\x00\x01needle")
-
-    # 不指定 include，让那个二进制也进入候选；它解码不了，应被跳过而不是让调用报错。
-    result = grep(str(workdir), "needle")
-
-    assert "one.py" in result
-    assert "blob.bin" not in result

@@ -60,6 +60,7 @@ from agent_runtime.skills import (
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin import create_tool_registry
+from agent_runtime.tools.builtin.grep import host_triple, rg_binary
 from agent_runtime.tools.builtin.todo import TodoBoard, progress_line, todo_note
 from agent_runtime.tools.builtin.webfetch import USER_AGENT, WebFetch
 from agent_runtime.tools.builtin.websearch import TavilySearch, WebSearch
@@ -450,6 +451,33 @@ class Runtime:
             out.append(Notice("err", code="web",
                 text="[联网] 没找到 TAVILY_API_KEY，web_search 未注册（fetch_web 不受影响）。"
                 "要启用就写进 .env：TAVILY_API_KEY=tvly-..."))
+
+        # [搜索]：**它和上面那条不是一类问题**，所以语气也不同。
+        #
+        # 缺 TAVILY_API_KEY 是"你没配这个可选能力"，缺引擎是"这份检出缺件" —— 后者按
+        # 设计本来就该在仓库里（tools/vendor/rg/ 随包走，见那个目录的 README）。所以
+        # 这里要给的是"怎么补"，而不是"怎么配密钥"。
+        #
+        # 必须说，不能静默：grep 不注册之后，模型搜文本只剩"起一条 shell 命令"那条路，
+        # 而那条路每次都弹审批 —— 用户看到的会是"怎么老问我"，而不是"我少了什么"。
+        #
+        # **两个分支要分开说。** "这个平台没被支持"和"支持了但文件没了"是两件事，补救
+        # 办法也完全不同（一个要往代码里加一行，一个跑条命令就行）。合成一句"缺少引擎"
+        # 的话，前者会让人反复跑 fetch 脚本，而脚本无论如何也解决不了它 —— 那正是
+        # "说反了原因，用户就去查一个不存在的问题"。
+        if rg_binary() is None:
+            triple = host_triple()
+            if triple is None:
+                out.append(Notice("err", code="grep",
+                    text=f"[搜索] 这个平台（{sys.platform}）不在 grep 引擎的支持列表里"
+                    f"（现在只有 x86_64 的 Windows / Linux），grep 未注册"
+                    f"（搜文本只能走 shell，每次都要审批）。"
+                    f"要支持它是两步，见 tools/vendor/rg/README.md。"))
+            else:
+                out.append(Notice("err", code="grep",
+                    text=f"[搜索] tools/vendor/rg/ 里少了 {triple} 这一份 ripgrep，"
+                    f"grep 未注册（搜文本只能走 shell，每次都要审批）。"
+                    f"跑 `uv run python scripts/fetch_rg.py` 补上。"))
 
         # [MCP]：**每次启动都说，而且说清"它们的工具每次都要审批"** —— 外部工具默认
         # 每条都要问人，而这句话是"为什么它又问我了"唯一的解释；不说的话，用户会以为

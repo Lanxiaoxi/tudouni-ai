@@ -1165,7 +1165,17 @@ def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai):
     assert result.returncode == 0, result.stderr
     # 握手过了：会话 id 和工具清单都显示出来了。
     assert "ansi-smoke" in result.stdout
-    assert "工具 11 个" in result.stdout
+    tools_line = next(
+        (line for line in result.stdout.splitlines() if line.startswith("工具 ")),
+        None,
+    )
+    assert tools_line, "init 回执里没有工具清单"
+    # **刻意不钉个数。** 这份清单里既有内置工具，也有本机 .env（TAVILY_API_KEY）和
+    # .tudouni/（MCP server）带来的那些 —— 钉死一个数就把这条冒烟测试绑在开发机的
+    # 配置上，而它要测的是"ANSI 客户端能握手"。钉几个**必然在**的名字就够了：
+    # 它们在，就说明这份清单是活的装配结果，不是一句占位文本。
+    for name in ("read_file", "grep", "shell"):
+        assert name in tools_line
     # 提示语在，说明它真的进到了交互循环。
     assert "输入内容回车发送" in result.stdout
 

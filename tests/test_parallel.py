@@ -25,6 +25,7 @@ from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import Session
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.builtin.filesystem import ListFilesArgs
+from agent_runtime.tools.builtin.grep import rg_binary
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
 
 from fakes import Collector, tool_call, usage
@@ -142,11 +143,18 @@ def test_the_real_registry_only_marks_the_read_only_tools():
 
     防的是将来有人顺手给 write_file / edit_file / shell 加上这个标志：那两个文件工具
     是"读进来、改一段、整份写回去"，并发调用会互相盖掉对方，而且两边都会报成功。
+
+    grep 在这个名单里：它是"起一个只读的子进程、读它的 stdout"，不写工作区、不碰共享
+    状态。它**只在引擎随包带着的时候才注册**（见 tools/vendor/rg/README.md），所以这里
+    跟着条件走 —— 缺引擎时那条缺口由 test_grep.py 的 gate 测试负责喊，不在这里假装。
     """
     tools = create_tool_registry(".").all()
-    assert {t.name for t in tools if t.parallel_safe} == {
-        "read_file", "list_files", "get_current_time",
-    }
+
+    expected = {"read_file", "list_files", "get_current_time"}
+    if rg_binary() is not None:
+        expected.add("grep")
+
+    assert {t.name for t in tools if t.parallel_safe} == expected
 
 
 # --- 顺序只由模型决定 -----------------------------------------------------
