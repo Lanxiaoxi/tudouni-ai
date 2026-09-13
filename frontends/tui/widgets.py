@@ -1299,24 +1299,28 @@ def model_and_workspace(state: view_state.ViewState) -> str:
 
 
 class RailBlock(Vertical):
-    """上下文栏里的一块：标题 + 右侧计数 + 内容。"""
+    """上下文栏里的一块：**一行小字标题 + 内容**（F1 的 `任务 · 2 / 5`）。
+
+    标题和计数**画在同一行里**，而不是"标题靠左、计数顶到栏的右边缘"：计数被推到
+    32 列栏的最右边之后，眼睛得横跨整栏才能把 `2 / 5` 和 `任务` 连起来 —— 贴在一起
+    读起来才是"这一块有几个"。计数为空的两块（权限范围 / 本次会话）不画那个 `·`。
+    """
 
     def __init__(self, palette: theme_mod.Theme, *args: Any, **kwargs: Any):
-        title = Static("", classes="rail-title")
-        count = Static("", classes="rail-count")
+        head = Static("", classes="rail-head")
         lines = Static("", classes="rail-lines")
-        super().__init__(Horizontal(title, count, classes="rail-head"), lines,
-                         *args, **kwargs)
-        self._title = title
-        self._count = count
+        super().__init__(head, lines, *args, **kwargs)
+        self._head = head
         self._lines = lines
         self._data: tuple[str, str, list[view_state.Line]] = ("", "", [])
 
     def show(self, title: str, count: str, lines: list[view_state.Line],
              palette: theme_mod.Theme) -> None:
         self._data = (title, count, lines)
-        self._title.update(Text(title, style=palette.ink3 + " bold"))
-        self._count.update(Text(count, style=palette.ink4))
+        text = f"{title} · {count}" if count else title
+        # 标题**和正文同一档灰**（`ink4`）、不加粗：它说的是"这一块叫什么"，不是重点
+        # —— 四块标题都加粗发亮的话，这一栏里就有四个东西同时在抢眼睛。
+        self._head.update(Text(text, style=palette.ink4))
         self._lines.update(paint_lines(palette, lines))
 
     def repaint(self, palette: theme_mod.Theme) -> None:

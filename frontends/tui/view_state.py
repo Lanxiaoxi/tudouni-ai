@@ -1278,10 +1278,17 @@ def _permission_block(state: ViewState) -> tuple[str, str, list[Line]]:
             (f"{risk:<7}", ROLE_PROCESS),
             (label.get(disposition, disposition), role),
         ))
+    # 这两行**不再是 `warn`（橙）**：`warn` 按设计文档 §14.1 是"MEDIUM 风险"那一档，
+    # 而这里是**用户自己记住的例外** —— 它不是风险，一栏里出现两行橙字之后，真正
+    # 该看一眼的风险色就不响了。改成"标签 `ink4` + 值 `ink3`"，和上面三行同一套写法。
+    # **文本一个字没变**（`str(line)` 仍是 `点名免问 fetch_web`），所以"左栏已经显示
+    # 着它、旁白就别再说一遍"那条断言照旧成立。
     if state.granted_tools:
-        lines.append(Line("点名免问 " + "、".join(state.granted_tools), ROLE_WARN))
+        lines.append(seg(("点名免问", ROLE_RULE),
+                         (" " + "、".join(state.granted_tools), ROLE_PROCESS)))
     if state.granted_prefixes:
-        lines.append(Line("命令规则 " + "、".join(state.granted_prefixes), ROLE_WARN))
+        lines.append(seg(("命令规则", ROLE_RULE),
+                         (" " + "、".join(state.granted_prefixes), ROLE_PROCESS)))
     if state.denied_tools:
         lines.append(Line("直接拒绝 " + "、".join(state.denied_tools), ROLE_DENIED))
     if not lines:

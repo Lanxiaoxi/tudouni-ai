@@ -119,13 +119,30 @@ class TuiApp(App[None]):
 
     /* --- 主体：左栏 + 会话流 ---------------------------------------------- */
     #body { height: 1fr; }
+    /* 滚动条：**设计稿里一条都没有**（沿右边缘取样：x2330→2382 是面板底、2382 就是
+       卡片边，再过去是页面底）。左栏直接不出 —— 那四块内容就那么多，真溢出了还有
+       `Ctrl+B` 和一行摘要那条路；会话流留 **1 格**中性滑块，因为长回合里"上面还有"
+       这个事实需要一个出口，但它不该是原来那条 2 格宽的金色轨道。
+       （Textual 默认 `scrollbar-size-vertical: 2`，滑块色由注册的 Textual 主题从
+       `accent` 派生 —— 所以默认形态恰好是"最显眼的那种"。） */
     #rail {
         width: 32;
         background: $td-rail;
         border-right: solid $td-hairline;
         padding: 1 1;
+        scrollbar-size-vertical: 0;
     }
-    #log { background: $td-bg; padding: 0 1; }
+    #log {
+        background: $td-bg;
+        padding: 0 1;
+        scrollbar-size-vertical: 1;
+        scrollbar-background: $td-bg;
+        scrollbar-background-hover: $td-rail;
+        scrollbar-background-active: $td-bg;
+        scrollbar-color: $td-hairline;
+        scrollbar-color-hover: $td-ink4;
+        scrollbar-color-active: $td-accent;
+    }
 
     /* 上下文栏的一块：**左边一条色条当视觉锚点**。
        它是主题的 `line` 色（那正是这一套配色的"描边"角色）—— 四块共用一条竖线，
@@ -136,9 +153,9 @@ class TuiApp(App[None]):
         border-left: solid $td-rail-bar;
         padding-left: 1;
     }
+    /* 块头 = **一行**：`任务 · 2 / 5`（计数贴着标题，见 `RailBlock.show`）。
+       它**没有自己的宽高分配**：颜色在控件里给（`ink4`），这里只管"它占一行"。 */
     .rail-head { height: 1; }
-    .rail-title { width: 1fr; }
-    .rail-count { width: auto; text-align: right; }
     .rail-lines { color: $td-ink3; }
 
     /* --- 回合块 ----------------------------------------------------------- */
