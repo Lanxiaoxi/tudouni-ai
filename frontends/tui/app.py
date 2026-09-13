@@ -572,10 +572,12 @@ class TuiApp(App[None]):
 
     def _refresh_chrome(self) -> None:
         palette = self.palette
-        # 上下文栏开合：**默认收起**，而"检测到有任务/技能时自动展开"按窗口宽度算
-        # （决策 1）。用户按过 Ctrl+B 之后不再自动开合（`rail_pinned`）。
+        # 上下文栏开合：**默认收起**，任务列表从无到有那一刻自动顶开一次
+        # （决策 26 —— 是边沿，不是"有任务就一直开着"）。之后听用户的：`Ctrl+B`
+        # 收得掉，宽度也不参与判断。判据全在 `should_auto_open` 里，这里只把结果
+        # 贴到控件上。
         state = self.state
-        want = view_state.should_auto_open(state, self.size.width)
+        want = view_state.should_auto_open(state)
         if want != state.rail_open:
             state.rail_open = want
         rail = self._widget("#rail", widgets.ContextRail)
@@ -1170,8 +1172,9 @@ class TuiApp(App[None]):
     def action_toggle_rail(self) -> None:
         """`Ctrl+B`：折叠/展开上下文栏。**纯界面操作**，不改变任何 agent 的事实。
 
-        按过一次之后 `rail_pinned` 置位：一次明确的操作不该被下一次状态更新推翻
-        （否则"有任务时自动展开"会在用户刚收起它之后立刻把它顶开）。
+        按过一次之后 `rail_pinned` 置位：一次明确的操作不该被下一次**状态更新**推翻
+        （否则"有任务就自动展开"会在用户刚收起它之后 50ms 又把它顶开）。所以自动展开
+        只认"任务列表从无到有"那一个边沿 —— 见 `should_auto_open`。
         """
         self.state.rail_open = not self.state.rail_open
         self.state.rail_pinned = True

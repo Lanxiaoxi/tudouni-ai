@@ -369,10 +369,14 @@ class ViewState:
     # 用户刚发出去的那句话。**回显要用它而不是事件里那份预览** ——
     # `run_started.user_input` 是审计的 200 字符预览，而用户敲的字界面本来就有。
     pending_input: str = ""
-    # 上下文栏开着吗。**默认收起**（决策 1）：宽屏且真的有任务/技能时才自动展开。
+    # 上下文栏开着吗。**默认收起**（决策 1）：任务列表**从无到有**时自动展开一次
+    # （决策 26，见 `should_auto_open`）。
     rail_open: bool = False
     # 用户手动按过 Ctrl+B 之后就不再自动开合 —— 一次明确的操作不该被下一次更新推翻。
     rail_pinned: bool = False
+    # "上一帧已经有任务列表了吗"。它让 `should_auto_open` 把"任务列表产生"认成一次
+    # **边沿事件**（顶开一次就完），而不是一个持续成立的电平（那会让 Ctrl+B 收起失效）。
+    rail_todos_seen: bool = False
 
     def reset_for_session(self) -> None:
         """把**属于某一个会话**的东西全清掉，只留下界面自己的开关。
@@ -1061,20 +1065,45 @@ def rail_summary(state: ViewState) -> str:
     return " · ".join(parts)
 
 
-def should_auto_open(state: ViewState, width: int) -> bool:
-    """上下文栏该不该自动展开（决策 1）。
+def should_auto_open(state: ViewState) -> bool:
+    """上下文栏该不该自动展开（决策 1，第三期改成决策 26）。
 
-    **默认收起**（贴 Claude Code 的克制），而"检测到有任务/技能时自动展开"是那句话
-    的另一半 —— 一条被维护的任务列表意味着这个会话值得看全局。两个附带条件：
+    **默认收起**（贴 Claude Code 的克制），而"真有任务/技能时自动展开"是那句话的另一
+    半 —— 一条被维护的任务列表意味着这个会话值得看全局。
 
-      * 窄屏（< 120 列）一律不展开：栏宽 32 列在 80 列的终端里要吃掉 40%，
-        那是灾难性的（F5 给的就是那种终端的降级形态）；
-      * 用户按过 Ctrl+B 之后**不再自动开合**（`rail_pinned`）—— 一次明确的操作
-        不该被下一次状态更新推翻。
+    ## 触发条件是「任务列表**从无到有**」，不是「有任务」
+
+    这是个**边沿**而不是电平，而且必须有这个区别：按电平做的话，用户在有任务时按
+    `Ctrl+B` 收起，下一次刷新（50ms 后）条件仍然成立，栏会被立刻顶回来 —— **收起
+    从此失效**。所以这里记一个 `rail_todos_seen`：任务列表第一次出现时顶开一次，
+    之后听用户的；列表被清空就重新武装（下一次出现又算一次新事件）。
+
+    列表**内容更新**（某个任务变成 completed）不重开：一次长任务里 `todo_write` 会被
+    调很多次，每次都顶开会变成一个自己弹开的栏。
+
+    ## v1 的两个附加条件为什么去掉了
+
+      * ~~窄屏（< 120 列）一律不展开~~：栏宽 32 列在 80 列的终端里吃掉 40%，这个代价
+        是真的，但"模型刚写下任务列表"比它更要紧 —— 那一栏装着"它打算做哪几件事"，
+        是用户唯一能提前看出"它理解得对不对"的地方。窄屏嫌挤就 `Ctrl+B` 收掉，
+        收起后还有那一行摘要；
+      * ~~用户按过 `Ctrl+B` 之后不再自动开合~~：手动操作仍然被尊重（**收起之后不会
+        因为别的状态更新自己弹开**），但**任务列表出现是一个新的、明确的事件** ——
+        用户当初收起它时，前提是"那时候没有任务"。所以它够格把栏顶开一次。
+
+    **它不是纯函数**：会推进 `state.rail_todos_seen` 那个边沿标记。
     """
-    if state.rail_pinned:
+    has_todos = bool(state.todos)
+    if has_todos and not state.rail_todos_seen:
+        state.rail_todos_seen = True
+        return True
+    if not has_todos:
+        # 清空了就重新武装：下一次出现是**新事件**，不是"同一批还在"。
+        state.rail_todos_seen = False
+    if state.todos or state.skills:
+        # 那次顶开之后听用户的（包括"又有技能"这种情况，它不算新事件）。
         return state.rail_open
-    return width >= NARROW_COLUMNS and bool(state.todos or state.skills)
+    return state.rail_open if state.rail_pinned else False
 
 
 # --- 命令面板 ------------------------------------------------------------------

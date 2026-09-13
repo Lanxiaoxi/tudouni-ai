@@ -417,19 +417,38 @@ def test_cancel_is_reported_as_its_own_outcome():
 
 # --- 上下文栏的开合（决策 1） -------------------------------------------------
 
-def test_the_rail_is_collapsed_until_there_is_something_to_show():
-    """决策 1：**默认收起**，检测到有任务/技能且宽屏时自动展开，窄屏一律不展开。"""
+def test_the_rail_opens_once_when_the_todo_list_appears():
+    """决策 26：任务列表**从无到有**时顶开一次，之后听用户的（`Ctrl+B` 收得掉）。
+
+    这里钉的是一条**边沿**，因为电平式（"有任务就开着"）会让 `Ctrl+B` 彻底失效：
+    用户收起之后 50ms，下一次刷新又把它顶回来 —— 界面上看起来就是"这个键坏了"。
+    """
     state = view_state.ViewState()
-    assert view_state.should_auto_open(state, 200) is False
+    assert view_state.should_auto_open(state) is False, "默认收起"
 
-    state.todos = [{"content": "写测试", "status": "in_progress"}]
-    assert view_state.should_auto_open(state, 200) is True
-    assert view_state.should_auto_open(state, 80) is False, "窄屏一律不展开"
-
-    # 用户按过 Ctrl+B 之后**不再自动开合** —— 一次明确的操作不该被下一次更新推翻。
+    # 从无到有 → 顶开一次。**不管之前手动收起过没有**：那个决定的前提是"那时没任务"。
     state.rail_pinned = True
+    state.todos = [{"content": "写测试", "status": "in_progress"}]
+    assert view_state.should_auto_open(state) is True
+
+    # 用户按 Ctrl+B 收起：同一批任务还在，但那次顶开已经用掉了 → 不再顶回来。
     state.rail_open = False
-    assert view_state.should_auto_open(state, 200) is False
+    assert view_state.should_auto_open(state) is False
+
+    # 列表**内容更新**不算新事件（长任务里 todo_write 会被调很多次，每次都顶开会变成
+    # 一个自己弹开的栏）。
+    state.todos = [{"content": "写测试", "status": "completed"}]
+    assert view_state.should_auto_open(state) is False
+
+    # 技能也不算新事件：它不改变"有没有活要干"。
+    state.todos = []
+    state.skills = [{"name": "x", "digest": "d"}]
+    assert view_state.should_auto_open(state) is False
+
+    # 清空之后重新武装：下一次出现又是新事件。
+    state.skills = []
+    state.todos = [{"content": "写文档", "status": "pending"}]
+    assert view_state.should_auto_open(state) is True
 
 
 def test_the_rail_summary_says_what_collapsing_hides():
@@ -1520,13 +1539,18 @@ async def test_resetting_for_a_session_keeps_the_ui_switches(monkeypatch):
         app.state.skills = [{"name": "旧技能"}]
         await _settle(app, pilot)
 
-        app.action_toggle_rail()          # 用户手动开了左栏
+        # 任务列表出现 → 栏自动顶开（决策 26）；用户按一下 Ctrl+B **收起**它。
+        # 这里刻意用"收起"来表达手动选择：`run_test()` 默认 80 列，而窄屏现在也会
+        # 自动开，所以"按一下 = 打开"那个旧写法不再成立（旧规则下 80 列从不自动开）。
+        assert app.state.rail_open is True, "任务列表出现就顶开"
+        app.action_toggle_rail()          # 用户手动收起
         assert app.state.rail_pinned is True
+        assert app.state.rail_open is False
 
         app._inbox.put(("message", _init_message("new-two")))
         await _settle(app, pilot)
 
-        assert app.state.rail_open is True, "左栏的开合是用户的选择，换会话不该动它"
+        assert app.state.rail_open is False, "左栏的开合是用户的选择，换会话不该动它"
         assert app.state.rail_pinned is True
         for field in ("turns", "answers", "thinking", "calls", "todos", "skills",
                       "risk_scope", "granted_tools", "granted_prefixes",
@@ -1723,8 +1747,8 @@ async def test_escape_interrupts_the_running_turn_instead_of_quitting(monkeypatc
 
 
 @pytest.mark.anyio
-async def test_the_rail_stays_collapsed_until_there_is_something_to_show(monkeypatch):
-    """决策 1 落到界面上：宽屏 + 有任务才自动展开，窄屏一律降级成一行摘要。"""
+async def test_the_rail_opens_when_a_todo_list_appears_then_obeys_ctrl_b(monkeypatch):
+    """决策 26 落到界面上：任务列表一出现就顶开（**窄屏也是**），之后 `Ctrl+B` 说了算。"""
     from textual.widgets import Static
 
     from agent_runtime.frontends.tui import widgets
@@ -1738,23 +1762,24 @@ async def test_the_rail_stays_collapsed_until_there_is_something_to_show(monkeyp
         app.state.todos = [{"content": "写测试", "status": "in_progress"}]
         app._refresh_chrome()
         await pilot.pause()
-        assert rail.display is True, "有任务时自动展开"
+        assert rail.display is True, "任务列表出现就顶开"
 
+        # 收起之后**不许**被下一次刷新顶回来（边沿和电平的区别就在这一条）。
         app.action_toggle_rail()
         assert rail.display is False
         assert app.state.rail_pinned is True, "手动按过之后不再自动开合"
         app._refresh_chrome()
-        assert rail.display is False
+        await pilot.pause()
+        assert rail.display is False, "同一批任务不该把收起的栏顶回来"
 
+    # 窄屏同样顶开（决策 26 去掉了"窄屏一律不展开"）；那一行摘要让位。
     app2 = _build_app(monkeypatch)
     async with app2.run_test(size=(80, 24)) as pilot:
         app2.state.todos = [{"content": "写测试", "status": "in_progress"}]
         app2._refresh_chrome()
         await pilot.pause()
-        assert app2.query_one("#rail").display is False, "窄屏一律不展开"
-        summary = app2.query_one("#rail-summary", Static)
-        assert summary.display is True
-        assert "Ctrl+B" in str(summary.render())
+        assert app2.query_one("#rail").display is True, "窄屏也开"
+        assert app2.query_one("#rail-summary", Static).display is False, "摘要让位给栏"
 
 
 @pytest.mark.anyio

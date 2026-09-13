@@ -1100,8 +1100,8 @@ class ContextRail(VerticalScroll):
     这四块此前只有"另开一个终端"的出口（`--skills` / `--audit` / `--list`），
     放进栏里之后"agent 为什么这么做""我现在放行了什么"变成常驻可见。
 
-    **它默认收起**（决策 1），而"检测到有任务/技能时自动展开"由 `app.py` 按窗口
-    宽度算（`view_state.should_auto_open`）—— 这个控件只负责画。
+    **它默认收起**（决策 1），而"任务列表从无到有时自动顶开一次、之后听用户的"由
+    `app.py` 每次刷新时问 `view_state.should_auto_open` —— 这个控件只负责画。
     """
 
     def __init__(self, palette: theme_mod.Theme, *args: Any, **kwargs: Any):
