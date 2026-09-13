@@ -59,7 +59,9 @@ from agent_runtime.skills import (
 )
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.state import agents_md
+from agent_runtime.state import catalog
 from agent_runtime.state import model as model_state
+from agent_runtime.state import reasoning
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin import create_tool_registry
 from agent_runtime.tools.builtin.grep import host_triple, rg_binary
@@ -405,13 +407,17 @@ class Runtime:
     memory: ApprovalMemory
     agent: Agent
 
-    # `/model` 那张清单（`state/model.py` 的目录）。它排在装配出来的零件之后，
-    # 因为有默认值：加一个模型是改那张表，不该逼每一个构造点都跟着改一行。
+    # `/model` 那张清单（`state/catalog.py` 的目录）。它排在装配出来的零件之后，
+    # 因为有默认值：加一个模型是改配置文件的事，不该逼每一个构造点都跟着改一行。
     #
     # **它是快照，而"现在用的是哪个"不是** —— 后者读 `agent.model_name`（见
     # `current_model`）。把当前模型也存成字段就有了两份事实，而它们分家的症状是
     # "状态栏写着 flash，请求发给了 pro"。
-    model_catalog: tuple[Any, ...] = model_state.MODEL_CATALOG
+    #
+    # 字段名**不叫 `catalog`**：那会和模块顶部 `from agent_runtime.state import catalog`
+    # 撞上，而类体里 `catalog.Registry()` 会解析成 `Registry`（注解求值把类作用域里的
+    # 同名属性当成了模块）—— 一个只在这一行报错的谜。
+    model_registry: catalog.Registry = catalog.Registry()
 
     # 一次性开关（用来渲染那条 autopilot 警告）
     autopilot: bool = False
@@ -455,114 +461,228 @@ class Runtime:
         return self.agent.model_name
 
     @property
-    def context_tokens(self) -> int | None:
-        """**当前模型**的上下文窗口（分母）。
+    def current_provider(self) -> str:
+        """现在这条请求发给哪条路由（`deepseek` / `acme` …）。"""
+        return str(getattr(self.agent.model, "provider", "") or "")
 
-        它从 `current_model` 派生，**不是一个存下来的字段** —— `/model` 能中途换模型，
+    @property
+    def current_base_url(self) -> str:
+        """**适配器上那个端点**，不是配置里那个。
+
+        两者不一样只可能出现在"换过路由但没生效"这种情况里（比如适配器不支持换），
+        而那时候该显示的是**真实**的端点 —— 报配置里那个等于把"请求发到哪儿"这件事
+        说反了，而它正是这一行存在的理由。
+        """
+        return str(getattr(self.agent.model, "base_url", "") or "")
+
+    @property
+    def current_route(self) -> str:
+        """`provider/model` —— 换模型那句说明和 `/status` 都用它。
+
+        两条路由可以有同名模型，而"请求发到哪儿"在账单上、在合规上都是另一件事 ——
+        所以这个名字里必须带路由，光一个模型名答不出"它到底在哪跑"。
+        """
+        provider, model = self.current_provider, self.current_model
+        return f"{provider}/{model}" if provider and model else (model or "")
+
+    @property
+    def context_tokens(self) -> int | None:
+        """**当前那条路线上那个模型**的上下文窗口（分母）。
+
+        它从目录派生，**不是一个存下来的字段** —— `/model` 能中途换模型（甚至换路由），
         存字段就意味着换完之后这里还是旧的那个，而症状是状态栏那个百分比按旧窗口算：
         看起来完全正常，只是数错了。
 
-        目录里没有这个名字时返回 None（`--model` 指向自建网关的模型、或者那个名字
-        已经下线）：只报用量、不报占比，错的百分比比没有百分比更坏。
+        目录里没有这个名字时返回 None（自建网关上的模型、或者配置里没写窗口）：
+        只报用量、不报占比 —— 错的百分比比没有百分比更坏。
         """
-        return model_state.context_window(self.current_model)
+        ref = self.model_ref()
+        return ref.window if ref is not None else None
 
-    def select_model(self, name: str) -> tuple[bool, str]:
-        """换这个会话用哪个模型。返回 `(换成了吗, 说给用户听的一句话)`。
+    def model_ref(self) -> catalog.ModelRef | None:
+        """当前这个"路由 + 模型"在目录里的那一条（认不出来返回 None）。
+
+        它是**唯一的对账口**：窗口、能力、这条路由上的出厂强度都从这里取。自己再存
+        一份的话，`/model` 换了之后就会有两份事实，而它们分家的症状正是最难看的那种
+        （界面显示 A 的窗口、请求用的是 B）。
+        """
+        provider = self.model_registry.provider(self.current_provider)
+        if provider is None:
+            return None
+        return provider.find(self.current_model)
+
+    def select_model(self, name: str, *, provider: str = "") -> tuple[bool, str]:
+        """换这个会话用哪条路由上的哪个模型。返回 `(换成了吗, 说给用户听的一句话)`。
+
+        ## 名字的三种写法
+
+          * `provider/model` —— 明确指定。两条路由有同名模型时**必须**这么写；
+          * 光写模型名 —— 只在**唯一一条**路由上有它时才认；落在多条路由上时**不猜**，
+            而是把候选报出来（随便挑一条是那种"看起来完全正常、账单却在另一个账号上"
+            的错误）；
+          * 光写 provider 名（`/model acme`）—— 用那条路由上的第一个模型。这个用法很
+            自然（"换到 acme 去"），而 acme 上有什么它自己知道。
 
         ## 三道检查，顺序有意
 
-          1. **名字认不认识** —— 判据是 `state/model.py` 的目录（`/model` 那个清单就是
-             从它渲染的）。不认识就拒绝：接受一个目录外的名字等于让 `/model` 的清单
-             变成一句谎话，而"选了一个它根本没列出来的模型"这件事没有任何地方会报；
-          2. **网关对不对** —— 目录里的模型**共享同一把密钥与同一个 base_url**（见
-             `state/model.py` 那一段）。一个指向自建网关的会话去选 DeepSeek 官方的
-             模型名，请求会发到一个那台网关多半没有的模型上（或者更糟：发到官方端点、
-             而密钥不是官方那把）。这一档里没有"provider"这个概念，所以只能这样挡：
-             配置里的 base_url 和适配器上那个不一致就直接拒绝 —— 那说明装配时就
-             已经分家了，是更该先修的问题；
+          1. **名字认不认识** —— 判据是目录（`/model` 那张清单就是从它渲染的）。
+             接受一个目录外的名字等于让那张清单变成一句谎话，而"选了一个它根本没
+             列出来的模型"这件事没有任何地方会报；
+          2. **那条路由有没有密钥** —— 没密钥的路线在目录里照样列着（"这台机器上知道
+             它存在"和"现在能用它"是两件事），但选不了；
           3. **适配器认不认** —— 见 `Agent.switch_model`。
 
         ## 落盘与生效的时序
 
-        这里**只改内存 + `session.metadata`**：`/model` 之后用户可能一句话都不说就退出，
-        而 `select()` 写的是一个活字典，下一次 checkpoint（或下一个回合开头）自然会带上它。
-        写文件不是这一层的事（`store.save` 由 Agent 的 on_checkpoint 调）。
+        这里**立刻落盘**（理由见 `_save_now`）。生效则是"下一次请求" —— 正在跑的那一轮
+        已经发出去了，不受影响（见 `Agent.switch_model`）。
 
-        模型名一样时**照样走完**并返回"已经是它了"：那是幂等的，而且用户按了两遍
+        模型与路由都一样时**照样走完**并返回"已经是它了"：那是幂等的，而且用户按了两遍
         `/model flash` 该得到一句"已经是它"，不是一句错误。
         """
         wanted = (name or "").strip()
         if not wanted:
             return False, "没给模型名。/model 不带参数看清单。"
 
-        known = model_state.get(wanted)
-        if known is None:
+        provider_name = (provider or "").strip()
+        if "/" in wanted and not provider_name:
+            provider_name, _, wanted = wanted.partition("/")
+            provider_name, wanted = provider_name.strip(), wanted.strip()
+
+        # 只写了 provider（`/model acme`）：用那条路由上的第一个模型。
+        #
+        # **先问"这是不是一条路由名"，再当模型名找。** 顺序不能反：反了的话，一条
+        # 名字恰好和一个模型同名的路由（网关叫 `flash`、而模型也叫 `flash`）就会被
+        # 当成模型名，于是 `/model flash` 换的是一个模型而不是那条路由 —— 而这两件事
+        # 在账单上完全不同。
+        if not wanted and provider_name:
+            found = self.model_registry.provider(provider_name)
+            if found is None:
+                return False, f"没有这条路由：{provider_name} —— /model 不带参数看清单。"
+            if not found.models:
+                return False, f"路由 {provider_name} 一个模型都没声明。"
+            wanted = found.models[0].id
+        elif not provider_name and self.model_registry.provider(wanted) is not None:
+            found = self.model_registry.provider(wanted)
+            if not found.models:
+                return False, f"路由 {wanted} 一个模型都没声明。"
+            provider_name, wanted = wanted, found.models[0].id
+
+        ref = self.model_registry.find(wanted, provider=provider_name or None)
+        if ref is None:
+            hits = self.model_registry.ambiguous(wanted)
+            if hits:
+                names = "、".join(item.qualified for item in hits)
+                return False, (
+                    f"{wanted} 在多条路由上都有（{names}）—— "
+                    f"写全一点：/model provider/model"
+                )
+            known = "、".join(item.id for item in self.model_registry.models()) or "（一条都没有）"
             return False, (
                 f"目录里没有这个模型：{wanted} —— /model 不带参数看清单。"
-                f"（目录是写死的几个名字，不会把任意名字转给网关："
-                f"那样打错一个字母只会在下一次请求时才炸。）"
+                f"（清单是配置里写死的几个名字，不会把任意名字转给网关："
+                f"那样打错一个字母只会在下一次请求时才炸。）现在有：{known}"
             )
-        model_id = known.id
 
-        configured = str(getattr(self.agent.model, "base_url", "") or "")
-        if configured and configured != self.model_cfg.base_url:
+        target = self.model_registry.provider(ref.provider)
+        if target is None:  # pragma: no cover - find() 就是从 providers 里找出来的
+            return False, f"那条路由不见了：{ref.provider}"
+        if not target.usable:
             return False, (
-                f"这个会话的模型端点和配置对不上（{configured} ≠ "
-                f"{self.model_cfg.base_url}），不换 —— "
-                f"否则请求会发到一个没配密钥的地址上。"
+                f"路由 {ref.provider} 没有密钥，选不了它下面的模型 —— 在 "
+                f"{catalog.MODELS_FILE_NAME} 里给它写一个 api_key 或 api_key_env。"
             )
 
-        if self.current_model == model_id:
-            return True, f"已经是 {model_id} 了。"
+        if self.current_model == ref.id and self.current_provider == ref.provider:
+            return True, f"已经是 {ref.qualified} 了。"
 
-        previous = self.current_model or "（未知）"
-        if not self.agent.switch_model(model_id):
+        previous = self.current_route or "（未知）"
+        if not self.agent.switch_model(
+            ref.id, provider=ref.provider,
+            api_key=target.api_key, base_url=target.base_url,
+        ):
             return False, (
                 f"这个会话的模型适配器不支持中途换模型（{type(self.agent.model).__name__}）"
-                f"—— 只能重启时用 DEEPSEEK_MODEL 指定。"
+                f"—— 只能重启时在 {catalog.MODELS_FILE_NAME} 里改默认值。"
             )
 
-        # **立刻落盘，不等下一个检查点。** 换模型是用户的一次明确操作，而"会话级选择
-        # 跟着会话走"这句话必须现在就成立：`/model` 之后一句话都不说就退出，是最自然的
-        # 用法之一（我们先告诉过用户"下一次请求生效"，而恢复会话时说"你选的是 flash"
-        # 会是同一份承诺的反面）。
-        #
-        # 此时此刻 messages 是**一致的**（没有人正在跑），所以这个落盘点和 Agent 那些
-        # 检查点一样安全。失败不当成失败：选择还在内存里，这一个会话照用；只是它不会
-        # 跨进程 —— 而那种情况必须说出来（和 `Agent._checkpoint` 那条规矩一致）。
+        self._save_now("换模型")
+        # 回报必须带上"上一个是谁"：那句话里同时有"上面那些轮次是谁写的"和"从这里
+        # 开始是谁"，而界面拼不出来（它不知道上一轮用了谁）。
+        return True, f"换成 {ref.qualified}（上一个：{previous}）—— 下一次请求生效。"
+
+    def select_thinking(self, on: bool) -> tuple[bool, str]:
+        """开关思考模式（`/thinking`）。返回 `(改了吗, 说给用户听的一句话)`。
+
+        **它不动模型，也不动强度**：三样是独立的旋钮，而"顺手把强度也重置了"是那种
+        用户没要求、事后也查不出来的行为。关掉之后强度仍然记着（`/thinking on` 回来
+        还是原来那个）—— 实测端点在关掉思考时**忽略** effort，所以我们也不发它
+        （见 `state/reasoning.request_fields`），但那不代表要把用户的选择删掉。
+        """
+        if not self.agent.set_reasoning(thinking=on, effort=None):
+            return False, "这个会话的模型适配器不支持改思考模式。"
+        self._save_now("改思考模式")
+        if on:
+            return True, (f"思考模式：开（强度 {self.agent.effort}）"
+                          f"—— 下一次请求生效。")
+        return True, "思考模式：关（强度记着，/thinking on 回来还是它）—— 下一次请求生效。"
+
+    def select_effort(self, effort: str) -> tuple[bool, str]:
+        """改思考强度（`/effort`）。返回 `(改了吗, 说给用户听的一句话)`。
+
+        **关着思考时照样接受并记下来**（只是这一次请求不会发出去）。拒绝的话，用户就
+        得先记住"要先把思考打开才能设强度"—— 而那是我们发明的顺序，不是任何地方要求的。
+        """
+        level = reasoning.resolve_effort(effort)
+        if level is None:
+            if reasoning.is_off(effort):
+                # `none` 是端点认的"关掉思考"的写法，而它在这一版里是**另一个旋钮**。
+                # 指路而不是照做：把 `/effort none` 当成 `/thinking off` 会让人以为
+                # 强度变成了 none（而清单里根本没有那一档）。
+                return False, ("`none` 是关掉思考，不是一档强度 —— 用 /thinking off"
+                               "（强度会留着），或者 /effort "
+                               f"{'、'.join(reasoning.EFFORT_LEVELS)}。")
+            return False, (
+                f"没有这一档强度：{effort} —— 能写的只有 "
+                f"{'、'.join(reasoning.EFFORT_LEVELS)}"
+                f"（端点还接受 {'、'.join(sorted(reasoning.ALIASES))} 这些等价写法）。"
+            )
+        if not self.agent.set_reasoning(thinking=None, effort=level):
+            return False, "这个会话的模型适配器不支持改思考强度。"
+        self._save_now("改思考强度")
+        if self.agent.thinking:
+            return True, f"思考强度：{level} —— 下一次请求生效。"
+        return True, f"思考强度记成 {level} 了，但思考模式关着（/thinking on 才用得上）。"
+
+    def _save_now(self, what: str) -> None:
+        """把这几个会话级设置立刻落盘。**失败不当失败，但必须说。**
+
+        换模型 / 改思考设置都是"用户明确按了一下"，而它们全部只改 `session.metadata`
+        —— 那一块平时靠回合里的检查点落盘。等着下一个检查点的话，最自然的用法之一
+        （进去、改一下、退出）会丢掉这次改动，而恢复会话时我们报的是旧值 —— 那和刚
+        给过的承诺相反。
+        """
         try:
             self.store.save(self.session)
         except Exception as exc:  # noqa: BLE001
-            _warn(f"换模型之后落盘失败（这一次仍然生效，重开会话会回到配置里那个）："
+            _warn(f"{what}之后落盘失败（这一次仍然生效，重开会话会回到配置里那个）："
                   f"{type(exc).__name__}: {exc}")
 
-        # **没有第三步**：`switch_model` 里已经把"这个会话选的是谁"记进
-        # `session.metadata` 了（那两件事分给两个方法是一条迟早会漏的约定，见那里的
-        # 说明）。这里只剩回报 —— 而回报必须带上"上一个是谁"：那句话里同时有"上面
-        # 那些轮次是谁写的"和"从这里开始是谁"，界面拼不出来（它不知道上一轮用了谁）。
-        return True, f"换成 {model_id}（上一个：{previous}）—— 下一次请求生效。"
-
-    def model_rows(self) -> list[dict]:
+    def model_rows(self) -> tuple[list[dict], list[dict]]:
         """`/model` 那张清单：目录 + "现在用的是哪个" + "认下的旧名字"。"""
-        current = model_state.canonical(self.current_model)
+        current = self.model_ref()
         rows = [
-            {
-                "id": item.id,
-                "label": item.label,
-                "window": item.window,
-                "summary": item.summary,
-                "note": item.note,
-                "current": item.id == current,
-            }
-            for item in self.model_catalog
+            item.as_row(current=bool(
+                current is not None and item.provider == current.provider
+                and item.id == current.id))
+            for item in self.model_registry.models()
         ]
         # 别名（已下线、仍可调用的旧名字）单列：它们是**认下的名字**，不是能选的选项。
-        # 放进主清单会摆出两个效果完全一样、价钱也一样的选项（官方明确说过旧名字由
-        # V4.1-Flash 提供服务），而"我到底选了哪个"就没有答案了。
+        # 放进主清单会摆出两个效果完全一样、价钱也一样的选项，而"我到底选了哪个"就没有
+        # 答案了。
         aliases = [
             {"id": alias, "of": target}
-            for alias, target in sorted(model_state.ALIASES.items())
+            for alias, target in sorted(catalog.ALIASES.items())
         ]
         return rows, aliases
 
@@ -597,6 +717,11 @@ class Runtime:
             "model": {
                 # **现在真正在用的那个**（`Agent` 上的适配器说了算），不是配置里那个。
                 "current": self.current_model,
+                # 哪条路由，以及**适配器上那个**端点。三分开是有意的：两条路由可以有
+                # 同名模型，而"请求发到哪儿"在账单上、在合规上都是另一件事。
+                "provider": self.current_provider,
+                "base_url": self.current_base_url,
+                "route": self.current_route,
                 # 这个会话**选**的（`/model` 写的那个）。它和 `current` 在换完模型、
                 # 下一次请求之前会暂时不同，而那个差别正是"还没生效"的证据。
                 "selected": session_model.selected if session_model is not None else "",
@@ -604,7 +729,13 @@ class Runtime:
                 "since": session_model.selected_since if session_model is not None else 0.0,
                 # 当前模型的窗口（分母）。None = 目录里没有这个名字，只报用量。
                 "window": self.context_tokens,
-                "base_url": self.model_cfg.base_url,
+                # 思考模式那两个旋钮。**它们和模型一样是"会话级设置"**，所以和
+                # provider/model 同住一组 —— `/status` 那一屏的"它在用什么"指的就是
+                # 这几样：谁、哪条路由、想不想、想多用力。
+                "reasoning": {
+                    "thinking": bool(self.agent.thinking),
+                    "effort": self.agent.effort,
+                },
             },
             "counters": dict(counts or {}),
             "usage": dict(usage or {}),
@@ -615,6 +746,9 @@ class Runtime:
                 "tool_count": len(self.tools.all()),
                 "audit_path": str(Path(self.logs.directory) / f"{self.session_id}.jsonl"),
                 "permissions": self.non_default_permissions(),
+                # 目录是从哪读的。**它是事实，不是装饰**："为什么我改的配置没生效"
+                # 这个问题的答案就是这一个字符串（内置 / 哪份文件的绝对路径）。
+                "catalog": self.model_registry.source,
             },
         }
 
@@ -673,8 +807,9 @@ class Runtime:
         # （错的百分比比没有百分比更坏）。
         if self.context_tokens is None:
             out.append(Notice("err", code="context",
-                text=f"[上下文] 模型 {self.current_model!r} 不在 state/model.py 的目录里，"
-                f"末尾只报上下文用量、不报占比；把它的窗口长度加进那张表即可。"))
+                text=f"[上下文] 模型 {self.current_model!r} 不在目录里（或者配置里没写"
+                f"它的 context_window），末尾只报上下文用量、不报占比；"
+                f"把它那一行补上即可。"))
 
         # 缺搜索密钥不是配置错误（不像 DEEPSEEK_API_KEY）：只是不注册那一个工具。
         if not self.web_cfg.tavily_api_key:
@@ -771,16 +906,36 @@ class Runtime:
         out.append(Notice("err", code="permissions",
                           text=f"[权限] 命令规则（按前缀放行）{rules}"))
 
-        # [模型]：**只在"这个会话选过模型"时说**。配置里那个（`.env` 的
-        # `DEEPSEEK_MODEL`）不是新闻 —— 启动横幅和 `init.model` 都写着它，再说一遍
-        # 就是噪音。而"恢复一个会话、它用的是你上次 `/model` 选的那个"必须说出来：
-        # 不说的话，用户会以为模型跟着 `.env` 走，而账单上会是另一回事。
-        if self.agent.session_model is not None and self.agent.session_model.selection is not None:
-            selected = self.agent.session_model.selected
-            where = self.model_cfg.base_url
+        # [模型]：**只在"这个会话选过模型"时说**。目录里那个默认值不是新闻 ——
+        # 启动横幅和 `init.model` 都写着它，再说一遍就是噪音。而"恢复一个会话、它用的是
+        # 你上次 `/model` 选的那个"必须说出来：不说的话，用户会以为模型跟着配置走，
+        # 而账单上会是另一回事。
+        session_model = self.agent.session_model
+        if session_model is not None and session_model.selection is not None:
             out.append(Notice("err", code="model",
-                text=f"[模型] 这个会话选的是 {selected}（{where}）—— "
-                     f"/model 可以换，/status 看现在这个。"))
+                text=f"[模型] 这个会话选的是 {session_model.route_name()}"
+                     f"（{self.current_base_url}）—— /model 可以换，/status 看现在这个。"))
+
+        # [思考]：**同样只在"这个会话改过"时说**。默认是开 + 目录里声明的那个强度 ——
+        # 那是常态，为它加一行噪音会把上面那些真警告淹掉。而"这个会话把思考关了"必须
+        # 说出来：那是账单和答案质量上都能看出差别的一件事，而它没有别的出口
+        # （左栏那一行写的是模型，不是思考设置）。
+        if session_model is not None and session_model.selection is not None:
+            if (not session_model.thinking
+                    or session_model.effort != reasoning.DEFAULT_EFFORT):
+                out.append(Notice("err", code="reasoning",
+                    text=f"[思考] 这个会话："
+                         f"{reasoning.summary(thinking=session_model.thinking, effort=session_model.effort)}"
+                         f"（默认是开 · {reasoning.DEFAULT_EFFORT}）—— "
+                         f"/thinking 开关、/effort 改强度。"))
+
+        # [目录]：**目录不是内置那份时说一句它从哪来**。这句话是"我改的配置怎么没生效"
+        # 唯一的答案 —— 没有它的时候，用户看到的现象只是"模型少了几个"。
+        if self.model_registry.source != "内置" and self.model_registry.notes:
+            out.extend(Notice("err", code="models", text=line)
+                       for line in self.model_registry.notes)
+        for problem in self.model_registry.problems:
+            out.append(Notice("err", code="models", level="warn", text=problem))
 
         # [任务] / [技能]：两者都比进程活得久（存在 session.metadata 里），所以恢复
         # 会话时不说的话，用户看到的会是"它怎么突然开始更新一个我从没见过的列表"。
@@ -986,6 +1141,142 @@ class Runtime:
         self.close()
 
 
+class ChosenModel(NamedTuple):
+    """**解析好了的一条路线**：请求发给谁、用哪把密钥、哪个模型。
+
+    它和 `catalog.ModelRef` 分开，是因为 ModelRef 说的是"目录里有这么一条"（纯数据、
+    可以被列出来但不能被用），而这个是"这一条现在真的能用"（密钥已经在手里）。
+    合并的话，每一个 ModelRef 都得带一个可能为空的密钥，而"这台机器上没有它"和
+    "有它但没配密钥"就分不出来了 —— 而那两句话给用户的下一步完全不同。
+    """
+
+    provider: str
+    provider_base_url: str
+    provider_key: str
+    id: str
+    window: int | None
+    default_effort: str
+
+
+def _chosen(ref: catalog.ModelRef, provider: catalog.Provider) -> ChosenModel:
+    return ChosenModel(
+        provider=provider.name,
+        provider_base_url=provider.base_url,
+        provider_key=provider.api_key,
+        id=ref.id,
+        window=ref.window,
+        default_effort=ref.default_effort,
+    )
+
+
+def resolve_model(
+    session_model: model_state.SessionModel, registry: catalog.Registry,
+) -> tuple[model_state.SessionModel, ChosenModel | None]:
+    """这个会话该用哪条路由上的哪个模型。**返回 (会用哪个, 解析结果)。**
+
+    ## 四步，顺序有意
+
+      1. **会话选过就用它**（`/model` 之后恢复会话的人期待还是那个）—— 前提是那条
+         路由还在、还有密钥、那个模型还认识；
+      2. 会话选的那个**解析不出来**（配置被人改了）时退回默认 —— 用户不在键盘前，
+         停下来问他没有意义；而"你想的那个没生效"由启动那条 `[模型]` 说明说清楚；
+      3. 没有会话级选择时用目录的默认值：**默认路由的第一个模型**。顺序是配置文件里
+         的顺序，也就是"哪个是默认"由人自己排出来，不是我们按名字猜的；
+      4. 一条能用的都没有 → 返回 `None`，由调用方报一段能照着改的话。
+
+    `fallback` / `fallback_provider` 会写回 `SessionModel`，所以"这个会话用哪条路由"
+    在 `/status` 和 `/model` 里答得出来 —— 即使它一次都没 `/model` 过。
+    """
+    def restored(ref: catalog.ModelRef) -> model_state.SessionModel:
+        return model_state.SessionModel.restore(
+            session_model.metadata, fallback=ref.id, fallback_provider=ref.provider)
+
+    def pick(provider: catalog.Provider | None) -> ChosenModel | None:
+        if provider is None or not provider.usable or not provider.models:
+            return None
+        return _chosen(provider.models[0], provider)
+
+    # 1/2：会话选过的那个。
+    wanted = session_model.selected
+    if wanted:
+        where = session_model.selected_provider
+        ref = registry.find(wanted, provider=where or None)
+        if ref is None and not where:
+            # 没写 provider 而又落在多条路由上：**不能猜**，但用户不在键盘前，所以
+            # 退到默认 —— 差别是那句"你想的那个没生效"必须说出来（`problems` 的活）。
+            hits = registry.ambiguous(wanted)
+            ref = hits[0] if hits and _usable(registry, hits[0]) else None
+        if ref is not None:
+            found = registry.provider(ref.provider)
+            if found is not None and found.usable:
+                return restored(ref), _chosen(ref, found)
+
+    # 3：默认路由。
+    provider = registry.default_provider()
+    if provider is not None and provider.usable:
+        # 配置里写的那个模型名（`DEEPSEEK_MODEL`）在默认路由上时优先 —— 它是"这台机器
+        # 上我想用哪个"的老写法，而配置文件的顺序是新的写法；两者优先级不能反：反了
+        # 之后，一个写着 `DEEPSEEK_MODEL` 的环境里加一份配置文件会悄悄改掉默认模型。
+        preferred = registry.find(wanted, provider=provider.name) if wanted else None
+        chosen = _chosen(preferred, provider) if preferred is not None else pick(provider)
+        if chosen is not None:
+            return model_state.SessionModel.restore(
+                session_model.metadata, fallback=chosen.id,
+                fallback_provider=chosen.provider), chosen
+
+    # 4：后面还有别的能用吗（默认那条缺密钥 / 没有模型）。
+    for other in registry.providers:
+        chosen = pick(other)
+        if chosen is not None:
+            return model_state.SessionModel.restore(
+                session_model.metadata, fallback=chosen.id,
+                fallback_provider=chosen.provider), chosen
+    return session_model, None
+
+
+def _usable(registry: catalog.Registry, ref: catalog.ModelRef) -> bool:
+    found = registry.provider(ref.provider)
+    return found is not None and found.usable
+
+
+def _no_model_message(registry: catalog.Registry) -> str:
+    """一条模型都配不出来时的那段报错。
+
+    **它必须说出下一步做什么。** 这一档和"缺密钥"是同一类（用户得先做点事），而
+    用户手上唯一的问题是"我该往哪写"。所以它列两种配法（写一份配置文件 / 只给一个
+    环境变量），并把这次读到的路由和逐条问题一起带上 —— 那几条正是"为什么每条都
+    不行"的答案。
+    """
+    lines = [
+        "一个可用的模型都没有 —— 配不出模型就什么都干不了。",
+        "",
+        f"两种配法，任选其一（模板见 {catalog.MODELS_EXAMPLE_NAME}）：",
+        "",
+        f"  1) 写一份 {catalog._PACKAGE_ROOT / catalog.MODELS_FILE_NAME}：",
+        "",
+        "        {",
+        '          "providers": {',
+        '            "deepseek": {',
+        '              "base_url": "https://api.deepseek.com",',
+        '              "api_key_env": "DEEPSEEK_API_KEY",',
+        '              "models": [{"id": "deepseek-flash", "context_window": 1000000}]',
+        "            }",
+        "          }",
+        "        }",
+        "",
+        "  2) 什么都不写，只给一个环境变量（或 .env）：",
+        "",
+        "        DEEPSEEK_API_KEY=sk-...",
+        "",
+        "优先级：真实环境变量 > .env > 配置文件里写死的 api_key。",
+    ]
+    if registry.notes:
+        lines += ["", "这次读到的路由：", *[f"  {item}" for item in registry.notes]]
+    if registry.problems:
+        lines += ["", "逐条问题：", *[f"  {item}" for item in registry.problems]]
+    return "\n".join(lines)
+
+
 def open_runtime(
     *,
     booted: Booted,
@@ -1002,6 +1293,7 @@ def open_runtime(
     permission_config: PermissionConfig | None = None,
     web_config: WebConfig | None = None,
     mcp_config: McpConfig | None = None,
+    catalog_config: catalog.Registry | None = None,
 ) -> Runtime:
     """从 `boot()` 的产物继续装配：配置 → 模型 → 工具 → 策略 → 记忆 → Agent。
 
@@ -1049,23 +1341,34 @@ def open_runtime(
     # 这一条界线就是"用户得先做点事"和"少一个能力"的界线。
     mcp_cfg = mcp_config or McpConfig.from_file()
 
-    # 这个会话用哪个模型：**会话级选择优先，配置里那个是兜底**。
+    # 这个会话用哪条路由上的哪个模型、想得多用力：**会话级选择优先，目录的默认值兜底**。
     #
     # 判据取 "这个会话选过吗" 而不是 "配置里是什么"：`/model` 之后恢复会话的人期待
     # 还是他选的那个（和任务列表、已加载技能同一条路 —— 它们都住在 session.metadata
     # 里，所以它们一起过期、一起恢复）。
     #
-    # 它在这里读、而不是在 Agent 里读：装配期的 `SessionModel` 要拿着它去造适配器
-    # （模型名是构造参数），而 Agent 手上只需要"想用谁 / 上一轮用了谁"那份状态。
+    # 它在这里解析、而不是在 Agent 里：装配期要拿着**解析出来的那条路由**（base_url +
+    # 密钥）去造适配器，而 Agent 手上只需要"想用谁 / 上一轮用了谁"那份状态。
+    #
+    # `fallback` 用配置里那个模型名（`DEEPSEEK_MODEL`，没写就是内置的默认值）：它是
+    # **兜底**，不是权威 —— 权威是解析出来的 `chosen`（它可能落在另一条路由上）。
     session_model = model_state.SessionModel.restore(
-        session.metadata, fallback=model_state.default_id(cfg.model),
+        session.metadata, fallback=cfg.model,
     )
+    model_registry = catalog_config or catalog.load()
+    session_model, chosen = resolve_model(session_model, model_registry)
+    if chosen is None:
+        raise ConfigError(_no_model_message(model_registry))
 
     model = OpenAICompatibleModel(
-        api_key=cfg.api_key,
-        base_url=cfg.base_url,
-        model=session_model.selected,
+        api_key=chosen.provider_key,
+        base_url=chosen.provider_base_url,
+        model=chosen.id,
         http_client=httpx.Client(),
+        provider=chosen.provider,
+        # 会话级的思考设置（`/thinking` `/effort` 写的那个）。
+        thinking=session_model.thinking,
+        effort=session_model.effort,
     )
 
     # 联网抓取用的 http client：**一个进程一个**，连接复用、TLS 握手只付一次。
@@ -1201,6 +1504,10 @@ def open_runtime(
         # server 是**我们起的子进程** —— 它们都不在调用方的清理路径上。
         if mcp is not None:
             mcp.close()
+        # 模型适配器现在**可能**已经造过一个 SDK 客户端（它是懒造的：`complete()`
+        # 之前不会）。这条路走到的概率很低（装配失败通常发生在它之前），但漏了就是
+        # 一个没人认领的连接池 —— 而它正是这一整个 try 块存在的理由。
+        model.close()
         http.close()
         raise
 
@@ -1209,6 +1516,7 @@ def open_runtime(
         web_cfg=web,
         mcp_cfg=mcp_cfg,
         permissions=permissions,
+        model_registry=model_registry,
         session_id=session_id,
         session=session,
         store=booted.store,

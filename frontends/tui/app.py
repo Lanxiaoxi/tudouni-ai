@@ -779,6 +779,14 @@ class TuiApp(App[None]):
 
         state.session_id = new_session
         state.model = message.get("model", "")
+        state.provider = message.get("provider", "")
+        # 思考模式那两个旋钮：**开场就显示**（它们可能来自这个会话上次的选择 ——
+        # `/thinking off` 之后恢复会话，那一格该还写着关）。
+        state.thinking_on = message.get("thinking") is not False
+        state.effort = str(message.get("effort") or state.effort)
+        levels = message.get("effort_levels")
+        if levels:
+            state.effort_levels = tuple(str(level) for level in levels)
         state.max_steps = message.get("max_steps", 0)
         state.workspace = message.get("workspace", "")
         state.audit_path = message.get("audit_path", "")
@@ -1184,6 +1192,10 @@ class TuiApp(App[None]):
             self._command_tools()
         elif command == "/model":
             self._command_model(rest)
+        elif command == "/thinking":
+            self._command_thinking(rest)
+        elif command == "/effort":
+            self._command_effort(rest)
         elif command == "/theme":
             self._command_theme(rest)
         elif command == "/autopilot":
@@ -1217,6 +1229,43 @@ class TuiApp(App[None]):
         if self._client is None:
             return
         self._client.ask_tools()
+
+    def _command_thinking(self, rest: str) -> None:
+        """`/thinking [on|off]`。**不带参数只报当前值，不做"切一下"。**
+
+        和 `/theme` `/model` 同一条交互：轮换把"现在是什么"变成一个必须靠记忆的状态，
+        而列一次的成本是零。
+
+        带参数时**只认字面的 `on` / `off`**（不认 `开` / `关` / `true`）：协议上那
+        一格是**布尔**，而"哪些词算开"如果由界面来判，就会有两个地方各自维护一份词表
+        —— 漂开之后 `/thinking 开` 在 CLI 里管用、在 TUI 里报错，而那种差别没人查得出。
+        所以界面只发协议认的两个字面量，剩下的写法由 CLI 那一支（它直连 runtime，
+        可以调 domain 的折算函数）自己处理。认不出来的一律提示，不猜。
+        """
+        if not rest:
+            self._say_lines(view_state.render_thinking(self.state))
+            return
+        word = rest.strip().lower()
+        if word not in ("on", "off"):
+            self._say(f"认不出这个写法：{rest}（用 /thinking on 或 /thinking off）")
+            return
+        if self._client is None:
+            return
+        self._client.set_thinking(word == "on")
+
+    def _command_effort(self, rest: str) -> None:
+        """`/effort [low|high|max]`。同上：不带参数只列档位。
+
+        档位清单**由 runtime 随协议发**（`effort_levels`），界面不写死也不去 import
+        内核 —— 这是决策 18 那条"前端只讲协议"的直接体现：它能长出 Web 前端的前提
+        就是"前端不认识 runtime 的任何 Python 对象"。
+        """
+        if not rest:
+            self._say_lines(view_state.render_effort(self.state, self.state.effort_levels))
+            return
+        if self._client is None:
+            return
+        self._client.set_effort(rest)
 
     def _command_model(self, rest: str) -> None:
         """`/model [名字]`。**不带参数只列清单，不做"轮换到下一个"。**

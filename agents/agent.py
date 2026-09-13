@@ -20,6 +20,7 @@ from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.security.policy import PermissionPolicy
 from agent_runtime.state import Session
 from agent_runtime.state.model import SessionModel
+from agent_runtime.state.reasoning import DEFAULT_EFFORT, DEFAULT_THINKING
 from agent_runtime.tools.tool import InvalidArgsError, Tool, ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
@@ -425,20 +426,28 @@ class Agent:
         """
         return str(getattr(self.model, "model", "") or "")
 
-    def switch_model(self, name: str) -> bool:
-        """换这个会话用哪个模型。返回"换成了吗"。**选择和生效在这里合成一件事。**
+    def switch_model(self, name: str, *, provider: str = "", api_key: str = "",
+                     base_url: str = "") -> bool:
+        """换这个会话用哪条路由上的哪个模型。返回"换成了吗"。
 
-        契约在适配器那一侧（`models/base.py` 的 `ChatModel.switch_model`），因为
-        **能不能中途换是适配器的性质**：一次构造就把模型名绑死、或者把名字烘进请求
-        路径的实现做不到 —— 而那样它照样是一个合法的 `ChatModel`。
+        ## 两种换法，判据是"端点或密钥变了没有"
+
+          * **同一条路由上换模型**（`/model deepseek-v4-pro`）：只改请求里那个字段
+            （`ChatModel.switch_model`）；
+          * **换到另一条路由**（`/model acme`，或者两条路由有同名模型而用户写了
+            `acme/xxx`）：密钥和端点都变了，而它们是 SDK 客户端的构造参数 —— 所以
+            走 `install()`，它会重造客户端并收掉旧的。
+
+        判据取"变了没有"而不是"调用方想走哪条路"：调用方知道的是**目标**（哪条路由），
+        而"要不要重造客户端"是适配器的知识。让调用方选方法就会出现"换了路由却没重造
+        客户端"这种半吊子状态，而它的症状是请求带着旧密钥发到新地址上。
 
         ## 为什么"记下这个选择"也在这里
 
         换模型是两步：**适配器上换**（下一个请求用新名字）和**会话里记**（下一轮开头
         留一句"换过"、恢复会话时还是它）。分给两个方法、让调用方记得两步都走，是一条
         迟早会漏的约定 —— 而漏掉第二步的症状尤其难看：模型确实换了，但历史里一句话
-        都没有，于是后半段那些回答看起来像是同一个模型写的（那是这个功能要解决的
-        那个问题本身）。
+        都没有，于是后半段那些回答看起来像是同一个模型写的。
 
         所以顺序钉在这里：**先让适配器换，成功了才记**。反过来的话，一个不支持换模型
         的适配器会留下一条"选了 pro"的记录，而请求照旧发给 flash。
@@ -446,18 +455,60 @@ class Agent:
         **只吞 `NotImplementedError`**（那是"这个能力不存在"的准确信号，基类的默认
         实现抛的就是它）。别的异常原样穿出去：一个写坏了、自己抛 `TypeError` 的适配器
         不该被当成"不支持"，那会把一个真 bug 变成一句轻描淡写的提示。
-
-        `self.model` **本身不动**（它还是同一个适配器对象）—— 换的是它内部的端点参数。
-        换对象的话，`Agent` 上所有持有它的东西（重试、审计、统计）都得跟着换一遍，
-        而那条路上漏一个的症状是"界面上写着新模型，请求还发给旧的"。
         """
+        same_route = (not provider or provider == self.model_provider) and (
+            api_key == "" or api_key == getattr(self.model, "_api_key", None)
+        )
         try:
-            self.model.switch_model(name)
+            if same_route:
+                self.model.switch_model(name)
+            else:
+                self.model.install(api_key=api_key, base_url=base_url,
+                                   model=name, provider=provider)
         except NotImplementedError:
             return False
         if self.session_model is not None:
-            self.session_model.select(name)
+            self.session_model.select_route(provider=provider, model=name)
         return True
+
+    def set_reasoning(self, *, thinking: bool | None = None,
+                      effort: str | None = None) -> bool:
+        """改思考开关 / 强度。返回"改了吗"。**和换模型同一条时序：下一次请求生效。**
+
+        两个参数都可以为 None = "不动它" —— 这样 `/thinking` 和 `/effort` 各改一格，
+        而"顺手把另一格也重置了"是那种用户没要求、事后也查不出来的行为。
+
+        记进会话的那一步和 `switch_model` 一样钉在这里（理由见那里）：适配器上改、
+        会话里记，两件事必须在同一处发生。
+        """
+        try:
+            self.model.set_reasoning(
+                thinking=self.thinking if thinking is None else thinking,
+                effort=self.effort if effort is None else effort,
+            )
+        except NotImplementedError:
+            return False
+        if self.session_model is not None:
+            if thinking is not None:
+                self.session_model.select_thinking(thinking)
+            if effort is not None:
+                self.session_model.select_effort(effort)
+        return True
+
+    @property
+    def model_provider(self) -> str:
+        """现在这条路由叫什么（空串 = 适配器不说 / 只有一条内置的）。"""
+        return str(getattr(self.model, "provider", "") or "")
+
+    @property
+    def thinking(self) -> bool:
+        """现在开着思考没有。**以适配器为准**（它才是请求里那个值）。"""
+        return bool(getattr(self.model, "thinking", DEFAULT_THINKING))
+
+    @property
+    def effort(self) -> str:
+        """现在的思考强度。**以适配器为准。**"""
+        return str(getattr(self.model, "effort", DEFAULT_EFFORT) or DEFAULT_EFFORT)
 
     def _emit(self, kind: str, session: Session, run_id: str, step: int, **data: Any) -> None:
         """报告一条审计事件。

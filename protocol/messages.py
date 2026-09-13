@@ -45,7 +45,7 @@ VERSION = 1
 # `_run_turn`）—— 所以"答案"这条老路一直是通的，delta 只是让它更早出现。
 PROTOCOL = 2
 
-# 入站（前端 → runtime）十一种。
+# 入站（前端 → runtime）十三种。
 IN_USER_MESSAGE = "user_message"
 IN_PERMISSION_RESPONSE = "permission_response"
 IN_QUESTION_RESPONSE = "question_response"
@@ -79,6 +79,14 @@ IN_SET_AUTOPILOT = "set_autopilot"
 # 校验（`state/model.py`），而目录是 runtime 的知识。前端拿到什么就发什么的话，
 # "选了一个它没列出来的模型"会一路走到下一次请求才炸。
 IN_SET_MODEL = "set_model"
+# **开关思考模式**（TUI 的 `/thinking`）和**改思考强度**（`/effort`）。
+#
+# 它们和 `set_model` 是同一类东西（"用户改了运行中的某个会话级选择"，runtime 处理完
+# 回一份 state 快照），但**分成了两条消息**而不是给 `set_model` 加参数：三个旋钮
+# 互不影响（关掉思考不清强度、换模型不改开关），而合成一条之后"只改其中一个"就得
+# 靠"没传的那个字段表示不动它"来表达 —— 那是一种每个客户端都要记住的约定。
+IN_SET_THINKING = "set_thinking"
+IN_SET_EFFORT = "set_effort"
 # **请 runtime 回一份状态**（`/status`）。它的答案走 `t:"ui", kind:"status"` —— 
 # 状态是"给界面看的"，和 `ui` 那条通道的性质一致。
 #
@@ -92,7 +100,8 @@ IN_SHUTDOWN = "shutdown"
 
 INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
            IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SET_AUTOPILOT,
-           IN_SET_MODEL, IN_STATUS, IN_TOOLS, IN_SHUTDOWN)
+           IN_SET_MODEL, IN_SET_THINKING, IN_SET_EFFORT, IN_STATUS, IN_TOOLS,
+           IN_SHUTDOWN)
 
 # 出站（runtime → 前端）十一种。**`/status` 和 `/tools` 不在这里** —— 它们复用
 # `t:"ui"` 那条通道（多两种 `kind`），因为它们是"给界面看的东西"，性质和面板快照

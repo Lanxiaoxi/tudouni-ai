@@ -28,6 +28,7 @@ from agent_runtime.runtime.composition import Runtime
 from agent_runtime.security.commands import format_rule
 from agent_runtime.skills import SkillLoader
 from agent_runtime.state import JsonSessionStore, Session
+from agent_runtime.state import reasoning
 from agent_runtime.state import status as status_summary
 from agent_runtime.tools.builtin.todo import progress_line
 
@@ -585,7 +586,19 @@ def _print_status(runtime: Runtime) -> None:
     current = model["current"] or "—"
     if model["selected"] and model["selected"] != model["current"]:
         current += f"（换成 {model['selected']} 的，下一次请求生效）"
+    if model.get("provider"):
+        # 路由名跟在一起：两条路由可以有同名模型，而"它到底在哪跑"决定账单和合规。
+        current += f"  @{model['provider']}"
     print(f"  模型        {current}（{model['base_url']}）", file=sys.stderr)
+
+    # 思考模式那两个旋钮。**关着时不写强度**（写了会让人以为它还生效）。
+    thought = model.get("reasoning") or {}
+    if thought.get("thinking", True):
+        print(f"  思考        开 · {thought.get('effort', '?')}"
+              f"（/thinking 开关、/effort 改强度）", file=sys.stderr)
+    else:
+        print(f"  思考        关（强度 {thought.get('effort', '?')} 记着，"
+              f"/thinking on 回来）", file=sys.stderr)
 
     # 分子是**最近一次请求**（`last_prompt_tokens`），分母是**当前模型**的窗口。
     # 分母为 0/None 时只报用量 —— 错的百分比比没有百分比更坏（和状态栏同一条规矩）。
@@ -650,14 +663,21 @@ def _print_tools(runtime: Runtime) -> None:
 
 
 def _print_models(runtime: Runtime) -> None:
-    """`/model` 不带参数：清单 + 现在用的是哪个。"""
+    """`/model` 不带参数：清单 + 现在用的是哪个。
+
+    名字写成 `provider/model` —— 同名模型可以在多条路由上，而只写模型名的话那两行
+    长得一模一样，可"选了哪一个"决定了请求发到哪个账号上。
+    """
     rows, aliases = runtime.model_rows()
-    print(f"当前模型：{runtime.current_model or '—'}", file=sys.stderr)
-    width = max(len(row["id"]) for row in rows) if rows else 0
-    for row in rows:
+    here = runtime.current_route or "—"
+    print(f"当前模型：{here}", file=sys.stderr)
+    names = [f"{row['provider']}/{row['id']}" if row.get("provider") else row["id"]
+             for row in rows]
+    width = max(len(name) for name in names) if names else 0
+    for row, name in zip(rows, names):
         mark = "●" if row["current"] else " "
         window = f" · 上下文 {row['window']}" if row["window"] else ""
-        print(f"  {mark} {row['id']:<{width}}  {row['summary']}"
+        print(f"  {mark} {name:<{width}}  {row['summary']}"
               f"   （{row['label']}{window}）", file=sys.stderr)
         if row["note"]:
             print(f"      {row['note']}", file=sys.stderr)
@@ -665,7 +685,27 @@ def _print_models(runtime: Runtime) -> None:
         # 旧名字单列：它们是**认下的名字**，不是能选的选项（官方已把对应模型下线，
         # 请求由新模型提供服务）。列进主清单会摆出两个效果一样的选项。
         print(f"  认下的旧名字：{alias['id']} → {alias['of']}", file=sys.stderr)
-    print("换一个：/model <名字>（名字要精确，打错不猜）", file=sys.stderr)
+    print("换一个：/model <名字>（名字要精确；两条路由同名时写 provider/model）",
+          file=sys.stderr)
+
+
+def _print_thinking(runtime: Runtime) -> None:
+    """`/thinking` 不带参数：现在是开还是关（**两个状态都要写出来**）。"""
+    thinking = runtime.agent.thinking
+    effort = runtime.agent.effort
+    print(f"思考模式：{'开' if thinking else '关'}"
+          + (f" · 强度 {effort}" if thinking else f"（强度 {effort} 记着，打开才用得上）"),
+          file=sys.stderr)
+    print("改：/thinking on   ·   /thinking off", file=sys.stderr)
+
+
+def _print_effort(runtime: Runtime) -> None:
+    """`/effort` 不带参数：现在是哪一档、有哪几档。"""
+    print(f"思考强度：{runtime.agent.effort}"
+          + ("" if runtime.agent.thinking else "（思考关着，打开才用得上）"),
+          file=sys.stderr)
+    print(f"可选：{'、'.join(reasoning.EFFORT_LEVELS)}", file=sys.stderr)
+    print(f"改：/effort {'  ·  /effort '.join(reasoning.EFFORT_LEVELS)}", file=sys.stderr)
 
 
 def _handle_slash_command(runtime: Runtime, line: str) -> bool:
@@ -701,9 +741,40 @@ def _handle_slash_command(runtime: Runtime, line: str) -> bool:
                 _print_models(runtime)
         else:
             _print_models(runtime)
+    elif command == "/thinking":
+        if rest:
+            # 认哪些写法（on/off/开/关/true/false…）由 `state/reasoning.py` 说了算 ——
+            # 这一支只管把字符串发过去、把回包原样打出来。少一处会漂的知识。
+            if not _apply_thinking(runtime, rest):
+                _print_thinking(runtime)
+        else:
+            _print_thinking(runtime)
+    elif command == "/effort":
+        if rest:
+            ok, message = runtime.select_effort(rest)
+            print(("[思考] " if ok else "[思考] 没改：") + message, file=sys.stderr)
+            if not ok:
+                _print_effort(runtime)
+        else:
+            _print_effort(runtime)
     else:
         return False
     return True
+
+
+def _apply_thinking(runtime: Runtime, text: str) -> bool:
+    """`/thinking <写法>`：把它折算成 on/off 再改。认不出来返回 False。
+
+    折算走 `reasoning.resolve_thinking`（它认 on/off/开/关/true/false 这些**给人写的**
+    词）—— 一个只认 `true` 的命令在中文界面里是荒谬的，而那张词表只该有一份。
+    """
+    on = reasoning.resolve_thinking(text)
+    if on is None:
+        print(f"[思考] 认不出这个写法：{text}", file=sys.stderr)
+        return False
+    ok, message = runtime.select_thinking(on)
+    print(("[思考] " if ok else "[思考] 没改：") + message, file=sys.stderr)
+    return ok
 
 
 def run_repl(runtime: Runtime) -> None:
@@ -722,8 +793,9 @@ def run_repl(runtime: Runtime) -> None:
     sink, context_tokens = runtime.logs, runtime.context_tokens
 
     print("输入内容回车发送。空行、exit、quit 或 Ctrl+C 退出。", file=sys.stderr)
-    print("（/status 看状态、/tools 看工具与权限、/model 换模型；"
-          "其他 / 开头的行会原样发给模型）", file=sys.stderr)
+    print("（/status 看状态、/tools 看工具与权限、/model 换模型、"
+          "/thinking 开关思考、/effort 改强度；其他 / 开头的行会原样发给模型）",
+          file=sys.stderr)
     print(file=sys.stderr)
     while True:
         try:

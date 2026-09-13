@@ -5,6 +5,10 @@
 # 但模板要提交 —— 它是给人看的那一份，里面没有真密钥。
 # 注意顺序：gitignore 后出现的 ! 才能把上面已经排除的文件重新包含进来。
 !.env.example
+# 模型路由配置：**真的那一份不进仓库**（它里面有 base_url、也可能有密钥），模板照旧。
+# 找文件的顺序见 state/catalog.py（工作区这份 → 用户级 ~/.tudouni/models.json → 内置）。
+models.local.json
+!models.example.json
 *.token
 .ericai_debug_token.txt
 

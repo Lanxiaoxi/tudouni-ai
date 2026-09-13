@@ -55,13 +55,40 @@ class ChatModel(ABC):
 
         它不是抽象方法 —— 因为"能不能中途换模型"是**适配器自己的性质**：一个把模型名
         烘进请求路径、或者一次构造就绑死了模型名的实现做不到，而那种实现照样是一个
-        合法的 `ChatModel`。所以默认实现是抛，调用方（`Agent.switch_model`）先
-        `getattr` 探一下，探不到就如实报"这个适配器不支持换模型"，而不是把沉默的失败
-        记成成功。
+        合法的 `ChatModel`。所以默认实现是抛，调用方（`Agent.switch_model`）会把它翻成
+        "这个适配器不支持"，而不是把沉默的失败记成成功。
 
         契约只有一条：**换完之后发出的下一个请求用新名字，已经发出去的那一个不受影响。**
         （`complete()` 每次调用时现读，所以这一点对同步实现是自然成立的。）
         """
         raise NotImplementedError(
             f"{type(self).__name__} 不支持运行中换模型"
+        )
+
+    def install(self, *, api_key: str, base_url: str, model: str,
+                provider: str = "") -> None:
+        """**可选能力**：换到另一条路由（连带密钥、端点、模型名）。
+
+        和 `switch_model` 分开是因为它们的代价不同：那个只改一个请求字段，而这个要换
+        凭据与端点 —— 对大多数实现意味着**重造客户端**。一个不支持换模型名的适配器
+        自然也不支持这个，所以默认实现同样抛。
+
+        契约多一条：**旧客户端要收掉**（如果这个实现持有连接池）。换路由之后不会再用它，
+        而留着它就是一个活到进程退出的 socket 池。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 不支持换到另一条路由"
+        )
+
+    def set_reasoning(self, *, thinking: bool, effort: str) -> None:
+        """**可选能力**：改思考开关与强度（`/thinking` `/effort`）。
+
+        两个值一起传（而不是分成两个方法）：它们在请求里是同一次调用的两个参数，
+        而分开改会让"改到一半"的中间状态有机会被发出去。
+
+        契约和 `switch_model` 一样：**下一个请求生效，正在返回的那个不受影响。**
+        实现可以把它们先记下来、每次调用时现读 —— 这是最简单也最不容易漂的做法。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 不支持改思考模式"
         )

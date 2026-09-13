@@ -237,18 +237,23 @@ class _FakeCompletions:
         return stream
 
 
-def _model_with(completions: _FakeCompletions):
+def _model_with(completions: _FakeCompletions, **options: Any):
     """一个真的 `OpenAICompatibleModel`，只把 completions 换成假的。
 
     不 monkeypatch 整个 client：`__init__` 里那句 `max_retries=0` 和 base_url
     都是被测行为的一部分（降级记忆的键就是 base_url）。
+
+    **替的是 `_client`，不是 `client`**：客户端是懒造的（`_ensure_client()`），
+    而那句"没有就去造一个真的"意味着给 `client` 赋值已经不管用了 —— 那种错误的表现
+    是测试真的去连 `http://fake.local`（实测：整片用例报 502）。
     """
     from agent_runtime.models.openai_compatible import OpenAICompatibleModel
 
     model = OpenAICompatibleModel(
         api_key="sk-test", base_url="http://fake.local/v1", model="fake-model",
+        **options,
     )
-    model.client = SimpleNamespace(
+    model._client = SimpleNamespace(  # noqa: SLF001 - 测试替身，见上
         chat=SimpleNamespace(completions=completions),
         close=lambda: None,
     )

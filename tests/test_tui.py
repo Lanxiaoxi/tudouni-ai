@@ -1109,20 +1109,20 @@ async def test_the_selected_option_is_marked_and_reversed(monkeypatch):
 
 
 def test_the_command_palette_filters_by_prefix_only():
-    """**只按前缀匹配**：命令一共十一条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
+    """**只按前缀匹配**：命令一共十四条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
     assert [c.name for c in view_state.filter_commands("/")] == \
         [c.name for c in view_state.COMMANDS]
     assert [c.name for c in view_state.filter_commands("/re")] == ["/resume"]
     assert view_state.filter_commands("/zz") == []
     # 带了参数就选不出东西 —— 于是回车走的是"整行命令"那条路（`/resume abc`）。
     assert view_state.filter_commands("/resume abc") == []
-    # 设计稿 F2 那五条还在原位，新增的六条排在末尾。
+    # 设计稿 F2 那五条还在原位，新增的八条排在末尾。
     names = [c.name for c in view_state.COMMANDS]
     assert names[:5] == ["/new", "/resume", "/audit", "/exit", "/help"]
     assert "/theme" in names and "/skills" in names
-    # 三条状态类命令（`/status` `/tools` `/model`）在末尾，而且**都在面板里** ——
-    # 一个"打得出来但面板里看不见"的命令，等于把发现它的成本推给记忆。
-    assert names[-3:] == ["/status", "/tools", "/model"]
+    # 五条"看/改当前设置"的命令在末尾，而且**都在面板里** —— 一个"打得出来但面板里
+    # 看不见"的命令，等于把发现它的成本推给记忆。
+    assert names[-5:] == ["/status", "/tools", "/model", "/thinking", "/effort"]
     # **`/list` 在第二期被去掉了**：它和"`/resume` 不带参数"是同一个出口，而两条
     # 命令指向同一件事时，人要先猜哪一条才对。这条断言钉的就是"别再把它加回来"。
     assert "/list" not in names
@@ -1136,7 +1136,8 @@ def test_commands_with_arguments_explain_them_in_help_not_in_the_palette():
     测试钉的是"两者都写上了，别只写一半"。
     """
     with_args = [c for c in view_state.COMMANDS if c.takes_arg]
-    assert {c.name for c in with_args} == {"/resume", "/theme", "/model"}
+    assert {c.name for c in with_args} == {
+        "/resume", "/theme", "/model", "/thinking", "/effort"}
     assert all(c.detail for c in with_args), "带参数的命令要在 /help 里说清怎么用"
     # 不带参数的那些没有 detail —— 空字符串不会被 `_help_lines` 渲染成空行。
     assert all(not c.detail for c in view_state.COMMANDS if not c.takes_arg)
@@ -1223,6 +1224,14 @@ class FakeClient:
     def set_model(self, model: str) -> None:
         # 和 `set_autopilot` 同一条规矩：发的是**名字**，认不认识由 runtime 判。
         self.sent.append({"t": "set_model", "model": model})
+
+    def set_thinking(self, on: bool) -> None:
+        # 协议上那一格是**布尔**（不是"on"/"off"两个字）—— 替身照协议发，
+        # 所以"界面发错了类型"这件事在测试里就会现形。
+        self.sent.append({"t": "set_thinking", "on": on})
+
+    def set_effort(self, effort: str) -> None:
+        self.sent.append({"t": "set_effort", "effort": effort})
 
     def ask_status(self) -> None:
         self.sent.append({"t": "status"})

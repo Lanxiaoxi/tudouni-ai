@@ -76,6 +76,42 @@
     },
     "required": ["v", "t", "model"]
   },
+  "set_thinking": {
+    "summary": "**开关思考模式**（TUI 的 `/thinking`）。默认是开（端点的默认行为就是开）。关掉之后模型不再先想一段：答案更快、更便宜，而在需要推理的活上更差。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "set_thinking"},
+      "on": {
+        "type": "boolean",
+        "doc": [
+          "true = 开，false = 关。**它是绝对状态，不是开关动作**（和 set_autopilot 同一条：",
+          "重发同一条幂等，界面不必先知道现在是什么）。**只认真正的 true** —— 猜错的",
+          "两个方向代价不对称（该开没开只是维持现状，不该开却开了是答案质量悄悄变差）。",
+          "**它是布尔，不是 \"on\"/\"off\" 两个字**：认哪些词算开是前端的事（CLI 那边折算",
+          "成这里的布尔），协议上只有这一个形状。",
+          "**它不动强度**：`/effort` 设过的那个记着，再打开时还是它。"
+        ]
+      }
+    },
+    "required": ["v", "t", "on"]
+  },
+  "set_effort": {
+    "summary": "**改思考强度**（TUI 的 `/effort`）。想得越久越贵、通常也越准。",
+    "fields": {
+      "v": {"type": "integer", "const": 1},
+      "t": {"type": "string", "const": "set_effort"},
+      "effort": {
+        "type": "string",
+        "doc": [
+          "强度。**runtime 只认 `low` / `high` / `max`**（端点还接受 minimal/medium/",
+          "xhigh/ultra，但它们折算之后分别是这三档，所以不列出来）；认不出来的回一条",
+          "`notice`，什么都不改。`none` 不在里面 —— 那是关掉思考，走 set_thinking。",
+          "思考关着时**照样接受**（记下来，等下次打开用）—— 不逼用户记住先开才能设。"
+        ]
+      }
+    },
+    "required": ["v", "t", "effort"]
+  },
   "status": {
     "summary": "请 runtime 回一份当前状态（出站的 `ui` / `kind=status`）。TUI 的 `/status`、CLI 的 `/status` 用它。",
     "fields": {

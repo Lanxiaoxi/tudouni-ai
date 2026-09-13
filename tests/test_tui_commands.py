@@ -11,6 +11,10 @@
 
 渲染函数是纯函数，所以第一层直接调它们；第二层用 `app.submit(...)` + 喂回包，
 测的是"命令发对了没有、回包画出来了没有"。
+
+**外观（每行长什么样、颜色对不对）不在这份测试的范围里**：项目规范说 UI 改动只测
+逻辑正确性，观感交给用户。所以这里断言的都是"哪个值出现在了哪一行""有没有按策略
+分色"这类**能被判定对错**的东西，不做逐字排版断言。
 """
 
 import pytest
@@ -25,9 +29,10 @@ STATUS = {
         "session": {"id": "20260911-165811", "resumed": True,
                     "workspace": r"C:\Users\me\repo\agent_runtime",
                     "messages": 12, "steps": 7},
-        "model": {"current": "deepseek-flash", "selected": "deepseek-flash",
-                  "last_used": "deepseek-flash", "window": 1_000_000,
-                  "base_url": "https://api.deepseek.com"},
+        "model": {"provider": "deepseek", "current": "deepseek-flash",
+                  "selected": "deepseek-flash", "last_used": "deepseek-flash",
+                  "window": 1_000_000, "base_url": "https://api.deepseek.com",
+                  "reasoning": {"thinking": True, "effort": "high"}},
         "counters": {"runs": 3, "model_calls": 9, "model_ok": 9, "tool_calls": 14,
                      "permission_waits": 2, "asks": 1},
         "usage": {"prompt": 203_500, "cached": 179_200, "miss": 24_300,
@@ -65,6 +70,48 @@ def test_the_status_screen_reports_every_number_with_its_own_unit():
     # 这次运行的环境 + 去处。
     assert "最多 80 步" in text and "流式" in text and "逐条审批" in text
     assert "14 个" in text and "x.jsonl" in text
+
+
+def test_the_status_screen_says_which_provider_and_thinking_settings():
+    """`/status` 要回答"它在用什么、想得多用力"。
+
+    provider 单独写出来是因为这一版能接多个网关（`/model` 会在它们之间选），而
+    "deepseek-flash" 这个名字在两条路由上都可能出现 —— 只看模型名说不出请求发到哪儿。
+    """
+    text = "\n".join(str(line) for line in
+                     view_state.render_status(view_state.ViewState(), STATUS))
+    assert "@deepseek" in text, "路由名要跟着模型名一起显示"
+    assert "思考" in text and "开" in text and "high" in text
+    # **官方端点不单独占一行**（它是绝大多数会话的样子），自建网关才写出来。
+    assert "api.deepseek.com" not in text
+
+    other = {"status": {**STATUS["status"],
+                        "model": {**STATUS["status"]["model"],
+                                  "provider": "acme",
+                                  "base_url": "https://gateway.example.com/v1"}},
+             "last_prompt_tokens": 10, "context_tokens": 1_000_000}
+    text = "\n".join(str(line) for line in
+                     view_state.render_status(view_state.ViewState(), other))
+    assert "@acme" in text and "https://gateway.example.com/v1" in text
+
+
+def test_a_disabled_thinking_setting_does_not_print_an_effort():
+    """关掉思考时**不写强度**：`关 · high` 会让人以为 high 还在生效。
+
+    强度并没有被丢掉（`/thinking on` 之后还是原来那个），只是这一行不该撒谎 ——
+    但它得说清"记着"，否则用户会以为刚才那个 max 没了。
+    """
+    message = {"status": {**STATUS["status"],
+                          "model": {**STATUS["status"]["model"],
+                                    "reasoning": {"thinking": False, "effort": "max"}}},
+               "last_prompt_tokens": 100,
+               "context_tokens": 1_000_000}
+    line = next(str(item) for item in
+                view_state.render_status(view_state.ViewState(), message)
+                if "思考" in str(item))
+    assert "关" in line
+    assert "max" not in line
+    assert "记着" in line
 
 
 def test_the_status_screen_shows_a_pending_model_change():
@@ -147,26 +194,48 @@ def test_the_tools_screen_says_so_when_nothing_is_registered():
 
 
 def test_the_model_list_marks_the_current_one_and_lists_aliases_separately():
-    """目录里标出当前那个；**旧名字不算可选项**，单独列。"""
+    """清单里标出当前那个；**旧名字不算可选项**，单独列。
+
+    名字写成 `provider/model`：同名模型可以在多条路由上，而只写模型名的话那两行长得
+    一模一样 —— 可"选了哪一个"决定了请求发到哪个账号上。
+    """
     state = view_state.ViewState(
-        model="deepseek-flash",
+        model="deepseek-flash", provider="deepseek",
         model_catalog=[
-            {"id": "deepseek-flash", "label": "Flash", "window": 1_000_000,
-             "summary": "快、便宜", "note": "细节 A", "current": True},
-            {"id": "deepseek-v4-pro", "label": "Pro", "window": 1_000_000,
-             "summary": "贵得多", "note": "细节 B", "current": False},
+            {"provider": "deepseek", "id": "deepseek-flash", "label": "Flash",
+             "window": 1_000_000, "summary": "快、便宜", "note": "细节 A",
+             "current": True},
+            {"provider": "deepseek", "id": "deepseek-v4-pro", "label": "Pro",
+             "window": 1_000_000, "summary": "贵得多", "note": "细节 B",
+             "current": False},
         ],
         model_aliases=[{"id": "deepseek-v4-flash", "of": "deepseek-flash"}],
     )
     text = "\n".join(str(line) for line in view_state.render_models(state))
-    assert "当前模型：deepseek-flash" in text
-    assert "● deepseek-flash" in text
-    assert "  deepseek-v4-pro" in text          # 前面没有 ●
+    assert "当前模型：deepseek/deepseek-flash" in text
+    assert "● deepseek/deepseek-flash" in text
+    assert "  deepseek/deepseek-v4-pro" in text          # 前面没有 ●
     assert "细节 A" in text and "细节 B" in text
     assert "认下的旧名字：deepseek-v4-flash → deepseek-flash" in text
 
 
-# --- 第二层：命令与回包（真的 App）----------------------------------------------
+def test_the_model_list_groups_by_provider():
+    """两条路由都有同一个模型名时，清单要**分得开**（名字一样不等于去处一样）。"""
+    state = view_state.ViewState(
+        model="deepseek-flash", provider="deepseek",
+        model_catalog=[
+            {"provider": "deepseek", "id": "deepseek-flash", "label": "Flash",
+             "window": 1_000_000, "summary": "官方", "note": "", "current": True},
+            {"provider": "acme", "id": "deepseek-flash", "label": "Flash",
+             "window": 1_000_000, "summary": "网关", "note": "", "current": False},
+        ],
+        model_aliases=[],
+    )
+    lines = [str(line) for line in view_state.render_models(state)]
+    text = "\n".join(lines)
+    assert "deepseek/deepseek-flash" in text and "acme/deepseek-flash" in text
+    assert "官方" in text and "网关" in text
+
 
 @pytest.mark.anyio
 async def test_status_and_tools_ask_the_runtime_instead_of_reading_files(monkeypatch):
@@ -245,12 +314,12 @@ async def test_model_without_arguments_lists_and_with_an_argument_asks_the_runti
             "context_tokens": 1_000_000, "tools": [], "permissions": {},
             "audit_path": "C:/w/.tudouni/logs/s.jsonl", "notices": [],
             "model_catalog": {
-                "models": [{"id": "deepseek-flash", "label": "Flash",
-                            "window": 1_000_000, "summary": "快、便宜",
-                            "note": "", "current": True},
-                           {"id": "deepseek-v4-pro", "label": "Pro",
-                            "window": 1_000_000, "summary": "贵得多",
-                            "note": "", "current": False}],
+                "models": [{"provider": "deepseek", "id": "deepseek-flash",
+                            "label": "Flash", "window": 1_000_000,
+                            "summary": "快、便宜", "note": "", "current": True},
+                           {"provider": "deepseek", "id": "deepseek-v4-pro",
+                            "label": "Pro", "window": 1_000_000,
+                            "summary": "贵得多", "note": "", "current": False}],
                 "aliases": [],
             },
         }))
@@ -308,7 +377,8 @@ async def test_the_model_catalog_survives_a_session_switch(monkeypatch):
             "v": 1, "t": "init", "session_id": "s1", "resumed": False,
             "model": "deepseek-flash", "workspace": "C:/w", "max_steps": 80,
             "tools": [], "permissions": {}, "notices": [],
-            "model_catalog": {"models": [{"id": "deepseek-flash", "label": "F",
+            "model_catalog": {"models": [{"provider": "deepseek",
+                                          "id": "deepseek-flash", "label": "F",
                                           "window": 1, "summary": "", "note": "",
                                           "current": True}],
                               "aliases": []},
@@ -320,10 +390,105 @@ async def test_the_model_catalog_survives_a_session_switch(monkeypatch):
             "v": 1, "t": "init", "session_id": "s2", "resumed": False,
             "model": "deepseek-flash", "workspace": "C:/w", "max_steps": 80,
             "tools": [], "permissions": {}, "notices": [],
-            "model_catalog": {"models": [{"id": "deepseek-flash", "label": "F",
+            "model_catalog": {"models": [{"provider": "deepseek",
+                                          "id": "deepseek-flash", "label": "F",
                                           "window": 1, "summary": "", "note": "",
                                           "current": True}],
                               "aliases": []},
         }))
         await _settle(app, pilot)
         assert app.state.model_catalog, "换会话之后目录还在"
+
+
+# --- `/thinking` `/effort`（第二版加的）----------------------------------------
+
+@pytest.mark.anyio
+async def test_thinking_and_effort_send_requests_and_render_replies(monkeypatch):
+    """两条命令都**不进** `/model` 那一条：它们是自己的会话级设置。
+
+    `/thinking` 不带参数只报当前值（不做"切一下"）：和 `/theme` `/model` 同一条交互
+    规矩 —— 轮换把"现在是什么"变成一个必须靠记忆的状态。
+
+    **发出去的是布尔，不是 "off" 两个字**：认哪些词算开是前端的事，而协议上那一格
+    只有一个形状。写错了在替身那里就会现形（它照协议记账）。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app.submit("/thinking")
+        await _settle(app, pilot)
+        assert app._client.sent == [], "不带参数只报当前值"
+
+        app.submit("/thinking off")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_thinking", "on": False}
+
+        app.submit("/effort max")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_effort", "effort": "max"}
+
+
+@pytest.mark.anyio
+async def test_a_bad_thinking_word_is_refused_without_guessing(monkeypatch):
+    """认不出的写法**不发请求也不猜** —— 猜错的方向是"用户以为关掉了、其实还开着"。"""
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app.submit("/thinking maybe")
+        await _settle(app, pilot)
+        assert app._client.sent == []
+        assert "认不出" in _log_text(app)
+
+
+@pytest.mark.anyio
+async def test_the_effort_menu_comes_from_the_runtime_not_the_frontend(monkeypatch):
+    """档位清单**随协议来**（`init.effort_levels`），前端不写死也不 import 内核。
+
+    这条钉的是决策 18：前端只讲协议。写死一份清单的代价是具体的 —— 端点加一档就得改
+    两个地方，而漏改的那一处只表现为"这一档选不了"。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "init", "session_id": "s", "resumed": True,
+            "model": "deepseek-flash", "provider": "deepseek",
+            "workspace": "C:/w", "max_steps": 80, "tools": [], "permissions": {},
+            "audit_path": "x", "notices": [],
+            "thinking": False, "effort": "low",
+            "effort_levels": ["low", "high", "max"],
+        }))
+        await _settle(app, pilot)
+        assert app.state.effort_levels == ("low", "high", "max")
+        assert app.state.thinking_on is False and app.state.effort == "low"
+
+        app.submit("/effort")
+        await _settle(app, pilot)
+        text = _log_text(app)
+        assert "low" in text and "high" in text and "max" in text
+        assert app._client.sent == [], "不带参数只列档位"
+
+
+@pytest.mark.anyio
+async def test_a_state_snapshot_carries_the_live_thinking_settings(monkeypatch):
+    """开关和强度**只能由 runtime 的快照改**（界面不许乐观更新）。
+
+    "灯亮着、其实没开"在这两格上的代价和 autopilot 一样：它们决定下一次请求花多少钱、
+    想多久，而用户按下的那一刻看到的必须是真的。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "ui", "kind": "state",
+            "thinking": False, "effort": "low",
+        }))
+        await _settle(app, pilot)
+        assert app.state.thinking_on is False
+        assert app.state.effort == "low"
+
+        # 老 runtime 的快照没有这两个键 → 保住已有的那份（不是猜成"开"）。
+        app._inbox.put(("message", {"v": 1, "t": "ui", "kind": "state",
+                                    "messages": 1}))
+        await _settle(app, pilot)
+        assert app.state.thinking_on is False and app.state.effort == "low"

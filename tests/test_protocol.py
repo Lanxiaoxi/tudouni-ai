@@ -38,7 +38,7 @@ import pytest
 
 from agent_runtime.protocol import messages
 from agent_runtime.runtime.config import CONTEXT_WINDOWS
-from agent_runtime.state.model import ALIASES, MODEL_CATALOG
+from agent_runtime.state.catalog import ALIASES, load as load_catalog
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 REPO_ROOT = MAIN_PY.parent
@@ -669,6 +669,10 @@ def test_a_new_turn_clears_a_previous_interrupt():
             seen["should_stop"] = server.should_stop()
             return "跑完了"
 
+        # `_state_message` 会读这两个（思考那两个旋钮和模型一起进快照）。
+        thinking = True
+        effort = "high"
+
     class _Logs:
         directory = "."
 
@@ -677,9 +681,11 @@ def test_a_new_turn_clears_a_previous_interrupt():
         agent = _Agent()
         logs = _Logs()
         max_steps = 1
-        # `_state_message` 会读这两个（`/model` 换完模型之后那个百分比的分母跟着变）。
-        # 替身给的是"这个替身没有模型"：`current_model` 为空串，窗口也就无从谈起。
+        # `_state_message` 会读这几个（`/model` 换完模型之后那个百分比的分母跟着变，
+        # 而思考那两个旋钮也和模型一起进快照）。替身给的是"这个替身没有模型"：
+        # `current_model` 为空串，窗口也就无从谈起。
         current_model = ""
+        current_provider = ""
         context_tokens = None
 
         def ui_state(self, *, with_catalog=False):
@@ -1487,10 +1493,12 @@ def test_init_carries_the_model_catalog(fake_openai):
     catalog = kinds(parse(lines), "init")[0]["model_catalog"]
 
     ids = [item["id"] for item in catalog["models"]]
-    assert ids == [item.id for item in MODEL_CATALOG]
+    assert ids == [item.id for item in load_catalog().models()]
     # `current` 由 runtime 标好（它要对账别名折算），界面不自己比字符串。
     current = [item for item in catalog["models"] if item["current"]]
     assert len(current) == 1 and current[0]["id"] == "deepseek-flash"
+    # **每一条都带 provider**：同名模型可以在多条路由上，而"请求发到哪儿"是另一件事。
+    assert all(item["provider"] for item in catalog["models"])
     # 旧名字**单列**，不混在可选项里。
     assert {item["id"] for item in catalog["aliases"]} == set(ALIASES)
     assert all(item["of"] in ids for item in catalog["aliases"])

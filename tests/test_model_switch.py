@@ -1,77 +1,45 @@
-"""`/model` 与模型目录：**一个名字只有一处事实**。
+"""`/model`（含跨路由）与思考设置：**会话级选择怎么存、什么时候生效**。
 
 这一组测试盯的是三件事，它们的共同点是"错了也不会报错，只会静默地按另一个模型跑"：
 
-  1. 目录（`state/model.py`）和 `CONTEXT_WINDOWS`（`runtime/config.py`）不能各写一份；
-  2. 会话级选择要跟着 `session.metadata` 走 —— 恢复会话之后还是你选的那个；
-  3. 换模型**不在本轮生效**，而是在下一轮开头留一句话。
+  1. 会话级选择要跟着 `session.metadata` 走 —— 恢复会话之后还是你选的那个；
+  2. 换模型**不在本轮生效**，而是在下一轮开头留一句话；
+  3. 换**路由**（不只换模型名）时请求真的发到另一台上 —— 这是多 provider 的全部意义。
+
+目录本身（`state/catalog.py`）和思考那个 domain（`state/reasoning.py`）在
+`tests/test_catalog.py` 里测。
 """
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
-from agent_runtime.runtime.config import CONTEXT_WINDOWS, DEFAULT_MODEL
+from agent_runtime.runtime.config import (
+    CONTEXT_WINDOWS,
+    McpConfig,
+    ModelConfig,
+    PermissionConfig,
+    WebConfig,
+)
+from agent_runtime.state import catalog
 from agent_runtime.state import model as model_state
+from agent_runtime.state import reasoning
 from agent_runtime.state.session import Session
-
-
-# --- 目录与窗口表 ---------------------------------------------------------------
-
-def test_the_window_table_is_derived_from_the_catalog():
-    """`CONTEXT_WINDOWS` 和目录**必须同源**。
-
-    它们各写一份的后果是静默的：往目录里加一个模型（`/model` 立刻列出它），而窗口表
-    没跟上，于是"选了它之后状态栏不报占比" —— 两处都不会报错，只是那个百分比消失了。
-    """
-    for item in model_state.MODEL_CATALOG:
-        assert CONTEXT_WINDOWS[item.id] == item.window
-    assert CONTEXT_WINDOWS[DEFAULT_MODEL] == model_state.get(DEFAULT_MODEL).window
-
-
-def test_legacy_names_are_recognised_but_not_offered():
-    """旧模型名**认，但不列进 `/model` 的清单**。
-
-    官方明确说过那两个旧名字对应的模型已下线、请求由 V4.1-Flash 提供服务。所以：
-      * 认它们 —— `DEEPSEEK_MODEL` 里可能就写着它们，而"昨天配的名字今天不能用"
-        是我们不该制造的意外；
-      * 不列它们 —— 摆出两个效果一样、价钱也一样的选项，是在骗选的人。
-    """
-    ids = {item.id for item in model_state.MODEL_CATALOG}
-    for alias in model_state.ALIASES:
-        assert alias not in ids
-        # 认得出来，而且折算到一个真正的目录项上。
-        assert model_state.get(alias) is not None
-        assert model_state.get(alias).id in ids
-        # 窗口照旧报得出来（否则旧名字的会话会突然没有分母）。
-        assert CONTEXT_WINDOWS[alias] == model_state.get(alias).window
-
-
-def test_an_unknown_model_name_has_no_window():
-    """认不出来的名字**不给窗口**（返回 None，而不是猜一个）。
-
-    这个项目可以指向自建网关（`DEEPSEEK_BASE_URL`），所以"不认识"是正常状态。
-    错的百分比比没有百分比更坏 —— 它会被当成真的。
-    """
-    assert model_state.get("gpt-9") is None
-    assert model_state.context_window("gpt-9") is None
-
-
-def test_the_catalog_rows_are_plain_data():
-    """`catalog_rows()` 的结果要能直接进 JSON（协议里发它）。"""
-    rows = model_state.catalog_rows()
-    assert rows and all(set(row) == {"id", "label", "window", "summary", "note"}
-                        for row in rows)
-    json.dumps(rows, ensure_ascii=False)
 
 
 # --- 会话级选择 -----------------------------------------------------------------
 
 def test_a_session_without_a_selection_falls_back_to_the_configured_model():
-    holder = model_state.SessionModel.restore({}, fallback="deepseek-flash")
+    holder = model_state.SessionModel.restore(
+        {}, fallback="deepseek-flash", fallback_provider="deepseek")
     assert holder.selected == "deepseek-flash"
+    assert holder.selected_provider == "deepseek"
     assert holder.last_used == ""
     assert holder.selection is None
+    # 没有会话级选择时，思考那两个旋钮用 domain 的默认值（**开 + high**）。
+    assert holder.thinking is True
+    assert holder.effort == reasoning.DEFAULT_EFFORT
 
 
 def test_selecting_writes_into_metadata_and_survives_a_roundtrip(workdir):
@@ -89,7 +57,7 @@ def test_selecting_writes_into_metadata_and_survives_a_roundtrip(workdir):
 
     session = Session.new("s1", workspace=None)
     holder = model_state.SessionModel.restore(session.metadata, fallback="deepseek-flash")
-    holder.select("deepseek-v4-pro", now=1234.0)
+    holder.select_route(provider="deepseek", model="deepseek-v4-pro", now=1234.0)
 
     store = JsonSessionStore(workdir)
     store.save(session)
@@ -97,6 +65,7 @@ def test_selecting_writes_into_metadata_and_survives_a_roundtrip(workdir):
 
     restored = model_state.SessionModel.restore(back.metadata, fallback="deepseek-flash")
     assert restored.selected == "deepseek-v4-pro"
+    assert restored.selected_provider == "deepseek"
     assert restored.selected_since == 1234.0
     # 只是"想用"，还没用过 —— `/status` 要分得开这两件事。
     assert restored.last_used == ""
@@ -119,17 +88,30 @@ def test_a_broken_selection_block_is_ignored_not_fatal():
     assert holder.selected_since == 0.0
 
 
+def test_an_old_selection_block_gets_the_default_thinking_settings():
+    """**老会话文件里没有 `thinking` / `effort`** —— 缺字段是"用默认"，不是"关掉"。
+
+    读成 `thinking=False` 会让每一个旧会话在恢复之后突然不再思考，而那种变化在界面上
+    完全看不出来（只是答案变差了、变便宜了）。
+    """
+    holder = model_state.SessionModel.restore(
+        {"model_selection": {"model": "deepseek-v4-pro"}}, fallback="deepseek-flash")
+    assert holder.thinking is True
+    assert holder.effort == reasoning.DEFAULT_EFFORT
+
+
 def test_changing_back_before_any_answer_needs_no_notice():
     """换了又换回来：**不留那句话** —— 中间那次没产生任何回答，说"换过"是假的。
 
-    判据是 `selected != last_used`（而不是"刚刚调过 /model"），所以这件事自然成立。
+    判据是"选中的 ≠ 上一轮用过的"（而不是"刚刚调过 /model"），所以这件事自然成立。
     """
-    holder = model_state.SessionModel.restore({}, fallback="deepseek-flash")
+    holder = model_state.SessionModel.restore(
+        {}, fallback="deepseek-flash", fallback_provider="deepseek")
     assert holder.notice_needed() is False       # 全新会话：没有"换"这回事
     holder.record_use()                          # 第一轮跑过（用的就是它）
-    holder.select("deepseek-v4-pro")
+    holder.select_route(provider="deepseek", model="deepseek-v4-pro")
     assert holder.notice_needed() is True
-    holder.select("deepseek-flash")
+    holder.select_route(provider="deepseek", model="deepseek-flash")
     assert holder.notice_needed() is False
 
 
@@ -140,18 +122,42 @@ def test_a_brand_new_session_never_announces_a_model_change():
     （"从 deepseek-flash 换成 deepseek-flash"），而它读起来像系统提示词的一部分 ——
     一个每个会话都出现、又从不携带信息的东西，只会在真正需要它的那一次被忽略掉。
     """
-    holder = model_state.SessionModel.restore({}, fallback="deepseek-flash")
+    holder = model_state.SessionModel.restore(
+        {}, fallback="deepseek-flash", fallback_provider="deepseek")
     assert holder.notice_needed() is False
     holder.record_use()
     assert holder.notice_needed() is False
+
+
+def test_thinking_settings_do_not_count_as_a_model_change():
+    """**改思考设置不算"换了模型"** —— 不改 route 就不该往历史里插那句话。
+
+    插了的话，那句话说的是"上面那些轮次由 A 生成" —— 而 A 还是 A，那是假话。
+    """
+    holder = model_state.SessionModel.restore(
+        {}, fallback="deepseek-flash", fallback_provider="deepseek")
+    holder.record_use()
+    holder.select_thinking(False)
+    holder.select_effort("max")
+    assert holder.notice_needed() is False
+    assert holder.thinking is False and holder.effort == "max"
 
 
 def test_record_use_clears_the_pending_notice():
-    holder = model_state.SessionModel.restore({}, fallback="deepseek-flash")
-    holder.select("deepseek-v4-pro")
+    holder = model_state.SessionModel.restore(
+        {}, fallback="deepseek-flash", fallback_provider="deepseek")
+    holder.select_route(provider="deepseek", model="deepseek-v4-pro")
     holder.record_use()
-    assert holder.last_used == "deepseek-v4-pro"
+    assert holder.last_used == "deepseek/deepseek-v4-pro"
     assert holder.notice_needed() is False
+
+
+def test_the_route_name_carries_the_provider():
+    """这句话里的名字是 `provider/model` —— 两条路由有同名模型时，光写模型名分不出
+    "上面那些轮次是在哪跑的"。"""
+    holder = model_state.SessionModel.restore(
+        {}, fallback="deepseek-flash", fallback_provider="deepseek")
+    assert holder.route_name() == "deepseek/deepseek-flash"
 
 
 def test_the_notice_says_both_names():
@@ -184,20 +190,36 @@ def _session_with_model(model: str = "deepseek-flash") -> Session:
 
 
 class _FakeAdapter:
-    """最小适配器：认识 `model` / `switch_model`，并且记下每一次请求的模型名。"""
+    """最小适配器：认识 `model` / `switch_model` / `install`，并记下每次请求的路线。
 
-    def __init__(self, model: str = "deepseek-flash") -> None:
+    **它同时记 provider**（`install` 收到什么就记什么）：跨路由换模型是这个版本的核心
+    行为，而"换了但还发到老地址"只有把两样都记下来才验得出来。
+    """
+
+    def __init__(self, model: str = "deepseek-flash", provider: str = "deepseek") -> None:
         self.model = model
+        self.provider = provider
         self.base_url = "http://x"
+        self._api_key = "sk-x"
+        self.thinking = reasoning.DEFAULT_THINKING
+        self.effort = reasoning.DEFAULT_EFFORT
         self.seen: list[str] = []
 
     def switch_model(self, name: str) -> None:
         self.model = name
 
+    def install(self, *, api_key: str, base_url: str, model: str,
+                provider: str = "", thinking=None, effort=None) -> None:
+        self._api_key, self.base_url = api_key, base_url
+        self.model, self.provider = model, provider
+
+    def set_reasoning(self, *, thinking: bool, effort: str) -> None:
+        self.thinking, self.effort = thinking, effort
+
     def complete(self, messages, tools=None, on_delta=None, on_attempt_started=None):
         from agent_runtime.models.types import ModelResponse
 
-        self.seen.append(self.model)
+        self.seen.append(f"{self.provider}/{self.model}")
         return ModelResponse(content="好")
 
 
@@ -209,6 +231,11 @@ class _StubbornAdapter(_FakeAdapter):
 
         ChatModel.switch_model(self, name)
 
+    def install(self, **kwargs) -> None:
+        from agent_runtime.models.base import ChatModel
+
+        ChatModel.install(self, **kwargs)
+
 
 def _agent(model, session, **kwargs):
     from agent_runtime.agents.agent import Agent
@@ -218,7 +245,8 @@ def _agent(model, session, **kwargs):
     return Agent(
         model, ToolRegistry(), PermissionPolicy(),
         session_model=model_state.SessionModel.restore(
-            session.metadata, fallback="deepseek-flash"),
+            session.metadata, fallback="deepseek-flash",
+            fallback_provider="deepseek"),
         **kwargs,
     )
 
@@ -231,7 +259,7 @@ def test_a_model_change_lands_in_the_history_before_the_next_turn():
     session = _session_with_model("deepseek-flash")
     adapter = _FakeAdapter("deepseek-flash")
     agent = _agent(adapter, session)
-    agent.switch_model("deepseek-v4-pro")
+    agent.switch_model("deepseek-v4-pro", provider="deepseek")
 
     agent.run(session, "第二个问题", max_steps=1)
 
@@ -242,7 +270,52 @@ def test_a_model_change_lands_in_the_history_before_the_next_turn():
     assert "deepseek-flash" in contents[1] and "deepseek-v4-pro" in contents[1]
     assert contents[2] == "第二个问题"
     # 请求里带的是**新**模型名。
-    assert adapter.seen == ["deepseek-v4-pro"]
+    assert adapter.seen == ["deepseek/deepseek-v4-pro"]
+
+
+def test_switching_to_another_provider_reinstalls_the_route():
+    """换到**另一条路由**要重造客户端（密钥、端点都变了），而且是立刻生效的。
+
+    这条是多 provider 的核心：`switch_model` 收到一个不同的 provider 时必须走
+    `install`（它会重造 SDK 客户端），而不是只改一个字段 —— 只改字段的症状是
+    "界面写着换了、密钥还是旧那把、地址还是旧那个"。
+    """
+    session = _session_with_model("deepseek-flash")
+    adapter = _FakeAdapter("deepseek-flash", "deepseek")
+    agent = _agent(adapter, session)
+
+    assert agent.switch_model("m1", provider="acme", api_key="sk-acme",
+                              base_url="https://acme.example/v1") is True
+    assert (agent.model_provider, agent.model_name) == ("acme", "m1")
+    assert adapter.base_url == "https://acme.example/v1"
+    assert adapter._api_key == "sk-acme"
+    # 会话里记的也是那条路由 —— 恢复会话时它得答得出来。
+    assert agent.session_model.route_name() == "acme/m1"
+
+
+def test_the_thinking_switch_and_effort_land_on_the_adapter_and_the_session():
+    """两个旋钮同时**改适配器**（下一次请求用它）和**记进会话**（恢复时还是它）。
+
+    分给两个方法、让调用方记得两步都走，是一条迟早会漏的约定 —— 漏掉"记进会话"的
+    症状是"恢复会话之后它又开始思考了"，而那笔钱已经在花了。
+    """
+    session = _session_with_model("deepseek-flash")
+    adapter = _FakeAdapter("deepseek-flash")
+    agent = _agent(adapter, session)
+
+    assert agent.set_reasoning(thinking=False, effort=None) is True
+    assert adapter.thinking is False
+    assert agent.thinking is False
+    assert agent.session_model.thinking is False
+    # 强度**没被动过** —— 关掉思考不该清掉它。
+    assert agent.effort == reasoning.DEFAULT_EFFORT
+
+    assert agent.set_reasoning(thinking=None, effort="max") is True
+    assert adapter.effort == "max"
+    assert agent.session_model.effort == "max"
+    # 而且关着的时候强度照样记着：`/thinking on` 之后回来还是它。
+    assert agent.session_model.thinking is False
+    assert agent.session_model.effort == "max"
 
 
 def test_the_notice_is_written_exactly_once():
@@ -250,7 +323,7 @@ def test_the_notice_is_written_exactly_once():
     session = _session_with_model("deepseek-flash")
     adapter = _FakeAdapter("deepseek-flash")
     agent = _agent(adapter, session)
-    agent.switch_model("deepseek-v4-pro")
+    agent.switch_model("deepseek-v4-pro", provider="deepseek")
     agent.run(session, "一", max_steps=1)
     agent.run(session, "二", max_steps=1)
     notices = [m for m in session.messages
@@ -277,8 +350,10 @@ def test_switching_mid_turn_does_not_split_a_turn_across_two_models():
                              on_attempt_started=None):
         response = original(messages, tools, on_delta, on_attempt_started)
         model_state.SessionModel.restore(
-            session.metadata, fallback="deepseek-flash").select("deepseek-v4-pro")
-        agent.switch_model("deepseek-v4-pro")
+            session.metadata, fallback="deepseek-flash",
+            fallback_provider="deepseek").select_route(
+                provider="deepseek", model="deepseek-v4-pro")
+        agent.switch_model("deepseek-v4-pro", provider="deepseek")
         return response
 
     adapter.complete = complete_then_switch
@@ -286,14 +361,14 @@ def test_switching_mid_turn_does_not_split_a_turn_across_two_models():
     agent.run(session, "第一轮", max_steps=1)
 
     # 本轮用的是**旧**模型，而且历史里**没有**那句话（它对本轮是假的）。
-    assert adapter.seen == ["deepseek-flash"]
+    assert adapter.seen == ["deepseek/deepseek-flash"]
     assert not [m for m in session.messages
                 if "model changed" in str(m.get("content") or "")]
 
     # 下一轮：先留那句话，再请求 —— 请求用的是新模型。
     adapter.complete = original
     agent.run(session, "第二轮", max_steps=1)
-    assert adapter.seen == ["deepseek-flash", "deepseek-v4-pro"]
+    assert adapter.seen == ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"]
     notices = [m for m in session.messages
                if "model changed" in str(m.get("content") or "")]
     assert len(notices) == 1
@@ -307,8 +382,10 @@ def test_an_adapter_that_cannot_switch_says_so():
     """
     session = _session_with_model("deepseek-flash")
     agent = _agent(_StubbornAdapter("deepseek-flash"), session)
-    assert agent.switch_model("deepseek-v4-pro") is False
+    assert agent.switch_model("deepseek-v4-pro", provider="deepseek") is False
     assert agent.model_name == "deepseek-flash"
+    # 没换成的时候**会话里也不许留下"选了它"** —— 两件事必须在同一处发生。
+    assert agent.session_model.selected == "deepseek-flash"
 
 
 def test_model_name_reads_the_adapter_not_a_copy():
@@ -321,7 +398,7 @@ def test_model_name_reads_the_adapter_not_a_copy():
     assert agent.model_name == "谁改的"
 
 
-# --- Runtime.select_model：三道检查 ---------------------------------------------
+# --- Runtime.select_model：名字的三种写法 + 跨路由 -------------------------------
 
 def test_select_model_rejects_a_name_outside_the_catalog():
     """目录外的名字**拒绝**，并给出处。
@@ -340,8 +417,11 @@ def test_select_model_accepts_a_catalog_name_and_reports_the_old_one():
     with _runtime() as runtime:
         ok, message = runtime.select_model("deepseek-v4-pro")
         assert ok is True
-        assert "deepseek-v4-pro" in message and "deepseek-flash" in message
+        # 回报里的名字带路由（`provider/model`）—— 这样"上一个是谁"也答得清。
+        assert "deepseek/deepseek-v4-pro" in message
+        assert "deepseek/deepseek-flash" in message
         assert runtime.current_model == "deepseek-v4-pro"
+        assert runtime.current_provider == "deepseek"
         # 分母跟着换（它是派生的，不是存下来的字段）。
         assert runtime.context_tokens == CONTEXT_WINDOWS["deepseek-v4-pro"]
 
@@ -354,18 +434,132 @@ def test_select_model_is_idempotent():
         assert "已经是" in message
 
 
-def test_select_model_refuses_when_the_endpoint_does_not_match():
-    """适配器上的 base_url 和配置对不上时**拒绝换**，而不是把请求发到没配密钥的地址上。
+def test_a_second_provider_gets_used_when_it_is_the_only_one_that_can_be(workdir):
+    """**跨路由**：第一条没有密钥时，装配会退到后面那条能用的。
 
-    这一档里没有 "provider" 这个概念（一个 base_url、一把密钥），所以"换到另一个网关
-    的模型"没法表达 —— 能做的是别让它悄悄发生。
+    这是多 provider 那个功能的底线行为 —— 一条配置里只要**有一条**能用，会话就该开得
+    起来，而缺密钥的那几条只在 `/model` 里表现为"选不了它下面的模型"。
     """
-    with _runtime() as runtime:
-        runtime.agent.model.base_url = "https://example.invalid"
-        ok, message = runtime.select_model("deepseek-v4-pro")
+    registry = _registry(workdir, {
+        "nokey": {"base_url": "https://a.example/v1",
+                  "models": [{"id": "m1", "context_window": 1000}]},
+        "acme": {"base_url": "https://b.example/v1", "api_key": "sk-b",
+                 "models": [{"id": "m2", "context_window": 2048}]},
+    })
+    with _runtime(registry=registry) as runtime:
+        assert (runtime.current_provider, runtime.current_model) == ("acme", "m2")
+        assert runtime.context_tokens == 2048
+
+
+def test_switching_across_providers_moves_the_request(workdir):
+    """`/model acme/m2`：**请求真的改发到另一台上**，而且会话里记着那条路由。
+
+    这条是整个多 provider 功能的验收：配置里两条路由、两条都有密钥，换过去之后
+    `current_provider` / `base_url` / 窗口三样一起跟着变。
+    """
+    registry = _registry(workdir, {
+        "deepseek": {"base_url": "https://a.example/v1", "api_key": "sk-a",
+                     "models": [{"id": "deepseek-flash", "context_window": 1000}]},
+        "acme": {"base_url": "https://b.example/v1", "api_key": "sk-b",
+                 "models": [{"id": "m2", "context_window": 2048}]},
+    })
+    with _runtime(registry=registry) as runtime:
+        assert runtime.current_provider == "deepseek"
+
+        ok, message = runtime.select_model("acme/m2")
+        assert ok is True and "acme/m2" in message
+        assert runtime.current_provider == "acme"
+        assert runtime.current_base_url == "https://b.example/v1"
+        assert runtime.context_tokens == 2048
+        assert runtime.agent.session_model.route_name() == "acme/m2"
+        # 适配器上那把密钥也换了 —— 换路由不换密钥就等于用旧账号敲新地址。
+        assert runtime.agent.model._api_key == "sk-b"
+
+
+def test_a_bare_provider_name_picks_that_routes_first_model(workdir):
+    """`/model acme` 是自然用法（"换到 acme 去"），而 acme 上有什么它自己知道。"""
+    registry = _registry(workdir, {
+        "deepseek": {"base_url": "https://a.example/v1", "api_key": "sk-a",
+                     "models": [{"id": "deepseek-flash", "context_window": 1000}]},
+        "acme": {"base_url": "https://b.example/v1", "api_key": "sk-b",
+                 "models": [{"id": "m2", "context_window": 2048},
+                            {"id": "m3", "context_window": 4096}]},
+    })
+    with _runtime(registry=registry) as runtime:
+        assert runtime.select_model("acme")[0] is True
+        assert runtime.current_model == "m2", "用那条路由上的第一个模型"
+
+
+def test_a_name_on_two_routes_is_refused_until_you_say_which(workdir):
+    """同名模型落在两条路由上时**拒绝并报出候选** —— 随便挑一条是那种"看起来完全
+    正常、账单却在另一个账号上"的错误。"""
+    registry = _registry(workdir, {
+        "a": {"base_url": "https://a.example/v1", "api_key": "sk-a",
+              "models": [{"id": "same", "context_window": 1000}]},
+        "b": {"base_url": "https://b.example/v1", "api_key": "sk-b",
+              "models": [{"id": "same", "context_window": 1000}]},
+    })
+    with _runtime(registry=registry) as runtime:
+        ok, message = runtime.select_model("same")
         assert ok is False
-        assert "对不上" in message
-        assert runtime.current_model == "deepseek-flash"
+        assert "a/same" in message and "b/same" in message
+        # 写全了就认。
+        assert runtime.select_model("b/same")[0] is True
+        assert runtime.current_provider == "b"
+
+
+def test_a_route_without_a_key_cannot_be_selected(workdir):
+    """没密钥的路由**在清单里但选不了**，而且那句话要说清怎么补。"""
+    registry = _registry(workdir, {
+        "deepseek": {"base_url": "https://a.example/v1", "api_key": "sk-a",
+                     "models": [{"id": "deepseek-flash", "context_window": 1000}]},
+        "nokey": {"base_url": "https://b.example/v1",
+                  "models": [{"id": "m2", "context_window": 2048}]},
+    })
+    with _runtime(registry=registry) as runtime:
+        ok, message = runtime.select_model("nokey/m2")
+        assert ok is False
+        assert "没有密钥" in message and "api_key" in message
+        assert runtime.current_provider == "deepseek"
+
+
+def test_thinking_and_effort_refuse_with_a_usable_message():
+    """两个旋钮的拒绝路径：**认不出的值不改任何东西，而且说清能写什么。**"""
+    with _runtime() as runtime:
+        ok, message = runtime.select_effort("hgih")
+        assert ok is False and "low" in message and "max" in message
+        assert runtime.agent.effort == reasoning.DEFAULT_EFFORT
+
+        # `none` 是"关掉思考"，属于另一个旋钮 —— 指路，不照做。
+        ok, message = runtime.select_effort("none")
+        assert ok is False and "/thinking off" in message
+
+        # 正常改：开关与强度互不影响。
+        assert runtime.select_thinking(False)[0] is True
+        assert runtime.agent.thinking is False
+        assert runtime.select_effort("max")[0] is True
+        assert runtime.agent.effort == "max"
+        assert runtime.agent.thinking is False, "改强度不该顺手把思考打开"
+
+
+def test_the_thinking_settings_are_written_to_disk_immediately(workdir, monkeypatch):
+    """和 `/model` 同一条：**一句话不说就退出，恢复会话时那两个设置还在。**
+
+    它们决定花多少钱、想多久 —— 丢掉之后用户看到的是一份"我明明关了"的设置。
+    """
+    registry = _registry(workdir, {
+        "deepseek": {"base_url": "https://a.example/v1", "api_key": "sk-a",
+                     "models": [{"id": "deepseek-flash", "context_window": 1000}]},
+    })
+    with _open_isolated(workdir, monkeypatch, registry) as (booted, runtime, session_id):
+        assert runtime.select_thinking(False)[0] is True
+        assert runtime.select_effort("low")[0] is True
+        reloaded = booted.store.load(session_id)
+
+    restored = model_state.SessionModel.restore(
+        reloaded.metadata, fallback="deepseek-flash")
+    assert restored.thinking is False
+    assert restored.effort == "low"
 
 
 def test_the_selection_is_written_to_disk_immediately(workdir, monkeypatch):
@@ -374,40 +568,25 @@ def test_the_selection_is_written_to_disk_immediately(workdir, monkeypatch):
     这条钉的是"立刻落盘"那一步：等下一个检查点的话，最自然的用法之一（进去、换模型、
     退出）会丢掉这次选择 —— 而恢复时我们会说"你选的是 flash"，那和刚给出过的承诺相反。
     """
-    from agent_runtime.runtime.channels import cli_channels
-    from agent_runtime.runtime.composition import boot, open_runtime, resolve_session
-    from agent_runtime.runtime.config import (
-        McpConfig, ModelConfig, PermissionConfig, WebConfig,
-    )
-
-    monkeypatch.setattr("agent_runtime.runtime.composition.project_dir",
-                        lambda: workdir)
-    booted = boot()
-    session_id, session, resumed = resolve_session(booted.store, None)
-    runtime = open_runtime(
-        booted=booted, session_id=session_id, session=session,
-        channels=cli_channels(), resumed=resumed,
-        model_config=ModelConfig(api_key="sk-x", base_url="http://127.0.0.1:1",
-                                 model="deepseek-flash"),
-        permission_config=PermissionConfig(), web_config=WebConfig(),
-        mcp_config=McpConfig(),
-    )
-    try:
-        assert runtime.select_model("deepseek-v4-pro")[0] is True
+    registry = _registry(workdir, {
+        "deepseek": {"base_url": "https://a.example/v1", "api_key": "sk-a",
+                     "models": [{"id": "deepseek-flash", "context_window": 1000},
+                                {"id": "m2", "context_window": 2048}]},
+    })
+    with _open_isolated(workdir, monkeypatch, registry) as (booted, runtime, session_id):
+        assert runtime.select_model("m2")[0] is True
         # 磁盘上那一份已经是新的了（**没有任何回合跑过**）。
         reloaded = booted.store.load(session_id)
-    finally:
-        runtime.close()
 
     restored = model_state.SessionModel.restore(
         reloaded.metadata, fallback="deepseek-flash")
-    assert restored.selected == "deepseek-v4-pro"
+    assert restored.selected == "m2"
 
 
 def test_the_selection_is_per_session_and_survives_a_resume():
     """`/model` 换的是**这个会话**，恢复它时还是那个（和任务列表、技能同一条路）。
 
-    这条同时钉住了"新会话用回配置里那个"：会话级选择住在 `session.metadata` 里，
+    这条同时钉住了"新会话用回目录里那个默认值"：会话级选择住在 `session.metadata` 里，
     所以另开一个会话拿到的就是干净的一份。
     """
     with _runtime() as runtime:
@@ -419,27 +598,73 @@ def test_the_selection_is_per_session_and_survives_a_resume():
         assert other.agent.session_model.selection is None
 
 
-def _runtime():
-    """一个真的 Runtime（假密钥、假网关地址，不发任何请求）。
+# --- 造一个真的 Runtime（用假的目录）--------------------------------------------
+
+def _registry(workdir, providers: dict):
+    """把一段 `providers` 写成配置文件再读成 Registry。
+
+    **走真的读盘那条路**（`catalog.load`）：这样目录的形状错误（少 base_url、
+    不认识的键）在测试里也会现形，而不是被一个手搓的 Registry 绕过去。
+    """
+    path = workdir / "models.local.json"
+    path.write_text(json.dumps({"providers": providers}, ensure_ascii=False),
+                    encoding="utf-8")
+    return catalog.load(path, env_file=workdir / "missing.env")
+
+
+def _channels():
+    """CLI 版的通道（不起子进程、不弹面板）—— 装配要它。"""
+    from agent_runtime.runtime.channels import cli_channels
+
+    return cli_channels()
+
+
+@contextmanager
+def _open_isolated(workdir, monkeypatch, registry):
+    """一个把会话/日志都落在 `workdir` 里的 Runtime —— "立刻落盘"那两条测试要它。
+
+    没有这个隔离，"立刻落盘"验的就是**开发机上那份真的 `.tudouni/`**（测试会往仓库里
+    写会话文件，而它们本来只该验证"写没写"）。
+    """
+    from agent_runtime.runtime import composition
+
+    monkeypatch.setattr(composition, "project_dir", lambda: workdir)
+    booted = composition.boot()
+    session_id, session, resumed = composition.resolve_session(booted.store, None)
+    runtime = composition.open_runtime(
+        booted=booted, session_id=session_id, session=session,
+        channels=_channels(), resumed=resumed,
+        model_config=_model_config(),
+        permission_config=PermissionConfig(), web_config=WebConfig(),
+        mcp_config=McpConfig(), catalog_config=registry,
+    )
+    try:
+        yield booted, runtime, session_id
+    finally:
+        runtime.close()
+
+
+def _runtime(registry=None):
+    """一个真的 Runtime（假密钥、假网关地址，**不发任何请求**）。
 
     **调用方必须 `runtime.close()`**（`httpx.Client` 是进程级资源）—— 所以这里不返回
     "已经替你收好"的东西，而是让测试用 `with` 收。给 Runtime 打补丁换掉 `close` 是
     不行的：它是 frozen + slots 的 dataclass，`monkeypatch.setattr` 会撞上
     `super(type, obj)` 那个 TypeError。
     """
-    from agent_runtime.runtime.channels import cli_channels
-    from agent_runtime.runtime.composition import boot, open_runtime, resolve_session
-    from agent_runtime.runtime.config import (
-        McpConfig, ModelConfig, PermissionConfig, WebConfig,
+    from agent_runtime.runtime import composition
+
+    booted = composition.boot()
+    session_id, session, resumed = composition.resolve_session(booted.store, None)
+    return composition.open_runtime(
+        booted=booted, session_id=session_id, session=session,
+        channels=_channels(), resumed=resumed,
+        model_config=_model_config(),
+        permission_config=PermissionConfig(), web_config=WebConfig(),
+        mcp_config=McpConfig(), catalog_config=registry,
     )
 
-    booted = boot()
-    session_id, session, resumed = resolve_session(booted.store, None)
-    return open_runtime(
-        booted=booted, session_id=session_id, session=session,
-        channels=cli_channels(), resumed=resumed,
-        model_config=ModelConfig(api_key="sk-x", base_url="http://127.0.0.1:1",
-                                 model="deepseek-flash"),
-        permission_config=PermissionConfig(), web_config=WebConfig(),
-        mcp_config=McpConfig(),
-    )
+
+def _model_config():
+    return ModelConfig(api_key="sk-x", base_url="http://127.0.0.1:1",
+                       model="deepseek-flash")

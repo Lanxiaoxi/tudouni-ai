@@ -243,6 +243,26 @@ class ProtocolClient:
         """
         self.send({"t": messages.IN_SET_MODEL, "model": str(model)})
 
+    def set_thinking(self, on: bool) -> None:
+        """开关思考模式（TUI 的 `/thinking`）。
+
+        **发的是绝对状态**（和 `set_autopilot` / `set_model` 同一条）：重发幂等，界面
+        也不必先知道现在是什么。它**不动强度** —— `/effort` 设过的那个记着，再打开时
+        还是它。
+
+        生效的时序和换模型一样：**下一次请求**。正在跑的那一轮参数已经发出去了。
+        """
+        self.send({"t": messages.IN_SET_THINKING, "on": bool(on)})
+
+    def set_effort(self, effort: str) -> None:
+        """改思考强度（TUI 的 `/effort`）。
+
+        强度值由 runtime 校验（只认 `low` / `high` / `max`，外加几个等价写法）——
+        界面只管把用户写的那个字符串发过去：**"哪几档是合法的"是 domain 的知识**，
+        前端自己抄一份清单就会在下一次加档位时漂掉。
+        """
+        self.send({"t": messages.IN_SET_EFFORT, "effort": str(effort)})
+
     def ask_status(self) -> None:
         """请 runtime 回一份状态（TUI 的 `/status`）。
 

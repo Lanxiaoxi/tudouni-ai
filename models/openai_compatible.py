@@ -20,6 +20,14 @@ from .types import (
     ModelTransientError,
     TokenUsage,
 )
+# **`models/` → `state/` 是这一版新加的依赖**，只有这一个模块用一个纯数据的子模块
+# （`state/reasoning.py`：思考开关与强度 → 请求参数）。它值得这个依赖，因为
+# "改完之后下一次请求就用新值"这条契约要求值**在每次调用时现读**，而把
+# `reasoning_effort=` 这种参数拼装写在两处（一次非流式、一次流式）就会漂。
+#
+# `state/reasoning.py` 自己不 import 任何东西（连 `dataclass` 都不用）—— 所以这条边
+# 是单向的、没有环，也不会把 store / session 那一套拖进模型的加载路径。
+from agent_runtime.state.reasoning import DEFAULT_EFFORT, DEFAULT_THINKING, request_fields
 
 
 # 值得重试的 HTTP 状态码。SDK 自己的重试策略也认这几个。
@@ -304,7 +312,22 @@ class _StreamAccumulator:
 
 
 class OpenAICompatibleModel(ChatModel):
-    """支持 OpenAI 兼容 API 的模型适配器"""
+    """支持 OpenAI 兼容 API 的模型适配器。
+
+    ## 它是一个"能换路线"的适配器，不是一条固定连接
+
+    这一版里 provider 是可选的（`/model` 能在多条路由之间选），所以这个对象同时记着
+    **当前这条路线**（`route` / `base_url` / `api_key`）和**怎么换过去**（`install`）。
+
+    ## 客户端是**懒造**的
+
+    换路由要换 `OpenAI(...)`（base_url 和密钥都是构造参数、且 SDK 的 client 是连接池），
+    而"造一个客户端"会建连接池、读代理环境变量 —— 一个**只用来看一眼 `/model` 清单**的
+    会话不该为它付钱，一个装配到一半就失败的会话更不该留下它。
+
+    所以 `self.client` 可能一直是 None：`complete()` 之前会 `_ensure_client()`。
+    调用方别去碰 `self.client`（它是实现细节，见 `_ensure_client` 那段）。
+    """
 
     def __init__(
         self,
@@ -312,6 +335,10 @@ class OpenAICompatibleModel(ChatModel):
         base_url: str,
         model: str,
         http_client: httpx.Client | None = None,
+        *,
+        provider: str = "",
+        thinking: bool = DEFAULT_THINKING,
+        effort: str = DEFAULT_EFFORT,
     ):
         """
         初始化适配器
@@ -321,28 +348,73 @@ class OpenAICompatibleModel(ChatModel):
             base_url: API 基础地址（如 https://api.deepseek.com）
             model: 模型名称（如 deepseek-chat）
             http_client: 可选的自定义 HTTP 客户端（用于跳过证书验证等）
+            provider: 这条路线叫什么（只用来显示和审计；请求本身不带它）
+            thinking: 要不要让模型先想一段（`/thinking`）
+            effort: 想的时候花多大力气（`/effort`）
         """
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            http_client=http_client,
-            # 关掉 SDK 自带的重试（默认是 2 次）。它的重试对审计日志完全不可见：
-            # 一次"成功"的调用背后可能已经失败过两轮，而日志里只有一条记录、耗时
-            # 还把重试时间算了进去 —— 会被误读成"模型很慢"。重试改由 Agent 负责，
-            # 这样每一次尝试都是一条可查的事件。
-            max_retries=0,
-        )
         self.model = model
         # 降级那条路要拿它们当键（见 `_NO_STREAM_OPTIONS`）。
         self.base_url = base_url
+        self.provider = provider
+        # 这两个是**每次请求现读**的（和 `model` 一样）：`/thinking` `/effort` 改完之后
+        # 下一个请求就该用新值，不需要重建适配器、也不该在重试之间变化。
+        self.thinking = thinking
+        self.effort = effort
+        self._api_key = api_key
+        self._http = http_client
+        self._client: OpenAI | None = None
+
+    # -- 路线 ------------------------------------------------------------------
+
+    def _ensure_client(self) -> OpenAI:
+        """造（或复用）SDK 客户端。**只有真要发请求时才调。**
+
+        关掉 SDK 自带的重试（默认 2 次）：它的重试对审计日志完全不可见 —— 一次"成功"
+        的调用背后可能已经失败过两轮，而日志里只有一条记录、耗时还把重试时间算了进去，
+        会被误读成"模型很慢"。重试改由 Agent 负责，每一次尝试都是一条可查的事件。
+        """
+        if self._client is None:
+            self._client = OpenAI(
+                api_key=self._api_key,
+                base_url=self.base_url,
+                http_client=self._http,
+                max_retries=0,
+            )
+        return self._client
+
+    @property
+    def route(self) -> str:
+        """`provider/model`（没有 provider 时就只是模型名）。"""
+        return f"{self.provider}/{self.model}" if self.provider else self.model
+
+    def install(self, *, api_key: str, base_url: str, model: str,
+                provider: str = "", thinking: bool | None = None,
+                effort: str | None = None) -> None:
+        """换成另一条路线（连同模型）。**这是"换 provider"那一半。**
+
+        和 `switch_model` 分开：那个只改一个字段（同一条路由上换模型），而这里要换
+        密钥和端点 —— 也就是**必须重造 SDK 客户端**（它们是构造参数）。旧客户端先关掉：
+        它持着连接池，而一个换过路由的会话不会再用它。
+
+        参数里 `thinking` / `effort` 允许为 None 表示"不动它们" —— 换路由通常不改这两样
+        （用户想要的是同一个思考设置，只是换个地方问）。
+        """
+        if base_url != self.base_url or api_key != self._api_key:
+            self.close()
+        self.base_url = base_url
+        self._api_key = api_key
+        self.provider = provider
+        self.model = model
+        if thinking is not None:
+            self.thinking = thinking
+        if effort is not None:
+            self.effort = effort
 
     def switch_model(self, model: str) -> None:
-        """换一个模型名（`/model`）。**同一条 base_url、同一把密钥、同一个 http client。**
+        """换一个模型名。**同一条 base_url、同一把密钥、同一个 http client。**
 
-        换的只是每次请求 `model=` 那个字段 —— 那正是"选哪个模型"在这里的全部含义。
-        `base_url` 也一并设上（调用方只会传同一个值）：它的用处是**留一个能对账的地方**，
-        见 `runtime/composition.py` 的 `select_model` —— 换到另一个网关上的模型时，那里
-        据此拒绝，而不是把请求悄悄发到一个根本没配密钥的地址上。
+        换的只是每次请求 `model=` 那个字段 —— 那正是"同一条路由上换模型"在这里的全部
+        含义。**跨路由换要调 `install`**（它要重造客户端）。
 
         `_NO_STREAM_OPTIONS` 那个降级缓存**不用清**：它的键是 `(base_url, model)`，所以
         "这个网关的这个模型不吃 stream_options"这件事天然是按模型分开记的。清掉的话，
@@ -352,6 +424,29 @@ class OpenAICompatibleModel(ChatModel):
         去的下一个请求就用新名字，而正在返回的那一个不受影响（它已经发出去了）。
         """
         self.model = model
+
+    def set_reasoning(self, *, thinking: bool, effort: str) -> None:
+        """改思考开关与强度（`/thinking` `/effort`）。**下一次请求生效。**
+
+        和 `switch_model` 同一条时序：正在返回的那一个请求不受影响（参数在发出去那一刻
+        就定了），而下一个请求用新值。所以"跑到一半改强度"不会把一个回合劈成两半。
+        """
+        self.thinking = thinking
+        self.effort = effort
+
+    def close(self) -> None:
+        """收掉 SDK 客户端（换路由时、以及会话收摊时）。
+
+        **失败不当失败**：收一个已经死掉的连接池不该盖住"换路由"这个动作本身的结果。
+        """
+        client, self._client = self._client, None
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as exc:  # noqa: BLE001
+            _warn_close(exc)
+
 
     def complete(
         self,
@@ -379,10 +474,11 @@ class OpenAICompatibleModel(ChatModel):
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
     ) -> ModelResponse:
         try:
-            response = self.client.chat.completions.create(
+            response = self._ensure_client().chat.completions.create(
                 model=self.model,
                 messages=messages,
                 tools=tools or [],
+                **request_fields(thinking=self.thinking, effort=self.effort),
             )
         except Exception as exc:
             # from exc 保住原始 traceback，排查时还看得到 SDK 那层到底报了什么
@@ -477,11 +573,14 @@ class OpenAICompatibleModel(ChatModel):
             "messages": messages,
             "tools": tools or [],
             "stream": True,
+            # 思考开关与强度：**和 `model` 一样是每次调用现读的**，所以 `/thinking`
+            # `/effort` 改完之后下一个请求就用新值，而正在返回的那一个不受影响。
+            **request_fields(thinking=self.thinking, effort=self.effort),
         }
         if include_usage:
             request["stream_options"] = dict(STREAM_USAGE_OPTION)
 
-        stream = self.client.chat.completions.create(**request)
+        stream = self._ensure_client().chat.completions.create(**request)
         for chunk in stream:
             accumulator.feed(chunk)
             choices = getattr(chunk, "choices", None) or []
@@ -508,3 +607,14 @@ def _warn_stream_options(base_url: str, model: str, exc: Exception) -> None:
         f"会少掉输入/命中/上下文占比）。",
         file=sys.stderr,
     )
+
+
+def _warn_close(exc: Exception) -> None:
+    """收掉客户端失败时说一句（`install` / `close` 那条路）。
+
+    它发生在**换路由成功之后**或者收摊的时候，所以不能抛出去盖住那件事本身的结果 ——
+    但也不能不说：一个没关掉的连接池会让 keep-alive 的 socket 活过这个进程，
+    而那种症状（句柄泄漏）在 Windows 上表现为"某个文件/端口被占用"，与这里毫无关系。
+    """
+    print(f"[warn] 关闭模型客户端时出错（已忽略）：{type(exc).__name__}: {exc}",
+          file=sys.stderr)

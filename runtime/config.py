@@ -31,7 +31,7 @@ from dotenv import dotenv_values
 
 from agent_runtime.security.commands import Rule, format_rule, parse_rule
 from agent_runtime.skills import RUNTIME_DIR_NAME
-from agent_runtime.state import model as model_state
+from agent_runtime.state import catalog
 from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
 
 
@@ -43,8 +43,8 @@ PROJECT_ROOT = REPO_ROOT / "agent_runtime"
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE_FILE = PROJECT_ROOT / ".env.example"
 
-DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = model_state.DEFAULT_MODEL
+DEFAULT_BASE_URL = catalog.BUILTIN_BASE_URL
+DEFAULT_MODEL = catalog.DEFAULT_MODEL
 
 # 各模型的上下文窗口（token）。它是**输入侧**的上限：真正发不出去的条件是"输入 + 输出"
 # 超过它，所以占比接近满之前就该有新会话。
@@ -54,10 +54,14 @@ DEFAULT_MODEL = model_state.DEFAULT_MODEL
 # **错的百分比比没有百分比更坏** —— 它会被当成真的。所以 cli 那边只报用量、不报占比，
 # 启动时也会说一句该往哪加。
 #
-# **表由 `state/model.py` 的目录派生，这里不抄第二份。** 目录同时是 `/model` 那个清单、
-# "这个名字认不认识"的判据；抄一份的话，往目录里加一个模型而忘了改这里，症状是
+# **表由目录（`state/catalog.py`）派生，这里不抄第二份。** 目录同时是 `/model` 那个清单
+# 和"这个名字认不认识"的判据；抄一份的话，往配置里加一个模型而忘了改这里，症状是
 # "`/model` 列出了它，选了之后状态栏却报不出占比"—— 两处都是静默的。
-CONTEXT_WINDOWS: dict[str, int] = model_state.context_windows()
+#
+# `catalog.load()` 读的是配置文件（没有那份文件时退到内置目录，而内置目录走
+# `DEEPSEEK_API_KEY` / `.env`）。**这里只取窗口，不看密钥** —— 所以它在一个没有密钥的
+# 机器上照样能算出来（`--list` / `--skills` 那些子命令不需要密钥）。
+CONTEXT_WINDOWS: dict[str, int] = catalog.load().windows()
 
 _ENV_API_KEY = "DEEPSEEK_API_KEY"
 _ENV_BASE_URL = "DEEPSEEK_BASE_URL"

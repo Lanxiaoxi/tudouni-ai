@@ -47,6 +47,7 @@ from agent_runtime.runtime.channels import Channels, TrustGroupLookup
 from agent_runtime.runtime.config import ConfigError
 from agent_runtime.security.commands import format_rule
 from agent_runtime.security.memory import ApprovalMemory
+from agent_runtime.state import reasoning
 from agent_runtime.state import status as status_summary
 from agent_runtime.state.session import is_valid_session_id
 from agent_runtime.tools.builtin.ask import ANSWERED, SKIPPED, UNAVAILABLE, Answer, AskUserArgs
@@ -571,6 +572,22 @@ class ProtocolServer:
             self._set_model(name)
             return True
 
+        if kind == messages.IN_SET_THINKING:
+            # 和 `set_autopilot` 同一条：**只认真正的 `true`**。这一档改的是"模型要不要
+            # 先想一段"，猜错的代价不对称 —— 该开没开只是维持现状，不该开却开了是
+            # 答案质量在没人察觉的情况下变差。
+            self._set_thinking(message.get("on") is True)
+            return True
+
+        if kind == messages.IN_SET_EFFORT:
+            level = message.get("effort")
+            if not isinstance(level, str):
+                self._notice("warn", "effort",
+                             "[思考] 强度要一个字符串（low / high / max）。")
+                return True
+            self._set_effort(level)
+            return True
+
         if kind == messages.IN_STATUS:
             self._send_status()
             return True
@@ -793,6 +810,14 @@ class ProtocolServer:
             # 拿新模型的用量去比旧窗口，而那看起来完全正常，只是数错了。
             "model": runtime.current_model,
             "model_window": runtime.context_tokens,
+            # 哪条路由。**和模型名分开是有意的**：两条路由可以有同名模型，而"请求
+            # 发到哪儿"在账单上是另一件事。
+            "model_provider": runtime.current_provider,
+            # 思考模式那两个旋钮。它们和模型一样是会话级设置，改完立刻回一份快照 ——
+            # 界面按它显示，不许乐观更新（理由见 `_set_thinking`）。
+            "thinking": bool(runtime.agent.thinking),
+            "effort": runtime.agent.effort,
+            "effort_levels": list(reasoning.EFFORT_LEVELS),
         }
 
 
@@ -830,6 +855,35 @@ class ProtocolServer:
         # 事实（拼的话就是第二份知识，而它漂掉的症状是"提示说换了、其实没换"）。
         self._notice("info" if ok else "warn", "model",
                      ("[模型] " if ok else "[模型] 没换：") + message)
+        self.send(self._state_message())
+
+    def _set_thinking(self, on: bool) -> None:
+        """开关思考模式（`/thinking`）。**成败都回话，而且回一条 state 快照。**
+
+        和 `_set_model` 同一条规矩：界面按 runtime 说的显示，不许自己在发请求的时候就
+        先改 —— 这一格决定下一次请求花多少钱、想多久，而"灯亮着、其实没开"和
+        autopilot 那一格是同一类错误。
+
+        生效的时序也一样：**下一次请求**。正在跑的那一轮已经把参数发出去了。
+        """
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "thinking", "[思考] 还没有会话。")
+            return
+        ok, message = runtime.select_thinking(on)
+        self._notice("info" if ok else "warn", "thinking",
+                     ("[思考] " if ok else "[思考] 没改：") + message)
+        self.send(self._state_message())
+
+    def _set_effort(self, effort: str) -> None:
+        """改思考强度（`/effort`）。同上。"""
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "effort", "[思考] 还没有会话。")
+            return
+        ok, message = runtime.select_effort(effort)
+        self._notice("info" if ok else "warn", "effort",
+                     ("[思考] " if ok else "[思考] 没改：") + message)
         self.send(self._state_message())
 
     def _send_status(self) -> None:
@@ -901,6 +955,7 @@ class ProtocolServer:
     def _init_message(self) -> dict[str, Any]:
         runtime = self.runtime
         rows, aliases = runtime.model_rows()
+        session_model = runtime.agent.session_model
         return {
             "v": messages.VERSION,
             "t": messages.OUT_INIT,
@@ -910,6 +965,16 @@ class ProtocolServer:
             # **现在真正在用的那个**，不是配置里那个：恢复一个换过模型的会话时，
             # 这两个是不同的值，而界面那一行要显示的是"接下来会用谁"。
             "model": runtime.current_model,
+            "provider": runtime.current_provider,
+            # 思考模式那两个旋钮。**必须开场就发**：界面要在第一轮之前就能显示
+            # "它现在想不想、想多用力"，而它们可能来自这个会话上次的选择
+            # （`/thinking off` 之后恢复会话，那一格该还写着关）。
+            "thinking": bool(runtime.agent.thinking),
+            "effort": runtime.agent.effort,
+            # 可选档位**随协议发**：界面要列它，而它不许 import 内核（决策 18 ——
+            # "前端只讲协议"是它能长出 Web 前端的前提）。抄一份清单到前端就会漂，
+            # 而漂掉的症状是"清单里列着它，打进去说没有这一档"。
+            "effort_levels": list(reasoning.EFFORT_LEVELS),
             # `/model` 那张清单。**开场就发**（它是常量数据，不随会话变）；
             # `current` 那一格由 runtime 按当前模型标好 —— 界面不需要知道
             # "怎么算当前"（那要对账别名折算）。

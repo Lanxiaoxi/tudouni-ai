@@ -12,9 +12,26 @@
       "session_id": {"type": "string"},
       "resumed": {"type": "boolean", "doc": "true = 接上了一个已存在的会话"},
       "model": {"type": "string"},
+      "provider": {
+        "type": "string",
+        "doc": "这条模型在哪条路由上（`deepseek` / `acme` …）。**和模型名分开是有意的**：两条路由可以有同名模型，而\"请求发到哪儿\"在账单上、在合规上都是另一件事。"
+      },
+      "thinking": {
+        "type": "boolean",
+        "doc": "这个会话开着思考没有。**默认是开**（端点的默认行为就是开）。开场就发是因为它可能来自这个会话上次的选择（`/thinking off` 之后恢复会话，那一格该还写着关）。"
+      },
+      "effort": {
+        "type": "string",
+        "doc": "思考强度（`low` / `high` / `max`）。**思考关着时它仍然有值** —— 那是用户的意图（\"下次打开时还是这个\"），不是错误状态。"
+      },
+      "effort_levels": {
+        "type": "array",
+        "items": {"type": "string"},
+        "doc": "可选档位。**随协议发而不是让前端写死**（前端不许 import 内核，见 `ui.effort_levels` 那段）。"
+      },
       "model_catalog": {
         "type": "object",
-        "doc": "`/model` 那张清单的数据源：`{\"models\": [{\"id\", \"label\", \"window\", \"summary\", \"note\", \"current\"}], \"aliases\": [{\"id\", \"of\"}]}`。**它是数据、不是答案** —— 界面照它渲染即可，别自己写死模型名。`current` 标着现在用的那个；`aliases` 是**认下但不在清单里**的旧模型名（它们仍可调用，由同一个新模型提供服务）。"
+        "doc": "`/model` 那张清单的数据源：`{\"models\": [{\"provider\", \"id\", \"label\", \"window\", \"summary\", \"note\", \"vision\", \"current\"}], \"aliases\": [{\"id\", \"of\"}]}`。**它是数据、不是答案** —— 界面照它渲染即可，别自己写死模型名。`provider` 是这条模型在哪条路由上（同名模型可以在多条路由上，那时 `/model` 要求写 `provider/model`）；`current` 标着现在用的那个；`aliases` 是**认下但不在清单里**的旧模型名（它们仍可调用，由同一个新模型提供服务）。"
       },
       "workspace": {"type": "string", "doc": "工作区绝对路径（agent 的文件工具能碰的范围）"},
       "max_steps": {"type": "integer"},
@@ -170,11 +187,28 @@
       "model_window": {
         "type": "integer",
         "nullable": true,
-        "doc": "**只有 kind=state 有**。当前模型的上下文窗口（状态栏那个百分比的分母）。它随 `/model` 变 —— 换模型时也重发一份快照就是为了这个。null = 目录里没有这个名字，界面只报用量、不报占比。"
+        "doc": "**只有 kind=state 有**。当前模型的上下文窗口（状态栏那个百分比的分母）。它随 `/model` 变 —— 换模型时也重发一份快照就是为了这个。null = 目录里没有这个名字（或者配置里没写 `context_window`），界面只报用量、不报占比。"
+      },
+      "model_provider": {
+        "type": "string",
+        "doc": "**只有 kind=state 有**。现在这条请求发给哪条路由（`deepseek` / `acme` …）。**和模型名分开是有意的**：两条路由可以有同名模型，而\"请求发到哪儿\"在账单上、在合规上都是另一件事。"
+      },
+      "thinking": {
+        "type": "boolean",
+        "doc": "**只有 kind=state 有**。现在开着思考没有（`/thinking`）。**以 runtime 为准**：界面按它显示，不在自己发请求的时候就改 —— 这一格决定下一次请求花多少钱、想多久。"
+      },
+      "effort": {
+        "type": "string",
+        "doc": "**只有 kind=state 有**。现在的思考强度（`low` / `high` / `max`，`/effort`）。**思考关着时它仍然有值**（用户的意图是\"下次打开时还是这个\"），所以界面别把它当成\"现在生效的强度\"。"
+      },
+      "effort_levels": {
+        "type": "array",
+        "items": {"type": "string"},
+        "doc": "**只有 kind=state 有**。可选档位（现在是 `[\"low\", \"high\", \"max\"]`）。**随协议发而不是让前端写死**：前端不许 import 内核（决策 18），而抄一份清单到前端就会漂 —— 漂掉的症状是\"清单里列着它，打进去说没有这一档\"。"
       },
       "status": {
         "type": "object",
-        "doc": "**只有 kind=status 有**。分组的状态快照：`session`（id/resumed/workspace/messages/steps）、`model`（current/selected/last_used/since/window/base_url）、`counters`（runs/model_calls/model_ok/tool_calls/permission_waits/asks）、`usage`（prompt/cached/miss/completion）、`meta`（max_steps/stream/autopilot/tool_count/audit_path/permissions）。**分组是有意的**：这一屏跨四个层次，平铺之后字段名早晚撞车。"
+        "doc": "**只有 kind=status 有**。分组的状态快照：`session`（id/resumed/workspace/messages/steps）、`model`（provider/current/selected/last_used/since/window/base_url/route/reasoning）、`counters`（runs/model_calls/model_ok/tool_calls/permission_waits/asks）、`usage`（prompt/cached/miss/completion）、`meta`（max_steps/stream/autopilot/tool_count/audit_path/permissions/catalog）。**分组是有意的**：这一屏跨四个层次，平铺之后字段名早晚撞车。"
       },
       "tools": {
         "type": "array",
