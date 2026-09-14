@@ -37,8 +37,8 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.protocol import messages
-from agent_runtime.runtime.config import context_windows
-from agent_runtime.state.catalog import ALIASES, load as load_catalog
+from agent_runtime.state.catalog import load as load_catalog
+from fakes import context_windows
 
 # 仓库根 —— 它下面有 `agent_runtime/`。子进程一律用 `-m agent_runtime.main` 起，
 # 而不是 `main.py` 的绝对路径：那是生产里真正的起法（见 `protocol/client.py` 的
@@ -1551,13 +1551,14 @@ def test_init_carries_the_model_catalog(fake_openai):
 
     ids = [item["id"] for item in catalog["models"]]
     assert ids == [item.id for item in load_catalog().models()]
-    # `current` 由 runtime 标好（它要对账别名折算），界面不自己比字符串。
+    # `current` 由 runtime 标好，界面不自己比字符串。
     current = [item for item in catalog["models"] if item["current"]]
     assert len(current) == 1 and current[0]["id"] == "deepseek-flash"
     # **每一条都带 provider**：同名模型可以在多条路由上，而"请求发到哪儿"是另一件事。
     assert all(item["provider"] for item in catalog["models"])
-    # 旧名字**单列**，不混在可选项里。
-    assert {item["id"] for item in catalog["aliases"]} == set(ALIASES)
-    assert all(item["of"] in ids for item in catalog["aliases"])
+    # **`aliases` 永远是空的。** 那一栏装的是"内置目录认下的旧名字"，而内置目录随
+    # "配置只有一个来源"退休了 —— 现在 `providers` 里写什么就认什么，没有第二份折算表。
+    # 字段还在（协议里那是一条已经存在的出站信息，删它要动协议版本），只是没人往里放。
+    assert catalog["aliases"] == []
 
 

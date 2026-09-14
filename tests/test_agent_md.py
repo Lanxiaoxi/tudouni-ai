@@ -316,7 +316,8 @@ def test_runtime_notices_carry_the_line_end_to_end(workdir, monkeypatch):
     """
     from agent_runtime.runtime import composition
     from agent_runtime.runtime.channels import cli_channels
-    from agent_runtime.runtime.config import McpConfig, ModelConfig, PermissionConfig, WebConfig
+    from agent_runtime.runtime.config import McpConfig, PermissionConfig, WebConfig
+    from fakes import model_registry
 
     write(workdir, "这个工作区用 uv 跑测试")
     monkeypatch.setattr(composition, "project_dir", lambda: workdir)
@@ -326,7 +327,7 @@ def test_runtime_notices_carry_the_line_end_to_end(workdir, monkeypatch):
     runtime = composition.open_runtime(
         booted=booted, session_id=session_id, session=session, channels=cli_channels(),
         resumed=resumed,
-        model_config=ModelConfig(api_key="sk-x", base_url="http://127.0.0.1:1", model="fake"),
+        catalog_config=model_registry(base_url="http://127.0.0.1:1", model="fake"),
         permission_config=PermissionConfig(), web_config=WebConfig(), mcp_config=McpConfig(),
     )
     try:
@@ -353,7 +354,8 @@ def test_the_notice_reads_the_session_not_the_disk(workdir, monkeypatch):
     """
     from agent_runtime.runtime.channels import cli_channels
     from agent_runtime.runtime.composition import boot, open_runtime
-    from agent_runtime.runtime.config import McpConfig, ModelConfig, PermissionConfig, WebConfig
+    from agent_runtime.runtime.config import McpConfig, PermissionConfig, WebConfig
+    from fakes import model_registry
 
     empty = workdir / "empty"
     empty.mkdir()
@@ -366,7 +368,7 @@ def test_the_notice_reads_the_session_not_the_disk(workdir, monkeypatch):
 
     runtime = open_runtime(
         booted=boot(), session_id="s", session=session, channels=cli_channels(),
-        model_config=ModelConfig(api_key="sk-x", base_url="http://127.0.0.1:1", model="fake"),
+        catalog_config=model_registry(base_url="http://127.0.0.1:1", model="fake"),
         permission_config=PermissionConfig(), web_config=WebConfig(), mcp_config=McpConfig(),
     )
     try:

@@ -15,21 +15,32 @@
 所以这些合成一份，放在**跟着人走**的位置：
 
     ~/.tudouni/config.json
-      ├─ "providers"   路由 + 模型清单（原来的 models.local.json，形状一字未改）
-      └─ "env"         原来 .env 里那些键值（密钥、可选的 base_url）
+      ├─ "providers"   路由 + 模型清单 + 密钥（原来的 models.local.json，形状基本没变）
+      └─ "web"         联网工具那几个键（tavily 的密钥与端点）
 
-## `env` 是 `.env` 的直接替代，优先级一字未改
+## 配置只有一个来源：这份文件
 
-    真实环境变量  >  config.json 的 "env"  >  内置默认值
+**不看真实环境变量、也不看 `.env`。** 以前这里有一条三级优先级
 
-这个方向不能反 —— 反了会让某天部署时被一份遗留的配置文件悄悄改到别的网关，而那种问题
-从源码里完全看不出来（原来那条规矩写在 `runtime/config.py` 的 docstring 里，有测试
-盯着，这里继承它）。
+    真实环境变量  >  config.json 的 "env" 段  >  内置默认值
 
-为什么是一个扁平的 `env` 映射，而不是 `{"web": {"tavily_api_key": ...}}` 这种分节：
-**它要能一对一地接住 `.env`**。分节的写法需要为每一个新键在这里加一段解析，而那些键
-（`TAVILY_BASE_URL`…）的主人是别的模块 —— 让它们各自去 `env` 里按名字取，才不会每加
-一个配置项就动这个文件。
+它退休了，理由是它自己的形状：一个值有两个地方能放、而只有一个生效，是最难排查的那种
+形态（改了 A 没反应，因为 B 在盖着它）。而这份文件本来就不进版本库、就在用户自己的机器
+上 —— "放进文件里"没有任何代价，那条优先级换来的只是这种困惑。
+
+同一件事也发生在 `providers` 的密钥上：以前还有 `api_key_env`（填一个**环境变量的名
+字**），而它和 `api_key` 长得几乎一样、一个装名字一个装值。实测有人把密钥填进了装名字的
+那个，然后只拿到一句"没有密钥" —— 而"两个地方都能放"正是让他那么填的原因。现在密钥只有
+`api_key` 一种写法，写了 `api_key_env` 会被当成**不认识的键**当场指出来。
+
+## 为什么 `web` 是一个节，而不是一张扁平的键值表
+
+它以前叫 `env`，是一张扁平映射，理由是"要能一对一地接住 `.env`"。`.env` 没了之后那个
+理由也没了，而"一个叫 env 的段里放着不来自环境变量的东西"是个会被反复追问的命名。
+
+现在是**一节一个主人**：`web` 归联网工具（`runtime/config.py` 的 `WebConfig` 读它），
+`providers` 归模型目录（`state/catalog.py` 读它）。这个模块只保证它们都是
+"字符串 → 字符串"的形状，**不解释里面的键** —— 那是各自主人的知识。
 
 ## `.env` 不再被读，而且这件事要出声
 
@@ -66,6 +77,12 @@ EXAMPLE_FILE_NAME = "config.example.json"
 
 # 环境变量：**这次读哪份配置**。测试和"临时换一份配置"都要它。
 #
+# **这是全项目仅剩的一个环境变量，而它不是"配置"。** 它回答的是"去哪找那份文件"，
+# 不是"配置里某个键是什么" —— 配置本身只有一个来源（这份文件），见模块 docstring。
+# 保留它是因为测试必须能把子进程指到一份隔离的配置上（`--runtime-stdio`、ansi 客户端
+# 那几条会起真进程的测试没有地方传参数），而换成命令行开关就得给每个子进程调用点加一层
+# 透传。
+#
 # 它比命令行开关合适：这一层不认识 argparse，而"用哪份配置"是**环境**的事实。
 # 名字从 `AGENT_MODELS_FILE` 改过来了 —— 那份文件已经不只装模型了，而一个说谎的
 # 变量名会让人以为它只影响 `/model`。
@@ -73,7 +90,7 @@ FILE_ENV = "AGENT_CONFIG_FILE"
 
 # 顶层认识的**全部**键。多一个不认识的就报错，不忽略 —— 和 `permissions.json` /
 # `mcp.json` / frontmatter 同一条规矩：写错一个键名而它静默不生效，是最坏的失败形态。
-_KNOWN_TOP_KEYS = frozenset({"providers", "env", "$comment"})
+_KNOWN_TOP_KEYS = frozenset({"providers", "web", "$comment"})
 
 
 class UserConfigError(Exception):
@@ -114,41 +131,12 @@ class UserConfig:
     found: bool = False
     # 原样的 providers 段。**这里不解释它**（那是 catalog 的知识），只保证它是个对象。
     providers: dict[str, Any] = field(default_factory=dict)
-    # 原来 `.env` 里那些键值。键是大写的环境变量名，值一律是字符串。
-    env: dict[str, str] = field(default_factory=dict)
+    # 原样的 `web` 段。由 `WebConfig` 解释里面的键，这里只保证是"字符串 → 字符串"。
+    web: dict[str, str] = field(default_factory=dict)
 
     @property
     def exists(self) -> bool:
         return self.found
-
-    def value(self, name: str, default: str = "") -> str:
-        """取一个配置值，**按那条不能反的优先级**：真实环境变量 > 文件 > 默认值。
-
-        空串一律当作"没设"，这样文件里留空的那一行会落到下一层默认值上，而不是变成
-        一个空字符串把后面的判断搞乱（`"DEEPSEEK_API_KEY": ""` 是"还没填"，不是
-        "填了一个空密钥"）。
-
-        **这一个函数就是那条优先级的唯一实现。** 它以前在 `ModelConfig.from_env` 和
-        `WebConfig.from_env` 里各写了一遍（一模一样的 `pick`），而"一字不差"这种要求
-        靠抄是维持不住的。
-        """
-        from_env_var = (os.environ.get(name) or "").strip()
-        if from_env_var:
-            return from_env_var
-        return self.value_in_file(name) or default
-
-    def value_in_file(self, name: str) -> str:
-        """**只看文件里那一格**，完全不看环境变量。空串 = 没填。
-
-        它不是 `value()` 的一半，它回答的是另一个问题：**这份文件里写了什么**。两个
-        用处，都不能用 `value()` 代替：
-
-          * "模板里有没有夹带真密钥"这条测试 —— 用 `value()` 的话，开发机上恰好设着
-            `TAVILY_API_KEY` 就会让它假红（而 CI 上是绿的，那种测试比没有更坏）；
-          * "这条路由的密钥是从哪儿来的"那句启动说明 —— 它必须能分清"文件里写着"和
-            "环境变量给的"，否则排查"为什么用的是旧密钥"就没有线索了。
-        """
-        return (self.env.get(name) or "").strip()
 
 
 def example_file() -> Path:
@@ -265,9 +253,12 @@ def read(path: Path | None = None) -> UserConfig:
 
     unknown = sorted(set(raw) - _KNOWN_TOP_KEYS)
     if unknown:
+        # **"认识哪些"从常量算，不写死。** 它以前是字面量 `providers、env`，而这个常量
+        # 改成 `{providers, web, $comment}` 之后那句话就开始**说谎**了 —— 用户照着它改，
+        # 改成一个同样不被认识的键名。报错文案和判据各写一份，漂掉是迟早的事。
         raise UserConfigError(
             f"{target} 里有不认识的顶层键：{', '.join(unknown)}\n"
-            f"  认识的只有：providers、env\n"
+            f"  认识的只有：{'、'.join(sorted(_KNOWN_TOP_KEYS - {'$comment'}))}\n"
             f"  （写错一个键名而它静默不生效是最坏的失败形态，所以这里直接停下）"
         )
 
@@ -281,26 +272,40 @@ def read(path: Path | None = None) -> UserConfig:
         )
 
     return UserConfig(path=target, found=True, providers=providers,
-                      env=_env_map(raw.get("env"), target))
+                      web=_string_map(raw.get("web"), target, section="web"))
 
 
-def _env_map(value: Any, where: Path) -> dict[str, str]:
-    """`"env"` 那一段：一个扁平的**字符串 → 字符串**映射。
+def text(mapping: dict[str, str], name: str, default: str = "") -> str:
+    """从一份"字符串 → 字符串"的段里取一个值。**空串一律当"没填"。**
 
-    数字和布尔**不自动转成字符串**：`{"DEEPSEEK_API_KEY": 12345}` 几乎总是写错了引号，
+    `{"tavily_api_key": ""}` 是"还没填"，不是"填了一个空值" —— 于是它落到 `default` 上，
+    而不是变成一个空字符串把后面的判断搞乱（模板里留空的那一行正是这个形态）。
+
+    它是**模块级函数**而不是 `UserConfig` 的方法：消费一段配置的人（`WebConfig`）手上拿到的
+    是那一**段**，不是整份文件。
+    """
+    return (mapping.get(name) or "").strip() or default
+
+
+def _string_map(value: Any, where: Path, *, section: str) -> dict[str, str]:
+    """`"web"` 那一段：一个扁平的**字符串 → 字符串**映射。
+
+    数字和布尔**不自动转成字符串**：`{"tavily_api_key": 12345}` 几乎总是写错了引号，
     而悄悄接受它会让一把"密钥"以 `"12345"` 的形态发出去，然后收到一句鉴权失败 ——
-    症状离原因太远。嵌套对象同理（那是把 `{"web": {...}}` 那种分节写法写进来了）。
+    症状离原因太远。嵌套对象同理（那是把 `{"web": {"web": {...}}}` 这种写法写进来了）。
 
     **`$` 开头的键当注释跳过。** JSON 没有注释，而这份文件是给人手写的 —— 模板里那段
     "可选的几个键有哪些"必须能待在它说明的东西旁边（放到顶层 `$comment` 里，读的人就
     得在两处之间来回找）。`$` 前缀是这个项目已有的约定（顶层就有 `$comment`），而它
-    不可能和真的环境变量名撞上。
+    不可能和真的配置键撞上。
+
+    `section` 只用来把那句话说得准（"web 的 tavily_api_key"），不改变行为。
     """
     if value is None:
         return {}
     if not isinstance(value, dict):
         raise UserConfigError(
-            f'{where} 的 "env" 必须是一个对象（环境变量名 → 值），'
+            f'{where} 的 "{section}" 必须是一个对象（键 → 值），'
             f"实际是 {type(value).__name__}"
         )
     out: dict[str, str] = {}
@@ -309,7 +314,8 @@ def _env_map(value: Any, where: Path) -> dict[str, str]:
             continue
         if not isinstance(item, str):
             raise UserConfigError(
-                f'{where} 的 env["{key}"] 必须是字符串，实际是 {type(item).__name__}'
+                f'{where} 的 {section}["{key}"] 必须是字符串，'
+                f"实际是 {type(item).__name__}"
                 f"（数字和 true/false 也要写成字符串，否则很可能是漏了引号）"
             )
         out[str(key)] = item
@@ -356,4 +362,5 @@ __all__ = [
     "example_file",
     "read",
     "scaffold",
+    "text",
 ]

@@ -30,19 +30,31 @@ Linux（x86_64）
     cd 到你自己的项目目录
     tudouni --tui
 
-第一次运行会直接报"没找到 DEEPSEEK_API_KEY"，并告诉你去哪个文件填。那份文件是：
+第一次运行会直接报"一条能用的模型路由都没有"，并告诉你去哪个文件填。那份文件是：
 
     Windows   %USERPROFILE%\.tudouni\config.json
     Linux     ~/.tudouni/config.json
 
-用记事本 / 任意编辑器打开它，在 "env" 那一段里填上：
+用记事本 / 任意编辑器打开它，把 "api_key" 那一格填上（模型和密钥写在**同一条路由**里）：
 
     {
-      "env": {
-        "DEEPSEEK_API_KEY": "sk-...",
-        "TAVILY_API_KEY": "tvly-..."      ← 可选，填了才有联网搜索
+      "providers": {
+        "deepseek": {
+          "base_url": "https://api.deepseek.com",
+          "api_key": "sk-...",                     ← 填这里
+          "models": [
+            {"id": "deepseek-flash", "context_window": 1000000},
+            {"id": "deepseek-v4-pro", "context_window": 1000000}
+          ]
+        }
+      },
+      "web": {
+        "tavily_api_key": ""                       ← 可选，填了才有联网搜索
       }
     }
+
+要接自己的网关，就改 `base_url` / `models`，或者再加一条路由 —— **第一条有密钥的路由
+就是默认路由**，顺序由你排。**配置只有这一个文件**：这个程序不读环境变量、也不读 .env。
 
 填完存盘，重新运行 tudouni --tui 就行。密钥只放在你自己这台机器上。
 

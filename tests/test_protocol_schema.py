@@ -105,10 +105,11 @@ def real_messages(workdir, monkeypatch):
     from agent_runtime.protocol.transport_stdio import StdioTransport
     from agent_runtime.runtime.channels import cli_channels
     from agent_runtime.runtime.composition import boot, open_runtime, resolve_session
-    from agent_runtime.runtime.config import McpConfig, ModelConfig, PermissionConfig, WebConfig
+    from agent_runtime.runtime.config import McpConfig, PermissionConfig, WebConfig
     from agent_runtime.protocol import codec
     from agent_runtime.tools.builtin.ask import AskUserArgs
     from agent_runtime.tools.tool import RiskLevel
+    from fakes import model_registry
 
     class _Sink:
         """一个把消息收下来的假传输。"""
@@ -142,8 +143,7 @@ def real_messages(workdir, monkeypatch):
     runtime = open_runtime(
         booted=booted, session_id=session_id, session=session,
         channels=cli_channels(), resumed=resumed,
-        model_config=ModelConfig(api_key="sk-x", base_url="http://127.0.0.1:1",
-                                 model="fake"),
+        catalog_config=model_registry(base_url="http://127.0.0.1:1", model="fake"),
         permission_config=PermissionConfig(), web_config=WebConfig(),
         mcp_config=McpConfig(),
     )

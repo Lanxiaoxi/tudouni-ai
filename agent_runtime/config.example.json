@@ -1,94 +1,34 @@
 {
   "$comment": [
-    "这台机器的配置。**你现在看到的这一份如果在 ~/.tudouni/config.json，那它就是生效的",
-    "那一份** —— 首次运行时程序会把模板抄到那儿（Windows 上是",
-    "%USERPROFILE%\\.tudouni\\config.json）。通常你只需要往下翻到 env，填那把密钥。",
+    "这台机器的配置。**跟着人走** —— 换个目录干活不该换密钥。",
+    "生效的就是这一份（~/.tudouni/config.json）；仓库里那份同名文件只是被抄的源。",
     "",
-    "（仓库里那份同名文件是模板本体，改它不影响任何运行 —— 它只是被抄的源。）",
+    "**配置只有这一个来源**：不看环境变量、也不看 .env。要改什么就改这个文件。",
     "",
-    "这份文件是**跟着人走**的，一台机器一份 —— 换个项目干活不该换密钥。跟着项目走的",
-    "东西在 <项目目录>/.tudouni/ 里（会话、审计日志、权限策略、项目技能），那些不用管，",
-    "第一次在那个目录里跑起来就自动建了。",
+    "providers：**键就是路由名**，顺序就是 /model 清单的顺序 —— 也就是\"哪个是默认\"",
+    "由你排出来：第一条有密钥的路由就是默认路由。一条路由给三样东西：",
+    "    base_url   请求发到哪",
+    "    api_key    密钥就写在这里（没有第二种写法）",
+    "    models     这条路上有什么；不写它这条路由就选不了",
     "",
-    "两段内容，都可以省：",
+    "  context_window 不知道就整行删掉：那样界面只报用量、不报占比。",
+    "  错的百分比比没有百分比更坏 —— 它会被当成真的。",
     "",
-    "  \"env\"        原来写在 .env 里的那些键。**最常用的就这一段** —— 只填一把",
-    "               DEEPSEEK_API_KEY 就能跑，那时候用的是内置的 deepseek 路由。",
-    "               优先级：真实环境变量 > 这里 > 内置默认值（方向不能反：反了会让",
-    "               某天部署时被一份遗留的配置悄悄改到别的网关，而源码里看不出来）。",
-    "",
-    "  \"providers\"  路由 + 模型清单。**只有要接第二家网关、或者想把可选模型写死成",
-    "               一份清单时才需要它。** 整段删掉不影响任何东西（那时自动造一条",
-    "               deepseek 路由，密钥从 env 或环境变量的 DEEPSEEK_API_KEY 读）。",
-    "",
-    "providers 的三条要点：",
-    "  1. 里面的**键就是路由名**（请求按它选），顺序就是 /model 清单的顺序 ——",
-    "     也就是\"哪个是默认\"由你排出来，不是我们按名字猜的；",
-    "  2. 每条路由要给 base_url 和一个模型清单。不给 models 的路由选不了",
-    "     （清单是「我知道这条路上有什么」，不是「这条路只允许这些」）；",
-    "  3. 密钥的优先级：**api_key（写死）> api_key_env 指的真实环境变量 > env 段里",
-    "     的同名键**。三种都行，因为这个文件本来就不进版本库。",
-    "",
-    "context_window 不知道就**整行删掉**：那样界面只报用量、不报占比。",
-    "错的百分比比没有百分比更坏 —— 它会被当成真的。",
-    "",
-    "下面那条 \"acme-gateway\" 是个占位示例：**整段删掉不影响任何东西**",
-    "（目录里少一条路由而已），但注意别把前面的逗号留下。"
+    "web：联网搜索那几个键。不填就不注册 web_search（fetch_web 不受影响，缺它不算错误）。"
   ],
-
-  "env": {
-    "DEEPSEEK_API_KEY": "",
-
-    "$comment": [
-      "可选的几个：",
-      "  DEEPSEEK_BASE_URL   换网关（默认 https://api.deepseek.com）",
-      "  DEEPSEEK_MODEL      改默认模型（下一次新会话生效）",
-      "  TAVILY_API_KEY      联网搜索（web_search 工具）。到 https://app.tavily.com",
-      "                      拿一个，形如 tvly-...。不填就不注册这个工具，",
-      "                      fetch_web 不受影响 —— 缺它不算配置错误。",
-      "  TAVILY_BASE_URL     换搜索网关（默认 https://api.tavily.com）"
-    ]
-  },
 
   "providers": {
     "deepseek": {
-      "display_name": "DeepSeek 官方",
       "base_url": "https://api.deepseek.com",
-      "api_key_env": "DEEPSEEK_API_KEY",
+      "api_key": "",
       "models": [
-        {
-          "id": "deepseek-flash",
-          "label": "Flash",
-          "context_window": 1000000,
-          "summary": "快、便宜，日常干活用它",
-          "note": "DeepSeek-V4.1-Flash；支持图像理解；并发上限 2500。",
-          "vision": true,
-          "reasoning_effort": "high"
-        },
-        {
-          "id": "deepseek-v4-pro",
-          "label": "Pro",
-          "context_window": 1000000,
-          "summary": "贵得多，难题上更强",
-          "note": "DeepSeek-V4-Pro-0813；不支持图像理解；并发上限 500。",
-          "reasoning_effort": "high"
-        }
-      ]
-    },
-    "acme-gateway": {
-      "display_name": "自建网关（示例，删掉它）",
-      "base_url": "https://gateway.example.com/v1",
-      "api_key_env": "ACME_GATEWAY_API_KEY",
-      "models": [
-        {
-          "id": "my-model-name",
-          "label": "MyModel",
-          "context_window": 262144,
-          "summary": "内网上的那个模型",
-          "note": "不知道窗口就删掉 context_window —— 那样界面只报用量、不报占比。",
-          "reasoning_effort": "low"
-        }
+        {"id": "deepseek-flash", "context_window": 1000000},
+        {"id": "deepseek-v4-pro", "context_window": 1000000}
       ]
     }
+  },
+
+  "web": {
+    "tavily_api_key": ""
   }
 }

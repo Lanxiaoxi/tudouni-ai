@@ -12,26 +12,25 @@
 
 ## 配置文件：`~/.tudouni/config.json` 的 `providers` 段
 
-它**跟着人走，不跟着工作区走**：换个项目干活不该换密钥。文件的定位、`env` 段、以及
-"为什么不再读 `.env` 和 `<包目录>/models.local.json`"都写在 `agent_runtime/userconfig.py`
-里 —— 这个模块只负责**解释 `providers` 段**，不负责找文件、也不负责读它。
+它**跟着人走，不跟着工作区走**：换个项目干活不该换密钥。文件的定位、`web` 段、以及
+"为什么不再读 `.env`"都写在 `agent_runtime/userconfig.py` 里 —— 这个模块只负责
+**解释 `providers` 段**，不负责找文件、也不负责读它。
 
 ```jsonc
 {
-  "providers": { "deepseek": { "base_url": "…", "api_key_env": "DEEPSEEK_API_KEY",
-                               "models": [{"id": "deepseek-flash", …}] } },
-  "env": { "DEEPSEEK_API_KEY": "sk-…" }
+  "providers": { "deepseek": { "base_url": "…", "api_key": "sk-…",
+                               "models": [{"id": "deepseek-flash", …}] } }
 }
 ```
 
-**密钥可以直接写进这个文件**：它在用户级目录、不进版本库、也不在工作区里被 agent 改
-（控制面那条只保护 `.tudouni/`，而这一份恰好也在那底下）。同时**也认 `api_key_env`**
-（引用一个环境变量名），因为"密钥不进任何文件、只从环境来"是更好的做法，而这两种都该
-能选。优先级是 **`api_key` > 环境变量 > 同一份文件的 `env` 段**：写死了就是"我要用这个"。
+**密钥就写在这条路由里**（`api_key`）：这份文件在用户级目录、不进版本库、也不在工作区里
+被 agent 改（控制面那条只保护 `.tudouni/`，而这一份恰好也在那底下）。填上它这条路由就能
+用，**就结束了** —— 配置只有这一个来源：不看真实环境变量、也不看 `.env`。要换密钥就改这
+个文件，没有第二个地方可改（"两个地方都能放、只有一个生效"正是最难排查的那种形态）。
 
-**没有这个文件也能跑。** 那种情况下会自动造一条 `deepseek` 路由（密钥从
-`DEEPSEEK_API_KEY` 读、端点从 `DEEPSEEK_BASE_URL` 读）—— 也就是说，这份配置文件是
-**加法**，不是"不配就跑不起来"的又一道门。容器里只给环境变量的部署就靠这一条。
+**没有 `providers` 就是一条路由也没有。** 那会以一句能照着改的话收场（见
+`composition._no_model_message`），而不是悄悄退到某条内置路由上去。以前那条"不配置也能
+跑"的兜底路由读的是环境变量（`DEEPSEEK_API_KEY`），它随环境变量一起退休了。
 
 ## 坏配置一律降级 + 出声，绝不拦启动
 
@@ -44,8 +43,7 @@
 from __future__ import annotations
 
 import json
-import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -55,72 +53,31 @@ from agent_runtime.state import reasoning
 # 文件的定位与读取**全在 `userconfig`**（那是个只 import 标准库和 `paths` 的叶子）。
 # 这里刻意不再自己算路径、也不再自己读 JSON：
 #
-#   * 同一份文件被两个模块读（这里要 `providers`，`runtime/config.py` 要 `env`），
+#   * 同一份文件被两个模块读（这里要 `providers`，`runtime/config.py` 要 `web`），
 #     各写一份"去哪找、怎么读"就是同一件事的第二份算法 —— 而那正是 `paths.py` 那段
 #     docstring 记着的那次事故（三份算法里有一份写死了目录名，改名之后静默失效）；
 #   * **仍然不 import `runtime.config`**：那个模块反过来要 import 本模块，环会让
 #     "哪个先加载"变成一个必须小心维持的顺序。
 MODELS_EXAMPLE_NAME = userconfig.EXAMPLE_FILE_NAME
 
-# 内置那条路由的名字与端点。**它是"没有配置文件时也能跑"的依据**，也是
-# `DEFAULT_MODEL` 的出处 —— `runtime/config.py` 从这里取，不另写一份字面量。
-BUILTIN_PROVIDER = "deepseek"
-BUILTIN_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-flash"
-# 内置那条兜底路由的密钥环境变量。**公开**：`composition` 要在"一条路由都没有"那句话
-# 里说清"只给一把密钥也能跑"是哪一把，而那句话不该自己抄一个字面量（抄了就会漂）。
-BUILTIN_API_KEY_ENV = "DEEPSEEK_API_KEY"
-_API_KEY_ENV = BUILTIN_API_KEY_ENV
-_BASE_URL_ENV = "DEEPSEEK_BASE_URL"
-_MODEL_ENV = "DEEPSEEK_MODEL"
-
 # 一条路由的合法键。**不认识的键直接报错，不忽略** —— 和 `permissions.json` /
 # `mcp.json` 同一条规矩：写错一个键名而它静默不生效，是最坏的失败形态。
+#
+# 这里**没有 `api_key_env`**：它要的是"环境变量的名字"，也就是把密钥放在**另一个地方**
+# 再指过来，而配置的唯一来源是这份文件。它现在落进"不认识的键"，所以谁写了它当场就会被
+# 指出来 —— 这正是一次实测换来的：有人把**密钥本身**填进了那个字段（它和 `api_key` 长得
+# 太像，一个装名字、一个装值），而旧代码只会说"没有密钥"，用户手里明明有一把填进去的
+# 密钥，于是只能来问"为什么"。
 _PROVIDER_KEYS = frozenset({
-    "display_name", "base_url", "api_key", "api_key_env", "models",
+    "display_name", "base_url", "api_key", "models",
 })
+# 模型那几个**可选**的说明性字段（`label` / `summary` / `note`）与 `vision` 仍然收下 ——
+# 它们是 `/model` 那份清单要显示的东西。模板里不出现它们（那才是给人抄的那份，越短越好），
+# 但 schema 认，因为"这条路上这个模型叫什么、有什么能力"是配置的事实。
 _MODEL_KEYS = frozenset({
     "id", "label", "context_window", "summary", "note", "vision",
     "reasoning_effort",
 })
-
-# 内置的 DeepSeek 目录。**它是"没有配置文件时也能跑"的依据**，不是第二份目录表 ——
-# 一旦配置文件的 `providers` 里声明了 `deepseek` 这条路由，这里就不再参与。
-#
-# 名字与能力取自官方文档（api-docs.deepseek.com 的「模型 & 价格」）：
-# 两个模型、窗口都是 1M。旧名字（`deepseek-v4-flash` / `…-vision-exp`）作为**别名**
-# 认下来，但不列进清单 —— 官方说它们对应的模型已下线、由 V4.1-Flash 提供服务。
-_BUILTIN_MODELS: tuple[dict[str, Any], ...] = (
-    {
-        "id": "deepseek-flash",
-        "label": "Flash",
-        "context_window": 1_000_000,
-        "summary": "快、便宜，日常干活用它",
-        "note": "DeepSeek-V4.1-Flash；支持图像理解；并发上限 2500。"
-                "缓存命中输入比 Pro 便宜约 7 倍。",
-        "vision": True,
-        "reasoning_effort": "high",
-    },
-    {
-        "id": "deepseek-v4-pro",
-        "label": "Pro",
-        "context_window": 1_000_000,
-        "summary": "贵得多，难题上更强",
-        "note": "DeepSeek-V4-Pro-0813；不支持图像理解；并发上限 500。"
-                "缓存未命中输入约为 Flash 的 4.5 倍。",
-        "vision": False,
-        "reasoning_effort": "high",
-    },
-)
-
-_BUILTIN_BASE_URL_ENV = _BASE_URL_ENV  # 兼容旧名字（同一个值）
-
-# 别名 → 现在真正在服务的那个模型。收下它们是因为别人的配置/环境变量里可能就写着它们，
-# 而"能用的名字被判成不认识"是最没必要的意外。
-ALIASES: dict[str, str] = {
-    "deepseek-v4-flash": "deepseek-flash",
-    "deepseek-v4-flash-vision-exp": "deepseek-flash",
-}
 
 
 class CatalogError(userconfig.UserConfigError):
@@ -203,8 +160,8 @@ class Provider:
         return bool(self.api_key)
 
     def find(self, model: str) -> ModelRef | None:
-        """这条路由上的某个模型（先折算别名）。"""
-        wanted = ALIASES.get((model or "").strip(), (model or "").strip())
+        """这条路由上的某个模型。名字**原样比**，不做任何折算。"""
+        wanted = (model or "").strip()
         for item in self.models:
             if item.id == wanted:
                 return item
@@ -216,16 +173,19 @@ class Registry:
     """这一台机器上**认识的全部模型**，加它们的路由。"""
 
     providers: tuple[Provider, ...] = ()
-    # 启动时那些"该看一眼"的说明（缺密钥、声明了却没有模型、`DEEPSEEK_MODEL` 找不到）。
-    # **分两档**，因为它们的处置不同：`problems` 是"这条路由用不了/你的配置没生效"，
-    # `notes` 是"它好着呢，这是它的事实"（比如"这条路由的密钥是从文件里读的"）。
-    # 混在一起的话，真正的问题会被淹没在正常信息里 —— 而"密钥到底是哪来的"又必须说，
-    # 因为它是排查"为什么它用的是旧密钥"唯一的线索。
+    # 启动时那些"该看一眼"的说明。**分两档**：`problems` 是"这条路由用不了 / 你的配置
+    # 没生效"，`notes` 是"它好着呢，这是它的事实"。混在一起的话，真正的问题会被淹没在
+    # 正常信息里。
+    #
+    # `notes` 现在**没人往里放东西**了：它以前装的是"这条路由的密钥来自哪个环境变量"，
+    # 而那个问题在"配置只有一个来源"之后没有答案可给（密钥就在这份文件里，看一眼就知道）。
+    # 字段留着是因为它在协议里是一条已经存在的出站信息，删它要动协议版本 —— 那和这次
+    # 收口无关。
     problems: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
     # 这份目录是哪来的（给 `/status` 和启动那行说明用）。**它是事实，不是装饰**：
     # "为什么我改的配置没生效"这个问题的答案就是这一个字符串。
-    source: str = "内置"
+    source: str = ""
 
     def provider(self, name: str) -> Provider | None:
         for item in self.providers:
@@ -269,12 +229,12 @@ class Registry:
         if provider is not None:
             found = self.provider(provider)
             return found.find(wanted) if found is not None else None
-        hits = [item for item in self.models() if item.id == ALIASES.get(wanted, wanted)]
+        hits = [item for item in self.models() if item.id == wanted]
         return hits[0] if len(hits) == 1 else None
 
     def ambiguous(self, name: str) -> tuple[ModelRef, ...]:
         """这个名字是不是落在多条路由上（那就要写 `provider/model`）。"""
-        wanted = ALIASES.get((name or "").strip(), (name or "").strip())
+        wanted = (name or "").strip()
         return tuple(item for item in self.models() if item.id == wanted)
 
     def default_provider(self) -> Provider | None:
@@ -295,17 +255,12 @@ class Registry:
         return found.models[0]
 
     def windows(self) -> dict[str, int]:
-        """`{模型名: 窗口}` —— 老接口（`config.CONTEXT_WINDOWS`）要的那张表。
+        """`{模型名: 窗口}` —— 只含**知道窗口**的那些。
 
-        只含**知道窗口**的那些，而且别名也进表：别人的 `DEEPSEEK_MODEL` 里写着旧名字
-        时，那张表得照样答得出分母。
+        界面拿它当占比的分母；表里没有这个名字时只报用量、不报占比（错的百分比比没有
+        百分比更坏，它会被当成真的）。
         """
-        table = {item.id: item.window for item in self.models() if item.window is not None}
-        for alias in ALIASES:
-            hit = self.find(alias)
-            if hit is not None and hit.window is not None:
-                table[alias] = hit.window
-        return table
+        return {item.id: item.window for item in self.models() if item.window is not None}
 
 
 # --- 解释 providers 段 ----------------------------------------------------------
@@ -386,88 +341,34 @@ def _models_from(raw: Any, *, provider: str, where: str) -> tuple[ModelRef, ...]
     return tuple(out)
 
 
-def _api_key(raw: dict, *, where: str, env: dict[str, str]) -> tuple[str, str]:
-    """一条路由的密钥：`(值, 从哪来)`。
+def _api_key(raw: dict, *, where: str) -> str:
+    """这条路由的密钥：**就写在它自己里面**（`api_key`）。
 
-    优先级 **文件里的 `api_key` > `api_key_env` 指的那个真实环境变量 > 同一份文件
-    `env` 段里的同名键**。返回"从哪来"是为了让启动那行说明能说清"这条路由的密钥是从
-    哪儿读的"—— 排查"为什么它用的是旧密钥"时，这句话是唯一的线索。
+    这里以前还有一条 `api_key_env` 分支（先查真实环境变量、再查同一份文件的 `env` 段）。
+    它退休了，理由写在模块 docstring 里：配置只有一个来源，就是这份文件。而那个字段名
+    和 `api_key` 长得几乎一样、一个装名字一个装值 —— 实测有人把密钥填进了装名字的那个，
+    然后只拿到一句"没有密钥"。
     """
-    key = _text(raw, "api_key", where=where)
-    if key:
-        return key, "文件"
-    name = _text(raw, "api_key_env", where=where)
-    if not name:
-        return "", ""
-    from_env = (os.environ.get(name) or "").strip()
-    if from_env:
-        return from_env, f"环境变量 {name}"
-    from_file = (env.get(name) or "").strip()
-    if from_file:
-        return from_file, f'配置里 env 的 {name}'
-    return "", ""
-
-
-def _builtin_registry(env: dict[str, str], *, source: str) -> Registry:
-    """没有配置文件时的那条 `deepseek` 路由（读 `DEEPSEEK_*`）。
-
-    它让"不写配置文件也能跑"成立 —— 也就是这个项目在这之前的全部用法。
-    """
-    key = (os.environ.get(_API_KEY_ENV) or "").strip() or (env.get(_API_KEY_ENV) or "").strip()
-    base = ((os.environ.get(_BASE_URL_ENV) or "").strip()
-            or (env.get(_BASE_URL_ENV) or "").strip() or BUILTIN_BASE_URL)
-    models = tuple(
-        ModelRef(
-            provider=BUILTIN_PROVIDER,
-            id=item["id"],
-            label=item.get("label", ""),
-            window=item.get("context_window"),
-            summary=item.get("summary", ""),
-            note=item.get("note", ""),
-            vision=bool(item.get("vision")),
-            default_effort=reasoning.resolve_effort(item.get("reasoning_effort", ""))
-            or reasoning.DEFAULT_EFFORT,
-        )
-        for item in _BUILTIN_MODELS
-    )
-    return Registry(
-        providers=(Provider(name=BUILTIN_PROVIDER, base_url=base, api_key=key,
-                            models=models),),
-        source=source,
-    )
+    return _text(raw, "api_key", where=where)
 
 
 def load(path: Path | None = None) -> Registry:
-    """读那份配置的 `providers` 段。**永远返回一个能用的 Registry，坏消息放在 `problems`。**
+    """读那份配置的 `providers` 段。**永远返回一个 Registry，坏消息放在 `problems`。**
 
     `path=None` 时读 `userconfig.config_file()`（默认 `~/.tudouni/config.json`，可以用
-    `AGENT_CONFIG_FILE` 顶掉）。**没有那个文件、或者它里面没写 `providers`**，就退到内置
-    那条 `deepseek` 路由 —— 见 `_builtin_registry`。
+    `AGENT_CONFIG_FILE` 顶掉）。**没有那个文件、或者它里面没写 `providers`**，就是一条
+    路由都没有 —— 那由调用方报一句能照着改的话（`composition._no_model_message`），不在
+    这里造一条兜底路由。
 
     **形状错误抛 `CatalogError`（`UserConfigError` 的子类），语义问题进 `problems`。**
-    这条分界线是有意的：读不懂再猜也没意义（停下让人改），而"缺密钥"少一条路由不该让
-    会话开不出来。
-
-    ## `env_file=` 那个参数没了
-
-    它以前是"去哪找 `.env`"。现在密钥和 providers 在**同一份文件**里，所以一个路径就够 ——
-    而留着两个参数会让"这两份必须是同一个文件"变成调用方要记住的事（测试里最容易忘，
-    而忘了的症状是"密钥读不到"）。
+    这条分界线是有意的：读不懂再猜也没意义（停下让人改），而"某条路由缺密钥"只是少一个
+    选择，不该让会话开不出来。
     """
     cfg = userconfig.read(path)
-    env = cfg.env
-
-    # 没有文件、或者文件里没写 providers（只写了 env / 只放了密钥）—— 两种都退到内置那条
-    # 路由。**第二种必须和第一种一样待**：只想换个密钥的人不该被迫把整份模型清单抄一遍。
-    if not cfg.providers:
-        source = str(cfg.path) if cfg.exists else f"内置（{_API_KEY_ENV}）"
-        return _builtin_registry(env, source=source)
-
     path = cfg.path
     providers_raw = cfg.providers
 
     problems: list[str] = []
-    notes: list[str] = []
     providers: list[Provider] = []
     for name, item in providers_raw.items():
         where = f"{path.name} 的 providers.{name}"
@@ -482,7 +383,7 @@ def load(path: Path | None = None) -> Registry:
         base_url = _text(item, "base_url", where=where)
         if not base_url:
             raise CatalogError(f'{where} 少了 "base_url"（请求发到哪）')
-        key, origin = _api_key(item, where=where, env=env)
+        key = _api_key(item, where=where)
         models = _models_from(item.get("models"), provider=name, where=where)
         if not models:
             problems.append(
@@ -496,33 +397,22 @@ def load(path: Path | None = None) -> Registry:
             models=models,
             display_name=_text(item, "display_name", where=where),
         ))
-        # **密钥来自哪里也要说**（`notes`，不是 `problems`）：它是排查"为什么它用的是
-        # 旧密钥"唯一的线索，而那种 bug 的症状只是"鉴权失败"或"账单在另一个账号上"。
-        notes.append(f"[模型] 路由 {name}：密钥来自{origin}" if key
-                     else f"[模型] 路由 {name}：没有密钥")
         if not key:
             problems.append(
                 f"[模型] 路由 {name} 没有密钥（{where}），选不了它下面的模型 —— "
-                f'写上 "api_key"，或者用 "api_key_env" 指一个环境变量'
+                f'在**这条路由里**写上 "api_key"'
             )
 
-    default = (os.environ.get(_MODEL_ENV) or env.get(_MODEL_ENV) or "").strip()
-    registry = Registry(providers=tuple(providers), problems=tuple(problems),
-                        notes=tuple(notes), source=str(path))
-    if not any(item.usable for item in registry.providers):
+    # **没有第二处可看**：密钥、端点、模型清单都只在这份文件里，所以这里不再有"密钥来自
+    # 哪个环境变量"那种说明（那是以前留给"两个地方都能放"的线索）。
+    if providers and not any(item.usable for item in providers):
         problems.append(
-            "[模型] 一条可用的路由都没有（每条都缺密钥）—— /model 会摆出一张"
-            f"选不了的清单，而 {BUILTIN_API_KEY_ENV} 兜底那条路也没配上"
+            "[模型] 一条可用的路由都没有（每条都缺密钥）—— /model 会摆出一张选不了的清单"
         )
-    if default and registry.find(default) is None:
-        problems.append(
-            f"[模型] {_MODEL_ENV}={default} 在所有路由里都找不到，已按默认模型继续"
-        )
-    return replace(registry, problems=tuple(problems))
+    return Registry(providers=tuple(providers), problems=tuple(problems),
+                    source=str(path))
 
 
 __all__ = [
-    "ALIASES", "BUILTIN_API_KEY_ENV", "BUILTIN_BASE_URL", "BUILTIN_PROVIDER",
-    "CatalogError", "DEFAULT_MODEL",
-    "MODELS_EXAMPLE_NAME", "ModelRef", "Provider", "Registry", "load",
+    "CatalogError", "MODELS_EXAMPLE_NAME", "ModelRef", "Provider", "Registry", "load",
 ]

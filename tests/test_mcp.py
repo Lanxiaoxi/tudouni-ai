@@ -850,10 +850,10 @@ def test_open_runtime_lists_mcp_servers_but_does_not_mount_them(workdir, capsys)
     )
     from agent_runtime.runtime.config import (
         McpConfig,
-        ModelConfig,
         PermissionConfig,
         WebConfig,
     )
+    from fakes import model_registry
 
     booted = boot()
     session_id, session, _resumed = resolve_session(booted.store, None)
@@ -876,9 +876,8 @@ def test_open_runtime_lists_mcp_servers_but_does_not_mount_them(workdir, capsys)
             session_id=session_id,
             session=session,
             channels=cli_channels(),
-            model_config=ModelConfig(
-                api_key="sk-test", base_url="http://127.0.0.1:1", model="fake-model",
-            ),
+            catalog_config=model_registry(base_url="http://127.0.0.1:1",
+                                          model="fake-model"),
             # 权限文件是**真的从磁盘读**的；这里给一份明确的，免得依赖跑测试的机器上
             # 恰好有 .tudouni/permissions.json。
             permission_config=PermissionConfig(),

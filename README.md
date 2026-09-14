@@ -24,35 +24,47 @@ tudouni
 **第一次跑会告诉你去哪填密钥**，而且那份文件已经替你建好了：
 
 ```
-没找到 DEEPSEEK_API_KEY。两种给法，任选其一：
+一条能用的模型路由都没有 —— 配不出模型就什么都干不了。
 
-  1) 我已经在这儿给你建好了一份配置，打开它、在 "env" 里填上密钥：
-         C:\Users\你\.tudouni\config.json
-     那一行长这样：   "DEEPSEEK_API_KEY": "sk-..."
+我已经在这儿给你建好了一份配置，打开它、填上你的模型和密钥：
+    C:\Users\你\.tudouni\config.json
 
-  2) 设成环境变量（CI / 容器里用这条）
-       PowerShell：  $env:DEEPSEEK_API_KEY = "sk-..."
-       bash：        export DEEPSEEK_API_KEY=sk-...
+模型层是抽象的：端点、模型名、密钥全由配置里的 providers 决定，
+代码里没有写死任何一家。在 "providers" 里加一条路由就能用：
+
+        {
+          "providers": {
+            "my-gateway": {
+              "base_url": "https://your-gateway.example.com/v1",
+              "api_key": "sk-...",
+              "models": [{"id": "my-model", "context_window": 200000}]
+            }
+          }
+        }
 ```
 
-优先级是 **真实环境变量 > `~/.tudouni/config.json` 的 `env` 段 > 默认值**。这个方向不能反
-—— 反了会让某天部署时被一份遗留的配置悄悄改到别的网关，而那种问题从源码里完全看不出来。
+**密钥就填在它自己那条路由的 `api_key` 里，填完就结束了。** 配置只有这一个来源 ——
+这个程序不看环境变量、也不看 `.env`（理由见下面「模型与路由」）。
 
-那份文件长这样（模板见 `agent_runtime/config.example.json`，两段都可以省）：
+那份文件长这样（模板见 `agent_runtime/config.example.json`，`web` 那段可以省）：
 
 ```jsonc
 {
-  "env": {
-    "DEEPSEEK_API_KEY": "sk-...",
-    // 可选：DEEPSEEK_BASE_URL 换网关、DEEPSEEK_MODEL 改默认模型
-    // 可选：TAVILY_API_KEY 开联网搜索（web_search 工具）
-    "TAVILY_API_KEY": "tvly-..."
-  }
-  // 要接第二家网关时才需要 "providers"，见下面「模型与路由」
+  "providers": {
+    "deepseek": {
+      "base_url": "https://api.deepseek.com",
+      "api_key": "sk-...",                     // ← 填这里
+      "models": [
+        {"id": "deepseek-flash", "context_window": 1000000},
+        {"id": "deepseek-v4-pro", "context_window": 1000000}
+      ]
+    }
+  },
+  "web": { "tavily_api_key": "tvly-..." }      // 可选：联网搜索
 }
 ```
 
-**没有 `TAVILY_API_KEY` 不算配置错误**（不像 `DEEPSEEK_API_KEY`）：只是不注册 `web_search`
+**没有 `web.tavily_api_key` 不算配置错误**（不像模型那一条）：只是不注册 `web_search`
 这一个工具，启动时在 stderr 说一句，其余功能照旧。理由见下面「联网工具」。
 
 ### 从源码跑（开发这个项目本身）
@@ -193,25 +205,21 @@ runtime 收掉当前会话的 runtime、按新会话重新装配，界面进程�
 ```powershell
 tudouni                                    # /model 看清单；/model deepseek-v4-pro 换
 tudouni --tui                              # 同上，那一屏会列 label、说明和上下文窗口
-$env:DEEPSEEK_MODEL = "deepseek-v4-pro"    # 改默认模型（下一次新会话生效）
+# 想换默认模型：/model 换一次（那个选择跟着会话存下来）—— **没有"默认模型"这个配置项**，
+# 默认就是配置里第一条有密钥的路由的第一个模型
 ```
 
-**默认不用配任何东西**：只填了一把 `DEEPSEEK_API_KEY`（`env` 段或环境变量）时会自动造一条
-`deepseek` 路由，端点从 `DEEPSEEK_BASE_URL` 读。也就是说 `providers` 那一段是**加法**，
-不是又一道"不配就跑不起来"的门 —— 容器里只给环境变量的部署就靠这一条。
+**没有 `providers` 就是一条路由也没有**（会以一句能照着改的话收场）。以前还有一条"只填
+一把密钥就能跑"的兜底路由，它读的是环境变量 —— 随"配置只有一个来源"一起退休了。
 
-### 接第二家：`~/.tudouni/config.json` 的 `providers` 段
-
-它和密钥在**同一份文件**里（`env` 是密钥，`providers` 是路由）：
+### 模型路由：`~/.tudouni/config.json` 的 `providers` 段
 
 ```jsonc
 {
-  "env": { "DEEPSEEK_API_KEY": "sk-...", "ACME_GATEWAY_API_KEY": "..." },
   "providers": {
     "deepseek": {
-      "display_name": "DeepSeek 官方",
       "base_url": "https://api.deepseek.com",
-      "api_key_env": "DEEPSEEK_API_KEY",
+      "api_key": "sk-...",
       "models": [
         { "id": "deepseek-flash", "label": "Flash", "context_window": 1000000,
           "summary": "快、便宜，日常干活用它", "vision": true,
@@ -222,29 +230,38 @@ $env:DEEPSEEK_MODEL = "deepseek-v4-pro"    # 改默认模型（下一次新会�
     },
     "acme-gateway": {
       "base_url": "https://gateway.acme.example/v1",
-      "api_key_env": "ACME_GATEWAY_API_KEY",
+      "api_key": "...",
       "models": [{ "id": "acme-think", "context_window": 262144 }]
     }
-  }
+  },
+  "web": { "tavily_api_key": "tvly-..." }
 }
 ```
 
 | 找哪份文件 | 顺序 |
 |---|---|
-| 1 | 环境变量 `AGENT_CONFIG_FILE` 指的那份（测试、以及"临时换一份配置"用它） |
+| 1 | 环境变量 `AGENT_CONFIG_FILE` 指的那份（测试、以及"临时换一份配置"用它）。**它不是配置，是"读哪份文件"** |
 | 2 | `~/.tudouni/config.json` ← 正常就是这一份（首次运行自动建出来） |
-| 3 | 没有它、或者它里面没写 `providers` → 内置那条 `deepseek` 路由（只认 `DEEPSEEK_*`） |
+
+**配置只有这一个来源：不看环境变量、也不看 `.env`。** 这条是刻意的，理由是它自己的形状
+—— 一个值有两个地方能放、而只有一个生效，是最难排查的那种形态（改了 A 没反应，因为 B 在
+盖着它）。而这份文件本来就不进版本库、就在用户自己的机器上。
 
 **它跟着人走，不跟着工作区走** —— 换个项目干活不该换密钥。所以工作区级**没有**模型配置：
 想让某个项目走另一条路由，`/model` 换一次，那个选择跟着会话存下来（见下面第 2 条）。
 
 - **`providers` 的键就是路由名**，顺序就是 `/model` 清单的顺序 —— 也就是"哪个是默认"
   由人排出来，不是我们按名字猜的（按名字猜的话，加一条路由可能悄悄改掉默认）。
-- **密钥的优先级：`api_key`（写死在 `providers` 里）> `api_key_env` 指的真实环境变量 >
-  同一份文件 `env` 段里的同名键。** 三种都行 —— 这个文件在用户级目录、不进版本库，
-  而且首次生成时权限就收到了 `0600`（目录 `0700`）。
+  **第一条有密钥的路由就是默认路由**；**没有"默认模型"这个配置项**。
+- **密钥就写在它自己那条路由里（`api_key`），只有这一种写法。** 以前还有一个
+  `api_key_env`（填一个环境变量的名字），它退休了：那个字段和 `api_key` 长得几乎一样、
+  一个装名字一个装值，实测有人把密钥填进了装名字的那个，然后只拿到一句"没有密钥"。
+  它现在落进"不认识的键"，同样的手滑会当场被指出来。
 - **`context_window` 不知道就整行删掉**：那样界面只报用量、不报占比（**错的百分比比
-  没有百分比更坏**）。`id` 是发给端点的模型名，原样传；`label` 只是给人看的短名。
+  没有百分比更坏**）。`id` 是发给端点的模型名，原样传；`label` / `summary` / `note`
+  只是给 `/model` 那份清单看的，都可以不写。
+- **`web` 是联网工具自己的节**（`tavily_api_key` / `tavily_base_url`）。缺它不算配置
+  错误 —— 只是不注册 `web_search`。
 - **写错一个键名直接报错并列出认识的键**（和 `permissions.json` / `mcp.json` 同一条
   规矩）。而"某条路由缺密钥"是**降级 + 出声**：它在清单里照样列着（好让人知道自己配了
   它），但选不了，启动那几行会说明。
@@ -430,7 +447,7 @@ L3 一行新代码都没有：技能目录就在文件系统上，`read_file` / 
 [技能] broken 被跳过：frontmatter 缺少 description —— 它是模型判断「什么时候该用这个技能」的唯一依据
 ```
 
-一个技能都没有时 `load_skill` **根本不注册**（和缺 `TAVILY_API_KEY` 不注册 `web_search`
+一个技能都没有时 `load_skill` **根本不注册**（和缺 `web.tavily_api_key` 不注册 `web_search`
 同一条路）：schema 每一轮都要发出去，而一个空目录里的 `load_skill` 只会让模型白花一步。
 这种情况下中途新建的技能要重开会话才用得上；已经有一个技能时，新加的技能下一轮就能加载
 （清单每次读都重扫，所以"模型看得见清单、却加载不了它"这个自相矛盾的状态不会出现）。
@@ -690,7 +707,7 @@ uv run python scripts/fetch_rg.py --all      # 拉支持的平台，按官方 sh
 uv run python scripts/fetch_rg.py --list     # 支持哪些、现在各自在不在、另外还有哪些官方构建
 ```
 
-缺本机那一份时 `grep` **不注册**（模型看不到就不会白调一次，和缺 `TAVILY_API_KEY`
+缺本机那一份时 `grep` **不注册**（模型看不到就不会白调一次，和缺 `web.tavily_api_key`
 不注册 `web_search` 同一条路），启动时往 stderr 打一句说明，`tests/test_grep.py` 里
 也有一条 gate 测试会红。
 
@@ -747,7 +764,7 @@ argv 的形状不是风格问题，这三条都是实测出来的：
 
 ```powershell
 # 搜索要先配一个密钥（没有它就不注册这个工具，fetch_web 不受影响）
-# 在 ~/.tudouni/config.json 的 "env" 里：  "TAVILY_API_KEY": "tvly-..."
+# 在 ~/.tudouni/config.json 的 "web" 段里：  "tavily_api_key": "tvly-..."
 ```
 
 | 工具 | 风险 | 默认会不会问你 |

@@ -1,20 +1,18 @@
 """运行配置。
 
-优先级（高 → 低）：
+## 配置只有一个来源
 
-    1. 真实环境变量
-    2. `~/.tudouni/config.json` 的 `env` 段
-    3. 内置默认值
+    ~/.tudouni/config.json
 
-配置文件只是本地图方便，**绝不能盖掉真实环境变量** —— 否则某天部署时会被一份遗留的
-配置悄悄改到别的网关上，而这种问题极难排查。这个顺序有测试盯着。
+**不看真实环境变量、也不看 `.env`。** 这里以前写着一张三级优先级（真实环境变量 > 文件的
+`env` 段 > 内置默认值），它随"配置只有一个来源"一起退休了：一个值有两个地方能放、而只有
+一个生效，是最难排查的形态。来龙去脉写在 `agent_runtime/userconfig.py`。
 
 密钥一律不进源码：源码会被提交到公开仓库，`~/.tudouni/config.json` 不会（它根本不在
 仓库里）。`config.example.json` 是给人看的那份模板，里面没有真密钥，所以它是被提交的。
 
-**这份文件由 `agent_runtime/userconfig.py` 读**，那里也写着"为什么它在用户级、以及为
-什么 `.env` 和 `models.local.json` 不再被读"。这个模块只解释其中几个键
-（`DEEPSEEK_*` / `TAVILY_*`）。
+**这个模块解释的是不属于模型目录的那一段**：`web`（联网工具）。模型那一层（`providers`：
+端点、模型清单、密钥）由 `state/catalog.py` 解释 —— 分开是因为它有自己的形状和判据。
 
 ## 三档配置，三种落点
 
@@ -24,8 +22,8 @@
 | 权限策略 | `<cwd>/.tudouni/permissions.json` | **跟着仓库走** —— 它要能 review、能提交 |
 | MCP server | `~/.tudouni/mcp.json` | 用户级，理由更硬（见 `MCP_FILE` 那一段） |
 
-密钥和权限分开不是风格问题：密钥要能从环境变量覆盖、且绝不能进版本库；而"这次启动到底
-放行了什么"写在环境变量里是没法 review 的。
+密钥和权限分开不是风格问题：密钥绝不能进版本库，而"这次启动到底放行了什么"是团队要
+review 的东西 —— 两类东西混在一份文件里，早晚会有人把密钥提交上去。
 """
 
 import json
@@ -37,7 +35,6 @@ from typing import Any
 
 from agent_runtime import paths, userconfig
 from agent_runtime.security.commands import Rule, format_rule, parse_rule
-from agent_runtime.state import catalog
 from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
 
 
@@ -59,8 +56,8 @@ from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
 # 不含任何写死的目录名。
 PROJECT_ROOT = paths.package_dir()
 
-# `.env` 的**旧位置**。它不再被读（密钥搬进了 `~/.tudouni/config.json` 的 `env` 段，
-# 见 `userconfig.py`），但这个常量留着 —— `Runtime.notices()` 要检查它是否还躺在那儿
+# `.env` 的**旧位置**。它不再被读（密钥现在写在 `~/.tudouni/config.json` 的 `providers`
+# 段里，见 `userconfig.py`），但这个常量留着 —— `Runtime.notices()` 要检查它是否还躺在那儿
 # 并说一句"它已经不算数了"。
 #
 # 为什么必须说：这份文件里装着密钥，而"我明明填了 key 却说没找到"是它失效之后**唯一**
@@ -68,56 +65,10 @@ PROJECT_ROOT = paths.package_dir()
 # `mcp.json` 完全同一条规矩：不读可以，不出声不行。
 LEGACY_ENV_FILE = PROJECT_ROOT / ".env"
 
-DEFAULT_BASE_URL = catalog.BUILTIN_BASE_URL
-DEFAULT_MODEL = catalog.DEFAULT_MODEL
-
-# 各模型的上下文窗口（token）。它是**输入侧**的上限：真正发不出去的条件是"输入 + 输出"
-# 超过它，所以占比接近满之前就该有新会话。
-#
-# 为什么是一张表、而不是问 provider：OpenAI 兼容的响应里根本没有这个字段。
-# 为什么表里没有的名字**不给分母**（而不是猜一个）：这个项目可以指向任意网关，而
-# **错的百分比比没有百分比更坏** —— 它会被当成真的。所以 cli 那边只报用量、不报占比，
-# 启动时也会说一句该往哪加。
-#
-# **表由目录（`state/catalog.py`）派生，这里不抄第二份。** 目录同时是 `/model` 那个清单
-# 和"这个名字认不认识"的判据；抄一份的话，往配置里加一个模型而忘了改这里，症状是
-# "`/model` 列出了它，选了之后状态栏却报不出占比"—— 两处都是静默的。
-#
-# `catalog.load()` 读的是配置文件（没有那份文件时退到内置目录，而内置目录走
-# `DEEPSEEK_API_KEY` / `.env`）。**这里只取窗口，不看密钥** —— 所以它在一个没有密钥的
-# 机器上照样能算出来（`--list` / `--skills` 那些子命令不需要密钥）。
-
-
-def context_windows() -> dict[str, int]:
-    """`{模型名: 上下文窗口}`，从模型目录现算。
-
-    ## 为什么是函数，不是模块级常量
-
-    它以前是 `CONTEXT_WINDOWS = catalog.load().windows()` —— 一句**在 import 期读盘**的
-    赋值。那有三个后果，越往后越难查：
-
-      1. `import agent_runtime.runtime.config` 会去碰 `~/.tudouni/` 和 cwd。一个"读配置"
-         的模块在被 import 的瞬间就产生文件系统依赖，而 import 顺序不是任何人打算维护
-         的东西；
-      2. 测试想换一份目录配置（`AGENT_MODELS_FILE`）就必须**在第一次 import 之前**设好
-         环境变量 —— 而那取决于哪个测试文件先被收集，也就是取决于运气；
-      3. 配置文件搬到用户级之后，它会和"首次运行生成模板"撞上：模板本该由**入口**在
-         明确的时机创建，而不是由某个 import 顺手触发。
-
-    ## 不缓存
-
-    每次调用读一次盘。这是有意的：`/model` 能在运行中换模型、用户也可能在两次调用之间
-    改配置文件，而一份缓存住的表会让"改了没生效"这种最难查的症状重新出现。代价可以忽略
-    —— 生产代码里只有 `ModelConfig.context_tokens` 一个消费者，而活路径（状态栏那个
-    百分比的分母）走的是 `Runtime.model_ref().window`，根本不经过这里。
-    """
-    return catalog.load().windows()
-
-_ENV_API_KEY = "DEEPSEEK_API_KEY"
-_ENV_BASE_URL = "DEEPSEEK_BASE_URL"
-_ENV_MODEL = "DEEPSEEK_MODEL"
-_ENV_TAVILY_KEY = "TAVILY_API_KEY"
-_ENV_TAVILY_URL = "TAVILY_BASE_URL"
+# `web` 段认识的**全部**键。多一个不认识的键就报错 —— 和 `permissions.json` /
+# `mcp.json` / `providers` 同一条规矩：写错一个键名而它静默不生效，是最坏的失败形态
+# （`tavily_api_key` 写成 `tavily_key`，`web_search` 就永远不注册，而人以为自己配了）。
+_WEB_KEYS = frozenset({"tavily_api_key", "tavily_base_url"})
 
 DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
 
@@ -130,72 +81,9 @@ class ConfigError(userconfig.UserConfigError):
     的模型路由都没有、`permissions.json` / `mcp.json` 里某个键写错），那个是
     "`providers` 段读不懂"。但对入口来说处置完全一样 —— 打到 stderr、退出码 2。
 
-    **"缺某一把密钥"不在这一档**（`DEEPSEEK_API_KEY` 那类）：模型层是抽象的，密钥来自
-    `providers` 里的路由，所以缺配置的判据是"一条能用的路由都没有"，那件事由
-    `composition.open_runtime` 判。
+    **"缺某一把密钥"不在这一档**：模型层是抽象的那一层，密钥来自 `providers` 里的路由，
+    所以缺配置的判据是"一条能用的路由都没有"，那件事由 `composition.open_runtime` 判。
     """
-
-
-@dataclass(frozen=True)
-class ModelConfig:
-    """**内置那条兜底路由**的取值（`DEEPSEEK_*` 那几个键）。
-
-    **它不是"这次要用哪条路由"的答案。** 那个由 `catalog.Registry` 说了算：端点、模型
-    清单、密钥都在 `Provider` 上（真正发出去的密钥是 `chosen.provider_key`）。这个类手上
-    只有 `DEEPSEEK_*` 三格，所以它在装配期只提供两样东西：
-
-      * 默认模型名（`DEEPSEEK_MODEL`，那是"这台机器上我想用哪个"的老写法）；
-      * "只想填一把密钥、不写 providers"时的取值来源。
-
-    ## 它**不是**启动的门
-
-    缺 `DEEPSEEK_API_KEY` 不等于配不出模型 —— 用户接的可能是自己的网关。以前这个方法
-    缺密钥就抛 `ConfigError`，而装配期无条件走它，于是**只配了自家网关的人连启动都过不
-    去**，被一句 DeepSeek 的密钥挡在门外，哪怕他的路由和密钥都是好的。
-
-    现在那道门在 `open_runtime` 里，判据是"一条能用的路由都没有"（`resolve_model` 的
-    返回值）。所以这里的读法一律不报错：没有就是空串，够不够用由 `catalog` 那边决定。
-    """
-
-    api_key: str
-    base_url: str
-    model: str
-
-    @classmethod
-    def from_env(cls, config_file: Path | None = None) -> "ModelConfig":
-        """读取配置：**真实环境变量 > `~/.tudouni/config.json` 的 `env` 段 > 默认值**。
-
-        `config_file` 可指定（测试用），默认走 `userconfig.config_file()`。文件不存在
-        不算错误 —— 只给环境变量是另一条合法通路（容器里的部署就靠它）。
-
-        那条优先级的实现在 `userconfig.UserConfig.value()`，**这里不再自己写一遍**：
-        它以前在这个方法和 `WebConfig.from_env` 里各有一份一模一样的 `pick`，而
-        "两处一字不差"这种要求靠抄是维持不住的。
-
-        **缺密钥不是错误**（见类 docstring）：`api_key` 就是空串。所以这里既不抛错、
-        也**不顺手往别人 home 里写模板** —— 写模板归"报错那一刻"，那件事现在由
-        `open_runtime` 做（它才知道是不是真的一条路由都没有）。
-        """
-        cfg = userconfig.read(config_file)
-        return cls(
-            api_key=cfg.value(_ENV_API_KEY),
-            base_url=cfg.value(_ENV_BASE_URL, DEFAULT_BASE_URL),
-            model=cfg.value(_ENV_MODEL, DEFAULT_MODEL),
-        )
-
-    @property
-    def context_tokens(self) -> int | None:
-        """这个模型的上下文窗口；表里没有就返回 None（不猜）。
-
-        派生值，不存成字段 —— 它完全由 model 决定，存下来就有了两份事实
-        （和 Session.step_count、`Session` 里那句"步数不存字段"是同一个理由）。
-
-        **它不是界面用的那一个。** 状态栏那个百分比的分母走
-        `Runtime.context_tokens`（也就是 `model_ref().window`），因为 `/model` 能在运行中
-        换模型、甚至换路由，而 `ModelConfig` 记的是**启动时**那一个。两者同源（都从目录
-        派生），所以不会给出矛盾的数；但要"现在用的是谁"，只能问 Runtime。
-        """
-        return context_windows().get(self.model)
 
 
 # --- 权限设置：`<工作区>/.tudouni/permissions.json` -----------------------
@@ -423,19 +311,15 @@ class McpConfig:
 
 @dataclass(frozen=True)
 class WebConfig:
-    """联网工具的配置。
+    """联网工具的配置。它读 `~/.tudouni/config.json` 的 **`web` 段**。
 
-    密钥走这里（环境变量 / 用户级配置的 `env` 段），**不进被 review 的那一类文件**。
-    这两类东西分开，和 ModelConfig 与 PermissionConfig 分开是同一条理由。
+    **它有自己的节**（而不是挤在某个通用的键值表里）：那不来自模型目录，也不该让人以为
+    它和环境变量有什么关系 —— 它的键名就是 `tavily_api_key` / `tavily_base_url` 这两格。
 
     **缺密钥不是错误，不拦启动 —— 这和模型那一档是有意相反的。** 模型那边缺了
     "一条能用的路由"整个程序什么都干不了，所以那是"用户得先做点事"、必须拦住启动；
     搜索密钥缺了只是少一个工具。混成一样会让"只想用文件工具的人"被迫先去注册一个
     搜索服务。
-
-    （注意判据的形状变了：拦住启动的**不是**"缺 `DEEPSEEK_API_KEY`"，而是
-    `open_runtime` 里"一条能用的路由都没有"那一问 —— 模型层是抽象的，密钥归
-    `providers` 管，而 `ModelConfig` 从头到尾都不报这个错。）
 
     代理由 httpx 的 trust_env 决定（main.py 里关掉了），不在这里做一个键 —— 一个
     只有一半人看得懂的 HTTP_PROXY 变体，比让人显式写代码更坏。
@@ -445,17 +329,26 @@ class WebConfig:
     tavily_base_url: str = DEFAULT_TAVILY_BASE_URL
 
     @classmethod
-    def from_env(cls, config_file: Path | None = None) -> "WebConfig":
-        """优先级和 ModelConfig **一字不差**，因为它们现在调的是同一个函数
-        （`userconfig.UserConfig.value`）—— 以前那是两份抄出来的 `pick`。
+    def from_file(cls, config_file: Path | None = None) -> "WebConfig":
+        """从 `web` 段读。**不认识的键就报错**（见 `_WEB_KEYS`）。
 
-        复用同一份配置：多一个文件就多一处"用户改错地方"的机会，而两把密钥填在同一个
-        文件里本来就是最省事的做法。
+        值一律是字符串、空串算"没填"（`userconfig.text`）—— 模板里那两行留空的形态正是
+        "还没填"，于是它落到默认值上，而不是变成一个空字符串把后面的判断搞乱。
         """
         cfg = userconfig.read(config_file)
+
+        unknown = sorted(key for key in cfg.web if key not in _WEB_KEYS)
+        if unknown:
+            raise ConfigError(
+                f'{userconfig.config_file() if config_file is None else config_file} 的 '
+                f'"web" 里有不认识的键：{", ".join(unknown)}\n'
+                f'  认识的只有：{", ".join(sorted(_WEB_KEYS))}\n'
+                f"  （写错一个键名而它静默不生效是最坏的失败形态，所以这里直接停下）"
+            )
         return cls(
-            tavily_api_key=cfg.value(_ENV_TAVILY_KEY),
-            tavily_base_url=cfg.value(_ENV_TAVILY_URL, DEFAULT_TAVILY_BASE_URL),
+            tavily_api_key=userconfig.text(cfg.web, "tavily_api_key"),
+            tavily_base_url=userconfig.text(
+                cfg.web, "tavily_base_url", DEFAULT_TAVILY_BASE_URL),
         )
 
     @property

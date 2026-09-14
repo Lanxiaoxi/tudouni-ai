@@ -9,6 +9,7 @@ from typing import Any
 
 from agent_runtime.models.base import ChatModel
 from agent_runtime.models.types import ModelResponse, TokenUsage
+from agent_runtime.state import catalog
 from agent_runtime.tools.builtin.ask import ANSWERED, Answer, AskUserArgs
 from agent_runtime.tools.builtin.filesystem import ListFilesArgs
 from agent_runtime.tools.tool import RiskLevel, Tool, ToolRegistry
@@ -113,6 +114,43 @@ class Collector:
 
     def of(self, kind: str) -> list[dict[str, Any]]:
         return [e for e in self.events if e["kind"] == kind]
+
+
+def context_windows() -> dict[str, int]:
+    """当前配置里的 `{模型名: 窗口}`。
+
+    它以前是 `runtime.config.context_windows()`。那个函数在 `ModelConfig` 退休之后**没有
+    生产消费者**了（活路径走 `Runtime.model_ref().window`，根本不经过它），所以它也跟着
+    走了 —— 测试要那张表就直接问目录。
+    """
+    return catalog.load().windows()
+
+
+def model_registry(
+    *,
+    provider: str = "fake",
+    model: str = "fake",
+    base_url: str = "http://127.0.0.1:1",
+    api_key: str = "sk-x",
+    window: int | None = None,
+) -> "catalog.Registry":
+    """一份最小的模型目录 —— 取代以前那个 `ModelConfig(...)` 注入点。
+
+    装配层现在只认 `catalog.Registry`（`open_runtime(catalog_config=...)`）：用哪条路由、
+    哪把密钥、哪个模型本来就是**目录这一层**的事，而 `ModelConfig` 那个类已经随着"配置
+    只有一个来源"退休了。
+
+    给测试一个现成的目录，比让每个测试自己拼 `Provider` / `ModelRef` 短一截，也少一处
+    会漂的写法。
+    """
+    ref = catalog.ModelRef(provider=provider, id=model, window=window)
+    return catalog.Registry(
+        providers=(
+            catalog.Provider(name=provider, base_url=base_url, api_key=api_key,
+                             models=(ref,)),
+        ),
+        source=f"测试造的（{provider}）",
+    )
 
 
 def recording_registry(

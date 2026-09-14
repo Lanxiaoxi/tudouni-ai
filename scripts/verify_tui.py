@@ -164,10 +164,27 @@ def _log_text(app) -> str:
 
 
 async def main() -> int:
+    from agent_runtime import userconfig
+
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    os.environ["DEEPSEEK_API_KEY"] = "sk-test"
-    os.environ["DEEPSEEK_BASE_URL"] = f"http://127.0.0.1:{server.server_port}/v1"
+
+    # **子进程要有一份能用的配置。** 模型那一层现在只认配置文件 —— 它不看 `DEEPSEEK_API_KEY`
+    # 那类环境变量了（配置只有一个来源）。所以这里把假网关写进一份临时配置，再用
+    # `AGENT_CONFIG_FILE` 指过去。
+    #
+    # 写在 `build/` 下而不是系统临时目录：受限环境里那儿未必写得动（实测撞过，那次红在一个
+    # 和被测的东西毫无关系的原因上）。`build/` 在 `.gitignore` 里。
+    config = Path(__file__).resolve().parent.parent / "build" / "verify_tui.config.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(json.dumps({
+        "providers": {"stub": {
+            "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+            "api_key": "sk-test",
+            "models": [{"id": "deepseek-flash", "context_window": 1_000_000}],
+        }},
+    }, ensure_ascii=False), encoding="utf-8")
+    os.environ[userconfig.FILE_ENV] = str(config)
     os.environ["PYTHONIOENCODING"] = "utf-8"
 
     # **每次一个干净的会话 id**：这条验收会换会话，而换回来的那个必须是"接着聊"。

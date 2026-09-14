@@ -771,10 +771,10 @@ def open_test_runtime():
     from agent_runtime.runtime.composition import boot, open_runtime, resolve_session
     from agent_runtime.runtime.config import (
         McpConfig,
-        ModelConfig,
         PermissionConfig,
         WebConfig,
     )
+    from fakes import model_registry
 
     booted = boot()
     session_id, session, _resumed = resolve_session(booted.store, None)
@@ -783,9 +783,10 @@ def open_test_runtime():
         session_id=session_id,
         session=session,
         channels=cli_channels(),
-        model_config=ModelConfig(
-            api_key="sk-test", base_url="http://127.0.0.1:1", model="fake-model",
-        ),
+        # 模型那一层现在只认目录（`ModelConfig` 随"配置只有一个来源"退休了）——
+        # 给一份现造的，免得依赖跑测试的机器上恰好配了什么。
+        catalog_config=model_registry(base_url="http://127.0.0.1:1",
+                                      model="fake-model"),
         # 权限文件是真的从磁盘读的；给一份明确的，免得依赖跑测试的机器上恰好有配置。
         permission_config=PermissionConfig(),
         web_config=WebConfig(),

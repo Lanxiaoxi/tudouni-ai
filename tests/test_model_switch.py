@@ -16,15 +16,14 @@ from contextlib import contextmanager
 import pytest
 
 from agent_runtime.runtime.config import (
-    context_windows,
     McpConfig,
-    ModelConfig,
     PermissionConfig,
     WebConfig,
 )
 from agent_runtime.state import catalog
 from agent_runtime.state import model as model_state
 from agent_runtime.state import reasoning
+from fakes import context_windows, model_registry
 from agent_runtime.state.session import Session
 
 
@@ -659,12 +658,6 @@ def _runtime(registry=None):
     return composition.open_runtime(
         booted=booted, session_id=session_id, session=session,
         channels=_channels(), resumed=resumed,
-        model_config=_model_config(),
         permission_config=PermissionConfig(), web_config=WebConfig(),
         mcp_config=McpConfig(), catalog_config=registry,
     )
-
-
-def _model_config():
-    return ModelConfig(api_key="sk-x", base_url="http://127.0.0.1:1",
-                       model="deepseek-flash")

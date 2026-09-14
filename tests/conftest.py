@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sys
@@ -49,6 +50,26 @@ def isolated_workspace(monkeypatch):
         shutil.rmtree(path, ignore_errors=True)
 
 
+# 隔离用的那份配置。**它顺手替掉了以前的内置目录**：`_BUILTIN_MODELS` 随"配置只有一个
+# 来源"一起退休之后，测试里那些"`deepseek-flash` 的窗口是 1M"的断言需要一份**声明了它们
+# 的配置** —— 于是就在这一处声明，而不是散到每个测试里去各写一遍。
+_ISOLATED_CONFIG = {
+    "providers": {
+        "deepseek": {
+            "display_name": "DeepSeek 官方",
+            "base_url": "https://api.deepseek.com",
+            "api_key": "sk-test-isolated",
+            "models": [
+                {"id": "deepseek-flash", "label": "Flash", "context_window": 1_000_000,
+                 "vision": True, "reasoning_effort": "high"},
+                {"id": "deepseek-v4-pro", "label": "Pro", "context_window": 1_000_000,
+                 "reasoning_effort": "high"},
+            ],
+        }
+    }
+}
+
+
 @pytest.fixture(autouse=True)
 def isolated_user_config(monkeypatch):
     """把**用户级配置**（`~/.tudouni/config.json`）指到一个隔离的临时文件。
@@ -58,27 +79,27 @@ def isolated_user_config(monkeypatch):
 
       * 开发机上有一份真配置 ⇒ 它的路由、默认模型、密钥会渗进断言里（`/model` 那组尤其
         明显：清单里会多出别人的网关）；
-      * 开发机上**什么都没配** ⇒ 每一条走 `open_runtime()` 的测试都会以"一个可用的模型
+      * 开发机上**什么都没配** ⇒ 每一条走 `open_runtime()` 的测试都会以"一条能用的路由
         都没有"收场，而它们要测的根本不是配置（实测过：`test_model_switch` 里有 5 条就是
         这么红的，而在配了密钥的机器上它们是绿的 —— 那种测试比没有更坏）。
 
-    ## 隔离的同时给一个能用的默认
+    ## 隔离的同时给一份能用的
 
-    临时文件里只写一把假密钥、**不写 providers**：那样 `catalog.load()` 会退到内置那条
-    `deepseek` 路由（deepseek-flash / deepseek-v4-pro），也就是"只填了密钥"这个最常见的
-    用法 —— 顺带让那条路径在每次跑测试时都被走一遍。
+    临时文件里声明**一条 deepseek 路由、一条假密钥、两个模型**（见 `_ISOLATED_CONFIG`）：
+    那是"最常见的那种配置"的缩影，顺带让这条路在每次跑测试时都被走一遍。
 
-    密钥放**文件里**而不是 `os.environ`：优先级的第一档是真实环境变量，往那里塞值会让
-    "环境变量优先于文件"这条规则的测试失去意义（它们会在一个已经被污染的环境里比较）。
+    密钥写在**文件里**而不是 `os.environ`：环境变量已经不再被读了（配置只有一个来源），
+    往那里塞值只会让人以为它有用。
 
     ## 顺手清掉那几个环境变量
 
-    真实环境变量压过文件，所以本机设着 `DEEPSEEK_MODEL=某个别的模型`时，"默认模型是
-    deepseek-flash"那批断言会莫名其妙地红。清掉它们之后，配置的**唯一**来源就是上面那份
-    临时文件。想自己设的测试照旧 `monkeypatch.setenv` —— 那发生在这条 fixture 之后。
+    它们**已经不被读了**，但清掉仍然值得：`DEEPSEEK_API_KEY` 之类如果在本机设着，会让人
+    误以为测试是在验"环境变量优先"—— 而那件事已经不存在了。清干净之后，"测试用的配置
+    只有这一个来源"是看得见的事实。
 
     `AGENT_CONFIG_FILE` 走环境变量而不是给每个调用点传参：它同时管住**子进程**
     （`--runtime-stdio`、ansi 客户端那几条会起真进程的测试），而那些测试没有地方传参数。
+    它是全项目仅剩的一个环境变量，而且它不是"配置"（见 `userconfig.FILE_ENV`）。
     """
     from agent_runtime import userconfig
 
@@ -88,8 +109,7 @@ def isolated_user_config(monkeypatch):
 
     path = TESTS_DIR / "_tmp" / f"userconfig-{uuid.uuid4().hex[:8]}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"env": {"DEEPSEEK_API_KEY": "sk-test-isolated"}}',
-                    encoding="utf-8")
+    path.write_text(json.dumps(_ISOLATED_CONFIG, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setenv(userconfig.FILE_ENV, str(path))
     try:
         yield path

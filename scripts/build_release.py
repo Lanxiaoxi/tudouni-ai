@@ -32,6 +32,7 @@ ripgrep 各自躺在包装脚本忘了带的地方，而源码目录里跑测试
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -207,13 +208,18 @@ def _check_it_runs(bundle: Path, version: str) -> None:
     #
     # 顺带挡掉一个副作用：`AGENT_CONFIG_FILE` 一旦指了，`scaffold()` 就不会往**构建者
     # 自己的 home** 里写模板（那是"我自己管路径"的表示）。一次打包不该动别人的 home。
+    #
+    # 配置里那条路由**要有密钥**：模型那一层现在只看配置文件（不看环境变量），所以"给个
+    # 假的 `DEEPSEEK_API_KEY` 就能跑"那招已经失效了 —— 得给一条真能用的路由。
     verify_config = WORK_DIR / "verify-config.json"
-    verify_config.write_text("{}", encoding="utf-8")
-    child_env = {
-        **os.environ,
-        "AGENT_CONFIG_FILE": str(verify_config),
-        "DEEPSEEK_API_KEY": "sk-build-verify",   # 让内置那条兜底路由可用
-    }
+    verify_config.write_text(json.dumps({
+        "providers": {"verify": {
+            "base_url": "http://127.0.0.1:1/v1",
+            "api_key": "sk-build-verify",
+            "models": [{"id": "verify-model"}],
+        }},
+    }, ensure_ascii=False), encoding="utf-8")
+    child_env = {**os.environ, "AGENT_CONFIG_FILE": str(verify_config)}
 
     # cwd 用**仓库里的一个临时目录**，不用 `tempfile`：`--runtime-stdio` 会真的开一个
     # 工作区、在 cwd 下建 `.tudouni/`，而系统 temp 在受限环境里未必写得动（实测撞过：
