@@ -29,8 +29,11 @@ from typing import Any
 
 import pytest
 
-MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
-REPO_ROOT = MAIN_PY.parent
+# 仓库根 —— 它下面有 `agent_runtime/`。子进程一律用 `-m agent_runtime.main` 起，
+# 而不是 `main.py` 的绝对路径：那是生产里真正的起法（见 `protocol/client.py` 的
+# `RUNTIME_MODULE`），所以这里照着用就顺带把它钉住了。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_ARGV = [sys.executable, "-m", "agent_runtime.main"]
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_mcp_server.py"
 KERNEL = "mcp__fake__echo"
 
@@ -65,11 +68,24 @@ class Session:
         # 在 Windows 上看 USERPROFILE、在 POSIX 上看 HOME。
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)
+        # `-m` 能不能找到包：装过的环境里本来就行，`PYTHONPATH` 是给没同步过的环境兜底。
+        env["PYTHONPATH"] = str(REPO_ROOT)
+
+        # **cwd 是一个独立的工作区，不是仓库根。** 两个理由，第二个是踩出来的：
+        #
+        #   1. 工作区就是 cwd（`paths.workspace_dir()`），所以这条测试跑起来会在 cwd 下
+        #      建 `.tudouni/`（会话、审计）—— 那不该落在仓库里；
+        #   2. 更要紧：假 HOME 在 `workdir/home` 里，**而 workdir 在仓库下面**。用仓库根
+        #      当 cwd 的话，工作区就成了那个 home 的上层，于是 `check_workspace()` 直接
+        #      拒绝启动（"它下面是所有人的 home"）—— 那条检查是对的（工作区真的会包住那个
+        #      home），错的是把仓库根当 cwd。
+        workspace = home.parent / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
 
         self.process = subprocess.Popen(
-            [sys.executable, str(MAIN_PY), "--runtime-stdio", "--session", "mcp-proto"],
+            [*RUNTIME_ARGV, "--runtime-stdio", "--session", "mcp-proto"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            encoding="utf-8", errors="replace", env=env, cwd=str(REPO_ROOT),
+            encoding="utf-8", errors="replace", env=env, cwd=str(workspace),
         )
         self.incoming: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, name="mcp-proto-reader",

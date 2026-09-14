@@ -3,21 +3,29 @@
 优先级（高 → 低）：
 
     1. 真实环境变量
-    2. 项目根目录的 .env
+    2. `~/.tudouni/config.json` 的 `env` 段
     3. 内置默认值
 
-.env 只是本地图方便，**绝不能盖掉真实环境变量** —— 否则某天部署时会被一个遗留的
-.env 悄悄改到别的网关上，而这种问题极难排查。这个顺序有测试盯着。
+配置文件只是本地图方便，**绝不能盖掉真实环境变量** —— 否则某天部署时会被一份遗留的
+配置悄悄改到别的网关上，而这种问题极难排查。这个顺序有测试盯着。
 
-密钥一律不进源码：源码会被提交到公开仓库，.env 不会（它在 .gitignore 里）。
-`.env.example` 是给人看的那份模板，里面没有真密钥，所以它是被提交的。
+密钥一律不进源码：源码会被提交到公开仓库，`~/.tudouni/config.json` 不会（它根本不在
+仓库里）。`config.example.json` 是给人看的那份模板，里面没有真密钥，所以它是被提交的。
 
-**用 `dotenv_values` 而不是 `load_dotenv`**：前者只返回一个 dict，不往 os.environ
-里写。没有全局副作用，优先级规则就能在这一个函数里读完，而不是靠库的默认行为。
+**这份文件由 `agent_runtime/userconfig.py` 读**，那里也写着"为什么它在用户级、以及为
+什么 `.env` 和 `models.local.json` 不再被读"。这个模块只解释其中几个键
+（`DEEPSEEK_*` / `TAVILY_*`）。
 
-权限设置走**另一条路**：工作区根目录的 `.tudouni.json`（见 PermissionConfig）。
-它和密钥不是一件事 —— 密钥要能从环境变量覆盖、且绝不能进版本库；而权限策略必须
-看得见、能 review、能提交。"这次启动到底放行了什么"写在环境变量里是没法 review 的。
+## 三档配置，三种落点
+
+| 什么 | 在哪 | 为什么在那 |
+|---|---|---|
+| 密钥、路由 | `~/.tudouni/config.json` | **跟着人走** —— 换个项目干活不该换密钥 |
+| 权限策略 | `<cwd>/.tudouni/permissions.json` | **跟着仓库走** —— 它要能 review、能提交 |
+| MCP server | `~/.tudouni/mcp.json` | 用户级，理由更硬（见 `MCP_FILE` 那一段） |
+
+密钥和权限分开不是风格问题：密钥要能从环境变量覆盖、且绝不能进版本库；而"这次启动到底
+放行了什么"写在环境变量里是没法 review 的。
 """
 
 import json
@@ -27,21 +35,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dotenv import dotenv_values
-
+from agent_runtime import paths, userconfig
 from agent_runtime.security.commands import Rule, format_rule, parse_rule
-from agent_runtime.skills import RUNTIME_DIR_NAME
 from agent_runtime.state import catalog
 from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
 
 
-# 仓库根，也就是 agent_runtime 这个包的父目录。**这个文件从仓库根搬进 runtime/ 之后
-# 多了一层**，所以比原来多一次 .parent —— 这一点是硬编码的，不能靠"当前工作目录"
-# 推断：`.env` 的位置由源码位置决定，不由 cwd 决定。
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-PROJECT_ROOT = REPO_ROOT / "agent_runtime"
-ENV_FILE = PROJECT_ROOT / ".env"
-ENV_EXAMPLE_FILE = PROJECT_ROOT / ".env.example"
+# 路径**一律从 `agent_runtime/paths.py` 取**，这里不再自己算。
+#
+# 它以前是这么算的：
+#
+#     REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+#     PROJECT_ROOT = REPO_ROOT / "agent_runtime"      # ← 上跳三层，再拼一个写死的名字
+#
+# **那一行已经坏了很久，而且完全没有症状。** 仓库目录上传时从 `agent_runtime` 改名成
+# 了 `tudouni-ai`，字面量没跟着改，于是 `PROJECT_ROOT` 指向一个不存在的树：`.env`
+# 一次都没被读到（密钥只能靠真实环境变量），`permissions.json` 被 `save_approvals`
+# 在那个凭空的目录里创建出来。之所以查不出来，是因为这条链上每一处"文件不存在"都是
+# **合法状态** —— `.env` 缺了不算错误、`permissions.json` 缺了就用内置默认。
+#
+# 教训不是"别写错字面量"，是**同一件事不该有三份算法**（另两份在 `state/catalog.py`
+# 和 `runtime/composition.py`，它们从 `__file__` 推，算的是对的）。收口之后这一处
+# 不含任何写死的目录名。
+PROJECT_ROOT = paths.package_dir()
+
+# `.env` 的**旧位置**。它不再被读（密钥搬进了 `~/.tudouni/config.json` 的 `env` 段，
+# 见 `userconfig.py`），但这个常量留着 —— `Runtime.notices()` 要检查它是否还躺在那儿
+# 并说一句"它已经不算数了"。
+#
+# 为什么必须说：这份文件里装着密钥，而"我明明填了 key 却说没找到"是它失效之后**唯一**
+# 的症状。和 `runtime/config.py` 放弃 `.tudouni.json` 旧位置、以及工作区里那份被忽略的
+# `mcp.json` 完全同一条规矩：不读可以，不出声不行。
+LEGACY_ENV_FILE = PROJECT_ROOT / ".env"
 
 DEFAULT_BASE_URL = catalog.BUILTIN_BASE_URL
 DEFAULT_MODEL = catalog.DEFAULT_MODEL
@@ -61,7 +86,32 @@ DEFAULT_MODEL = catalog.DEFAULT_MODEL
 # `catalog.load()` 读的是配置文件（没有那份文件时退到内置目录，而内置目录走
 # `DEEPSEEK_API_KEY` / `.env`）。**这里只取窗口，不看密钥** —— 所以它在一个没有密钥的
 # 机器上照样能算出来（`--list` / `--skills` 那些子命令不需要密钥）。
-CONTEXT_WINDOWS: dict[str, int] = catalog.load().windows()
+
+
+def context_windows() -> dict[str, int]:
+    """`{模型名: 上下文窗口}`，从模型目录现算。
+
+    ## 为什么是函数，不是模块级常量
+
+    它以前是 `CONTEXT_WINDOWS = catalog.load().windows()` —— 一句**在 import 期读盘**的
+    赋值。那有三个后果，越往后越难查：
+
+      1. `import agent_runtime.runtime.config` 会去碰 `~/.tudouni/` 和 cwd。一个"读配置"
+         的模块在被 import 的瞬间就产生文件系统依赖，而 import 顺序不是任何人打算维护
+         的东西；
+      2. 测试想换一份目录配置（`AGENT_MODELS_FILE`）就必须**在第一次 import 之前**设好
+         环境变量 —— 而那取决于哪个测试文件先被收集，也就是取决于运气；
+      3. 配置文件搬到用户级之后，它会和"首次运行生成模板"撞上：模板本该由**入口**在
+         明确的时机创建，而不是由某个 import 顺手触发。
+
+    ## 不缓存
+
+    每次调用读一次盘。这是有意的：`/model` 能在运行中换模型、用户也可能在两次调用之间
+    改配置文件，而一份缓存住的表会让"改了没生效"这种最难查的症状重新出现。代价可以忽略
+    —— 生产代码里只有 `ModelConfig.context_tokens` 一个消费者，而活路径（状态栏那个
+    百分比的分母）走的是 `Runtime.model_ref().window`，根本不经过这里。
+    """
+    return catalog.load().windows()
 
 _ENV_API_KEY = "DEEPSEEK_API_KEY"
 _ENV_BASE_URL = "DEEPSEEK_BASE_URL"
@@ -72,8 +122,60 @@ _ENV_TAVILY_URL = "TAVILY_BASE_URL"
 DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
 
 
-class ConfigError(Exception):
-    """配置缺失或非法 —— 属于"用户得先做点事"，不是 bug。"""
+class ConfigError(userconfig.UserConfigError):
+    """配置缺失或非法 —— 属于"用户得先做点事"，不是 bug。
+
+    **它和 `CatalogError` 共一个基类**（`userconfig.UserConfigError`），而入口层捕的是
+    基类。两个名字都留着，因为它们说的是两件不同的事：这个是"这次运行缺东西"（没密钥、
+    某个键写错），那个是"`providers` 段读不懂"。但对入口来说处置完全一样 —— 打到
+    stderr、退出码 2。
+    """
+
+
+def _no_key_message(cfg: "userconfig.UserConfig", *, created: Path | None = None) -> str:
+    """"没找到密钥"那句话。**两条给法都要写出来，而且要说清文件在哪。**
+
+    它是这个程序对一个新用户说的第一句话（装完命令、第一次运行就会看到），所以：
+
+      * 路径写成**绝对路径**：`~/.tudouni/config.json` 在 Windows 上不是任何人能直接
+        双击打开的东西；
+      * **三种情形三种说法** —— "我刚给你建好了"、"打开你那份填上"、"你得自己建一份"
+        是三件不同的下一步，说成一句会让人去做错的那件事（已经建过文件的人会以为路径写
+        错了，再建一份到别处去）；
+      * 环境变量那条路照样列出来：CI 和容器里没有 home 可写。
+
+    `created` 是 `scaffold()` 刚写出来的那份模板（没写就是 None）。**它排在最前面**，
+    因为"文件已经在那儿了、你只要填一格"是这三种情形里唯一不需要用户动脑子的一种。
+    """
+    where = cfg.path or userconfig.config_file()
+    if created is not None:
+        first = (
+            f"  1) 我已经在这儿给你建好了一份配置，打开它、在 \"env\" 里填上密钥：\n"
+            f"         {created}\n"
+            f"     那一行长这样：   \"{_ENV_API_KEY}\": \"sk-...\"\n"
+        )
+    elif cfg.exists:
+        first = (
+            f"  1) 打开 {where}，在 \"env\" 里填上：\n"
+            f"         \"{_ENV_API_KEY}\": \"sk-...\"\n"
+        )
+    else:
+        first = (
+            f"  1) 建一份 {where}（照模板抄：{userconfig.example_file()}）：\n"
+            f"         {{\"env\": {{\"{_ENV_API_KEY}\": \"sk-...\"}}}}\n"
+        )
+    return (
+        f"没找到 {_ENV_API_KEY}。两种给法，任选其一：\n"
+        f"\n"
+        f"{first}"
+        f"\n"
+        f"  2) 设成环境变量（CI / 容器里用这条）\n"
+        f"       PowerShell：  $env:{_ENV_API_KEY} = \"sk-...\"\n"
+        f"       bash：        export {_ENV_API_KEY}=sk-...\n"
+        f"\n"
+        f"可选：{_ENV_MODEL}、{_ENV_BASE_URL}（同样两条路都认）\n"
+        f"注：真实环境变量的优先级高于配置文件。"
+    )
 
 
 @dataclass(frozen=True)
@@ -85,45 +187,31 @@ class ModelConfig:
     model: str
 
     @classmethod
-    def from_env(cls, env_file: Path | None = None) -> "ModelConfig":
-        """读取配置。
+    def from_env(cls, config_file: Path | None = None) -> "ModelConfig":
+        """读取配置：**真实环境变量 > `~/.tudouni/config.json` 的 `env` 段 > 默认值**。
 
-        env_file 可指定，默认用项目根的 .env（文件不存在就跳过，不算错误 ——
-        环境变量和 .env 任选其一即可）。
+        `config_file` 可指定（测试用），默认走 `userconfig.config_file()`。文件不存在
+        不算错误 —— 只给环境变量是另一条合法通路（容器里的部署就靠它）。
+
+        那条优先级的实现在 `userconfig.UserConfig.value()`，**这里不再自己写一遍**：
+        它以前在这个方法和 `WebConfig.from_env` 里各有一份一模一样的 `pick`，而
+        "两处一字不差"这种要求靠抄是维持不住的。
         """
-        path = ENV_FILE if env_file is None else Path(env_file)
-        file_values = dotenv_values(path) if path.is_file() else {}
+        cfg = userconfig.read(config_file)
 
-        def pick(name: str, default: str = "") -> str:
-            # 空串一律当作"没设"，这样 .env 里留空的项也能落到下一层默认值上，
-            # 而不是变成一个空字符串把后面的判断搞乱。
-            from_env_var = os.environ.get(name, "").strip()
-            if from_env_var:
-                return from_env_var
-            from_file = (file_values.get(name) or "").strip()
-            return from_file or default
-
-        api_key = pick(_ENV_API_KEY)
+        api_key = cfg.value(_ENV_API_KEY)
         if not api_key:
-            raise ConfigError(
-                f"没找到 {_ENV_API_KEY}。两种给法，任选其一：\n"
-                f"\n"
-                f"  1) 写进 {ENV_FILE}（推荐，已被 .gitignore 忽略）\n"
-                f"       先从模板复制一份：  Copy-Item {ENV_EXAMPLE_FILE.name} .env\n"
-                f"       然后填上：          {_ENV_API_KEY}=sk-...\n"
-                f"\n"
-                f"  2) 设成环境变量\n"
-                f"       当前终端：  $env:{_ENV_API_KEY} = \"sk-...\"\n"
-                f"       永久有效：  setx {_ENV_API_KEY} \"sk-...\"   （重开终端生效）\n"
-                f"\n"
-                f"可选：{_ENV_MODEL}、{_ENV_BASE_URL}\n"
-                f"注：环境变量的优先级高于 .env。"
-            )
+            # **首次运行就在这儿被兜住**：没有配置、也没有密钥时，先把模板写到默认位置，
+            # 然后那句报错就能指着一个**真的存在**的文件说"打开它填一格"。
+            #
+            # 写盘放在这里（而不是每次启动都确保存在）的理由写在 `scaffold()` 里：
+            # 只给环境变量的部署不该被在 $HOME 里凭空写文件。
+            raise ConfigError(_no_key_message(cfg, created=userconfig.scaffold()))
 
         return cls(
             api_key=api_key,
-            base_url=pick(_ENV_BASE_URL, DEFAULT_BASE_URL),
-            model=pick(_ENV_MODEL, DEFAULT_MODEL),
+            base_url=cfg.value(_ENV_BASE_URL, DEFAULT_BASE_URL),
+            model=cfg.value(_ENV_MODEL, DEFAULT_MODEL),
         )
 
     @property
@@ -132,8 +220,13 @@ class ModelConfig:
 
         派生值，不存成字段 —— 它完全由 model 决定，存下来就有了两份事实
         （和 Session.step_count、`Session` 里那句"步数不存字段"是同一个理由）。
+
+        **它不是界面用的那一个。** 状态栏那个百分比的分母走
+        `Runtime.context_tokens`（也就是 `model_ref().window`），因为 `/model` 能在运行中
+        换模型、甚至换路由，而 `ModelConfig` 记的是**启动时**那一个。两者同源（都从目录
+        派生），所以不会给出矛盾的数；但要"现在用的是谁"，只能问 Runtime。
         """
-        return CONTEXT_WINDOWS.get(self.model)
+        return context_windows().get(self.model)
 
 
 # --- 权限设置：`<工作区>/.tudouni/permissions.json` -----------------------
@@ -146,11 +239,22 @@ class ModelConfig:
 # 留一条"新文件没有就去看旧文件"的分支，等于让这份配置解析永远背着一次历史迁移，而
 # 那是一次性的事。旧文件留在磁盘上不影响任何行为；想彻底清掉就删了它，程序不会碰它。
 
-RUNTIME_DIR = PROJECT_ROOT / RUNTIME_DIR_NAME
+PERMISSION_FILE_NAME = "permissions.json"
 
-PERMISSION_FILE = RUNTIME_DIR / "permissions.json"
 
-PERMISSION_FILE_NAME = PERMISSION_FILE.name
+def permission_file() -> Path:
+    """这个工作区的权限策略文件：`<cwd>/.tudouni/permissions.json`。
+
+    **它是函数而不是常量，这一点是必须的。** 工作区跟着 cwd 走（见
+    `paths.workspace_dir()`），所以一个模块级常量会在 `import` 那一刻把 cwd 冻死 ——
+    而"哪个模块先被 import"不是任何人打算维护的顺序。冻错了的症状很难看：按一次 `t`
+    记住的规则写进了**上一个目录**的 `permissions.json`，而这一个目录下一次启动照旧
+    问你。
+
+    对照 `MCP_FILE`：它在用户级、不随 cwd 变，所以它可以是常量。看一眼是函数还是常量
+    就知道它属于哪一层，这个区别值得留着。
+    """
+    return paths.workspace_runtime_dir() / PERMISSION_FILE_NAME
 
 # 认识的**全部**键。多一个不认识的键就报错 —— 理由和 ToolArgs 的 extra="forbid"
 # 是同一个：写错一个键名而它静默不生效，是最坏的失败形态。你以为自己放行了或者
@@ -212,7 +316,7 @@ class PermissionConfig:
 
     @classmethod
     def from_file(cls, path: Path | None = None) -> "PermissionConfig":
-        path = PERMISSION_FILE if path is None else Path(path)
+        path = permission_file() if path is None else Path(path)
         if not path.is_file():
             return cls()
 
@@ -295,7 +399,7 @@ class PermissionConfig:
 #
 # 所以这里写死用户级；工作区里那份**不读**，但要报出来（见 main.py 的 [MCP] 那行）
 # ——"文件明明在那儿却完全不起作用"和坏技能是同一类症状，绝不能静默。
-USER_RUNTIME_DIR = Path.home() / RUNTIME_DIR_NAME
+USER_RUNTIME_DIR = paths.user_config_dir()
 
 MCP_FILE = USER_RUNTIME_DIR / "mcp.json"
 
@@ -368,25 +472,17 @@ class WebConfig:
     tavily_base_url: str = DEFAULT_TAVILY_BASE_URL
 
     @classmethod
-    def from_env(cls, env_file: Path | None = None) -> "WebConfig":
-        """优先级和 ModelConfig **一字不差**：真实环境变量 > .env > 默认值。
+    def from_env(cls, config_file: Path | None = None) -> "WebConfig":
+        """优先级和 ModelConfig **一字不差**，因为它们现在调的是同一个函数
+        （`userconfig.UserConfig.value`）—— 以前那是两份抄出来的 `pick`。
 
-        复用同一份 .env：多一个文件就多一处"用户改错地方"的机会，而两个密钥填在同一个
+        复用同一份配置：多一个文件就多一处"用户改错地方"的机会，而两把密钥填在同一个
         文件里本来就是最省事的做法。
         """
-        path = ENV_FILE if env_file is None else Path(env_file)
-        file_values = dotenv_values(path) if path.is_file() else {}
-
-        def pick(name: str, default: str = "") -> str:
-            from_env_var = os.environ.get(name, "").strip()
-            if from_env_var:
-                return from_env_var
-            from_file = (file_values.get(name) or "").strip()
-            return from_file or default
-
+        cfg = userconfig.read(config_file)
         return cls(
-            tavily_api_key=pick(_ENV_TAVILY_KEY),
-            tavily_base_url=pick(_ENV_TAVILY_URL, DEFAULT_TAVILY_BASE_URL),
+            tavily_api_key=cfg.value(_ENV_TAVILY_KEY),
+            tavily_base_url=cfg.value(_ENV_TAVILY_URL, DEFAULT_TAVILY_BASE_URL),
         )
 
     @property

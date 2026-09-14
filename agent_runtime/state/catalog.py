@@ -10,22 +10,28 @@
 四件事必须同一份数据：各写一份的话，"清单里能选、发出去报模型不存在"这类漂移
 全都是静默的。
 
-## 配置文件：`models.local.json`，随工作区走，不进版本库
+## 配置文件：`~/.tudouni/config.json` 的 `providers` 段
 
+它**跟着人走，不跟着工作区走**：换个项目干活不该换密钥。文件的定位、`env` 段、以及
+"为什么不再读 `.env` 和 `<包目录>/models.local.json`"都写在 `agent_runtime/userconfig.py`
+里 —— 这个模块只负责**解释 `providers` 段**，不负责找文件、也不负责读它。
+
+```jsonc
+{
+  "providers": { "deepseek": { "base_url": "…", "api_key_env": "DEEPSEEK_API_KEY",
+                               "models": [{"id": "deepseek-flash", …}] } },
+  "env": { "DEEPSEEK_API_KEY": "sk-…" }
+}
 ```
-<工作区>/models.local.json      ← 真的读这一份（已在 .gitignore 里）
-<工作区>/models.example.json    ← 仓库里带着的模板，**照它复制一份**
-~/.tudouni/models.json          ← 没有上面那份时读它
-```
 
-**密钥可以放这个文件**：它在 `.gitignore` 里、也不在工作区里被 agent 改（控制面那条
-只保护 `.tudouni/`）—— 和 `.env` 是同一类东西。同时**也认 `api_key_env`**（引用一个
-环境变量名），因为"密钥不进任何文件、只从环境来"是更好的做法，而这两种都该能选。
-优先级是 **文件里的 `api_key` > 环境变量 > `.env`**：文件里写死了就是"我要用这个"。
+**密钥可以直接写进这个文件**：它在用户级目录、不进版本库、也不在工作区里被 agent 改
+（控制面那条只保护 `.tudouni/`，而这一份恰好也在那底下）。同时**也认 `api_key_env`**
+（引用一个环境变量名），因为"密钥不进任何文件、只从环境来"是更好的做法，而这两种都该
+能选。优先级是 **`api_key` > 环境变量 > 同一份文件的 `env` 段**：写死了就是"我要用这个"。
 
-**没有这个文件也能跑。** 那种情况下会自动造一条 `deepseek` 路由（从
-`DEEPSEEK_API_KEY` / `.env` 读密钥，`DEEPSEEK_BASE_URL` 读端点）—— 也就是说，
-这份配置文件是**加法**，不是"不配就跑不起来"的又一道门。
+**没有这个文件也能跑。** 那种情况下会自动造一条 `deepseek` 路由（密钥从
+`DEEPSEEK_API_KEY` 读、端点从 `DEEPSEEK_BASE_URL` 读）—— 也就是说，这份配置文件是
+**加法**，不是"不配就跑不起来"的又一道门。容器里只给环境变量的部署就靠这一条。
 
 ## 坏配置一律降级 + 出声，绝不拦启动
 
@@ -43,34 +49,18 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from agent_runtime import userconfig
 from agent_runtime.state import reasoning
 
-from dotenv import dotenv_values
-
-# 文件名。**读的是 `.local.` 那一份**：模板随仓库走，真配置不进版本库 ——
-# 和 `.env` / `.env.example` 的关系完全一样（那条边界写了整整一节在 README 里）。
-MODELS_FILE_NAME = "models.local.json"
-MODELS_EXAMPLE_NAME = "models.example.json"
-
-# 用户级的位置。没有工作区那一份时退到这里 —— 它和 `mcp.json` 同一个目录，
-# 理由是同一件事：这类"这台机器的路由与凭据"是**本机**的，不该跟着每个工作区走一遍。
-USER_MODELS_FILE_NAME = "models.json"
-
-# 路径**在这里算**，不 import `runtime.config`：那个模块反过来要 import 本模块
-# （`CONTEXT_WINDOWS` 由目录派生）—— 而环会让"哪个先加载"变成一个必须小心维持的顺序。
-# 目录文件放哪本来就是目录自己的知识，所以这条边不该存在。
+# 文件的定位与读取**全在 `userconfig`**（那是个只 import 标准库和 `paths` 的叶子）。
+# 这里刻意不再自己算路径、也不再自己读 JSON：
 #
-# `package = false`，所以包目录就是仓库根（和 `runtime/config.py` 里那段同一个算法：
-# 靠源码位置，不靠当前工作目录）。
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-ENV_FILE = _PACKAGE_ROOT / ".env"
-USER_RUNTIME_DIR = Path.home() / ".tudouni"
-
-# 环境变量：**指定这次读哪份模型配置**（测试和"临时换一份配置"都要它）。
-#
-# 它比命令行开关更合适：这一层（`state/`）不认识 argparse，而"哪份配置"是**环境**的
-# 事实 —— 和 `DEEPSEEK_BASE_URL` 同一档。没有它就按下面的顺序找。
-FILE_ENV = "AGENT_MODELS_FILE"
+#   * 同一份文件被两个模块读（这里要 `providers`，`runtime/config.py` 要 `env`），
+#     各写一份"去哪找、怎么读"就是同一件事的第二份算法 —— 而那正是 `paths.py` 那段
+#     docstring 记着的那次事故（三份算法里有一份写死了目录名，改名之后静默失效）；
+#   * **仍然不 import `runtime.config`**：那个模块反过来要 import 本模块，环会让
+#     "哪个先加载"变成一个必须小心维持的顺序。
+MODELS_EXAMPLE_NAME = userconfig.EXAMPLE_FILE_NAME
 
 # 内置那条路由的名字与端点。**它是"没有配置文件时也能跑"的依据**，也是
 # `DEFAULT_MODEL` 的出处 —— `runtime/config.py` 从这里取，不另写一份字面量。
@@ -92,7 +82,7 @@ _MODEL_KEYS = frozenset({
 })
 
 # 内置的 DeepSeek 目录。**它是"没有配置文件时也能跑"的依据**，不是第二份目录表 ——
-# 一旦 `models.local.json` 里声明了 `deepseek` 这条路由，这里就不再参与。
+# 一旦配置文件的 `providers` 里声明了 `deepseek` 这条路由，这里就不再参与。
 #
 # 名字与能力取自官方文档（api-docs.deepseek.com 的「模型 & 价格」）：
 # 两个模型、窗口都是 1M。旧名字（`deepseek-v4-flash` / `…-vision-exp`）作为**别名**
@@ -130,12 +120,16 @@ ALIASES: dict[str, str] = {
 }
 
 
-class CatalogError(Exception):
-    """配置文件的**形状**写坏了 —— 属于"用户得先做点事"，不是 bug。
+class CatalogError(userconfig.UserConfigError):
+    """`providers` 段的**形状**写坏了 —— 属于"用户得先做点事"，不是 bug。
 
-    它和"某条路由起不来"是两档：这个是"文件根本读不懂"（坏 JSON、不认识的键、
-    类型不对），那个是"读懂了，但这条路由用不了"（缺密钥）。前者当场停下，
-    后者降级 + 出声 —— 因为前者再猜也没意义，而后者少一条路由不该让会话开不出来。
+    它和"某条路由起不来"是两档：这个是"这一段根本读不懂"（不认识的键、类型不对），
+    那个是"读懂了，但这条路由用不了"（缺密钥）。前者当场停下，后者降级 + 出声 ——
+    因为前者再猜也没意义，而后者少一条路由不该让会话开不出来。
+
+    **它继承 `UserConfigError`**，而入口层捕的是基类。在这之前它谁都不继承、也**没有
+    任何地方捕它**，所以一个写坏的配置文件会以一整段 Python traceback 收场 —— 而那
+    恰好是新用户最先编辑的那份文件。
     """
 
 
@@ -297,27 +291,10 @@ class Registry:
         return table
 
 
-# --- 读配置 ---------------------------------------------------------------------
-
-def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        raise CatalogError(
-            f"{path} 不是 UTF-8 编码，读出来是乱码。用记事本「另存为」时选 UTF-8。"
-        ) from None
-    except OSError as exc:
-        raise CatalogError(f"读不了 {path}：{exc}") from None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise CatalogError(
-            f"{path} 不是合法 JSON：第 {exc.lineno} 行第 {exc.colno} 列 {exc.msg}"
-        ) from None
-    if not isinstance(data, dict):
-        raise CatalogError(f"{path} 的最外层必须是一个 JSON 对象（{{...}}）")
-    return data
-
+# --- 解释 providers 段 ----------------------------------------------------------
+#
+# 找文件、读 JSON、校验顶层形状都在 `userconfig`。这里从"已经是一个 dict"开始 ——
+# 那条分界线让这个模块只需要认识"一条路由长什么样"这一件事。
 
 def _text(raw: dict, key: str, *, where: str, default: str = "") -> str:
     value = raw.get(key, default)
@@ -395,9 +372,9 @@ def _models_from(raw: Any, *, provider: str, where: str) -> tuple[ModelRef, ...]
 def _api_key(raw: dict, *, where: str, env: dict[str, str]) -> tuple[str, str]:
     """一条路由的密钥：`(值, 从哪来)`。
 
-    优先级 **文件里的 `api_key` > `api_key_env` 指的那个环境变量 > 同名的大写环境变量**。
-    返回"从哪来"是为了让启动那行说明能说清"这条路由的密钥是从文件里读的"——
-    排查"为什么它用的是旧密钥"时，这句话是唯一的线索。
+    优先级 **文件里的 `api_key` > `api_key_env` 指的那个真实环境变量 > 同一份文件
+    `env` 段里的同名键**。返回"从哪来"是为了让启动那行说明能说清"这条路由的密钥是从
+    哪儿读的"—— 排查"为什么它用的是旧密钥"时，这句话是唯一的线索。
     """
     key = _text(raw, "api_key", where=where)
     if key:
@@ -410,7 +387,7 @@ def _api_key(raw: dict, *, where: str, env: dict[str, str]) -> tuple[str, str]:
         return from_env, f"环境变量 {name}"
     from_file = (env.get(name) or "").strip()
     if from_file:
-        return from_file, f".env 的 {name}"
+        return from_file, f'配置里 env 的 {name}'
     return "", ""
 
 
@@ -443,50 +420,34 @@ def _builtin_registry(env: dict[str, str], *, source: str) -> Registry:
     )
 
 
-def load(path: Path | None = None, *, env_file: Path | None = None) -> Registry:
-    """读一份目录配置。**永远返回一个能用的 Registry，坏消息放在 `problems` 里。**
+def load(path: Path | None = None) -> Registry:
+    """读那份配置的 `providers` 段。**永远返回一个能用的 Registry，坏消息放在 `problems`。**
 
-    `path=None` 时按 `models.local.json` → 用户级 `~/.tudouni/models.json` 的顺序找，
-    都没有就退到内置那条 `deepseek` 路由。
+    `path=None` 时读 `userconfig.config_file()`（默认 `~/.tudouni/config.json`，可以用
+    `AGENT_CONFIG_FILE` 顶掉）。**没有那个文件、或者它里面没写 `providers`**，就退到内置
+    那条 `deepseek` 路由 —— 见 `_builtin_registry`。
 
-    **形状错误抛 `CatalogError`，语义问题进 `problems`。** 这条分界线是有意的：
-    坏 JSON 再猜也没意义（停下让人改），而"缺密钥"少一条路由不该让会话开不出来。
+    **形状错误抛 `CatalogError`（`UserConfigError` 的子类），语义问题进 `problems`。**
+    这条分界线是有意的：读不懂再猜也没意义（停下让人改），而"缺密钥"少一条路由不该让
+    会话开不出来。
+
+    ## `env_file=` 那个参数没了
+
+    它以前是"去哪找 `.env`"。现在密钥和 providers 在**同一份文件**里，所以一个路径就够 ——
+    而留着两个参数会让"这两份必须是同一个文件"变成调用方要记住的事（测试里最容易忘，
+    而忘了的症状是"密钥读不到"）。
     """
-    env_path = ENV_FILE if env_file is None else Path(env_file)
-    env = dotenv_values(env_path) if env_path.is_file() else {}
+    cfg = userconfig.read(path)
+    env = cfg.env
 
-    if path is None:
-        # 环境变量指的那份优先（测试、以及"临时换一份配置"用它）。
-        forced = (os.environ.get(FILE_ENV) or "").strip()
-        if forced:
-            forced_path = Path(forced)
-            if not forced_path.is_file():
-                raise CatalogError(
-                    f"{FILE_ENV}={forced} 指的文件不存在 —— "
-                    f"要么把它建出来，要么删掉这个环境变量（那样会按默认顺序找）"
-                )
-            path = forced_path
-    if path is None:
-        candidates = [_PACKAGE_ROOT / MODELS_FILE_NAME,
-                      USER_RUNTIME_DIR / USER_MODELS_FILE_NAME]
-        found = next((item for item in candidates if item.is_file()), None)
-        if found is None:
-            return _builtin_registry(env, source=f"内置（{_API_KEY_ENV}）")
-        path = found
+    # 没有文件、或者文件里没写 providers（只写了 env / 只放了密钥）—— 两种都退到内置那条
+    # 路由。**第二种必须和第一种一样待**：只想换个密钥的人不该被迫把整份模型清单抄一遍。
+    if not cfg.providers:
+        source = str(cfg.path) if cfg.exists else f"内置（{_API_KEY_ENV}）"
+        return _builtin_registry(env, source=source)
 
-    raw = _read_json(Path(path))
-    providers_raw = raw.get("providers")
-    unknown_top = sorted(set(raw) - {"providers", "$comment"})
-    if unknown_top:
-        raise CatalogError(
-            f"{path} 里有不认识的顶层键：{', '.join(unknown_top)}\n"
-            f'  目前只有 "providers" 一个'
-        )
-    if not isinstance(providers_raw, dict) or not providers_raw:
-        raise CatalogError(
-            f'{path} 里没有 "providers"（或者它是空的）—— '
-            f'至少要有一条路由，形如 {{"providers": {{"deepseek": {{...}}}}}}'
-        )
+    path = cfg.path
+    providers_raw = cfg.providers
 
     problems: list[str] = []
     notes: list[str] = []
@@ -545,6 +506,5 @@ def load(path: Path | None = None, *, env_file: Path | None = None) -> Registry:
 
 __all__ = [
     "ALIASES", "BUILTIN_BASE_URL", "BUILTIN_PROVIDER", "CatalogError", "DEFAULT_MODEL",
-    "ENV_FILE", "MODELS_EXAMPLE_NAME", "MODELS_FILE_NAME", "ModelRef", "Provider",
-    "Registry", "USER_MODELS_FILE_NAME", "USER_RUNTIME_DIR", "load",
+    "MODELS_EXAMPLE_NAME", "ModelRef", "Provider", "Registry", "load",
 ]

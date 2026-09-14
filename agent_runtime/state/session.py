@@ -37,15 +37,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_runtime import paths
 from agent_runtime.state import agents_md
 
 
-# 提示词文件的位置：state/session.py → 项目根 → prompts/
-PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+# 提示词文件的位置。**它跟着代码走，不跟着工作区走** —— 所以取的是 `package_dir()`
+# 而不是 `workspace_dir()`：这份提示词是这个项目的作者写的、和代码同版本，装成命令
+# 之后它在 site-packages 里。工作区那边贡献的是另一份文本（AGENT.md），两者的主人
+# 不是同一个人，见本模块 docstring 末尾那一段。
+PROMPTS_DIR = paths.package_dir() / "prompts"
 SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system.zh.md"
 
-# 工作区的默认位置。**权威在 `runtime.composition.project_dir()`** —— 那边的装配会显式
-# 传给 `Session.new()`，这里留着只是为了"不传工作区的新会话"有一个说得通的地方可查。
+# 工作区的默认位置。**权威在 `paths.workspace_dir()`** —— 装配会把它显式传给
+# `Session.new()`，这里留着只是为了"不传工作区的新会话"有一个说得通的地方可查。
 # 名字在这里再出口一次，是为了让测试能一处 monkeypatch 掉它（见 tests/conftest.py）。
 WORKSPACE = agents_md.WORKSPACE
 

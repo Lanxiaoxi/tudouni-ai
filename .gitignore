@@ -1,14 +1,17 @@
 # ---- 密钥与本地配置 ----
-# 绝不提交。源码进公开仓库，密钥不进。
+# **真正的那一份不在这个仓库里，也不在任何工作区里** —— 它在 `~/.tudouni/config.json`
+# （首次运行自动生成，权限 0600）。理由见 agent_runtime/userconfig.py：换个项目干活
+# 不该换密钥，而装成命令之后包在 site-packages 里，那不是能放配置的地方。
+#
+# 所以这一节现在守的只是"别把误放在仓库里的密钥带进去"。模板本身
+# （agent_runtime/config.example.json）是**要提交**的，它里面没有真值，有测试盯着。
 .env
 .env.*
-# 但模板要提交 —— 它是给人看的那一份，里面没有真密钥。
-# 注意顺序：gitignore 后出现的 ! 才能把上面已经排除的文件重新包含进来。
-!.env.example
-# 模型路由配置：**真的那一份不进仓库**（它里面有 base_url、也可能有密钥），模板照旧。
-# 找文件的顺序见 state/catalog.py（工作区这份 → 用户级 ~/.tudouni/models.json → 内置）。
+# 旧位置（`.env` / `models.local.json`）程序已经不再读。留着这几行是因为它们可能还躺在
+# 磁盘上、而且装的就是密钥 —— 绝不该被 `git add -A` 顺手带进去。
 models.local.json
-!models.example.json
+models.json
+config.local.json
 *.token
 .ericai_debug_token.txt
 

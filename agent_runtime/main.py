@@ -19,17 +19,23 @@ Agent Runtime 主入口。
 """
 
 import sys
-from pathlib import Path
 
-# 项目自身目录与它的父目录是两件事，不要共用一个变量：
-#   - agent_runtime 是一个包，要能 `import agent_runtime`，
-#     sys.path 必须包含【包所在目录】，也就是项目的父目录；
-#   - agent 的文件工作区必须是【项目自身】，不能是父目录，
-#     否则 read_file / write_file 会伸到同级的其它项目里去。
-PROJECT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = PROJECT_DIR.parent
-
-sys.path.insert(0, str(REPO_ROOT))
+# **这里不再动 `sys.path`。**
+#
+# 以前有三行 bootstrap：算出包目录、再算出它的上一层、把上一层插进 `sys.path`。那是
+# **扁平布局**逼出来的（包就是仓库根本身，而 `python main.py` 只会把包目录自己放进
+# 搜索路径），而它有一个致命的隐含要求 —— 那个目录必须恰好叫 `agent_runtime`。
+# 仓库在 GitHub 上叫 tudouni-ai，clone 下来于是什么都 import 不了。
+#
+# 现在包住在仓库里的 `agent_runtime/` 子目录、跟着代码一起提交，所以三条入口都自然成立：
+#
+#   * `tudouni`（装出来的命令）        —— 包在 site-packages 里，本来就在搜索路径上；
+#   * `python -m agent_runtime.main`  —— `-m` 会把 cwd 放进 `sys.path`；
+#   * `pytest`                        —— 仓库根的 `conftest.py` 管这一条。
+#
+# 顺带说清：**"包在哪"和"工作区在哪"现在是彻底分开的两件事**（`paths.package_dir()` 和
+# `paths.workspace_dir()`）。以前那段注释说"agent 的文件工作区必须是项目自身"，那句话
+# 在装成命令之后是错的 —— 工作区是 cwd，理由见 `paths.py`。
 
 from agent_runtime.frontends.cli import (
     print_audit,
@@ -45,10 +51,11 @@ from agent_runtime.runtime.composition import (
     Notice,
     boot,
     check_session_id,
+    check_workspace,
     open_runtime,
     resolve_session,
 )
-from agent_runtime.runtime.config import ConfigError
+from agent_runtime.userconfig import UserConfigError
 
 
 def _emit(notices: list[Notice], *, audit_line: str | None = None) -> None:
@@ -73,6 +80,23 @@ def _emit(notices: list[Notice], *, audit_line: str | None = None) -> None:
 def main() -> int:
     """返回退出码：配置缺失是"用户得先做点事"，脚本调用方应该能看出失败。"""
     args = build_parser().parse_args()
+
+    # ---- 工作区能不能用：**在所有分支之前** ----
+    #
+    # 工作区就是 cwd（见 `paths.workspace_dir()`），而 agent 的文件围栏、会话、审计、
+    # 权限文件全都从它长出来。所以这一问必须先于**每一条**路：
+    #
+    #   * `--tui` 起的子进程继承父进程的 cwd，所以父进程这一关就是它那一关 ——
+    #     而且在这里报，那句话还能落在终端上（界面接管屏幕之后就没地方显示了）；
+    #   * `--runtime-stdio` 直接开工作区；
+    #   * `--list` / `--audit` 这些只读子命令也要 —— 它们读的就是工作区里的会话文件，
+    #     在 home 下跑只会得到一句空清单，而那比报错更让人困惑。
+    #
+    # 它排在参数解析之后、别的一切之前：argparse 自己的报错（`--session` 少个值之类）
+    # 该先出来，那是"这条命令写错了"，比"这个目录不能用"更靠前一层。
+    if (problem := check_workspace()) is not None:
+        print(problem, file=sys.stderr)
+        return 2
 
     # ---- `--tui`：父进程，只起界面 ----
     #
@@ -172,7 +196,10 @@ def main() -> int:
             debug=args.debug,
             resumed=resumed,
         )
-    except ConfigError as exc:
+    except UserConfigError as exc:
+        # **捕基类，不是 `ConfigError`。** `CatalogError`（`~/.tudouni/config.json` 的
+        # `providers` 段读不懂）也是它的子类，而它以前一处都没被捕 —— 那份文件里多写
+        # 一个逗号就会以一整段 Python traceback 收场，而它恰好是新用户最先编辑的文件。
         print(exc, file=sys.stderr)
         return 2
 

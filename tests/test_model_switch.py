@@ -16,7 +16,7 @@ from contextlib import contextmanager
 import pytest
 
 from agent_runtime.runtime.config import (
-    CONTEXT_WINDOWS,
+    context_windows,
     McpConfig,
     ModelConfig,
     PermissionConfig,
@@ -423,7 +423,7 @@ def test_select_model_accepts_a_catalog_name_and_reports_the_old_one():
         assert runtime.current_model == "deepseek-v4-pro"
         assert runtime.current_provider == "deepseek"
         # 分母跟着换（它是派生的，不是存下来的字段）。
-        assert runtime.context_tokens == CONTEXT_WINDOWS["deepseek-v4-pro"]
+        assert runtime.context_tokens == context_windows()["deepseek-v4-pro"]
 
 
 def test_select_model_is_idempotent():
@@ -606,10 +606,10 @@ def _registry(workdir, providers: dict):
     **走真的读盘那条路**（`catalog.load`）：这样目录的形状错误（少 base_url、
     不认识的键）在测试里也会现形，而不是被一个手搓的 Registry 绕过去。
     """
-    path = workdir / "models.local.json"
+    path = workdir / "config.json"
     path.write_text(json.dumps({"providers": providers}, ensure_ascii=False),
                     encoding="utf-8")
-    return catalog.load(path, env_file=workdir / "missing.env")
+    return catalog.load(path)
 
 
 def _channels():

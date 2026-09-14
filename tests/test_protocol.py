@@ -37,11 +37,14 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.protocol import messages
-from agent_runtime.runtime.config import CONTEXT_WINDOWS
+from agent_runtime.runtime.config import context_windows
 from agent_runtime.state.catalog import ALIASES, load as load_catalog
 
-MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
-REPO_ROOT = MAIN_PY.parent
+# 仓库根 —— 它下面有 `agent_runtime/`。子进程一律用 `-m agent_runtime.main` 起，
+# 而不是 `main.py` 的绝对路径：那是生产里真正的起法（见 `protocol/client.py` 的
+# `RUNTIME_MODULE`），所以这里照着用就顺带把它钉住了。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_ARGV = [sys.executable, "-m", "agent_runtime.main"]
 
 
 # --- 一个假的 OpenAI 兼容端点 -------------------------------------------------
@@ -191,7 +194,7 @@ def run_protocol(inbound: list[dict | str], *, env_extra: dict | None = None,
         for line in inbound
     )
 
-    argv = [sys.executable, str(MAIN_PY), "--runtime-stdio"]
+    argv = [*RUNTIME_ARGV, "--runtime-stdio"]
     if session is not None:
         argv += ["--session", session]
     argv += list(argv_extra or [])
@@ -303,10 +306,10 @@ def test_init_carries_the_context_window(fake_openai):
     """`init.context_tokens` 是状态栏那个百分比的分母。
 
     **响应里没有这个字段**（OpenAI 兼容的形状里就没有"上下文窗口"），所以它来自
-    `config.CONTEXT_WINDOWS` 那张按模型名的表。界面拿它算占比；表里没有这个名字时
+    `config.context_windows()` 那张按模型名的表。界面拿它算占比；表里没有这个名字时
     它是 null，界面就只报用量、不报占比（错的百分比比没有百分比更坏）。
     """
-    from agent_runtime.runtime.config import CONTEXT_WINDOWS
+    from agent_runtime.runtime.config import context_windows
 
     base, _, _ = fake_openai
     code, lines, err = run_protocol(
@@ -316,7 +319,7 @@ def test_init_carries_the_context_window(fake_openai):
     assert code == 0, err
     init = parse(lines)[0]
     assert "context_tokens" in init
-    assert init["context_tokens"] == CONTEXT_WINDOWS.get(init["model"])
+    assert init["context_tokens"] == context_windows().get(init["model"])
 
 
 def test_the_state_snapshot_carries_the_rail_data(fake_openai):
@@ -387,7 +390,7 @@ def _open_protocol(fake_openai, *, session: str | None = None,
     env["DEEPSEEK_BASE_URL"] = base
     env["PYTHONIOENCODING"] = "utf-8"
 
-    argv = [sys.executable, str(MAIN_PY), "--runtime-stdio"]
+    argv = [*RUNTIME_ARGV, "--runtime-stdio"]
     if session is not None:
         argv += ["--session", session]
     argv += list(argv_extra or [])
@@ -959,7 +962,7 @@ def test_approval_goes_over_the_protocol(fake_openai):
     env["DEEPSEEK_BASE_URL"] = base
 
     proc = subprocess.Popen(
-        [sys.executable, str(MAIN_PY), "--runtime-stdio", "--session", "approval-probe"],
+        [*RUNTIME_ARGV, "--runtime-stdio", "--session", "approval-probe"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         encoding="utf-8", errors="replace", env=env, cwd=str(REPO_ROOT),
     )
@@ -1115,25 +1118,31 @@ def test_autopilot_turned_on_mid_session_stops_the_asking(fake_openai):
                 if e.get("kind") == "permission"]
     assert outcomes == ["autopilot"]
 
-def test_the_client_layer_finds_the_runtime_entrypoint():
-    """`protocol/client.py` 算出来的 `main.py` 路径必须真的存在。
+def test_the_client_layer_starts_the_runtime_as_a_module():
+    """子进程用 `-m agent_runtime.main` 起，而且那个模块真的存在。
 
-    这条测试是**为一次真实的 bug** 写的：`__file__` 是 `<包>/protocol/client.py`，
-    所以包目录要上两级、仓库根再上一级 —— 少算一级，子进程会去找
-    `<仓库>/main.py`，而报错是 "can't open file"，看起来像路径写错了，
-    其实是层级算错了。任何前端的**每一次启动**都会踩它，所以值得一条。
+    这条测试是**为一次真实的 bug** 改写的。它原来盯的是"算出来的 `main.py` 绝对路径存在"
+    —— 那条路径要从 `<包>/protocol/client.py` 往上跳两级，而少算一级会让子进程去找一个
+    不存在的文件，报错是 "can't open file"（看起来像路径写错了，其实是层级算错了）。
+
+    包变成真包之后那段算术整个消失了，但要守的性质没变、而且更强：**任何前端的每一次
+    启动都会踩这条 argv**，所以它必须指向一个真的能被 import 的模块。用
+    `importlib.util.find_spec` 而不是拼路径去看文件 —— 后者就是原来那个 bug 的形状。
     """
+    import importlib.util
+
     from agent_runtime.protocol import client
 
-    entry = client.runtime_entrypoint()
-    assert entry.is_file(), f"算出来的入口不存在：{entry}"
-    assert entry.name == "main.py"
-    assert (client.repo_root() / "agent_runtime").is_dir()
-    # 而 argv 用的是**绝对路径**：`python -m agent_runtime.main` 在
-    # `package = false` 下不工作（见 default_argv 的说明）。
+    assert importlib.util.find_spec(client.RUNTIME_MODULE) is not None, (
+        f"起不来：{client.RUNTIME_MODULE} 不是一个能 import 的模块"
+    )
+
     argv = client.default_argv("s")
-    assert str(entry) in argv
+    # `-m <模块>` 必须紧挨着出现，而且在任何 runtime 参数之前。
+    assert argv[1:4] == ["-u", "-m", client.RUNTIME_MODULE], argv
+    # `-u`：stdout 接管道时不关缓冲，界面会几秒不动（见 default_argv 的说明）。
     assert "-u" in argv
+    assert "--runtime-stdio" in argv
 
 
 def test_the_client_asks_for_streaming_by_default():
@@ -1158,23 +1167,34 @@ def test_the_client_asks_for_streaming_by_default():
     assert "--stream" not in client.default_argv("s", stream=False)
 
 
-def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai):
+def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai, tmp_path):
     """冒烟：那个 200 行的 ANSI 客户端能起来、能握手、能干净退出。
 
     它**不是** TUI，但它是一个真前端，所以它的启动路径值得跑一遍 ——
     它就是"协议能被一个第三方消费者用起来"的最小证据。这里只喂 `exit`，
     所以不碰模型。
+
+    ## cwd 有两个互相冲突的要求，所以这里用 `PYTHONPATH` 而不是 `cwd`
+
+      * `python -m agent_runtime.frontends.ansi` 要求**包的父目录**在 `sys.path` 上
+        （`package = false`，包没被安装）；
+      * 但 cwd **就是工作区**（`paths.workspace_dir()`），所以把 cwd 设成包的父目录会让
+        这条测试在**仓库外面**建一个 `.tudouni/`（实测过：`/repo/echuzhi/.tudouni`）。
+
+    两个要求分开满足：import 路径走 `PYTHONPATH`，工作区走一个临时目录。这也顺带钉住了
+    "工作区是 cwd"这件事 —— 会话文件出现在 `tmp_path` 下面才算对。
     """
     base, _, _ = fake_openai
     env = dict(os.environ)
     env["DEEPSEEK_API_KEY"] = "sk-test"
     env["PYTHONIOENCODING"] = "utf-8"
     env["DEEPSEEK_BASE_URL"] = base
+    env["PYTHONPATH"] = str(REPO_ROOT)
 
     result = subprocess.run(
         [sys.executable, "-m", "agent_runtime.frontends.ansi", "--session", "ansi-smoke"],
         input="exit\n", capture_output=True, encoding="utf-8", errors="replace",
-        env=env, cwd=str(REPO_ROOT.parent), timeout=60,
+        env=env, cwd=str(tmp_path), timeout=60,
     )
 
     assert result.returncode == 0, result.stderr
@@ -1193,6 +1213,13 @@ def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai):
         assert name in tools_line
     # 提示语在，说明它真的进到了交互循环。
     assert "输入内容回车发送" in result.stdout
+    # **工作区就是 cwd**：运行期目录建在临时目录里，而不是包目录、也不是仓库的父目录。
+    # 这一行同时钉住 `ProtocolClient` 没有把子进程按到别的目录去（它以前传
+    # `cwd=repo_root()`，那会让界面和 runtime 在两个工作区里干活）。
+    #
+    # 断言的是**目录**而不是会话文件：这一轮只喂了 `exit`，一句话都没说，而第一次写盘
+    # 发生在说出第一句话之后（"开了不用不会留下空文件"是刻意的，见 `resolve_session`）。
+    assert (tmp_path / ".tudouni" / "sessions").is_dir()
 
 
 def test_a_bad_version_exits_cleanly(fake_openai):
@@ -1287,7 +1314,7 @@ def test_status_answers_with_the_audit_numbers(fake_openai):
     assert body["session"]["steps"] == 1
     # 模型那一组：现在用的那个，加它的窗口。
     assert body["model"]["current"] == "deepseek-flash"
-    assert body["model"]["window"] == CONTEXT_WINDOWS["deepseek-flash"]
+    assert body["model"]["window"] == context_windows()["deepseek-flash"]
     # 账那一组：**和网关报的数一致**（假网关固定报 10 输入 / 5 输出，见 `_reply_stream`）。
     assert body["usage"]["prompt"] == 10
     assert body["usage"]["completion"] == 5
@@ -1296,7 +1323,7 @@ def test_status_answers_with_the_audit_numbers(fake_openai):
     assert body["counters"]["tool_calls"] == 0
     # "上一次请求实际发出去多少"是另一个字段（它是**最近一次**，不是累计）。
     assert status["last_prompt_tokens"] == 10
-    assert status["context_tokens"] == CONTEXT_WINDOWS["deepseek-flash"]
+    assert status["context_tokens"] == context_windows()["deepseek-flash"]
 
 
 def test_status_does_not_wait_for_a_running_turn(fake_openai):
@@ -1423,7 +1450,7 @@ def test_set_model_switches_and_says_so(fake_openai):
 
     snapshot = _ui(got, "state")
     assert snapshot["model"] == "deepseek-v4-pro"
-    assert snapshot["model_window"] == CONTEXT_WINDOWS["deepseek-v4-pro"]
+    assert snapshot["model_window"] == context_windows()["deepseek-v4-pro"]
 
     notices = [m for m in kinds(got, "notice") if m.get("code") == "model"]
     assert notices, "换模型要回一条说明"

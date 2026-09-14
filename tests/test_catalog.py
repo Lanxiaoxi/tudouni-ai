@@ -4,22 +4,22 @@
 （目录）和**选了之后怎么想**（思考那两个旋钮）。它们各自最容易错的地方也是同一类：
 **默认值猜错、名字认错，而两种错都不会报错** —— 只会静默地按另一个模型/另一档强度跑。
 
-配置文件那部分的测试全部**自己造文件**（`workdir` 下的临时 json），不碰仓库里真的
-`models.local.json` —— 那是个人的东西，而测试要看的是"给一份配置会发生什么"。
+配置文件那部分的测试全部**自己造文件**（`workdir` 下的临时 json），不碰这台机器上真的
+`~/.tudouni/config.json` —— 那是个人的东西，而测试要看的是"给一份配置会发生什么"。
 """
 
 import json
 
 import pytest
 
-from agent_runtime.runtime.config import CONTEXT_WINDOWS
+from agent_runtime.runtime.config import context_windows
 from agent_runtime.state import catalog, reasoning
 
 
 # --- 内置目录（没有配置文件时）--------------------------------------------------
 
 def test_the_builtin_directory_is_derived_into_the_window_table():
-    """`CONTEXT_WINDOWS` 和内置目录**必须同源**。
+    """`context_windows()` 和内置目录**必须同源**。
 
     它们各写一份的后果是静默的：往配置里加一个模型（`/model` 立刻列出它），而窗口表
     没跟上，于是"选了它之后状态栏不报占比" —— 两处都不会报错，只是那个百分比消失了。
@@ -27,7 +27,7 @@ def test_the_builtin_directory_is_derived_into_the_window_table():
     registry = catalog.load()
     assert registry.providers, "至少要有内置那一条路由"
     for item in registry.models():
-        assert CONTEXT_WINDOWS[item.id] == item.window
+        assert context_windows()[item.id] == item.window
 
 
 def test_legacy_names_are_recognised_but_not_offered():
@@ -43,7 +43,7 @@ def test_legacy_names_are_recognised_but_not_offered():
     for alias in catalog.ALIASES:
         assert alias not in ids
         assert registry.find(alias) is not None
-        assert CONTEXT_WINDOWS[alias] == registry.find(alias).window
+        assert context_windows()[alias] == registry.find(alias).window
 
 
 def test_an_unknown_model_name_has_no_window():
@@ -60,7 +60,7 @@ def test_an_unknown_model_name_has_no_window():
 # --- 配置文件 -------------------------------------------------------------------
 
 def _write(tmp_path, payload) -> "object":
-    path = tmp_path / "models.local.json"
+    path = tmp_path / "config.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
 
@@ -126,45 +126,95 @@ def test_a_bad_effort_is_refused_at_load_time(workdir):
     assert "low" in str(caught.value) and "max" in str(caught.value)
 
 
-def test_the_api_key_priority_is_file_then_env_then_dotenv(workdir, monkeypatch):
-    """密钥优先级：**文件里写死的 > `api_key_env` 指的环境变量 > `.env`**。
+def test_the_api_key_priority_is_inline_then_env_var_then_the_env_section(workdir, monkeypatch):
+    """密钥优先级：**`api_key` 写死的 > `api_key_env` 指的真实环境变量 > 同一份文件的
+    `env` 段**。
 
-    文件里写死就是"我要用这个"（它是用户级/工作区级的私有文件，不进版本库）。而
-    "密钥不进任何文件"是更好的做法，所以环境变量那条路照样得通 —— 两种都该能选。
+    文件里写死就是"我要用这个"（它是用户级的私有文件，不进版本库）。而"密钥不进任何
+    文件、只从环境来"是更好的做法，所以环境变量那条路照样得通 —— 两种都该能选。
+
+    **三档都在同一份文件里**（`env` 段取代了 `.env`），所以这条测试不再需要第二个路径
+    参数 —— 而那个参数正是它以前最容易写错的地方：忘了传就等于测了另一件事。
     """
-    env_file = workdir / ".env"
-    env_file.write_text("MY_KEY=sk-from-dotenv\n", encoding="utf-8")
-    path = _write(workdir, {"providers": {
-        "x": {"base_url": "https://a", "api_key_env": "MY_KEY",
-              "models": [{"id": "m"}]},
-    }})
+    def write(provider):
+        return _write(workdir, {
+            "env": {"MY_KEY": "sk-from-config-env"},
+            "providers": {"x": {**provider, "models": [{"id": "m"}]}},
+        })
 
-    # 1) 只有 .env：用它。
-    assert catalog.load(path, env_file=env_file).provider("x").api_key == "sk-from-dotenv"
+    path = write({"base_url": "https://a", "api_key_env": "MY_KEY"})
 
-    # 2) 真实环境变量优先于 .env。
-    monkeypatch.setenv("MY_KEY", "sk-from-env")
-    assert catalog.load(path, env_file=env_file).provider("x").api_key == "sk-from-env"
+    # 1) 只有 env 段：用它。
+    assert catalog.load(path).provider("x").api_key == "sk-from-config-env"
+    # 来源要能说出来 —— 排查"为什么用的是旧密钥"时那是唯一的线索。
+    assert any("env" in note and "MY_KEY" in note
+               for note in catalog.load(path).notes)
 
-    # 3) 文件里写了 api_key：它压过两者（写死了就是写死了）。
-    path = _write(workdir, {"providers": {
-        "x": {"base_url": "https://a", "api_key": "sk-in-file",
-              "api_key_env": "MY_KEY", "models": [{"id": "m"}]},
-    }})
-    assert catalog.load(path, env_file=env_file).provider("x").api_key == "sk-in-file"
+    # 2) 真实环境变量优先于文件。
+    monkeypatch.setenv("MY_KEY", "sk-from-real-env")
+    assert catalog.load(path).provider("x").api_key == "sk-from-real-env"
+
+    # 3) 写死的 api_key 压过两者。
+    path = write({"base_url": "https://a", "api_key": "sk-inline",
+                  "api_key_env": "MY_KEY"})
+    assert catalog.load(path).provider("x").api_key == "sk-inline"
 
 
-def test_a_sample_file_is_shipped_and_loads(workdir):
-    """仓库里那份 `models.example.json` **必须是一份能读的配置**。
+def test_a_config_with_only_an_env_section_falls_back_to_the_builtin_route(workdir):
+    """**只填了密钥、没写 providers** —— 那是最常见的用法，必须当"没配路由"处理。
+
+    首次运行生成的模板就长这样（`env` 里一把密钥）。如果"文件存在"被当成"路由清单是
+    空的"，那么每个只想填密钥的人都会撞上一句"一条可用的路由都没有" —— 而他什么都没
+    做错。
+    """
+    path = _write(workdir, {"env": {"DEEPSEEK_API_KEY": "sk-x"}})
+
+    registry = catalog.load(path)
+
+    assert [p.name for p in registry.providers] == [catalog.BUILTIN_PROVIDER]
+    assert registry.provider(catalog.BUILTIN_PROVIDER).api_key == "sk-x"
+    assert registry.find(catalog.DEFAULT_MODEL) is not None
+    # 那份文件仍然是"这份目录从哪来"的答案 —— `/status` 要拿它回答"为什么我改的没生效"。
+    assert str(path) == registry.source
+
+
+def test_an_unknown_top_level_key_is_refused(workdir):
+    """顶层写错一个键名也直接报错，不忽略。
+
+    和 providers 里面那条同一个理由，但它更容易犯：`"provider"`（少个 s）、
+    `"environment"`（不是 `env`）都是很自然的手滑，而静默忽略的表现是"我明明配了，
+    它却完全没生效"。
+
+    **抛的是 `UserConfigError` 而不是 `CatalogError`**，这一点是分工的直接体现：顶层长
+    什么样是 `userconfig` 的知识（它读文件），`providers` 里面长什么样才是这个模块的。
+    对入口来说没有区别 —— 它捕的是基类，两者都会变成"打到 stderr + 退出码 2"。
+    """
+    from agent_runtime import userconfig
+
+    path = _write(workdir, {"provider": {}})
+
+    with pytest.raises(userconfig.UserConfigError) as caught:
+        catalog.load(path)
+
+    assert "不认识的顶层键" in str(caught.value)
+    assert "providers" in str(caught.value) and "env" in str(caught.value)
+    # 而 `CatalogError` 是它的子类，所以入口那条 `except` 一样能兜住这一类。
+    assert issubclass(catalog.CatalogError, userconfig.UserConfigError)
+
+
+def test_a_sample_file_is_shipped_and_loads():
+    """仓库里那份 `config.example.json` **必须是一份能读的配置**。
 
     它是给人照抄的模板，而"模板本身是坏的"是所有失败形态里最浪费时间的一种：
     照着写的人会以为是自己写错了。所以把它当成真的配置读一遍。
     """
-    from agent_runtime.runtime.config import PROJECT_ROOT
+    from agent_runtime import userconfig
 
-    sample = PROJECT_ROOT / catalog.MODELS_EXAMPLE_NAME
-    assert sample.is_file(), "模板不见了 —— 它是 /model 那条路的说明书"
-    registry = catalog.load(sample, env_file=workdir / "missing.env")
+    sample = userconfig.example_file()
+    assert sample.is_file(), "模板不见了 —— 它是这条路的说明书"
+
+    registry = catalog.load(sample)
+
     assert registry.provider("deepseek") is not None
     assert registry.find("deepseek-flash") is not None
     # 模板里那条示例路由没有密钥：它必须**降级成"选不了"，而不是让整个文件读不出来**。

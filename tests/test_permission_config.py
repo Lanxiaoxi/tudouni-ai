@@ -19,8 +19,8 @@ import pytest
 
 from agent_runtime.runtime.config import (
     ConfigError,
-    PERMISSION_FILE,
     PermissionConfig,
+    permission_file,
     save_approvals,
 )
 
@@ -59,8 +59,30 @@ def test_the_permission_file_lives_in_the_runtime_dir():
     """
     from agent_runtime.skills import RUNTIME_DIR_NAME
 
-    assert PERMISSION_FILE.parent.name == RUNTIME_DIR_NAME
-    assert PERMISSION_FILE.name == "permissions.json"
+    assert permission_file().parent.name == RUNTIME_DIR_NAME
+    assert permission_file().name == "permissions.json"
+
+
+def test_the_permission_file_follows_the_working_directory(workdir, monkeypatch):
+    """**它跟着 cwd 走，而且是每次调用现算。**
+
+    权限策略是**工作区级**的（一个仓库一份，能 review、能提交），所以换个目录干活就该
+    是另一份规则。这条测试真正盯的是"现算"这件事：`permission_file` 以前是个模块级常量
+    `PERMISSION_FILE`，那会在 `import` 那一刻把 cwd 冻死 —— 而"哪个模块先被 import"
+    不是任何人打算维护的顺序。
+
+    冻错了的症状很难看且完全静默：按一次 `t` 记住的规则写进了**上一个目录**的
+    `permissions.json`，而当前这个目录下一次启动照旧问你。
+    """
+    monkeypatch.chdir(workdir)
+
+    assert permission_file() == workdir / ".tudouni" / "permissions.json"
+
+    other = workdir / "另一个项目"
+    other.mkdir()
+    monkeypatch.chdir(other)
+
+    assert permission_file() == other / ".tudouni" / "permissions.json"
 
 
 def test_save_creates_the_runtime_dir_when_missing(workdir):

@@ -1,6 +1,8 @@
 """技能：发现（loader）+ 渲染（render）。
 
-**这个包不 import 任何内部模块**，这是它能独立成包的全部依据。所以：
+**这个包不 import 任何有行为的内部模块**，这是它能独立成包的全部依据。唯一的例外是
+`agent_runtime.paths`（只 import 标准库的叶子，回答"目录叫什么、在哪"）—— 引它不可能
+成环，而 `RUNTIME_DIR_NAME` 本来就是它的知识，不是技能的。所以：
 
   * 它不认识 `Tool` / `ToolRegistry` / `ToolResult` —— 那是 `tools/builtin/skills.py` 的活；
   * 它不 import `state` —— 已加载技能的指针就存在 `session.metadata` 这个普通 dict 里，

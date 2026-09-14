@@ -1,5 +1,16 @@
+[build-system]
+# hatchling：它把"包在哪"写成一行显式配置（下面的 `packages`），而不是靠猜目录布局。
+# 这一点在这个项目里不是无关紧要的 —— 它以前是**扁平布局**（仓库根本身就是包），
+# 于是"包叫什么"取决于**克隆出来的目录叫什么**：仓库在 GitHub 上叫 tudouni-ai，
+# clone 下来 `import agent_runtime` 直接 ModuleNotFoundError，而 `runtime/config.py`
+# 里还有一处拼死了 "agent_runtime" 的路径跟着一起失效（见 paths.py 的 docstring）。
+#
+# 现在包在 `agent_runtime/` 子目录里、跟着仓库一起提交，所以仓库爱叫什么叫什么。
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "agent-runtime"
+name = "tudouni-ai"
 version = "0.1.0"
 description = "Minimal agent runtime with a pluggable chat-model adapter and tool registry"
 # 下界由代码决定，不是随意的：@dataclass(slots=True) 与运行时求值的 `X | None`
@@ -13,8 +24,6 @@ dependencies = [
     # 都是 Pydantic v2 的 API。它原本只是 openai 的传递依赖，这里显式声明，
     # 因为项目代码直接 import 它。
     "pydantic>=2",
-    # 读项目根的 .env。只用来装本地配置（主要是密钥），不参与任何运行时逻辑。
-    "python-dotenv>=1.0",
     # TUI 前端（`frontends/tui/`）。**只有那个包会 import 它**，其余路径
     # （老 CLI、`--runtime-stdio` 子进程、四个不需要模型的子命令）都不加载它 ——
     # 这一点由 `tests/test_imports.py` 里那条"textual 只准出现在 app/widgets 里"
@@ -26,22 +35,43 @@ dependencies = [
     "textual>=0.80",
 ]
 
+# 装完之后 PATH 上多的那个命令。
+#
+# **叫 `tudouni` 而不是 `agent-runtime`**：后者是包的内部名字（一个描述"这是什么"的
+# 通用词），而命令是人每天要敲的东西，得是这个项目的名字。运行期目录也叫 `.tudouni`，
+# 三处对得上。
+#
+# `main()` 返回退出码，控制台包装器会把它交给 `sys.exit` —— 所以"配置缺失退出码 2"
+# 那条约定装成命令之后照旧成立。
+[project.scripts]
+tudouni = "agent_runtime.main:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
 ]
 
+[tool.hatch.build.targets.wheel]
+# 显式点名，不靠猜。仓库根还有 tests/ doc/ scripts/，它们不该进 wheel。
+packages = ["agent_runtime"]
+
+# **随代码走的非 .py 文件不需要额外声明** —— 上面那行 `packages` 会把 `agent_runtime/`
+# 下的所有文件都收进 wheel，不只是 .py。刻意不写 `force-include`：那会让同一个文件被加
+# 两遍，而 hatchling 直接报 "A second file is being added to the wheel archive at the
+# same path"（实测撞过）。
+#
+# 四类必须在里面，缺一个就是"装出来的命令能起、但某个功能悄悄没了"：
+#   * prompts/            每轮都要发给模型的系统提示词（缺了 `load_system_prompt` 抛异常）
+#   * config.example.json 首次运行抄成 `~/.tudouni/config.json` 的那份模板
+#   * protocol/schema/    协议消息的 JSON Schema
+#   * tools/vendor/rg/    随仓库带的 ripgrep（缺本机那一份时 `grep` 工具不注册）
+# 这四类由 `tests/test_packaging.py` 盯着 —— 它们只在**装出来的包**里才可能缺，
+# 而源码目录里跑测试永远看不到。
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# tests/ 里靠 conftest.py 把仓库根加进 sys.path（package = false，包没被安装）。
 # 关掉缓存写入，免得在只读环境里报 warning。
 addopts = "-q"
-
-[tool.uv]
-# main.py 位于包目录内部，且通过 sys.path.insert 把父目录加进搜索路径后
-# `import agent_runtime`。若让 uv 构建安装本项目，扁平布局会把顶级模块解析成
-# main/models/tools/agents 而不是 agent_runtime，因此不打包。
-package = false
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"

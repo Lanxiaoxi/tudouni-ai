@@ -24,7 +24,11 @@ import pytest
 from agent_runtime.runtime.composition import check_session_id
 from agent_runtime.state.session import is_valid_session_id
 
-MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
+# 仓库根 —— 它下面有 `agent_runtime/`。子进程一律用 `-m agent_runtime.main` 起，
+# 而不是 `main.py` 的绝对路径：那是生产里真正的起法（见 `protocol/client.py` 的
+# `RUNTIME_MODULE`），所以这里照着用就顺带把它钉住了。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_ARGV = [sys.executable, "-m", "agent_runtime.main"]
 
 
 # --- 单元：翻译层 ---------------------------------------------------------
@@ -61,7 +65,7 @@ def test_the_message_is_a_translation_not_a_second_rule():
 
 def run_main(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(MAIN_PY), *args],
+        [*RUNTIME_ARGV, *args],
         capture_output=True, encoding="utf-8", errors="replace",
     )
 

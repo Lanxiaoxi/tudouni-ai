@@ -48,7 +48,7 @@ from agent_runtime.runtime.composition import (
     resolve_session,
     session_summaries,
 )
-from agent_runtime.runtime.config import ConfigError
+from agent_runtime.userconfig import UserConfigError
 
 # 按一个（可能为空的）会话 id 装出一个 runtime。见上面那一节。
 OpenSession = Callable[[str], object]
@@ -138,7 +138,8 @@ def main(session_id: str | None = None, *, autopilot: bool = False,
 
     try:
         server.open_session(session_id)
-    except ConfigError as exc:
+    except UserConfigError as exc:
+        # 捕**基类**：`ConfigError`（缺密钥）和 `CatalogError`（配置文件读不懂）都算。
         # **只走 stderr**：stdout 是协议通道，混一行人话进去前端就解析崩了。
         print(exc, file=sys.stderr)
         return 2

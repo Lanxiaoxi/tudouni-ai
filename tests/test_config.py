@@ -1,20 +1,25 @@
 ﻿"""配置的优先级与报错。
 
-优先级（高 → 低）：**真实环境变量 > .env > 默认值**。
+优先级（高 → 低）：**真实环境变量 > `~/.tudouni/config.json` 的 `env` 段 > 默认值**。
 
-这条顺序值得有测试盯着：搞反了会让某天部署时被一个遗留的 .env 悄悄改到别的网关，
+这条顺序值得有测试盯着：搞反了会让某天部署时被一份遗留的配置悄悄改到别的网关，
 而那种问题极难排查 —— 因为源码里什么都看不出来。
+
+（`.env` 那一层已经不在了：密钥搬进了用户级那份 `config.json`，理由写在
+`agent_runtime/userconfig.py` 的 docstring 里。这个文件里的用例是照着搬过来的 ——
+**同一条优先级，只是换了个文件**。）
 """
 
+import json
 from pathlib import Path
 
 import pytest
 
+from agent_runtime import userconfig
 from agent_runtime.runtime.config import (
-    CONTEXT_WINDOWS,
+    context_windows,
     DEFAULT_MODEL,
     DEFAULT_TAVILY_BASE_URL,
-    ENV_EXAMPLE_FILE,
     ConfigError,
     ModelConfig,
     WebConfig,
@@ -33,42 +38,44 @@ def clean_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def write_env(workdir, text: str) -> Path:
-    path = workdir / ".env"
-    path.write_text(text, encoding="utf-8")
+def write_config(workdir, env: dict, **rest) -> Path:
+    """写一份用户级配置（只有 `env` 段，除非调用方另给）。"""
+    path = workdir / "config.json"
+    path.write_text(json.dumps({"env": env, **rest}, ensure_ascii=False),
+                    encoding="utf-8")
     return path
 
 
-# --- 从 .env 读 ---------------------------------------------------------
+# --- 从配置文件读 -------------------------------------------------------
 
-def test_reads_key_from_env_file(workdir):
-    cfg = ModelConfig.from_env(write_env(workdir, "DEEPSEEK_API_KEY=sk-from-file\n"))
+def test_reads_key_from_the_config_file(workdir):
+    cfg = ModelConfig.from_env(write_config(workdir, {"DEEPSEEK_API_KEY": "sk-from-file"}))
     assert cfg.api_key == "sk-from-file"
 
 
-def test_env_file_supplies_optional_overrides(workdir):
-    path = write_env(workdir, "\n".join([
-        "DEEPSEEK_API_KEY=sk-x",
-        "DEEPSEEK_BASE_URL=https://gateway.example/v1/",
-        "DEEPSEEK_MODEL=my-model",
-    ]))
+def test_the_config_file_supplies_optional_overrides(workdir):
+    path = write_config(workdir, {
+        "DEEPSEEK_API_KEY": "sk-x",
+        "DEEPSEEK_BASE_URL": "https://gateway.example/v1/",
+        "DEEPSEEK_MODEL": "my-model",
+    })
     cfg = ModelConfig.from_env(path)
     assert cfg.base_url == "https://gateway.example/v1/"
     assert cfg.model == "my-model"
 
 
-def test_defaults_when_env_file_is_minimal(workdir):
-    cfg = ModelConfig.from_env(write_env(workdir, "DEEPSEEK_API_KEY=sk-x\n"))
+def test_defaults_when_the_config_file_is_minimal(workdir):
+    cfg = ModelConfig.from_env(write_config(workdir, {"DEEPSEEK_API_KEY": "sk-x"}))
     assert cfg.base_url == "https://api.deepseek.com"
     assert cfg.model == "deepseek-flash"
 
 
 # --- 优先级 -------------------------------------------------------------
 
-def test_real_env_var_wins_over_env_file(workdir, monkeypatch):
-    """重点：.env 只是本地方便，不能盖掉真实环境变量。"""
-    path = write_env(workdir,
-                     "DEEPSEEK_API_KEY=sk-from-file\nDEEPSEEK_MODEL=file-model\n")
+def test_real_env_var_wins_over_the_config_file(workdir, monkeypatch):
+    """重点：配置文件只是本地方便，不能盖掉真实环境变量。"""
+    path = write_config(workdir, {"DEEPSEEK_API_KEY": "sk-from-file",
+                                  "DEEPSEEK_MODEL": "file-model"})
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
 
     cfg = ModelConfig.from_env(path)
@@ -76,68 +83,201 @@ def test_real_env_var_wins_over_env_file(workdir, monkeypatch):
     assert cfg.model == "file-model"        # 没设的那个仍然用文件
 
 
-def test_missing_file_falls_back_to_env_var(monkeypatch):
-    """没有 .env 不是错误 —— 环境变量是另一条合法通路。"""
+def test_missing_file_falls_back_to_env_var(workdir, monkeypatch):
+    """**没有配置文件不是错误** —— 只给环境变量是另一条合法通路（容器里就这么用）。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
-    assert ModelConfig.from_env(Path("definitely-does-not-exist.env")).api_key == "sk-from-env"
+    missing = workdir / "definitely-does-not-exist.json"
+    assert ModelConfig.from_env(missing).api_key == "sk-from-env"
 
 
 # --- 缺失与空值 ---------------------------------------------------------
 
 def test_empty_file_value_does_not_count_as_a_key(workdir):
-    """`.env` 里留空的那一行不该被当成有效值。"""
+    """留空的那一格是"还没填"，不是"填了一个空密钥"。
+
+    它必须落到下一层，否则一个空字符串会被当成有效值发出去 —— 而首次运行生成的模板里
+    那一格**就是空的**，所以这条路径是每个新用户都会走一遍的。
+    """
     with pytest.raises(ConfigError):
-        ModelConfig.from_env(write_env(workdir, "DEEPSEEK_API_KEY=\n"))
+        ModelConfig.from_env(write_config(workdir, {"DEEPSEEK_API_KEY": ""}))
 
 
 def test_empty_file_value_falls_through_to_env_var(workdir, monkeypatch):
-    path = write_env(workdir, "DEEPSEEK_API_KEY=\n")
+    path = write_config(workdir, {"DEEPSEEK_API_KEY": ""})
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
     assert ModelConfig.from_env(path).api_key == "sk-from-env"
 
 
 def test_missing_key_error_names_both_options(workdir):
-    """报错要把两条路都给出来 —— 配置错误是"用户得先做点事"，不该让人去翻源码。"""
+    """报错要把两条路都给出来 —— 配置错误是"用户得先做点事"，不该让人去翻源码。
+
+    路径必须是**刚才找过的那个文件**，不是默认位置：显式指了一份配置却被告知"去建
+    ~/.tudouni/config.json"，会让人以为自己的 AGENT_CONFIG_FILE 没生效。
+    """
+    missing = workdir / "nope.json"
+
     with pytest.raises(ConfigError) as exc:
-        ModelConfig.from_env(workdir / "nope.env")
+        ModelConfig.from_env(missing)
 
     message = str(exc.value)
     assert "DEEPSEEK_API_KEY" in message
-    assert ".env" in message        # 可以写文件
-    assert "setx" in message        # 也可以设环境变量
+    assert str(missing) in message        # 可以写文件，而且说的是**这个**文件
+    assert "export" in message            # 也可以设环境变量
+
+
+def test_the_missing_key_error_changes_when_the_file_already_exists(workdir):
+    """文件在不在，下一步是两件不同的事，所以那句话得分开说。
+
+    文件不存在 ⇒ "建一份"；文件已经在了 ⇒ "打开它，在 env 里填"。说成一句会让已经建过
+    文件的人以为自己路径写错了，然后再建一份到别处去。
+    """
+    existing = write_config(workdir, {"DEEPSEEK_API_KEY": ""})
+
+    with pytest.raises(ConfigError) as exc:
+        ModelConfig.from_env(existing)
+
+    message = str(exc.value)
+    assert str(existing) in message
+    assert "建一份" not in message
+
+
+def test_a_missing_key_scaffolds_the_config_and_points_at_it(workdir, monkeypatch):
+    """**首次运行的完整那一步：没配置、没密钥 ⇒ 建一份模板，然后指着它报错。**
+
+    这条测试盯的是"接线"，而 `test_userconfig.py` 盯的是 `scaffold()` 本身。少了这条接线
+    的话，`scaffold()` 全绿而用户仍然看到"你得自己建一份" —— 而那正是它要消灭的那句话。
+    """
+    from agent_runtime import paths, userconfig
+
+    monkeypatch.delenv(userconfig.FILE_ENV, raising=False)
+    monkeypatch.setenv("HOME", str(workdir))
+    monkeypatch.setenv("USERPROFILE", str(workdir))
+
+    with pytest.raises(ConfigError) as exc:
+        ModelConfig.from_env()
+
+    created = workdir / paths.RUNTIME_DIR_NAME / userconfig.CONFIG_FILE_NAME
+    assert created.is_file(), "缺密钥那条路没有把模板建出来"
+    message = str(exc.value)
+    assert str(created) in message
+    assert "已经在这儿给你建好了" in message
+
+
+def test_a_key_in_the_environment_scaffolds_nothing(workdir, monkeypatch):
+    """密钥在环境变量里 ⇒ **一个文件都不建**。
+
+    容器和 CI 的 home 常常是临时的、甚至只读的，而我们凭什么在那儿留东西。这也是
+    `scaffold()` 被放在"报错那一刻"而不是"每次启动"的全部理由。
+    """
+    from agent_runtime import paths, userconfig
+
+    monkeypatch.delenv(userconfig.FILE_ENV, raising=False)
+    monkeypatch.setenv("HOME", str(workdir))
+    monkeypatch.setenv("USERPROFILE", str(workdir))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
+
+    assert ModelConfig.from_env().api_key == "sk-from-env"
+    assert not (workdir / paths.RUNTIME_DIR_NAME).exists()
 
 
 # --- 模板文件本身 -------------------------------------------------------
 
-def test_env_example_exists_and_has_no_secret():
+def test_the_example_config_exists_and_has_no_secret():
     """模板是**会被提交**的那一份，里面绝不能出现真密钥。
 
     这条断言很小，但它是"密钥不进仓库"这个承诺在测试里的落点。
     """
-    assert ENV_EXAMPLE_FILE.is_file()
-    text = ENV_EXAMPLE_FILE.read_text(encoding="utf-8")
+    path = userconfig.example_file()
+    assert path.is_file()
+    text = path.read_text(encoding="utf-8")
     assert "sk-" not in text
     assert "DEEPSEEK_API_KEY" in text
 
 
-def test_dotenv_does_not_leak_into_os_environ(workdir, monkeypatch):
-    """用 dotenv_values 而不是 load_dotenv：读配置不该有全局副作用。
+def test_the_example_config_is_a_config_the_program_can_read():
+    """模板必须**真的能被这个程序读懂**。
 
-    否则一次 from_env 就会把 .env 的内容写进 os.environ，之后任何代码（包括别的
-    测试）都会莫名看到这些值，而优先级规则也就不再成立。
+    它是照着抄的那一份，所以里面一个写错的键名会让每个照着做的人都撞上同一个报错，
+    然后以为是自己写错了。所以把它当成真配置读一遍 —— 顶层形状、`env` 段、`providers`
+    段全走一遍解析。
+    """
+    cfg = userconfig.read(userconfig.example_file())
+
+    assert "DEEPSEEK_API_KEY" in cfg.env
+    assert "deepseek" in cfg.providers
+
+
+def test_reading_the_config_does_not_leak_into_os_environ(workdir):
+    """**读配置不许有全局副作用。**
+
+    这一条以前叫 `test_dotenv_does_not_leak_into_os_environ`，盯的是"用 `dotenv_values`
+    而不是 `load_dotenv`"。dotenv 那层依赖已经没了，但要守的性质一字未变，而且现在更
+    要紧 —— 因为优先级的第一档就是 `os.environ`：
+
+    一旦读配置顺手把文件里的值写进 `os.environ`，那么**第二次**读的时候它们就变成了
+    "真实环境变量"，于是"环境变量优先于文件"这条规则表面上还成立，实际上已经没有意义
+    了。而这种自我实现的错误从任何一次断言里都看不出来。
     """
     import os
-    write_env(workdir, "DEEPSEEK_API_KEY=sk-from-file\n")
-    ModelConfig.from_env(workdir / ".env")
+
+    path = write_config(workdir, {"DEEPSEEK_API_KEY": "sk-from-file",
+                                  "TAVILY_API_KEY": "tvly-from-file"})
+
+    ModelConfig.from_env(path)
+    WebConfig.from_env(path)
+
     assert "DEEPSEEK_API_KEY" not in os.environ
+    assert "TAVILY_API_KEY" not in os.environ
 
 
 # --- 上下文窗口那张表 -----------------------------------------------------
 
+def test_importing_config_does_not_read_the_catalog():
+    """**import 这个模块不许读盘。**
+
+    那张窗口表以前是一句模块级赋值（`CONTEXT_WINDOWS = catalog.load().windows()`），
+    于是 `import agent_runtime.runtime.config` 会在那一瞬间去碰 `~/.tudouni/` 和 cwd。
+    三个后果，一个比一个难查：
+
+      1. import 顺序变成了必须维护的东西，而没人在维护它；
+      2. 测试想换一份目录配置（`AGENT_MODELS_FILE`）就得抢在第一次 import 之前设环境
+         变量 —— 也就是取决于哪个测试文件先被收集；
+      3. 配置搬到用户级之后，它会和"首次运行生成模板"撞上：模板该由入口在明确的时机
+         创建，不该被某个 import 顺手触发。
+
+    验法是**在子进程里**数一次：`catalog.load` 被 import 期调用过没有。用子进程是因为
+    这个模块在当前进程里早就被 import 过了，`sys.modules` 里那份看不出任何东西。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    script = (
+        "import sys;"
+        f"sys.path.insert(0, {str(repo_root)!r});"
+        "import agent_runtime.state.catalog as cat;"
+        "calls = [];"
+        "real = cat.load;"
+        "cat.load = lambda *a, **k: (calls.append(1), real(*a, **k))[1];"
+        "import agent_runtime.runtime.config;"
+        "print(len(calls))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0", (
+        f"import config 时调了 {result.stdout.strip()} 次 catalog.load() —— "
+        f"那张表必须惰性算（见 config.context_windows）"
+    )
+
+
 def test_the_default_model_has_a_declared_window():
     """默认模型必须在表里 —— 否则每次启动都会打一句"没分母"，而那是默认体验。"""
     cfg = ModelConfig(api_key="sk-x", base_url="x", model=DEFAULT_MODEL)
-    assert cfg.context_tokens == CONTEXT_WINDOWS[DEFAULT_MODEL]
+    assert cfg.context_tokens == context_windows()[DEFAULT_MODEL]
 
 
 def test_an_unknown_model_has_no_window_rather_than_a_guess():
@@ -154,37 +294,38 @@ def test_configured_model_name_decides_the_window(workdir, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-x")
     monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
-    cfg = ModelConfig.from_env(Path("definitely-does-not-exist.env"))
+    cfg = ModelConfig.from_env(workdir / "definitely-does-not-exist.json")
 
     assert cfg.model == "deepseek-v4-pro"
-    assert cfg.context_tokens == CONTEXT_WINDOWS["deepseek-v4-pro"]
+    assert cfg.context_tokens == context_windows()["deepseek-v4-pro"]
 
 
 # --- 联网工具的配置（WebConfig） ------------------------------------------
 #
-# 它和 ModelConfig 共用同一个 .env、同一套优先级，但**缺密钥的处置完全不同**：
+# 它和 ModelConfig 共用同一份配置文件、同一套优先级（同一个 `UserConfig.value`），
+# 但**缺密钥的处置完全不同**：
 # 模型密钥缺了整个程序什么都干不了（ConfigError + 退出码 2），搜索密钥缺了只是少一个
 # 工具。这两件事混成一样，会让"只想用文件工具的人"被迫先去注册一个搜索服务。
 
-def test_web_key_is_read_from_the_same_env_file(workdir):
-    cfg = WebConfig.from_env(write_env(workdir, "TAVILY_API_KEY=tvly-from-file\n"))
+def test_web_key_is_read_from_the_same_config_file(workdir):
+    cfg = WebConfig.from_env(write_config(workdir, {"TAVILY_API_KEY": "tvly-from-file"}))
 
     assert cfg.tavily_api_key == "tvly-from-file"
     assert cfg.tavily_base_url == DEFAULT_TAVILY_BASE_URL
     assert cfg.enabled is True
 
 
-def test_web_env_var_wins_over_the_env_file(workdir, monkeypatch):
-    """和 ModelConfig 一字不差的优先级：真实环境变量 > .env > 默认值。"""
-    path = write_env(workdir, "TAVILY_API_KEY=tvly-from-file\n")
+def test_web_env_var_wins_over_the_config_file(workdir, monkeypatch):
+    """和 ModelConfig 一字不差的优先级 —— 它们调的就是同一个函数。"""
+    path = write_config(workdir, {"TAVILY_API_KEY": "tvly-from-file"})
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-from-env")
 
     assert WebConfig.from_env(path).tavily_api_key == "tvly-from-env"
 
 
 def test_an_empty_web_key_counts_as_unset(workdir, monkeypatch):
-    """.env 里留空的那一行是"还没填"，不是"填了一个空密钥"。"""
-    path = write_env(workdir, "TAVILY_API_KEY=\n")
+    """留空的那一格是"还没填"，不是"填了一个空密钥"。"""
+    path = write_config(workdir, {"TAVILY_API_KEY": ""})
 
     assert WebConfig.from_env(path).enabled is False
     assert WebConfig.from_env(path).tavily_api_key == ""
@@ -199,7 +340,7 @@ def test_a_missing_web_key_is_not_an_error(workdir):
     缺搜索密钥不该拦启动：那只会逼着"只想用文件工具的人"先去注册一个搜索服务。
     要说的那句话由 main.py 打到 stderr（"[联网] 没找到 TAVILY_API_KEY…"）。
     """
-    cfg = WebConfig.from_env(workdir / "nope.env")
+    cfg = WebConfig.from_env(workdir / "nope.json")
 
     assert cfg.enabled is False
     assert cfg.tavily_base_url == DEFAULT_TAVILY_BASE_URL
@@ -209,25 +350,29 @@ def test_web_base_url_can_be_switched(workdir, monkeypatch):
     """换网关的口子（和 DEEPSEEK_BASE_URL 同一个理由）。"""
     monkeypatch.setenv("TAVILY_BASE_URL", "https://gateway.example/v1")
 
-    assert WebConfig.from_env(Path("nonexistent.env")).tavily_base_url == "https://gateway.example/v1"
+    assert WebConfig.from_env(workdir / "nonexistent.json").tavily_base_url == "https://gateway.example/v1"
 
 
-def test_env_example_documents_the_web_key_without_a_secret():
+def test_the_example_config_documents_the_web_key_without_a_secret():
     """模板是**会被提交**的那一份。
 
-    键名要出现在里面（否则没人知道该填什么），但它必须**是空的或者被注释掉**。
-    盯的不是"文本里不出现 tvly- 这几个字"：模板里"形如 tvly-..." 那句提示是有用的，
-    真该禁的是**一个真的值**。所以判据落在"赋值那一行有没有内容"上 —— 那正是密钥
-    会泄漏的那个位置，而提示、注释都不在那里。
+    键名要出现在里面（否则没人知道该填什么），但它必须**没有一个真的值**。盯的不是
+    "文本里不出现 tvly- 这几个字"：模板里"形如 tvly-..." 那句提示是有用的，真该禁的是
+    一个真的值。
 
-    （`test_env_example_exists_and_has_no_secret` 那条盯的是 "sk-"，同一个手法。
-    这里不能照抄它："sk-" 是 DeepSeek 密钥的固有前缀、不会出现在说明文字里，
-    而 "tvly-" 会。）
+    判据落在**解析出来的那个 `env` 映射**上，而不是原文的正则：改成 JSON 之后，"赋值
+    那一行"这个概念没了（值可以跨行、可以待在注释里），而"程序读出来是什么"才是密钥真正
+    泄漏的位置。
+
+    （`test_the_example_config_exists_and_has_no_secret` 那条盯的是 "sk-"，同一个手法。
+    这里不能照抄它："sk-" 是 DeepSeek 密钥的固有前缀、不会出现在说明文字里，而 "tvly-"
+    会。）
     """
-    import re
+    text = userconfig.example_file().read_text(encoding="utf-8")
+    assert "TAVILY_API_KEY" in text, "模板里得说一句这个键存在，否则没人知道该填什么"
 
-    text = ENV_EXAMPLE_FILE.read_text(encoding="utf-8")
-    assert "TAVILY_API_KEY" in text
+    cfg = userconfig.read(userconfig.example_file())
+    assert not cfg.value_in_file("TAVILY_API_KEY"), "模板里出现了真的搜索密钥"
+    assert not cfg.value_in_file("DEEPSEEK_API_KEY"), "模板里出现了真的模型密钥"
 
-    assigned = re.findall(r"^\s*TAVILY_API_KEY\s*=\s*(\S+)", text, re.M)
-    assert assigned == [], f"模板里出现了真的密钥值：{assigned}"
+

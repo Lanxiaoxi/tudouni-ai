@@ -31,13 +31,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# 工作区 = `runtime.composition.project_dir()`（agent_runtime 包目录）。
+from agent_runtime import paths
+
+# 工作区。**它在这里只是一个默认值，唯一的权威是 `paths.workspace_dir()`**（装配层
+# 的 `composition.project_dir()` 转发它，并把真值显式传给 `Session.new()`）。留着这个
+# 默认值的理由是可测：测试 monkeypatch 它就能让整份用例不受"开发机的包里恰好躺着一份
+# AGENT.md"影响，否则这个功能会让全套测试变成看运气的（有的机器红、有的绿，症状还是
+# "提示词里多了一段"）。
 #
-# **它在这里只是一个默认值，唯一的权威是 `composition.project_dir()`** —— 那边
-# 会把工作区显式传给 `Session.new()`。留着这个默认值的理由是可测：测试 monkeypatch
-# 它就能让整份用例不受"开发机的包里恰好躺着一份 AGENT.md"影响，否则这个功能会让
-# 全套测试变成看运气的（有的机器红、有的绿，症状还是"提示词里多了一段"）。
-WORKSPACE = Path(__file__).resolve().parent.parent
+# 它以前自己算 `Path(__file__).parent.parent`。同一件事有四处各自算一遍时，改名那次
+# 就已经崩掉一处了 —— 见 `paths.py` 的 docstring。
+WORKSPACE = paths.workspace_dir()
 
 # 文件名写死、大小写敏感。**Windows 上 `Path.exists()` 本来就大小写不敏感**，
 # 所以那边 `agent.md` 也能命中；刻意不做"两种名字都试"的兼容层：那会让同一个位置

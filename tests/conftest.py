@@ -1,3 +1,4 @@
+import os
 import shutil
 import sys
 import threading
@@ -46,6 +47,61 @@ def isolated_workspace(monkeypatch):
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_config(monkeypatch):
+    """把**用户级配置**（`~/.tudouni/config.json`）指到一个隔离的临时文件。
+
+    这是 `isolated_workspace` 的对称物，而且理由一字不差：不隔离的话，一大批测试的结果
+    取决于**跑测试的那台机器上配了什么**。两个方向都会出事：
+
+      * 开发机上有一份真配置 ⇒ 它的路由、默认模型、密钥会渗进断言里（`/model` 那组尤其
+        明显：清单里会多出别人的网关）；
+      * 开发机上**什么都没配** ⇒ 每一条走 `open_runtime()` 的测试都会以"一个可用的模型
+        都没有"收场，而它们要测的根本不是配置（实测过：`test_model_switch` 里有 5 条就是
+        这么红的，而在配了密钥的机器上它们是绿的 —— 那种测试比没有更坏）。
+
+    ## 隔离的同时给一个能用的默认
+
+    临时文件里只写一把假密钥、**不写 providers**：那样 `catalog.load()` 会退到内置那条
+    `deepseek` 路由（deepseek-flash / deepseek-v4-pro），也就是"只填了密钥"这个最常见的
+    用法 —— 顺带让那条路径在每次跑测试时都被走一遍。
+
+    密钥放**文件里**而不是 `os.environ`：优先级的第一档是真实环境变量，往那里塞值会让
+    "环境变量优先于文件"这条规则的测试失去意义（它们会在一个已经被污染的环境里比较）。
+
+    ## 顺手清掉那几个环境变量
+
+    真实环境变量压过文件，所以本机设着 `DEEPSEEK_MODEL=某个别的模型`时，"默认模型是
+    deepseek-flash"那批断言会莫名其妙地红。清掉它们之后，配置的**唯一**来源就是上面那份
+    临时文件。想自己设的测试照旧 `monkeypatch.setenv` —— 那发生在这条 fixture 之后。
+
+    `AGENT_CONFIG_FILE` 走环境变量而不是给每个调用点传参：它同时管住**子进程**
+    （`--runtime-stdio`、ansi 客户端那几条会起真进程的测试），而那些测试没有地方传参数。
+    """
+    from agent_runtime import userconfig
+
+    for name in ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL",
+                 "TAVILY_API_KEY", "TAVILY_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+    path = TESTS_DIR / "_tmp" / f"userconfig-{uuid.uuid4().hex[:8]}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"env": {"DEEPSEEK_API_KEY": "sk-test-isolated"}}',
+                    encoding="utf-8")
+    monkeypatch.setenv(userconfig.FILE_ENV, str(path))
+    try:
+        yield path
+    finally:
+        # **用 `os.remove` 而不是 `Path.unlink`。** 有测试会把 `Path.unlink` 打成桩来验
+        # "删不掉的文件不该拖垮清理"（`test_jobs.py::test_pruning_survives_an_undeletable_file`），
+        # 而那个桩在**这条 fixture 的 teardown 时仍然生效** —— monkeypatch 比它先建立、
+        # 所以比它后拆除。撞上去的表现是一个和本测试毫无关系的 TypeError。
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 @pytest.fixture

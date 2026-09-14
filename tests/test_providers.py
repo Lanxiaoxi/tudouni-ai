@@ -21,8 +21,11 @@ import pytest
 
 from agent_runtime.protocol import messages
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-MAIN_PY = REPO_ROOT / "agent_runtime" / "main.py"
+# 仓库根 —— 它下面有 `agent_runtime/`。子进程一律用 `-m agent_runtime.main` 起，
+# 而不是 `main.py` 的绝对路径：那是生产里真正的起法（见 `protocol/client.py` 的
+# `RUNTIME_MODULE`），所以这里照着用就顺带把它钉住了。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_ARGV = [sys.executable, "-m", "agent_runtime.main"]
 
 
 class _Gateway(BaseHTTPRequestHandler):
@@ -103,9 +106,9 @@ def _fresh_session() -> str:
 def run(inbound, *, env_extra=None, session=None, timeout=60.0):
     """喂几行给 `--runtime-stdio`，返回 (退出码, 已解析的消息, stderr)。
 
-    `env_extra["AGENT_MODELS_FILE"]` 指定这次用哪份模型配置 —— **测试一律显式给**
-    （不给就会读到开发机上那份 `models.local.json`，而"哪条路由被选中"正是这一组要验
-    的东西）。
+    `env_extra["AGENT_CONFIG_FILE"]` 指定这次用哪份配置 —— **测试一律显式给**
+    （不给就会读到开发机上那份 `~/.tudouni/config.json`，而"哪条路由被选中"正是这一组
+    要验的东西）。
     """
     env = dict(os.environ)
     env["DEEPSEEK_API_KEY"] = "sk-test"
@@ -113,7 +116,7 @@ def run(inbound, *, env_extra=None, session=None, timeout=60.0):
     env.update(env_extra or {})
 
     payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in inbound)
-    argv = [sys.executable, str(MAIN_PY), "--runtime-stdio"]
+    argv = [*RUNTIME_ARGV, "--runtime-stdio"]
     if session is not None:
         argv += ["--session", session]
     result = subprocess.run(
@@ -262,7 +265,7 @@ def test_a_non_string_effort_is_refused_at_the_envelope(gateway):
 # --- 多 provider：真凭据是"请求落到哪一台" ---------------------------------------
 
 def _write_models(workdir: Path, providers: dict) -> Path:
-    path = workdir / "models.local.json"
+    path = workdir / "config.json"
     path.write_text(json.dumps({"providers": providers}, ensure_ascii=False),
                     encoding="utf-8")
     return path
@@ -289,7 +292,7 @@ def test_a_request_lands_on_the_second_gateway_after_switching(two_gateways, wor
                 "models": [{"id": "m-two", "context_window": 2222}]},
     })
     session = _fresh_session()
-    env_extra = {"AGENT_MODELS_FILE": str(models)}
+    env_extra = {"AGENT_CONFIG_FILE": str(models)}
 
     code, got, err = run(
         [{"v": 1, "t": "user_message", "text": "一"}, {"v": 1, "t": "shutdown"}],
@@ -337,7 +340,7 @@ def test_the_chosen_route_survives_a_resume(two_gateways, workdir):
                 "models": [{"id": "m-two", "context_window": 2222}]},
     })
     session = _fresh_session()
-    env_extra = {"AGENT_MODELS_FILE": str(models)}
+    env_extra = {"AGENT_CONFIG_FILE": str(models)}
 
     code, _got, err = run(
         [{"v": 1, "t": "set_model", "model": "two/m-two"},
@@ -380,7 +383,7 @@ def test_a_route_without_a_key_is_listed_but_not_selectable(two_gateways, workdi
         [{"v": 1, "t": "set_model", "model": "nokey/m-two"},
          {"v": 1, "t": "user_message", "text": "一"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"AGENT_MODELS_FILE": str(models)}, session=_fresh_session(),
+        env_extra={"AGENT_CONFIG_FILE": str(models)}, session=_fresh_session(),
     )
     assert code == 0, err
     notices = [item for item in kinds(got, "notice") if item.get("code") == "model"]

@@ -75,18 +75,17 @@ class ClientHooks(Protocol):
         """
 
 
-def runtime_entrypoint() -> Path:
-    """`main.py` 的绝对路径。
-
-    `__file__` 是 `<包>/protocol/client.py`，所以包目录是**上两级**、仓库根是再上一级
-    （实测踩过一次：少算一级会让子进程去找 `C:\\...\\repo\\main.py`，而报错是
-    "can't open file" —— 看起来像路径写错了，其实是层级算错了）。
-    """
-    return Path(__file__).resolve().parent.parent / "main.py"
-
-
-def repo_root() -> Path:
-    return runtime_entrypoint().parent.parent
+# 子进程用 `-m` 起哪个模块。**它取代了原来那条"算出 main.py 的绝对路径"**。
+#
+# 以前只能用绝对路径：项目是 `package = false`，`agent_runtime` 根本没被安装，`-m`
+# 找不到它。而算那个路径要从 `<包>/protocol/client.py` 往上跳两级 —— 一个层级数写错就
+# 让子进程去找一个不存在的 `main.py`，而报错是 "can't open file"（看起来像路径写错了，
+# 其实是层级算错了，实测踩过一次）。
+#
+# 包现在是真的包（住在仓库的 `agent_runtime/` 子目录里、可安装），所以 `-m` 成立，而它
+# 比路径好在两点：**没有层级要算**（改目录结构不会悄悄改掉它），而且它跟着"父进程用哪个
+# 解释器"自然走到同一份代码 —— 装出来的 `tudouni` 和源码目录里的 `uv run` 都对。
+RUNTIME_MODULE = "agent_runtime.main"
 
 
 def default_argv(session: str | None = None, *, autopilot: bool = False,
@@ -102,15 +101,14 @@ def default_argv(session: str | None = None, *, autopilot: bool = False,
          父进程读到 EOF；
       2. **`-u`** —— stdout 接管道时 Python 用块缓冲，不关掉就会出现"事件攒在缓冲区
          里、界面几秒不动"；
-      3. **绝对路径 + `cwd=仓库根`，不能用 `python -m agent_runtime.main`** ——
-         项目是 `package = false`，`agent_runtime` 根本没被安装，`-m` 找不到它。
-         `main.py` 里那句 `sys.path.insert` 在当脚本跑时生效、在 `-m` 下不生效。
+      3. **`-m agent_runtime.main`，不是 main.py 的绝对路径** —— 见 `RUNTIME_MODULE`
+         上面那段。（这一条是反过来的历史：以前**只能**用绝对路径，因为包没被安装。）
 
     `stream` 默认**开**：这个入口只服务界面（TUI / ansi），而界面要的就是逐字。
     `--no-stream` 显式传一个 `--stream` 过去关掉它 —— **两个方向都写出来**，
     因为子进程的默认值不需要和父进程的意图一致：这里说了才算。
     """
-    argv = [sys.executable, "-u", str(runtime_entrypoint()), "--runtime-stdio"]
+    argv = [sys.executable, "-u", "-m", RUNTIME_MODULE, "--runtime-stdio"]
     if session is not None:
         argv += ["--session", session]
     if autopilot:
@@ -157,7 +155,14 @@ class ProtocolClient:
             stderr=stderr_to,
             encoding="utf-8",
             errors="replace",
-            cwd=str(repo_root()),
+            # **cwd 继承父进程，不许指定。** 工作区就是 cwd（见 `paths.workspace_dir()`），
+            # 所以把子进程按到别处去，等于让界面和 runtime 在两个不同的工作区里干活 ——
+            # 用户在 ~/proj 敲 `--tui`，而 agent 的 read_file 却在包目录里找文件。
+            #
+            # 它以前写着 `cwd=str(repo_root())`。那时工作区是包目录，所以这一行**看起来**
+            # 是对的（其实也没用上：`main.py` 自己用 `__file__` 修 `sys.path`，从来不靠
+            # cwd 找包）。工作区改成 cwd 之后，同一行就从"没用"变成"错"。
+            cwd=None,
             env=_child_env(),
         )
 

@@ -32,14 +32,17 @@ from typing import Any, Callable, NamedTuple
 
 import httpx
 
+from agent_runtime import paths
 from agent_runtime.agents import Agent
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models import OpenAICompatibleModel
 from agent_runtime.runtime.channels import Channels, resolve_memory_factory
+from agent_runtime import userconfig
 from agent_runtime.runtime.config import (
     DEFAULT_AUTO_APPROVE,
+    LEGACY_ENV_FILE,
     MCP_FILE,
-    PERMISSION_FILE,
+    PERMISSION_FILE_NAME,
     ConfigError,
     McpConfig,
     ModelConfig,
@@ -136,13 +139,16 @@ def _warn(text: str) -> None:
 # --- 第一段：不需要模型、也不需要通道 -------------------------------------------
 
 def project_dir() -> Path:
-    """工作区 = `agent_runtime` 包目录。
+    """这次操作的工作区。**唯一的权威是 `paths.workspace_dir()`，这里只是转发。**
 
-    它和"仓库根"是两件事，别共用一个变量：包要能 `import agent_runtime`（所以
-    `sys.path` 需要仓库根），而 agent 的文件工作区必须是包目录本身 —— 否则
-    `read_file` / `write_file` 会伸到同级的其它项目里去。
+    这个名字留着（而不是让全仓库改成 `paths.workspace_dir()`）有两个具体理由：
+    它被十几处引用着、还被 `tests/test_agent_md.py` monkeypatch 用来把工作区顶到临时
+    目录 —— 那条测试要验的正是"装配真的把工作区传下去了"，而它需要一个能替换的接缝。
+
+    以前它自己算 `Path(__file__).parent.parent`（也就是包目录），那是"同一件事的第三份
+    算法"里唯一算对的一份。现在三份收成一份，见 `paths.py`。
     """
-    return Path(__file__).resolve().parent.parent
+    return paths.workspace_dir()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +166,13 @@ class Booted:
 
 
 def boot() -> Booted:
-    """造 store / logs / 技能扫描器。不需要密钥、不需要会话。"""
+    """造 store / logs / 技能扫描器。不需要密钥、不需要会话。
+
+    **会话和审计都落在工作区里**（`<cwd>/.tudouni/`），所以换个目录干活就是换一份历史
+    —— 那正是"工作区级"的意思。想接着聊上一个项目的会话，`cd` 回去。
+    """
     root = project_dir()
+    runtime_dir = paths.workspace_runtime_dir()
 
     # 技能是硬盘上的文件，所以扫它不需要模型 —— 和 `--list` 同一档。
     #
@@ -171,10 +182,52 @@ def boot() -> Booted:
     # 操作系统帮着保证的。
     loader = SkillLoader(root)
     return Booted(
-        store=JsonSessionStore(root / RUNTIME_DIR_NAME / "sessions"),
-        logs=JsonlSink(root / RUNTIME_DIR_NAME / "logs"),
+        store=JsonSessionStore(runtime_dir / "sessions"),
+        logs=JsonlSink(runtime_dir / "logs"),
         skill_loader=loader,
         skill_catalog=loader.reload(),
+    )
+
+
+def check_workspace() -> str | None:
+    """工作区（也就是 cwd）能不能用？**能就返回 None，不能就返回那句要打给人看的话。**
+
+    判据在 `paths.unsafe_workspace()`（它认识文件系统的布局），措辞在这里（入口层知道
+    该怎么跟用户说）—— 和 `check_session_id` 一字不差的分工。
+
+    ## 为什么这一问不能省
+
+    文件工具的围栏是"不许出工作区"，而工作区现在就是 cwd。所以在 `~` 下敲一次命令，
+    那道围栏圈住的是**整个 home**：`.ssh/`、浏览器的 cookie 库、别的项目的 `.env`
+    全在里面，而 `read_file` 是 LOW —— **免审批**。这不是"配置不当"，是把这个运行时
+    唯一一道文件边界变成了一句空话，而且从任何一行输出里都看不出来。
+
+    ## 为什么是拒绝，不是警告
+
+    警告在这里没有用：它出现在启动那几行里，而人正准备打第一句话。而且这个错误**极其
+    容易犯**（新开一个终端默认就在 home），所以它必须是一道门，不是一条注脚。
+
+    退出码由调用方给（和 `check_session_id` 一样是 2 —— "用户得先做点事"那一档）。
+    """
+    reason = paths.unsafe_workspace()
+    if not reason:
+        return None
+
+    here = paths.workspace_dir()
+    # 每一条都说清**三件事**：这是哪儿、为什么不行、下一步敲什么。
+    # 只说"拒绝"的报错会让人以为程序坏了。
+    what = {
+        paths.UNSAFE_HOME: f"{here} 是你的 home 目录",
+        paths.UNSAFE_ROOT: f"{here} 是文件系统的根",
+        paths.UNSAFE_ABOVE_HOME: f"{here} 在 home 的上层（它下面是所有人的 home）",
+    }[reason]
+    return (
+        f"不能把这里当工作区：{what}。\n"
+        f"  工作区就是当前目录，而 agent 的文件工具**只能读写工作区里的东西** ——\n"
+        f"  在这里启动等于把它下面的一切都交出去（.ssh、别的项目的 .env、"
+        f"浏览器数据……），\n"
+        f"  而 read_file 是免审批的，你不会被问第二次。\n"
+        f"  先 cd 进一个具体的项目目录再跑。"
     )
 
 
@@ -934,7 +987,7 @@ class Runtime:
         if not target.usable:
             return False, (
                 f"路由 {ref.provider} 没有密钥，选不了它下面的模型 —— 在 "
-                f"{catalog.MODELS_FILE_NAME} 里给它写一个 api_key 或 api_key_env。"
+                f"{userconfig.config_file()} 里给它写一个 api_key 或 api_key_env。"
             )
 
         if self.current_model == ref.id and self.current_provider == ref.provider:
@@ -947,7 +1000,7 @@ class Runtime:
         ):
             return False, (
                 f"这个会话的模型适配器不支持中途换模型（{type(self.agent.model).__name__}）"
-                f"—— 只能重启时在 {catalog.MODELS_FILE_NAME} 里改默认值。"
+                f"—— 只能重启时在 {userconfig.config_file()} 里改默认值。"
             )
 
         self._save_now("换模型")
@@ -1220,6 +1273,19 @@ class Runtime:
                 f"随仓库一起被 clone 进来（见 config.McpConfig 上面的说明）。"
                 f"要用就把它挪到 {MCP_FILE}"))
 
+        # 旧位置那份 `.env` 也是同一类症状，而且更要紧：它里面装着**密钥**，而"我明明
+        # 填了 key 却说没找到"是它失效之后唯一的表现。
+        #
+        # 为什么不干脆继续读它：留一条"新文件没有就去看 .env"的分支，等于让这份配置
+        # 解析永远背着一次历史迁移，而迁移是一次性的事（和放弃 `.tudouni.json` 旧位置
+        # 同一条规矩）。不读可以，不出声不行。
+        if LEGACY_ENV_FILE.is_file():
+            out.append(Notice("err", code="config", level="warn",
+                text=f"[配置] 忽略了 {LEGACY_ENV_FILE}：密钥现在读 "
+                f"{userconfig.config_file()} 的 \"env\" 段。"
+                f"把里面那几行搬过去，形如 {{\"env\": {{\"DEEPSEEK_API_KEY\": \"sk-...\"}}}}；"
+                f"搬完就可以删掉这个文件了（真实环境变量照旧优先于配置文件）。"))
+
         # [后台] 两条，而且必须分开说 —— 它们的补救办法完全不同。
         #
         # 第一条：**上一个进程留下了没收掉的任务**。这意味着那次会话不是正常收场的
@@ -1254,7 +1320,7 @@ class Runtime:
         unknown = self.permissions.unknown_tools(t.name for t in self.tools.all())
         if unknown:
             out.append(Notice("err", code="permissions", level="warn",
-                text=f"[权限] {PERMISSION_FILE.name} 里这些工具没有注册，规则不会生效："
+                text=f"[权限] {PERMISSION_FILE_NAME} 里这些工具没有注册，规则不会生效："
                      f"{', '.join(sorted(unknown))}"))
 
         # [权限]：**每次启动都说一遍。**「按一次 t 就永久生效」是最容易忘掉的那类
@@ -1654,9 +1720,9 @@ def _no_model_message(registry: catalog.Registry) -> str:
     lines = [
         "一个可用的模型都没有 —— 配不出模型就什么都干不了。",
         "",
-        f"两种配法，任选其一（模板见 {catalog.MODELS_EXAMPLE_NAME}）：",
+        f"两种配法，任选其一（模板见 {userconfig.example_file()}）：",
         "",
-        f"  1) 写一份 {catalog._PACKAGE_ROOT / catalog.MODELS_FILE_NAME}：",
+        f"  1) 在 {userconfig.config_file()} 里写路由：",
         "",
         "        {",
         '          "providers": {',
@@ -1668,11 +1734,12 @@ def _no_model_message(registry: catalog.Registry) -> str:
         "          }",
         "        }",
         "",
-        "  2) 什么都不写，只给一个环境变量（或 .env）：",
+        "  2) 不写 providers，只给一把密钥（那时用内置的 deepseek 路由）：",
         "",
-        "        DEEPSEEK_API_KEY=sk-...",
+        f'        同一个文件里：  {{"env": {{"DEEPSEEK_API_KEY": "sk-..."}}}}',
+        "        或者环境变量：  export DEEPSEEK_API_KEY=sk-...",
         "",
-        "优先级：真实环境变量 > .env > 配置文件里写死的 api_key。",
+        "优先级：真实环境变量 > 配置文件的 env 段 > providers 里写死的 api_key。",
     ]
     if registry.notes:
         lines += ["", "这次读到的路由：", *[f"  {item}" for item in registry.notes]]

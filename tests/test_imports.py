@@ -43,17 +43,32 @@ def test_module_imports(name):
     importlib.import_module(name)
 
 
+# `skills/` 唯一准 import 的内部模块。**它是个只 import 标准库的叶子** —— 也就是说
+# 放它进来不可能造出环，而这一点由下面 `test_the_paths_leaf_stays_a_leaf` 盯着。
+#
+# 为什么开这个口子：`RUNTIME_DIR_NAME`（那个 `.tudouni`）以前定义在 `skills/loader.py`，
+# 而那份注释自己承认过理由是"skills 谁也不依赖，是这条链上唯一能安全承载布局常量的
+# 地方"—— 承认的是"没有更好的地方"，不是"这里对"。`paths.py` 出现之后就有了，于是
+# 常量搬走、这里改成引它。
+#
+# **这个集合只能有一项。** 多一项就说明有人把别的东西也塞进"叶子"这个借口里了，
+# 而那时这条测试守的边界已经没有意义 —— 见 `test_the_skills_exemption_is_only_paths`。
+_SKILLS_EXEMPT_IMPORTS = {"agent_runtime.paths"}
+
+
 def test_the_skills_package_imports_no_internal_module():
     """**这条测试盯的是架构，不是语法。**
 
-    `skills/` 能独立成包（而不是夹在 tools/ 里）的全部依据就是它**不 import 任何内部
-    模块**：它不认识 Tool / ToolRegistry / ToolResult，不 import state、security、config。
-    顺序反过来的话就会出现 `skills → tools`，而 `tools/builtin/__init__.py` 又要 import skills
-    来注册 load_skill —— 环一出现，README 里那句"依赖方向是单向的，无环"就成了假话，
-    而且环不会被任何别的测试发现：它只是让将来某次改动莫名其妙地 import 失败。
+    `skills/` 能独立成包（而不是夹在 tools/ 里）的全部依据就是它**不 import 任何有行为
+    的内部模块**：它不认识 Tool / ToolRegistry / ToolResult，不 import state、security、
+    config。顺序反过来的话就会出现 `skills → tools`，而 `tools/builtin/__init__.py` 又要
+    import skills 来注册 load_skill —— 环一出现，README 里那句"依赖方向是单向的，无环"
+    就成了假话，而且环不会被任何别的测试发现：它只是让将来某次改动莫名其妙地 import 失败。
 
     所以这条检查写成对源码的判断（AST），而不是靠"现在能 import 成功"—— 能 import 成功
     恰恰是环出现时的表现（Python 允许部分初始化的模块借这次机会先跑通）。
+
+    唯一的例外是 `agent_runtime.paths`，见 `_SKILLS_EXEMPT_IMPORTS`。
     """
     package = importlib.import_module("agent_runtime.skills")
     root = Path(package.__file__).parent
@@ -73,10 +88,45 @@ def test_the_skills_package_imports_no_internal_module():
             else:
                 continue
             for name in names:
+                if name in _SKILLS_EXEMPT_IMPORTS:
+                    continue
                 assert name != "agent_runtime" and not name.startswith("agent_runtime."), (
                     f"{path.name} 里出现了对内部模块的依赖：{name} —— "
                     f"skills/ 一旦 import 内部模块就可能和 tools/ 成环"
                 )
+
+
+def test_the_skills_exemption_is_only_paths():
+    """例外只能有一个，而且必须真的是那个叶子。
+
+    和 `test_the_frontend_exemption_is_only_the_cli` 同一条取向：**例外慢慢变多是没人
+    会注意的**，而这个集合一旦变成两三项，上面那条测试守的就不再是"skills 是叶子"，
+    而是"skills 大概不 import 太多东西"。
+    """
+    assert _SKILLS_EXEMPT_IMPORTS == {"agent_runtime.paths"}, (
+        "skills/ 只准 import 那个只含标准库的 paths 叶子。要加第二项之前，先想清楚"
+        "它会不会把环带进来 —— 那正是这条边界防的东西。"
+    )
+
+
+def test_the_paths_leaf_stays_a_leaf():
+    """`paths.py` 只准 import 标准库。**这是上面那个例外能成立的全部依据。**
+
+    它是全仓库依赖面最宽的模块（skills、state、runtime 都引它），所以它一旦 import
+    任何内部模块，就等于在每一条依赖链上凭空插一条边 —— 而"环"这种东西不会当场报错，
+    它只会让将来某次无关的改动莫名其妙地 import 失败。
+
+    盯的是**源码**而不是 `sys.modules`：后者在这个模块已经被别人 import 过之后什么都
+    看不出来。
+    """
+    path = _PKG_ROOT / "paths.py"
+    assert path.is_file(), "paths.py 不在了 —— 它是路径的单一事实来源"
+
+    for lineno, module in _internal_imports(path):
+        assert not (module == "agent_runtime" or module.startswith("agent_runtime.")), (
+            f"paths.py:{lineno} import 了 {module} —— 它必须只依赖标准库，"
+            f"否则 skills/ 那个例外就把环放进来了"
+        )
 
 
 # --- tools/ 的边界：除入口外，只准 import 契约 ---------------------------------
@@ -131,9 +181,15 @@ def test_only_the_tool_contract_is_imported_from_outside(package):
 
 
 def test_the_exemptions_are_few_and_real():
-    """例外必须真的存在 —— 一个指向已删除文件的例外会静默放宽这条规则。"""
+    """例外必须真的存在 —— 一个指向已删除文件的例外会静默放宽这条规则。
+
+    路径走 `_PKG_ROOT`（下面那个常量），**不再自己算一遍**：它以前写着
+    `Path(__file__).parent.parent`，而那在扁平布局下恰好等于包目录 —— 代码挪进
+    `agent_runtime/` 子目录之后它就指到仓库根去了，于是这条测试红在"main.py 不在了"上，
+    而 main.py 好好地待在包里。同一件事算两遍，早晚有一遍是错的。
+    """
     for name in _EXEMPT_FILES:
-        assert (Path(__file__).resolve().parent.parent / name).is_file(), (
+        assert (_PKG_ROOT / name).is_file(), (
             f"{name} 已经不在了，_EXEMPT_FILES 里这一项该删掉"
         )
 
@@ -194,7 +250,8 @@ _TEXTUAL_ALLOWED = {
     "frontends/tui/widgets.py",
 }
 
-_PKG_ROOT = Path(__file__).resolve().parent.parent
+# 包目录（不是仓库根）—— 仓库根下面还有 tests/ doc/ scripts/，它们不在这条边界里。
+_PKG_ROOT = Path(__file__).resolve().parent.parent / "agent_runtime"
 
 
 def _source_files(subdir: str) -> list[Path]:

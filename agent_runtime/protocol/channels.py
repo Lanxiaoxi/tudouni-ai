@@ -44,7 +44,7 @@ from agent_runtime.models.types import ModelError
 from agent_runtime.protocol import codec, messages
 from agent_runtime.protocol.transport_stdio import StdioTransport
 from agent_runtime.runtime.channels import Channels, TrustGroupLookup
-from agent_runtime.runtime.config import ConfigError
+from agent_runtime.userconfig import UserConfigError
 from agent_runtime.security.commands import format_rule
 from agent_runtime.security.memory import ApprovalMemory
 from agent_runtime.state import reasoning
@@ -732,7 +732,9 @@ class ProtocolServer:
         self._join_turn()
         try:
             runtime = self.open_session(session_id)
-        except ConfigError as exc:
+        except UserConfigError as exc:
+            # 基类：缺密钥（`ConfigError`）和配置文件读不懂（`CatalogError`）都该在
+            # 这里变成一条 notice，而不是把整个进程带走。
             self._notice("warn", "session",
                          f"[会话] 换不过去（当前会话没有变）：{exc}")
             return

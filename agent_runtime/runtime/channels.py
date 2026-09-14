@@ -108,16 +108,23 @@ def memory_from_permissions(permissions) -> ApprovalMemory:
     函数内 import `ApprovalMemory` / `save_approvals` 是有意的：这个模块被
     `protocol/` 和 `frontends/` 引用，而它们大多数路径不需要碰权限文件。
     """
-    from agent_runtime.runtime.config import PERMISSION_FILE, save_approvals
+    from agent_runtime.runtime.config import (
+        PERMISSION_FILE_NAME,
+        permission_file,
+        save_approvals,
+    )
     from agent_runtime.security.memory import ApprovalMemory
 
+    # **路径在 lambda 里现算**（`permission_file()` 而不是先取出来存着）：装配和"按下
+    # t"之间隔着整个会话，而 cwd 理论上能在这中间被改掉（工具里没有 chdir，但
+    # `shell` 起的进程、或者将来某个前端都可能）。现算保证写的一定是**这次**的工作区。
     return ApprovalMemory(
         permissions.auto_approve_tools,
         on_change=lambda granted, prefixes: save_approvals(
-            PERMISSION_FILE, tools=granted, prefixes=prefixes
+            permission_file(), tools=granted, prefixes=prefixes
         ),
         prefixes=permissions.shell_allow,
-        label=PERMISSION_FILE.name,
+        label=PERMISSION_FILE_NAME,
     )
 
 

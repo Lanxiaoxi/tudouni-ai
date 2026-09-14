@@ -15,7 +15,11 @@ from pathlib import Path
 from agent_runtime.frontends.cli import BANNER, print_banner
 
 
-MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
+# 仓库根 —— 它下面有 `agent_runtime/`。子进程一律用 `-m agent_runtime.main` 起，
+# 而不是 `main.py` 的绝对路径：那是生产里真正的起法（见 `protocol/client.py` 的
+# `RUNTIME_MODULE`），所以这里照着用就顺带把它钉住了。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_ARGV = [sys.executable, "-m", "agent_runtime.main"]
 
 
 def test_banner_is_pure_ascii():
@@ -63,7 +67,7 @@ def test_model_free_subcommands_do_not_print_a_banner():
     会话了"那条路径。这里直接跑真入口 —— 那是唯一能证明这个分工的地方。
     """
     result = subprocess.run(
-        [sys.executable, str(MAIN_PY), "--list"],
+        [*RUNTIME_ARGV, "--list"],
         capture_output=True, encoding="utf-8", errors="replace",
     )
 
@@ -92,9 +96,9 @@ def test_the_two_streams_carry_the_two_kinds_of_text():
     # 一个假密钥就够：这条测试问的是"谁打到哪里"，不是"能不能真的调模型"。
     env["DEEPSEEK_API_KEY"] = "sk-not-used"
     result = subprocess.run(
-        [sys.executable, str(MAIN_PY), "--session", "stream-check"],
+        [*RUNTIME_ARGV, "--session", "stream-check"],
         input="exit\n", capture_output=True, encoding="utf-8", errors="replace",
-        env=env, cwd=str(MAIN_PY.parent),
+        env=env, cwd=str(REPO_ROOT),
     )
 
     assert result.returncode == 0, result.stderr

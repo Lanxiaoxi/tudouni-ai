@@ -2,8 +2,11 @@
 
 **技能的"领域"住在 skills/ 包，不夹在 tools/ 里。** 切分的依据只有一条：这一层是
 纯数据 —— 扫描目录、读 frontmatter、校验、组织成 `Skill` / `SkillCatalog`，它
-**不 import 任何内部模块**（连 `tools.tool` 都不）。所以它能独立成包而不会让依赖
-方向成环：`tools → skills`，而 skills 谁也不依赖。
+**不 import 任何有行为的内部模块**（连 `tools.tool` 都不）。所以它能独立成包而不会
+让依赖方向成环：`tools → skills`。
+
+唯一的内部依赖是 `agent_runtime.paths`，而那是个只 import 标准库的叶子（它回答
+"目录叫什么、在哪"）—— 引它不可能成环，理由写在 `paths.py` 的 docstring 里。
 
 一旦这里出现 `Tool` / `ToolRegistry` / `ToolResult`，就会变成 `skills → tools`，
 而 `tools/builtin/__init__.py` 又要 import 本包来注册 load_skill —— 环一出现，README 里那句
@@ -61,17 +64,20 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# 这个运行时的**私有目录名**（每个工作区一个）。技能住它下面的 skills/，会话住 sessions/，
+# 这个运行时的**私有目录名**。技能住它下面的 skills/，会话住 sessions/，
 # 审计日志住 logs/，权限策略是 permissions.json。
 #
-# 常量住在 skills/ 包而不是 config.py，是**依赖方向**逼出来的：config → security →
-# tools → skills，所以 config 反过来给 skills 提供常量就会成环。而 skills 谁也不依赖，
-# 是这条链上唯一能安全承载"布局常量"的地方 —— 它描述的也确实是文件系统的布局，不是
-# 技能专属的知识。
-RUNTIME_DIR_NAME = ".tudouni"
-# 旧名字（单目录时代留下的），保留是因为它在测试和文档里被引用得太多，而这个常量的
-# 含义一个字都没变。
-TUDOUNI_DIR_NAME = RUNTIME_DIR_NAME
+# **定义在 `agent_runtime/paths.py`，这里只是再出口一次。** 它以前定义在本模块，
+# 理由是依赖方向（config → security → tools → skills，所以 config 反过来给 skills
+# 提供常量会成环，而 skills 谁也不依赖）—— 那句话当时是对的，但它承认的是"没有更好
+# 的地方"，不是"这里是对的地方"。`paths.py` 是个只 import 标准库的顶层叶子模块，
+# 所以它谁都能引、也不成环，而"文件系统的布局"本来就该住在那儿。
+#
+# 名字在这里保留，是因为它被 `tools/builtin/filesystem.py`（控制面名单）、
+# `runtime/config.py`、`runtime/composition.py` 和好几条测试按 `from
+# agent_runtime.skills import RUNTIME_DIR_NAME` 引着 —— 那些引用没有一处是错的
+# （技能目录确实在它下面），没有理由为了搬家去改它们。
+from agent_runtime.paths import RUNTIME_DIR_NAME, TUDOUNI_DIR_NAME
 
 # 通用兜底目录（生态里部分工具用它们）。它们**不在**运行期目录里面 —— 认它们是为了吃下
 # 别人的技能包，而别人的布局我们无权改。
