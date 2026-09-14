@@ -1208,11 +1208,12 @@ class Runtime:
                 f"它的 context_window），末尾只报上下文用量、不报占比；"
                 f"把它那一行补上即可。"))
 
-        # 缺搜索密钥不是配置错误（不像 DEEPSEEK_API_KEY）：只是不注册那一个工具。
+        # 缺搜索密钥不是配置错误（不像"一条能用的模型路由都没有"）：只是不注册那一个工具。
         if not self.web_cfg.tavily_api_key:
             out.append(Notice("err", code="web",
                 text="[联网] 没找到 TAVILY_API_KEY，web_search 未注册（fetch_web 不受影响）。"
-                "要启用就写进 .env：TAVILY_API_KEY=tvly-..."))
+                f'要启用就写进 {userconfig.config_file()} 的 "env" 段：'
+                f'"TAVILY_API_KEY": "tvly-..."'))
 
         # [搜索]：**它和上面那条不是一类问题**，所以语气也不同。
         #
@@ -1709,37 +1710,73 @@ def _usable(registry: catalog.Registry, ref: catalog.ModelRef) -> bool:
     return found is not None and found.usable
 
 
-def _no_model_message(registry: catalog.Registry) -> str:
-    """一条模型都配不出来时的那段报错。
+def _no_model_message(registry: catalog.Registry, *, created: Path | None = None) -> str:
+    """一条能用的模型路由都没有时的那段报错 —— **它也是新用户看到的第一句话**。
 
-    **它必须说出下一步做什么。** 这一档和"缺密钥"是同一类（用户得先做点事），而
-    用户手上唯一的问题是"我该往哪写"。所以它列两种配法（写一份配置文件 / 只给一个
-    环境变量），并把这次读到的路由和逐条问题一起带上 —— 那几条正是"为什么每条都
-    不行"的答案。
+    ## 不能把某一家网关说成"这个工具"
+
+    模型层是抽象的：端点、模型名、密钥全都是配置（`providers` 那一段），代码里没有写死
+    任何一家。所以这段话的框架必须是"你有两种配法"，而 deepseek 那个例子只是**最快能
+    跑起来的那一种**（内置的兜底路由），不是唯一的一种 —— 一个接了自家网关的人读到这里
+    应该看到"我这种就是第 1 条"，而不是"这工具是给 DeepSeek 用的"。
+
+    这也是为什么它排在第 1 位的是 `providers`：那是这个程序真正的模型配置面，
+    `env` 里那把密钥只是"懒得写 providers 时的捷径"。
+
+    ## 别的几条
+
+    `created` 是刚替用户写出来的模板（没写就是 None）。它排在最前面，因为几种情形里
+    "文件已经在那儿了、你只要填一格"是唯一不需要动脑子的。
+
+    末尾把 `notes` / `problems` 原样带上：它们正是"为什么每条都不行"的答案（哪条路由
+    缺密钥、哪个模型名不认识），而那是用户此刻唯一需要的信息。
     """
+    key_env = catalog.BUILTIN_API_KEY_ENV
+    provider = catalog.BUILTIN_PROVIDER
+
+    if created is not None:
+        lead = (
+            "一条能用的模型路由都没有 —— 配不出模型就什么都干不了。\n"
+            "\n"
+            "我已经在这儿给你建好了一份配置，打开它、写下你的模型：\n"
+            f"    {created}\n"
+        )
+    else:
+        lead = (
+            "一条能用的模型路由都没有 —— 配不出模型就什么都干不了。\n"
+            "\n"
+            f"配置写在 {userconfig.config_file()}"
+            f"（模板见 {userconfig.example_file()}）。\n"
+        )
+
     lines = [
-        "一个可用的模型都没有 —— 配不出模型就什么都干不了。",
+        lead,
+        "模型层是抽象的：端点、模型名、密钥全由配置决定，代码里没有写死任何一家。",
+        "两种配法，任选其一：",
         "",
-        f"两种配法，任选其一（模板见 {userconfig.example_file()}）：",
-        "",
-        f"  1) 在 {userconfig.config_file()} 里写路由：",
+        '  1) 接你自己的网关 —— 在 "providers" 里加一条路由：',
         "",
         "        {",
         '          "providers": {',
-        '            "deepseek": {',
-        '              "base_url": "https://api.deepseek.com",',
-        '              "api_key_env": "DEEPSEEK_API_KEY",',
-        '              "models": [{"id": "deepseek-flash", "context_window": 1000000}]',
+        '            "my-gateway": {',
+        '              "base_url": "https://your-gateway.example.com/v1",',
+        '              "api_key_env": "MY_GATEWAY_API_KEY",',
+        '              "models": [{"id": "my-model", "context_window": 200000}]',
         "            }",
         "          }",
         "        }",
         "",
-        "  2) 不写 providers，只给一把密钥（那时用内置的 deepseek 路由）：",
+        "     一条路由给三样东西：base_url（请求发到哪）、models（这条路上有什么）、",
+        "     以及密钥从哪来（api_key 写死，或者 api_key_env 指一个环境变量）。",
+        f"     **第一条有密钥的路由就是默认路由**，顺序由你排。",
         "",
-        f'        同一个文件里：  {{"env": {{"DEEPSEEK_API_KEY": "sk-..."}}}}',
-        "        或者环境变量：  export DEEPSEEK_API_KEY=sk-...",
+        f"  2) 只想快点跑起来 —— 给一把 {key_env} 就行，那时走内置的 {provider} 路由：",
         "",
-        "优先级：真实环境变量 > 配置文件的 env 段 > providers 里写死的 api_key。",
+        f'        同一个文件里：  {{"env": {{"{key_env}": "sk-..."}}}}',
+        f"        或者环境变量：  export {key_env}=sk-...",
+        "",
+        "密钥优先级：providers 里写死的 api_key > api_key_env 指的**真实环境变量**",
+        '> 同一个文件 "env" 段里的同名键。',
     ]
     if registry.notes:
         lines += ["", "这次读到的路由：", *[f"  {item}" for item in registry.notes]]
@@ -1801,7 +1838,15 @@ def open_runtime(
     发生在它们之后 —— 抛出去之前必须把它们收掉，否则一次启动失败会留下一个活着的
     node 进程。这是原来的 `main.py` 就做对了的事，这里保持。
     """
+    # 模型这一层**先问目录**：能不能跑，判据是"有没有一条能用的路由"，而不是"有没有
+    # `DEEPSEEK_API_KEY`"。模型层是抽象的 —— 端点、模型名、密钥都来自配置里的
+    # `providers`，所以只接了自家网关的人不该被一句 DeepSeek 的密钥挡在门外。
+    model_registry = catalog_config or catalog.load()
+
+    # `DEEPSEEK_MODEL` 仍然认，但它只是**内置那条兜底路由**的默认值来源，不该有拦截权
+    # （见 `ModelConfig` 的 docstring）。密钥由目录上的路由给。
     cfg = model_config or ModelConfig.from_env()
+
     # 权限策略和密钥一起在这里读：两类配置错误都是「用户得先做点事」，都该在开出
     # 会话之前停下，而不是跑到第一次工具调用才炸。
     permissions = permission_config or PermissionConfig.from_file()
@@ -1826,10 +1871,14 @@ def open_runtime(
     session_model = model_state.SessionModel.restore(
         session.metadata, fallback=cfg.model,
     )
-    model_registry = catalog_config or catalog.load()
     session_model, chosen = resolve_model(session_model, model_registry)
     if chosen is None:
-        raise ConfigError(_no_model_message(model_registry))
+        # **首次运行就在这儿被兜住**：一条能用的路由都没有时，先把模板写到默认位置，
+        # 那句话才能指着一个**真的存在**的文件说"打开它填一格"。写盘放在报错这一刻、
+        # 而不是每次启动都确保存在，理由见 `userconfig.scaffold()` —— 只给环境变量的
+        # 部署不该被在 $HOME 里凭空写文件。
+        raise ConfigError(
+            _no_model_message(model_registry, created=userconfig.scaffold()))
 
     model = OpenAICompatibleModel(
         api_key=chosen.provider_key,

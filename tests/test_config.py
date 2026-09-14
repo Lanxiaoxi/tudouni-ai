@@ -1,4 +1,4 @@
-﻿"""配置的优先级与报错。
+"""配置的优先级与报错。
 
 优先级（高 → 低）：**真实环境变量 > `~/.tudouni/config.json` 的 `env` 段 > 默认值**。
 
@@ -20,7 +20,6 @@ from agent_runtime.runtime.config import (
     context_windows,
     DEFAULT_MODEL,
     DEFAULT_TAVILY_BASE_URL,
-    ConfigError,
     ModelConfig,
     WebConfig,
 )
@@ -91,15 +90,25 @@ def test_missing_file_falls_back_to_env_var(workdir, monkeypatch):
 
 
 # --- 缺失与空值 ---------------------------------------------------------
+#
+# **"缺密钥"在这个文件里不再是错误。** 它原来是 `ModelConfig.from_env()` 抛的
+# `ConfigError`，而那句话正是新用户看到的第一句 —— 后来发现那是把工具说成了一家网关的
+# 客户端（模型层是抽象的：端点和密钥都在 `providers` 里）。现在拦住启动的是
+# `open_runtime` 里"一条能用的路由都没有"那一问，所以**报错文案和"首次运行写模板"那条
+# 接线搬到了 `tests/test_providers.py`** —— 那里起真子进程，验的是用户真正看到的东西。
+# 这里只留"值怎么读"。
+
 
 def test_empty_file_value_does_not_count_as_a_key(workdir):
     """留空的那一格是"还没填"，不是"填了一个空密钥"。
 
     它必须落到下一层，否则一个空字符串会被当成有效值发出去 —— 而首次运行生成的模板里
     那一格**就是空的**，所以这条路径是每个新用户都会走一遍的。
+
+    这里只钉"空串没被当成有值"。它会不会因此拦住启动，是另一件事（见上面那段）。
     """
-    with pytest.raises(ConfigError):
-        ModelConfig.from_env(write_config(workdir, {"DEEPSEEK_API_KEY": ""}))
+    cfg = ModelConfig.from_env(write_config(workdir, {"DEEPSEEK_API_KEY": ""}))
+    assert cfg.api_key == ""
 
 
 def test_empty_file_value_falls_through_to_env_var(workdir, monkeypatch):
@@ -108,76 +117,17 @@ def test_empty_file_value_falls_through_to_env_var(workdir, monkeypatch):
     assert ModelConfig.from_env(path).api_key == "sk-from-env"
 
 
-def test_missing_key_error_names_both_options(workdir):
-    """报错要把两条路都给出来 —— 配置错误是"用户得先做点事"，不该让人去翻源码。
+def test_reading_these_three_cells_never_requires_a_key(workdir):
+    """一把密钥都没有时，这三格**照样读得出来**（`api_key` 就是空串）。
 
-    路径必须是**刚才找过的那个文件**，不是默认位置：显式指了一份配置却被告知"去建
-    ~/.tudouni/config.json"，会让人以为自己的 AGENT_CONFIG_FILE 没生效。
+    这条守的是"读配置"和"够不够用"是两件事：读永远成功，判断在 `catalog` 那边。
+    以前这个方法缺密钥就抛错，于是连"只想看看默认模型名是什么"都得先有一把真密钥 ——
+    而那正是"模型层被绑死在一家网关上"的样子。
     """
-    missing = workdir / "nope.json"
-
-    with pytest.raises(ConfigError) as exc:
-        ModelConfig.from_env(missing)
-
-    message = str(exc.value)
-    assert "DEEPSEEK_API_KEY" in message
-    assert str(missing) in message        # 可以写文件，而且说的是**这个**文件
-    assert "export" in message            # 也可以设环境变量
-
-
-def test_the_missing_key_error_changes_when_the_file_already_exists(workdir):
-    """文件在不在，下一步是两件不同的事，所以那句话得分开说。
-
-    文件不存在 ⇒ "建一份"；文件已经在了 ⇒ "打开它，在 env 里填"。说成一句会让已经建过
-    文件的人以为自己路径写错了，然后再建一份到别处去。
-    """
-    existing = write_config(workdir, {"DEEPSEEK_API_KEY": ""})
-
-    with pytest.raises(ConfigError) as exc:
-        ModelConfig.from_env(existing)
-
-    message = str(exc.value)
-    assert str(existing) in message
-    assert "建一份" not in message
-
-
-def test_a_missing_key_scaffolds_the_config_and_points_at_it(workdir, monkeypatch):
-    """**首次运行的完整那一步：没配置、没密钥 ⇒ 建一份模板，然后指着它报错。**
-
-    这条测试盯的是"接线"，而 `test_userconfig.py` 盯的是 `scaffold()` 本身。少了这条接线
-    的话，`scaffold()` 全绿而用户仍然看到"你得自己建一份" —— 而那正是它要消灭的那句话。
-    """
-    from agent_runtime import paths, userconfig
-
-    monkeypatch.delenv(userconfig.FILE_ENV, raising=False)
-    monkeypatch.setenv("HOME", str(workdir))
-    monkeypatch.setenv("USERPROFILE", str(workdir))
-
-    with pytest.raises(ConfigError) as exc:
-        ModelConfig.from_env()
-
-    created = workdir / paths.RUNTIME_DIR_NAME / userconfig.CONFIG_FILE_NAME
-    assert created.is_file(), "缺密钥那条路没有把模板建出来"
-    message = str(exc.value)
-    assert str(created) in message
-    assert "已经在这儿给你建好了" in message
-
-
-def test_a_key_in_the_environment_scaffolds_nothing(workdir, monkeypatch):
-    """密钥在环境变量里 ⇒ **一个文件都不建**。
-
-    容器和 CI 的 home 常常是临时的、甚至只读的，而我们凭什么在那儿留东西。这也是
-    `scaffold()` 被放在"报错那一刻"而不是"每次启动"的全部理由。
-    """
-    from agent_runtime import paths, userconfig
-
-    monkeypatch.delenv(userconfig.FILE_ENV, raising=False)
-    monkeypatch.setenv("HOME", str(workdir))
-    monkeypatch.setenv("USERPROFILE", str(workdir))
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
-
-    assert ModelConfig.from_env().api_key == "sk-from-env"
-    assert not (workdir / paths.RUNTIME_DIR_NAME).exists()
+    cfg = ModelConfig.from_env(write_config(workdir, {"DEEPSEEK_MODEL": "my-model"}))
+    assert cfg.api_key == ""
+    assert cfg.model == "my-model"
+    assert cfg.base_url == "https://api.deepseek.com"
 
 
 # --- 模板文件本身 -------------------------------------------------------
@@ -304,8 +254,12 @@ def test_configured_model_name_decides_the_window(workdir, monkeypatch):
 #
 # 它和 ModelConfig 共用同一份配置文件、同一套优先级（同一个 `UserConfig.value`），
 # 但**缺密钥的处置完全不同**：
-# 模型密钥缺了整个程序什么都干不了（ConfigError + 退出码 2），搜索密钥缺了只是少一个
-# 工具。这两件事混成一样，会让"只想用文件工具的人"被迫先去注册一个搜索服务。
+# 模型那边缺的是"一条能用的路由"，整个程序什么都干不了（ConfigError + 退出码 2）；
+# 搜索密钥缺了只是少一个工具。这两件事混成一样，会让"只想用文件工具的人"被迫先去注册
+# 一个搜索服务。
+#
+# 注意两边的判据形状不同 —— 模型那边**不是**"缺 DEEPSEEK_API_KEY"（密钥归 providers
+# 管），所以那件事的测试也不在这个文件里。
 
 def test_web_key_is_read_from_the_same_config_file(workdir):
     cfg = WebConfig.from_env(write_config(workdir, {"TAVILY_API_KEY": "tvly-from-file"}))

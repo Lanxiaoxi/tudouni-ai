@@ -126,61 +126,36 @@ class ConfigError(userconfig.UserConfigError):
     """配置缺失或非法 —— 属于"用户得先做点事"，不是 bug。
 
     **它和 `CatalogError` 共一个基类**（`userconfig.UserConfigError`），而入口层捕的是
-    基类。两个名字都留着，因为它们说的是两件不同的事：这个是"这次运行缺东西"（没密钥、
-    某个键写错），那个是"`providers` 段读不懂"。但对入口来说处置完全一样 —— 打到
-    stderr、退出码 2。
+    基类。两个名字都留着，因为它们说的是两件不同的事：这个是"这次运行缺东西"（一条能用
+    的模型路由都没有、`permissions.json` / `mcp.json` 里某个键写错），那个是
+    "`providers` 段读不懂"。但对入口来说处置完全一样 —— 打到 stderr、退出码 2。
+
+    **"缺某一把密钥"不在这一档**（`DEEPSEEK_API_KEY` 那类）：模型层是抽象的，密钥来自
+    `providers` 里的路由，所以缺配置的判据是"一条能用的路由都没有"，那件事由
+    `composition.open_runtime` 判。
     """
-
-
-def _no_key_message(cfg: "userconfig.UserConfig", *, created: Path | None = None) -> str:
-    """"没找到密钥"那句话。**两条给法都要写出来，而且要说清文件在哪。**
-
-    它是这个程序对一个新用户说的第一句话（装完命令、第一次运行就会看到），所以：
-
-      * 路径写成**绝对路径**：`~/.tudouni/config.json` 在 Windows 上不是任何人能直接
-        双击打开的东西；
-      * **三种情形三种说法** —— "我刚给你建好了"、"打开你那份填上"、"你得自己建一份"
-        是三件不同的下一步，说成一句会让人去做错的那件事（已经建过文件的人会以为路径写
-        错了，再建一份到别处去）；
-      * 环境变量那条路照样列出来：CI 和容器里没有 home 可写。
-
-    `created` 是 `scaffold()` 刚写出来的那份模板（没写就是 None）。**它排在最前面**，
-    因为"文件已经在那儿了、你只要填一格"是这三种情形里唯一不需要用户动脑子的一种。
-    """
-    where = cfg.path or userconfig.config_file()
-    if created is not None:
-        first = (
-            f"  1) 我已经在这儿给你建好了一份配置，打开它、在 \"env\" 里填上密钥：\n"
-            f"         {created}\n"
-            f"     那一行长这样：   \"{_ENV_API_KEY}\": \"sk-...\"\n"
-        )
-    elif cfg.exists:
-        first = (
-            f"  1) 打开 {where}，在 \"env\" 里填上：\n"
-            f"         \"{_ENV_API_KEY}\": \"sk-...\"\n"
-        )
-    else:
-        first = (
-            f"  1) 建一份 {where}（照模板抄：{userconfig.example_file()}）：\n"
-            f"         {{\"env\": {{\"{_ENV_API_KEY}\": \"sk-...\"}}}}\n"
-        )
-    return (
-        f"没找到 {_ENV_API_KEY}。两种给法，任选其一：\n"
-        f"\n"
-        f"{first}"
-        f"\n"
-        f"  2) 设成环境变量（CI / 容器里用这条）\n"
-        f"       PowerShell：  $env:{_ENV_API_KEY} = \"sk-...\"\n"
-        f"       bash：        export {_ENV_API_KEY}=sk-...\n"
-        f"\n"
-        f"可选：{_ENV_MODEL}、{_ENV_BASE_URL}（同样两条路都认）\n"
-        f"注：真实环境变量的优先级高于配置文件。"
-    )
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """模型连接的配置。"""
+    """**内置那条兜底路由**的取值（`DEEPSEEK_*` 那几个键）。
+
+    **它不是"这次要用哪条路由"的答案。** 那个由 `catalog.Registry` 说了算：端点、模型
+    清单、密钥都在 `Provider` 上（真正发出去的密钥是 `chosen.provider_key`）。这个类手上
+    只有 `DEEPSEEK_*` 三格，所以它在装配期只提供两样东西：
+
+      * 默认模型名（`DEEPSEEK_MODEL`，那是"这台机器上我想用哪个"的老写法）；
+      * "只想填一把密钥、不写 providers"时的取值来源。
+
+    ## 它**不是**启动的门
+
+    缺 `DEEPSEEK_API_KEY` 不等于配不出模型 —— 用户接的可能是自己的网关。以前这个方法
+    缺密钥就抛 `ConfigError`，而装配期无条件走它，于是**只配了自家网关的人连启动都过不
+    去**，被一句 DeepSeek 的密钥挡在门外，哪怕他的路由和密钥都是好的。
+
+    现在那道门在 `open_runtime` 里，判据是"一条能用的路由都没有"（`resolve_model` 的
+    返回值）。所以这里的读法一律不报错：没有就是空串，够不够用由 `catalog` 那边决定。
+    """
 
     api_key: str
     base_url: str
@@ -196,20 +171,14 @@ class ModelConfig:
         那条优先级的实现在 `userconfig.UserConfig.value()`，**这里不再自己写一遍**：
         它以前在这个方法和 `WebConfig.from_env` 里各有一份一模一样的 `pick`，而
         "两处一字不差"这种要求靠抄是维持不住的。
+
+        **缺密钥不是错误**（见类 docstring）：`api_key` 就是空串。所以这里既不抛错、
+        也**不顺手往别人 home 里写模板** —— 写模板归"报错那一刻"，那件事现在由
+        `open_runtime` 做（它才知道是不是真的一条路由都没有）。
         """
         cfg = userconfig.read(config_file)
-
-        api_key = cfg.value(_ENV_API_KEY)
-        if not api_key:
-            # **首次运行就在这儿被兜住**：没有配置、也没有密钥时，先把模板写到默认位置，
-            # 然后那句报错就能指着一个**真的存在**的文件说"打开它填一格"。
-            #
-            # 写盘放在这里（而不是每次启动都确保存在）的理由写在 `scaffold()` 里：
-            # 只给环境变量的部署不该被在 $HOME 里凭空写文件。
-            raise ConfigError(_no_key_message(cfg, created=userconfig.scaffold()))
-
         return cls(
-            api_key=api_key,
+            api_key=cfg.value(_ENV_API_KEY),
             base_url=cfg.value(_ENV_BASE_URL, DEFAULT_BASE_URL),
             model=cfg.value(_ENV_MODEL, DEFAULT_MODEL),
         )
@@ -456,13 +425,17 @@ class McpConfig:
 class WebConfig:
     """联网工具的配置。
 
-    密钥走这里（环境变量 / .env），**不进 `.tudouni.json`** —— 那个文件是策略，是要被
-    review、能被提交的；密钥不能 review 也不该被提交。这两类东西分开，和 ModelConfig
-    与 PermissionConfig 分开是同一条理由。
+    密钥走这里（环境变量 / 用户级配置的 `env` 段），**不进被 review 的那一类文件**。
+    这两类东西分开，和 ModelConfig 与 PermissionConfig 分开是同一条理由。
 
-    **缺密钥不是错误，不拦启动。** 这和 ModelConfig 缺 key 必须抛 ConfigError 是有意的
-    差别：模型密钥缺了整个程序什么都干不了；搜索密钥缺了只是少一个工具。混成一样会让
-    "只想用文件工具的人"被迫先去注册一个搜索服务。
+    **缺密钥不是错误，不拦启动 —— 这和模型那一档是有意相反的。** 模型那边缺了
+    "一条能用的路由"整个程序什么都干不了，所以那是"用户得先做点事"、必须拦住启动；
+    搜索密钥缺了只是少一个工具。混成一样会让"只想用文件工具的人"被迫先去注册一个
+    搜索服务。
+
+    （注意判据的形状变了：拦住启动的**不是**"缺 `DEEPSEEK_API_KEY`"，而是
+    `open_runtime` 里"一条能用的路由都没有"那一问 —— 模型层是抽象的，密钥归
+    `providers` 管，而 `ModelConfig` 从头到尾都不报这个错。）
 
     代理由 httpx 的 trust_env 决定（main.py 里关掉了），不在这里做一个键 —— 一个
     只有一半人看得懂的 HTTP_PROXY 变体，比让人显式写代码更坏。

@@ -103,17 +103,29 @@ def _fresh_session() -> str:
     return f"proto-{uuid.uuid4().hex[:10]}"
 
 
-def run(inbound, *, env_extra=None, session=None, timeout=60.0):
+def run(inbound, *, env_extra=None, session=None, timeout=60.0, cwd=None):
     """喂几行给 `--runtime-stdio`，返回 (退出码, 已解析的消息, stderr)。
 
     `env_extra["AGENT_CONFIG_FILE"]` 指定这次用哪份配置 —— **测试一律显式给**
     （不给就会读到开发机上那份 `~/.tudouni/config.json`，而"哪条路由被选中"正是这一组
     要验的东西）。
+
+    `env_extra` 里给 `None` 表示**把这个变量删掉**（不是设成 "None"）。要验"一把
+    DeepSeek 密钥都没有也能跑"就得这么做 —— 上面那行默认值是给别的用例垫的底。
+
+    `cwd` 默认是仓库根（`-m agent_runtime.main` 靠它找到包）。只有要跟"假 home"错开时
+    才需要传 —— 验"首次运行往 home 里写模板"时，home **不能落在工作区里面**：工作区是
+    cwd，而它是 home 的上层时 `check_workspace()` 会（正确地）拒绝启动。那种时候 cwd 换成
+    一个和 home 平级的目录，包改由 `PYTHONPATH` 找到。
     """
     env = dict(os.environ)
     env["DEEPSEEK_API_KEY"] = "sk-test"
     env["PYTHONIOENCODING"] = "utf-8"
-    env.update(env_extra or {})
+    for name, value in (env_extra or {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
 
     payload = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in inbound)
     argv = [*RUNTIME_ARGV, "--runtime-stdio"]
@@ -121,7 +133,7 @@ def run(inbound, *, env_extra=None, session=None, timeout=60.0):
         argv += ["--session", session]
     result = subprocess.run(
         argv, input=payload, capture_output=True, encoding="utf-8",
-        errors="replace", env=env, cwd=str(REPO_ROOT), timeout=timeout,
+        errors="replace", env=env, cwd=str(cwd or REPO_ROOT), timeout=timeout,
     )
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     return result.returncode, [json.loads(line) for line in lines], result.stderr
@@ -396,3 +408,127 @@ def test_a_route_without_a_key_is_listed_but_not_selectable(two_gateways, workdi
     # 启动那几行里也报了这条路由没密钥 —— 它不该只在按下 /model 时才现形。
     assert any("nokey" in item.get("text", "")
                for item in kinds(got, "init")[0]["notices"])
+
+
+# --- 模型层是抽象的：DeepSeek 只是"最快那条捷径" --------------------------------
+#
+# 这个工具**不是**一家网关的客户端。端点、模型名、密钥全都是配置，所以"能不能跑"的判据
+# 只能是"有没有一条能用的路由"，不能是"有没有 DEEPSEEK_API_KEY"。
+
+
+def test_a_custom_provider_needs_no_deepseek_key_at_all(gateway, workdir):
+    """**只配了自家网关、一把 DeepSeek 密钥都没有，照样能起来。**
+
+    这一条盯的是一个真实存在过的绑定：装配期曾经无条件走 `ModelConfig.from_env()`，
+    而它缺 `DEEPSEEK_API_KEY` 就抛错 —— 于是接了自家网关的人被一句 DeepSeek 的密钥挡在
+    门外，哪怕他的路由是好的、密钥也是好的。而真正发出去的那把密钥来自 `providers`
+    （`chosen.provider_key`），和那个环境变量毫无关系。
+
+    所以这里把 `DEEPSEEK_API_KEY` **删掉**（不是设成空串 —— 那也仍然是一条"能读到但为
+    空"的记录），只留 `providers` 里的一条路由，然后要求这一轮真的跑完。
+    """
+    models = _write_models(workdir, {
+        "my-gw": {"base_url": gateway.base_url, "api_key": "sk-mine",
+                  "models": [{"id": "my-model", "context_window": 4096}]},
+    })
+    code, got, err = run(
+        [{"v": 1, "t": "user_message", "text": "你好"}, {"v": 1, "t": "shutdown"}],
+        env_extra={"AGENT_CONFIG_FILE": str(models), "DEEPSEEK_API_KEY": None},
+        session=_fresh_session(),
+    )
+    assert code == 0, f"只配自家网关就该能跑，却被拦下了：\n{err}"
+    assert [call["model"] for call in gateway.calls] == ["my-model"]
+    assert "没找到 DEEPSEEK_API_KEY" not in err
+    # 而且这条路由真的被当成默认那条（配置里第一条有密钥的）。
+    assert kinds(got, "init")[0]["provider"] == "my-gw"
+
+
+def test_nothing_configured_asks_for_a_route_not_for_a_deepseek_key(workdir):
+    """一条路由都配不出来时，那句话**先让人写 `providers`**，而不是"去弄把 DeepSeek 密钥"。
+
+    新用户看到的第一句话就是它（首次运行时模板也是在这一刻被写出来的）。所以它必须让人
+    看出"接哪家都行"，而第 2 条那条捷径只是捷径。原来的第一句话是"没找到
+    DEEPSEEK_API_KEY，两种给法"（一个已经退休的 `_no_key_message`）—— 换成现在这句的
+    全部理由就是把这个工具说成"某家网关的客户端"是错的。
+    """
+    empty = workdir / "empty-config.json"
+    empty.write_text("{}", encoding="utf-8")
+
+    code, _got, err = run(
+        [{"v": 1, "t": "shutdown"}],
+        env_extra={"AGENT_CONFIG_FILE": str(empty), "DEEPSEEK_API_KEY": None},
+        session=_fresh_session(),
+    )
+    assert code == 2, f"配不出模型就该以 2 收场（用户得先做点事）：\n{err}"
+    assert "模型层是抽象的" in err, err
+    assert "providers" in err and "任选其一" in err
+    # 第 1 条必须是 providers（真正的模型配置面），捷径排第 2。
+    assert err.index("providers") < err.index("DEEPSEEK_API_KEY"), err
+
+
+# --- 首次运行那一步：写模板的接线 ----------------------------------------------
+#
+# 这两条**原来住在 `tests/test_config.py`**，跟着 `ModelConfig.from_env()` 那个 raise 一起。
+# raise 退休之后，"写模板"这件事归了 `open_runtime`（只有它才知道是不是真的一条路由都没
+# 有），所以接线也搬到这里来验 —— 而这里能起真子进程，验的是用户真正看到的东西。
+
+
+def test_a_missing_route_scaffolds_the_config_and_points_at_it(workdir):
+    """**首次运行的完整那一步：一条路由都没有 ⇒ 建一份模板，然后指着它报错。**
+
+    这条盯的是"接线"，而 `test_userconfig.py` 盯的是 `scaffold()` 本身。少了这条接线的话，
+    `scaffold()` 全绿而用户仍然看到"你得自己建一份" —— 而那正是它要消灭的那句话。
+
+    用假 home（`USERPROFILE`）而不是真 home：这条测试会**真的写一个配置文件**，而它必须
+    写在那个被指过去的目录里。
+
+    **工作区和 home 必须是平级的两个目录**：工作区是 cwd，而 cwd 是 home 的上层时
+    `check_workspace()` 会拒绝启动（它以为你要把整个 home 交出去 —— 那次拒绝是对的）。
+    所以这里 cwd 用 `ws/`，包由 `PYTHONPATH` 找到。
+    """
+    home = workdir / "home"
+    ws = workdir / "ws"
+    home.mkdir()
+    ws.mkdir()
+
+    code, _got, err = run(
+        [{"v": 1, "t": "shutdown"}],
+        env_extra={"AGENT_CONFIG_FILE": None, "DEEPSEEK_API_KEY": None,
+                   "USERPROFILE": str(home), "HOME": str(home),
+                   "PYTHONPATH": str(REPO_ROOT)},
+        session=_fresh_session(),
+        cwd=ws,
+    )
+
+    assert code == 2, err
+    created = home / ".tudouni" / "config.json"
+    assert created.is_file(), "报错那一刻没有把模板建出来（scaffold 没接上）"
+    assert str(created) in err
+    assert "已经在这儿给你建好了" in err
+
+
+def test_a_usable_route_scaffolds_nothing(workdir):
+    """一条能用的路由在手 ⇒ **一个文件都不建**。
+
+    容器和 CI 的 home 常常是临时的、甚至只读的，而我们凭什么在那儿留东西。这也是
+    `scaffold()` 被放在"报错那一刻"而不是"每次启动"的全部理由。
+
+    这里让 `run()` 垫上的 `DEEPSEEK_API_KEY` 生效（内置那条兜底路由因此可用），于是
+    装配成功、压根走不到报错那一刻。
+    """
+    home = workdir / "home"
+    ws = workdir / "ws"
+    home.mkdir()
+    ws.mkdir()
+
+    code, _got, err = run(
+        [{"v": 1, "t": "shutdown"}],
+        env_extra={"AGENT_CONFIG_FILE": None,
+                   "USERPROFILE": str(home), "HOME": str(home),
+                   "PYTHONPATH": str(REPO_ROOT)},
+        session=_fresh_session(),
+        cwd=ws,
+    )
+
+    assert code == 0, err
+    assert not (home / ".tudouni").exists(), "有可用路由时不该往别人 home 里写东西"

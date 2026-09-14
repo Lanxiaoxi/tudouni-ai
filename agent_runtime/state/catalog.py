@@ -67,7 +67,10 @@ MODELS_EXAMPLE_NAME = userconfig.EXAMPLE_FILE_NAME
 BUILTIN_PROVIDER = "deepseek"
 BUILTIN_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
-_API_KEY_ENV = "DEEPSEEK_API_KEY"
+# 内置那条兜底路由的密钥环境变量。**公开**：`composition` 要在"一条路由都没有"那句话
+# 里说清"只给一把密钥也能跑"是哪一把，而那句话不该自己抄一个字面量（抄了就会漂）。
+BUILTIN_API_KEY_ENV = "DEEPSEEK_API_KEY"
+_API_KEY_ENV = BUILTIN_API_KEY_ENV
 _BASE_URL_ENV = "DEEPSEEK_BASE_URL"
 _MODEL_ENV = "DEEPSEEK_MODEL"
 
@@ -495,7 +498,7 @@ def load(path: Path | None = None) -> Registry:
     if not any(item.usable for item in registry.providers):
         problems.append(
             "[模型] 一条可用的路由都没有（每条都缺密钥）—— /model 会摆出一张"
-            "选不了的清单，而 DEEPSEEK_API_KEY 和 .env 兜底那条路也没配上"
+            f"选不了的清单，而 {BUILTIN_API_KEY_ENV} 兜底那条路也没配上"
         )
     if default and registry.find(default) is None:
         problems.append(
@@ -505,6 +508,7 @@ def load(path: Path | None = None) -> Registry:
 
 
 __all__ = [
-    "ALIASES", "BUILTIN_BASE_URL", "BUILTIN_PROVIDER", "CatalogError", "DEFAULT_MODEL",
+    "ALIASES", "BUILTIN_API_KEY_ENV", "BUILTIN_BASE_URL", "BUILTIN_PROVIDER",
+    "CatalogError", "DEFAULT_MODEL",
     "MODELS_EXAMPLE_NAME", "ModelRef", "Provider", "Registry", "load",
 ]
