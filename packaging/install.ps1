@@ -89,19 +89,14 @@ if ($entries -contains $Target) {
     Write-Host '  [2/3] 已加进用户 PATH'
 }
 
-# --- 3. 确认这个二进制真的能跑 ----------------------------------------------
+# --- 3. 确认这个二进制真的能跑，并说出它是哪一版 ----------------------------
 #
-# `--help` 是**唯一一个不碰工作区**的调用：它在 argparse 里就结束了，不会建
-# `.tudouni/`、不读配置、不需要密钥。所以拿它当"装好了没有"的判据是干净的。
-# 放在 cwd 之外跑，连"当前目录被写进东西"都不必担心。
-Push-Location $env:TEMP
-try {
-    $out = & $Exe --help 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "tudouni --help 退出码 $LASTEXITCODE`n$out" }
-    Write-Host '  [3/3] 装好了，二进制能跑'
-} finally {
-    Pop-Location
-}
+# `--version` 是**最干净**的那个调用：它在 argparse 里就结束了 —— 不碰工作区、不读
+# 配置、不需要密钥。所以拿它同时验"装好了没有"和"装的是哪一版"，比 `--help` 还多给一样
+# 东西（用户核对"我这次装上新版没有"就靠它）。也因此不需要先 cd 到别处。
+$out = & $Exe --version 2>&1
+if ($LASTEXITCODE -ne 0) { throw "tudouni --version 退出码 $LASTEXITCODE`n$out" }
+Write-Host "  [3/3] 装好了：$out"
 
 # --- 收尾 -------------------------------------------------------------------
 Write-Host ''

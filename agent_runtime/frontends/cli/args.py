@@ -15,9 +15,22 @@ runtime 内部"的测试（`tests/test_imports.py`）第一次跑就把我最初
 
 import argparse
 
+from agent_runtime import version
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent Runtime 命令行入口")
+    # **`--version` 排在最前面，而且它由 argparse 自己处理**（打印完就 `sys.exit(0)`）：
+    # 于是它和 `--session` 的合法性检查、工作区检查、配置检查全都不相干 —— 一个连配置
+    # 都没有的人也应该能问出"我装的是哪一版"。
+    #
+    # 版本号来自 `agent_runtime/version.py`，**不是这里的字面量**：那个数字的真值在
+    # `pyproject.toml`（发布用的那个），而冻结产物里没有那个文件，所以打包时会额外带上
+    # 一个戳。见那个模块的 docstring。
+    parser.add_argument(
+        "--version", action="version", version=version.describe(),
+        help="打印版本号然后退出",
+    )
     parser.add_argument(
         "--session", default=None,
         help="会话 id。给了就接着那个会话聊（不存在则新建）；不给就自动开一个新的",

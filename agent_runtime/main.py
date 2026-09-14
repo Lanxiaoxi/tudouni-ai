@@ -50,6 +50,7 @@ from agent_runtime.runtime.channels import cli_channels
 from agent_runtime.runtime.composition import (
     Notice,
     boot,
+    check_config,
     check_session_id,
     check_workspace,
     open_runtime,
@@ -104,14 +105,21 @@ def main() -> int:
     # `--runtime-stdio` 子进程里；父进程扫一遍技能、建一遍日志目录、再装配一个
     # Agent 然后什么都不干，是纯浪费。
     #
-    # 它也必须早于配置检查：父进程自己**不需要密钥**（要密钥的是子进程），
-    # 而"没配密钥"那种失败必须能在界面上显示出来，而不是让父进程先崩掉。
+    # 它**不装配任何东西**（父进程不需要密钥，要密钥的是子进程），但**配置要在这里先问
+    # 一遍**。原来的注释写的是"父进程不需要密钥，那种失败让界面去显示" —— 那是错的：
+    # 界面一起来就接管了终端的备用屏幕缓冲区，而备用屏没有回滚缓冲，子进程那句配置报错
+    # 会变成一屏被截断、滚不动的乱码。详见 `composition.check_config`。
     #
     # import 放在函数里：`frontends/tui/__init__.py` 不许在顶层 import textual
     # （否则 `--list` 那种查询子命令也要加载一个 TUI 框架）。
     if args.tui:
         from agent_runtime.frontends.tui import theme as tui_theme
         from agent_runtime.frontends.tui.app import run_tui
+
+        # **进备用屏之前**把"用户得先做点事"那一档查掉，用普通终端把那句话说完。
+        if (problem := check_config()) is not None:
+            print(problem, file=sys.stderr)
+            return 2
 
         # `--theme` 收的是"人能写出来的一段字"（`p7` / `靛夜` / `7`），而认它的是
         # `theme.resolve` —— 同一个函数也是 `/theme` 用的那个，所以两条入口对

@@ -40,6 +40,7 @@ PKG = ROOT / "agent_runtime"
 # 而那是静默的（`grep` 不注册，见 `grep.py` 的 `_VENDOR_DIR` 那段）。
 sys.path.insert(0, str(ROOT))
 from agent_runtime.tools.builtin.grep import host_triple  # noqa: E402
+from agent_runtime.version import current as package_version  # noqa: E402
 
 TRIPLE = host_triple()
 if TRIPLE is None:
@@ -58,6 +59,21 @@ DATAS = [
     (str(PKG / "config.example.json"), "agent_runtime"),
     (str(PKG / "protocol" / "schema"), "agent_runtime/protocol/schema"),
 ]
+
+# 版本戳 —— **产物里没有 `pyproject.toml`**（那是构建用的文件，不该跟着可执行文件发给
+# 用户），而 `--version` 和欢迎屏都要那个数字。所以在这里把它单独写成一份数据随包带上，
+# `agent_runtime/version.py` 优先读它（文件名就是那边认的 `STAMP_FILE_NAME`）。
+#
+# 写在 `build/` 下（PyInstaller 自己的中间目录，`.gitignore` 里有）：**不碰源码树**，
+# 也**不用 `tempfile`** —— 受限环境里系统临时目录未必写得动（实测撞过一次，那次构建
+# 红在一个和产物毫无关系的原因上）。
+_version = package_version()
+if not _version:
+    raise SystemExit("读不出 pyproject.toml 里的版本号，打出来的包会是个没版本的东西")
+STAMP = ROOT / "build" / "_version.txt"
+STAMP.parent.mkdir(parents=True, exist_ok=True)
+STAMP.write_text(_version, encoding="utf-8")
+DATAS.append((str(STAMP), "agent_runtime"))
 
 BINARIES = [
     (str(RG_SOURCE), f"agent_runtime/tools/vendor/rg/{TRIPLE}"),

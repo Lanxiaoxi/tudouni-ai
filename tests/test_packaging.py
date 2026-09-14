@@ -155,6 +155,36 @@ def test_the_installed_layout_is_importable_from_anywhere(tmp_path):
     assert answer["workspace"] == str(tmp_path)
 
 
+def test_the_installer_scripts_have_the_bytes_their_target_needs():
+    """随包那两个脚本的**存储形态**：BOM 与换行符。
+
+    三条都属于"在你机器上一切正常、在用户机器上炸"那一类：
+
+      * `install.ps1` **必须带** UTF-8 BOM —— Windows PowerShell 5.1（双击、
+        `powershell -File` 走的那个）没有 BOM 就按系统 ANSI 代码页解码，中文注释变乱码，
+        而乱码里出现一个引号类的字节就足以让整个脚本解析失败；
+      * `install.sh` **不能带** BOM —— `#!` 前面多三个字节，内核就找不到解释器；
+      * `install.sh` **必须是 LF** —— CRLF 让它变成 `#!/bin/sh\\r`，Linux 上直接
+        bad interpreter（`.gitattributes` 里钉了 `*.sh text eol=lf`，这里是兜底）。
+
+    ## 为什么这条测试不是多余的
+
+    它是**会被无意破坏的**：实测过一次 —— 任何重写 `install.ps1` 的编辑器/工具都会把
+    BOM 抹掉（这个仓库里改一次文件就会），而抹掉之后它在任何 UTF-8 编辑器里看都完全
+    正常。`build_release.py` 打包前也查这三条，但那时人已经走到打包那一步了；这里让它在
+    `pytest` 就红。
+    """
+    ps1 = (REPO_ROOT / "packaging" / "install.ps1").read_bytes()
+    assert ps1.startswith(b"\xef\xbb\xbf"), (
+        "install.ps1 掉了 UTF-8 BOM —— Windows PowerShell 5.1 会把中文注释读成乱码并"
+        "解析失败（存成「UTF-8 带 BOM」）"
+    )
+
+    sh = (REPO_ROOT / "packaging" / "install.sh").read_bytes()
+    assert not sh.startswith(b"\xef\xbb\xbf"), "install.sh 的 #! 前面不能有 BOM"
+    assert b"\r\n" not in sh, "install.sh 变成 CRLF 了 —— Linux 上会 bad interpreter"
+
+
 # --- 冻结产物：两条只在二进制里才成立的约定 ---------------------------------------
 #
 # 下面两条都不摆弄 PyInstaller（那要几十秒、还要装它），它们只把"冻结"这件事**装出来**

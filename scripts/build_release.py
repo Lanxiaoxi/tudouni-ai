@@ -32,6 +32,7 @@ ripgrep 各自躺在包装脚本忘了带的地方，而源码目录里跑测试
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,11 @@ REQUIRED = (
     "agent_runtime/config.example.json",
     "agent_runtime/protocol/schema/outbound.schema.json",
 )
+
+# 版本戳：`--version` 和欢迎屏靠它。产物里没有 `pyproject.toml`（构建用的文件不发给
+# 用户），所以它是**唯一**能让冻出来的程序说出自己版本的东西 —— 少了它，那个包就是
+# "永远说不出版本号"的包，而这件事在源码目录里测不出来。
+VERSION_STAMP = "agent_runtime/_version.txt"
 
 # 随压缩包一起给用户的说明与安装脚本（它们本身不是程序的一部分）。
 SHIPPED_ALONGSIDE = ("install.ps1", "install.sh", "README.txt")
@@ -133,10 +139,21 @@ def _check_no_source(bundle: Path) -> None:
         )
 
 
-def _check_data_files(bundle: Path) -> None:
-    """四类随代码走的文件必须在。缺了的症状全是静默的（见 tests/test_packaging.py）。"""
+def _check_data_files(bundle: Path, version: str) -> None:
+    """四类随代码走的文件 + 版本戳必须在。缺了的症状全是静默的。"""
     root = _internal(bundle)
     missing = [name for name in REQUIRED if not (root / name).is_file()]
+
+    # 版本戳不但要在，**内容还得对**：一份写着旧版本号的戳比没有更坏（`--version` 会
+    # 一脸确信地报一个错的数字，而那正是用户拿来核对"我装上新版没有"的东西）。
+    stamp = root / VERSION_STAMP
+    if not stamp.is_file():
+        missing.append(VERSION_STAMP)
+    elif stamp.read_text(encoding="utf-8").strip() != version:
+        raise SystemExit(
+            f"{VERSION_STAMP} 里是 {stamp.read_text(encoding='utf-8').strip()!r}，"
+            f"而这次构建的版本是 {version!r}。"
+        )
 
     # ripgrep 单拎出来：它是一份**可执行文件**，路径里还带 triple，所以没法写进
     # REQUIRED 那张常量表里（那会让这张表在别的平台上不成立）。
@@ -156,15 +173,20 @@ def _check_data_files(bundle: Path) -> None:
         )
 
 
-def _check_it_runs(bundle: Path) -> None:
-    """真的把产物跑起来。两条，各自钉一件不重叠的事。
+def _check_it_runs(bundle: Path, version: str) -> None:
+    """真的把产物跑起来。三条，各自钉一件不重叠的事。
 
     ## 1. `--help`：这个二进制能起来
 
     它是**唯一一个不碰工作区**的调用（在 argparse 里就结束），所以它是"这个二进制
     本身能不能起来"的最便宜判据，不会顺带建出一个 `.tudouni/`。
 
-    ## 2. `--runtime-stdio`：**TUI 要起的那条子进程真的能起**
+    ## 2. `--version`：**版本戳真的被打进产物里了**
+
+    源码目录里这条永远绿（那边从 `pyproject.toml` 读），而产物里没有那个文件 —— 少了
+    戳，`--version` 会说"版本号读不出来"，而用户正是拿它核对"我装上新版没有"的。
+
+    ## 3. `--runtime-stdio`：**TUI 要起的那条子进程真的能起**
 
     这一条是这次打包最该盯的地方：界面是个父进程，它把**同一个可执行文件**再起一遍
     当 runtime 子进程（`protocol/client.py`）。冻结之后 `sys.executable` 不再是一个
@@ -177,6 +199,22 @@ def _check_it_runs(bundle: Path) -> None:
     """
     exe = bundle / _binary_name()
 
+    # **子进程的环境要隔离。** 这一问验的是"产物里的 runtime 起不起得来"，不是"构建这台
+    # 机器上有没有配好模型"。不隔离的话，一个还没填密钥的人（或者刚清过配置、正拿自己
+    # 当新用户试的人）会在打包这一步被拦住 —— 而那是**和产物毫无关系**的一次失败。
+    # 实测撞过：开发机上 `~/.tudouni/config.json` 是空的模板，构建就红在"一条能用的路由
+    # 都没有"上。
+    #
+    # 顺带挡掉一个副作用：`AGENT_CONFIG_FILE` 一旦指了，`scaffold()` 就不会往**构建者
+    # 自己的 home** 里写模板（那是"我自己管路径"的表示）。一次打包不该动别人的 home。
+    verify_config = WORK_DIR / "verify-config.json"
+    verify_config.write_text("{}", encoding="utf-8")
+    child_env = {
+        **os.environ,
+        "AGENT_CONFIG_FILE": str(verify_config),
+        "DEEPSEEK_API_KEY": "sk-build-verify",   # 让内置那条兜底路由可用
+    }
+
     # cwd 用**仓库里的一个临时目录**，不用 `tempfile`：`--runtime-stdio` 会真的开一个
     # 工作区、在 cwd 下建 `.tudouni/`，而系统 temp 在受限环境里未必写得动（实测撞过：
     # 沙箱把 `%TEMP%` 挡掉了，于是这条验证红在一个和产物毫无关系的原因上，还顺带
@@ -188,21 +226,28 @@ def _check_it_runs(bundle: Path) -> None:
     try:
         for label, argv in (
             ("--help", [str(exe), "--help"]),
+            ("--version", [str(exe), "--version"]),
             ("--runtime-stdio", [str(exe), "--runtime-stdio"]),
         ):
             with subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 encoding="utf-8", errors="replace",
-                cwd=str(workspace),
+                cwd=str(workspace), env=child_env,
             ) as child:
-                _, stderr = child.communicate(timeout=120)
+                stdout, stderr = child.communicate(timeout=120)
                 code = child.returncode
 
             if code != 0:
                 hint = "（这正是 TUI 起的那个子进程）" if label == "--runtime-stdio" else ""
                 raise SystemExit(
                     f"`{exe.name} {label}` 退出码 {code}{hint}\n  stderr:\n{stderr[-2000:]}"
+                )
+
+            if label == "--version" and version not in stdout:
+                raise SystemExit(
+                    f"`{exe.name} --version` 没说出 {version!r}，说的是 {stdout.strip()!r}。\n"
+                    f"  产物里少了版本戳 {VERSION_STAMP} —— 那样用户没法核对装的是哪一版。"
                 )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
@@ -323,12 +368,12 @@ def main() -> int:
 
     print("[3/4] 验证产物……")
     _check_no_source(bundle)
-    _check_data_files(bundle)
-    _check_it_runs(bundle)
+    _check_data_files(bundle, version)
+    _check_it_runs(bundle, version)
     print("      · install.ps1 带 BOM、install.sh 是 LF（不然在用户机器上直接跑不起来）")
     print("      · 没有 .py 泄漏")
-    print("      · 四类随代码走的文件都在")
-    print("      · 二进制能起，runtime 子进程也起得来")
+    print("      · 四类随代码走的文件都在，版本戳内容对得上")
+    print("      · 二进制能起，`--version` 说得出话，runtime 子进程也起得来")
 
     bundle = _stage(bundle, version, triple)
     target = _archive(bundle, version, triple)

@@ -231,6 +231,55 @@ def check_workspace() -> str | None:
     )
 
 
+def check_config() -> str | None:
+    """把"用户得先做点事"那一档配置查一遍。**能就返回 None。**
+
+    和 `check_workspace` / `check_session_id` 同一个分工：判据在别人那儿，措辞在这里，
+    调用方负责打出去 + 退出码 2。
+
+    ## 为什么 `--tui` 单独需要它，别的入口不需要
+
+    模型、权限、MCP 的配置错误都在**子进程**启动时才被读到（TUI 的子进程是
+    `--runtime-stdio`），而它们走的是子进程的 stderr。问题是：界面起来的时候已经接管了
+    终端的**备用屏幕缓冲区**（Textual 的 `run(inline=False)`，也就是默认），而备用屏
+    **没有回滚缓冲**。于是那段报错变成"只有最后一屏看得见、开头永久丢失、在界面里滚不动"
+    —— 因为它根本不是界面的内容，只是一段被界面盖住的终端输出。
+
+    实测过：一个全新用户第一次跑 `--tui`，看到的就是一屏被截断、滚不动的配置报错，外加
+    一个停在那儿什么都干不了的界面。而 `run_tui` 的 docstring 以为这种情形是"界面闪一下
+    就退、stderr 上的原因看得见" —— 两半都不成立（子进程死了界面不知道，原因也读不到）。
+
+    所以这一问必须做在**进备用屏之前**：那时候还是普通终端，话能完整打出来、能滚、能
+    复制。换到别的入口（老 CLI / `--runtime-stdio`）就没有这个问题 —— 那些路径本来就在
+    普通终端里报错。
+
+    ## 查的就是"会让孩子以 2 收场"的那几样
+
+    它们的处置完全一样（把话说清楚、退出码 2），所以这里一并问掉，而不是让用户撞一次
+    改一次：
+
+      * 模型：一条能用的路由都没有。**不是**"缺某把密钥" —— 密钥归 `providers` 管，
+        用户接的可能就是自己的网关；
+      * `permissions.json`：有不认识的键、`auto_approve` 里写了 high、规则写错……
+      * `mcp.json`：清单形状不对（那里写错一个键名就停下）。
+
+    联网那一档**不在**里面：缺 `TAVILY_API_KEY` 只是少一个工具，不拦启动。
+    """
+    try:
+        registry = catalog.load()
+        if not registry.usable:
+            # **首次运行就在这儿被兜住**：先把模板写到默认位置，这句话才能指着一个真的
+            # 存在的文件说"打开它填一格"。理由和 `open_runtime` 里那一处一样。
+            return _no_model_message(registry, created=userconfig.scaffold())
+        PermissionConfig.from_file()
+        McpConfig.from_file()
+    except userconfig.UserConfigError as exc:
+        # `providers` 段的形状错误、那两份文件的问题，都归这一档（`UserConfigError` 说的
+        # 就是"用户得先做点事"）。原样把话带出去 —— 它们在子进程里也是这么报的。
+        return str(exc)
+    return None
+
+
 def check_session_id(session_id: str | None) -> str | None:
     """`--session` 是用户直接敲进来的字符串，写错了要能照着改。
 

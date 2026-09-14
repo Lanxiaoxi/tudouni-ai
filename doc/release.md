@@ -42,8 +42,14 @@ README.txt                        给用户的说明
 2. 四类随代码走的文件都在（缺了 = 能启动、少一个功能，且没有任何别的症状）；
 3. `install.ps1` 带 UTF-8 BOM（少了它 Windows PowerShell 5.1 会把中文注释读成乱码
    并解析失败）；
-4. 真的把 exe 跑起来：`--help`，以及 `--runtime-stdio`（TUI 起的正是这个子进程）；
+4. 真的把 exe 跑起来：`--help`、`--version`（版本号必须对得上这次构建），以及
+   `--runtime-stdio`（TUI 起的正是这个子进程）；
 5. 冻结时 `protocol/client.py` 拼的 argv 不再带 `-m`。
+
+顺带说清版本号是怎么进产物的：**产物里没有 `pyproject.toml`**（构建用的文件不该跟着
+可执行文件发给用户），所以打包时把它写成一个版本戳（`agent_runtime/_version.txt`）随包带上，
+`agent_runtime/version.py` 优先读它、读不到才回落去找 `pyproject.toml`。少了戳，用户就没法
+核对"我这次装上新版没有" —— `tudouni --version` 会说"版本号读不出来"。
 
 改完代码先跑全量测试：`uv run pytest`。
 

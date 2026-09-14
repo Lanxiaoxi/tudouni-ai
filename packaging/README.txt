@@ -54,6 +54,7 @@ Linux（x86_64）
     tudouni --session <id>           接着某个会话聊
     tudouni --list                   列出这个目录里存过的会话（不需要密钥）
     tudouni --skills                 列出这个目录里有哪些技能（不需要密钥）
+    tudouni --version                看装的是哪一版（不需要密钥）
     tudouni --tui --theme 墨绿仪器    换配色
     tudouni --tui --no-stream        不要逐字输出，答案整段出现
 
@@ -80,6 +81,9 @@ Linux（x86_64）
 
 五、出问题了
 ------------
+
+想知道装的是哪一版
+    tudouni --version
 
 程序根本起不来 / 提示不是有效的 Win32 应用程序
     平台不对。这个包只支持 x86_64 的 Windows 和 Linux。

@@ -233,6 +233,20 @@ class Registry:
                 return item
         return None
 
+    @property
+    def usable(self) -> bool:
+        """**有没有至少一条能用的路由。** 这就是"模型配好了没有"的判据。
+
+        注意它问的**不是**"有没有某一把密钥"：密钥来自路由，而路由可能是用户自己的网关。
+        入口在起界面之前问一次（`composition.check_config`）问的就是这一个问题，所以它
+        值得有个名字 —— 而不是让每个调用点各写一遍 `any(p.usable for p in ...)`。
+
+        （`default_provider()` 不是这个判据：一条都不用时它会退回 `providers[0]`，
+        也就是**返回一条不能用的路由** —— 那是它该有的行为，"挑一条来当默认"，不是
+        "有没有能用的"。）
+        """
+        return any(item.usable for item in self.providers)
+
     def models(self) -> tuple[ModelRef, ...]:
         """可选的模型清单，**按路由顺序**（顺序就是配置文件里的顺序）。"""
         return tuple(item for provider in self.providers for item in provider.models)

@@ -48,6 +48,7 @@ from textual.containers import Horizontal, Vertical
 from textual.theme import Theme as TextualTheme
 from textual.widgets import Static
 
+from agent_runtime import version
 from agent_runtime.frontends.tui import theme as theme_mod
 from agent_runtime.frontends.tui import view_state, widgets
 from agent_runtime.protocol import messages
@@ -83,29 +84,16 @@ _STATE_REFRESH_SECONDS = 2.0
 
 
 def _version() -> str:
-    """`pyproject.toml` 里的版本号，读不到就返回空串。
+    """欢迎屏上那个版本号。**一个事实，实现搬到了 `agent_runtime/version.py`。**
 
-    **不在这里抄一个 `"0.1.0"`**：一个数字两处写，迟早会漂，而漂掉的那一处
-    （欢迎屏）没人会去核对。读文件失败不算错误 —— 它只影响欢迎屏的一行字，
-    所以失败时安静地不显示（比让界面起不来好得多）。
+    它原来住在这里，带着一段"别抄字面量、往上找 pyproject.toml"的道理。`--version`
+    成了第二个消费者之后，那段道理和实现一起搬走了 —— 留在原地的第二份会漂，而漂掉的
+    症状是"命令行说是 A、界面上写着 B"，比少一行字坏得多。
 
-    **往上找而不是数层数**：这个仓库的布局是"包目录就是仓库根"（`package = false`，
-    见 pyproject 里那段），而 `frontends/tui/app.py` 到 `pyproject.toml` 正好是三层 ——
-    但"正好三层"是个会随目录调整而失效的假设（第一版写成 `parents[3]`，实测拿到
-    空串，而症状只是欢迎屏少一行字，没人会注意）。所以改成往上找那个文件。
+    这里保留这个薄壳是因为它在类里被用了两次（`_version` 这个字段名也跟着走），
+    而它现在只负责取一次。
     """
-    try:
-        import tomllib
-        from pathlib import Path
-
-        for parent in Path(__file__).resolve().parents:
-            candidate = parent / "pyproject.toml"
-            if candidate.is_file():
-                data = tomllib.loads(candidate.read_text(encoding="utf-8"))
-                return str(data.get("project", {}).get("version", ""))
-        return ""
-    except Exception:  # pragma: no cover - 只在打包/裁剪过的环境里走到
-        return ""
+    return version.current()
 
 
 class TuiApp(App[None]):
@@ -1676,10 +1664,23 @@ def run_tui(session: str | None = None, *, autopilot: bool = False,
             theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True) -> int:
     """`main.py --tui` 走这里。
 
-    **配置错时子进程会以退出码 2 结束、并把原因打在 stderr 上。** 那一支由界面
-    自然显示（stderr 是继承的，所以那几行会出现在终端上）—— 这条路径刻意不特殊
-    处理"还没起来就失败"，因为它的表现是"界面闪一下就退"，而 stderr 上的原因是
-    看得见的。
+    ## 配置错时压根走不到这里
+
+    `main.py` 在进这一支之前先问了 `composition.check_config()`，所以"一条能用的路由都
+    没有"这类错误是在**普通终端**上说完的（退出码 2）。那是有意的：界面一起来就接管了
+    终端的备用屏幕缓冲区，而备用屏**没有回滚缓冲** —— 子进程那句配置报错会变成"只有最后
+    一屏看得见、开头永久丢失、在界面里滚不动"的一屏乱码。
+
+    （这里原来写的是"界面闪一下就退、stderr 上的原因看得见"。实测两半都不成立：子进程死了
+    界面不知道，原因也读不到。所以那一问挪到了父进程。）
+
+    ## 但仍然留着一个洞
+
+    子进程**在界面起来之后**才死（运行中配置被改坏、或者它自己崩了）时，界面只知道读到
+    了 EOF —— 它会停在那儿什么都不干，而用户看不到原因。补它要让客户端把 stderr 收进来
+    （`ProtocolClient` 早就留了 `stderr_to` 这个口子），那是另一件事。
+
+    返回值是子进程的退出码（界面正常收场时是 0）。
     """
     app = TuiApp(session=session, autopilot=autopilot, theme_key=theme_key,
                  stream=stream)
