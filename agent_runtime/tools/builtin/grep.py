@@ -101,6 +101,8 @@ from typing import Any
 
 from pydantic import Field
 
+from agent_runtime import paths
+
 from ..text import truncate
 from ..tool import ToolArgs
 from .filesystem import FileSystem
@@ -145,7 +147,13 @@ TIMEOUT_SECONDS = 10
 
 # 随仓库带的 ripgrep 住在哪。`tools/vendor/rg/<triple>/rg[.exe]`，一个平台一份
 # （`tools/vendor/rg/README.md` 记着来源、许可和升级办法）。
-_VENDOR_DIR = Path(__file__).resolve().parents[1] / "vendor" / "rg"
+#
+# **走 `paths`，不自己算 `__file__`。** 原来那句 `parents[1] / "vendor" / "rg"` 在源码
+# 目录里是对的，而冻结成可执行文件之后 `__file__` 指向别处、数据文件在 `_MEIPASS` 下 ——
+# 症状特别隐蔽：`rg_binary()` 返回 None，于是 `grep` **不注册**，模型看不到它，改去猜
+# 文件名然后 `read_file`（正好是提示词里"优先搜索定位"的反面）。而这一切只表现为启动时
+# 一行提示。
+_VENDOR_DIR = paths.package_dir() / "tools" / "vendor" / "rg"
 
 # 平台 → ripgrep 官方 release 的 target triple。
 #

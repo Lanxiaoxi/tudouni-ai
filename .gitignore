@@ -47,6 +47,12 @@ tests/_tmp/
 # 性能分析脚本的临时工作区（scripts/perf_*.py 建的假工作区、假会话、假日志）
 .perf-tmp/
 
+# ---- 出发布包（scripts/build_release.py）----
+# dist/ 里是冻结好的可执行文件，几十兆且每个平台一份 —— 它是**产物**，不是源码。
+# build/ 是 PyInstaller 的中间目录，比 dist/ 还大。两者都由那一条命令重建。
+dist/
+build/
+
 # ---- 编辑器与系统 ----
 .vscode/
 .idea/

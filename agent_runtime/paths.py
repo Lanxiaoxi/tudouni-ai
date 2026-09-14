@@ -62,6 +62,7 @@
 调用一次的代价是一次 `Path` 拼接，可以忽略。
 """
 
+import sys
 from pathlib import Path
 
 # 这个运行时的私有目录名。**用户级和工作区级共用同一个名字**（`~/.tudouni` 与
@@ -86,7 +87,29 @@ def package_dir() -> Path:
     **从 `__file__` 推，不拼任何目录名。** 那个写死的 `"agent_runtime"` 就是上面
     docstring 里说的那次事故 —— 目录改名之后它指向一个不存在的树，而且完全没有症状。
     这个文件在包根上，所以一层 `parent` 就到。
+
+    ## 冻结成可执行文件之后，这里多一个来源（PyInstaller）
+
+    打包成二进制之后 `__file__` 指向解包出来的临时目录，而随包的数据文件被放在
+    `<_MEIPASS>/agent_runtime/` 下（打包脚本把仓库里的布局原样搬过去）。所以这里多问
+    一句 `_MEIPASS`，**返回值的含义一个字都没变**（还是"这个包自己的目录"），变的只是
+    它从哪算出来。
+
+    为什么值得挤在这个函数里：`prompts/`、`config.example.json`、`protocol/schema/`、
+    `tools/vendor/rg/` 四类都从这里派生，**改一处就四类一起对**。这正是这个模块存在的
+    理由（同一件事不该有多份算法），而冻结只是让"这件事"多了一种机器形态。
+
+    **写它的时候别绕开它。** 现在还有两个地方自己算 `__file__`
+    （`protocol/messages.py` 的 schema、`tools/builtin/grep.py` 的 rg）—— 它们原来
+    等价，冻结之后不等价，所以那两个已经改成走这里了。新代码请照做。
     """
+    frozen_base = getattr(sys, "_MEIPASS", None)
+    if frozen_base:
+        # `__package__` 就是"我这个包叫什么"—— 不写字面量，所以它不会和真实情况漂开
+        # （这正是上面那句"不拼任何目录名"的精神：名字由**事实**给，不由这里的字面量给）。
+        # 打包脚本把源码树按同样的布局搬进 `_MEIPASS`，所以两边天然对得上。
+        return Path(frozen_base) / __package__
+
     return Path(__file__).resolve().parent
 
 

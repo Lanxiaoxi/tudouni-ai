@@ -1,0 +1,11 @@
+# 换行符：**别依赖检出平台**。
+#
+# 这个仓库开着 core.autocrlf=true，所以 Windows 上检出默认给 CRLF。对大多数文件无所谓，
+# 但随包发给用户的 shell 脚本不行：CRLF 让第一行变成 `#!/bin/sh\r`，在 Linux 上是
+# "bad interpreter: No such file or directory" —— 而在 Windows 的编辑器里打开它，
+# 和正常的文件看不出任何区别。典型的"只在别人机器上炸"。
+*.sh text eol=lf
+
+# `install.ps1` 的换行两种都能跑，所以不钉；但**它必须带 UTF-8 BOM**（少了 BOM，
+# Windows PowerShell 5.1 会按 ANSI 代码页解码中文注释并解析失败）。BOM 不是版本控制
+# 能保证的事，所以那条由 scripts/build_release.py 在打包前检查。

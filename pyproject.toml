@@ -50,6 +50,16 @@ tudouni = "agent_runtime.main:main"
 dev = [
     "pytest>=8.0",
 ]
+# 出发布包用（`scripts/build_release.py`：把程序冻成一个不含 .py 的压缩包）。
+#
+# **刻意不放进 dev**：它连带拖进 altgraph / pefile / pywin32-ctypes 一串，而跑测试的人
+# 一个都不需要。要用的时候一条命令装：`uv pip install pyinstaller`。
+#
+# 它只能出**本平台**的包 —— PyInstaller 不是交叉编译器（产物里带着 CPython 运行时和
+# 平台相关的扩展）。要 Windows + Linux 两份，就在两个平台上各跑一次那条命令。
+build = [
+    "pyinstaller>=6.0",
+]
 
 [tool.hatch.build.targets.wheel]
 # 显式点名，不靠猜。仓库根还有 tests/ doc/ scripts/，它们不该进 wheel。

@@ -14,6 +14,18 @@
 所以这里真的**构建一次 wheel** 再打开来看。慢（几秒）但没有替代品：断言"文件在源码目录里"
 证明不了任何事。
 
+## 第二种容器：冻结出来的可执行文件
+
+`scripts/build_release.py` 把同一个包冻成一个**不含 .py 的**压缩包（给不想要源码的用户）。
+那是同一批文件的第二种落点，而它多出两条**源码目录里永远看不出来**的约定，所以各有一条
+测试钉在这里（都不需要真的摆弄 PyInstaller）：
+
+  * **路径要跟着包走，不跟着 `__file__` 走** —— 冻结之后 `__file__` 指到别处，数据文件
+    却在 `_MEIPASS` 下。`paths.package_dir()` 里那个分支加上 `messages.py` / `grep.py`
+    两处收口，是这件事成立的全部；
+  * **子进程不能再走 `-m`** —— 界面把同一个 exe 再起一遍当 runtime 子进程，而冻结产物
+    不是通用解释器，`-m agent_runtime.main` 解析不了。
+
 ## 为什么不是断言一张清单
 
 清单会漂。这里只钉**四类各挑一个代表**，外加一条"tests/ 不许进 wheel"—— 那是另一个方向的
@@ -94,7 +106,7 @@ def test_the_wheel_does_not_carry_the_repository(wheel):
     """
     leaked = [
         name for name in wheel.namelist()
-        if name.startswith(("tests/", "doc/", "scripts/", ".venv/"))
+        if name.startswith(("tests/", "doc/", "scripts/", "packaging/", ".venv/"))
     ]
 
     assert leaked == [], f"这些不该进 wheel：{leaked[:10]}"
@@ -141,3 +153,64 @@ def test_the_installed_layout_is_importable_from_anywhere(tmp_path):
     answer = __import__("json").loads(result.stdout)
     assert answer["package"] == str(REPO_ROOT / "agent_runtime")
     assert answer["workspace"] == str(tmp_path)
+
+
+# --- 冻结产物：两条只在二进制里才成立的约定 ---------------------------------------
+#
+# 下面两条都不摆弄 PyInstaller（那要几十秒、还要装它），它们只把"冻结"这件事**装出来**
+# ——一个 `_MEIPASS`、一个 `sys.frozen` —— 然后问结果。理由见模块 docstring 最后那一节：
+# 这两条约定在源码目录里跑起来**永远是对的**，所以只能靠测试守。
+
+
+def test_the_code_paths_follow_the_bundle_when_frozen(tmp_path):
+    """冻结之后，随包的数据文件要从 `_MEIPASS` 下找，不能从 `__file__` 算。
+
+    它同时是**"收口"的证据**：`messages.py` 和 `grep.py` 原来各自用 `__file__` 算一遍
+    （在源码目录里和 `package_dir()` 恰好等价），现在必须走 `paths`。谁把它们改回去，
+    这一条就红 —— 而那种回退在本地是看不出来的。
+    """
+    script = (
+        "import sys, json;"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r});"
+        f"sys._MEIPASS = {str(tmp_path)!r};"
+        "from agent_runtime import paths;"
+        "from agent_runtime.protocol import messages;"
+        "from agent_runtime.tools.builtin import grep;"
+        "print(json.dumps({'package': str(paths.package_dir()),"
+        " 'schema': str(messages.SCHEMA_DIR), 'vendor': str(grep.vendor_dir())}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=str(tmp_path),
+        capture_output=True, encoding="utf-8", errors="replace",
+    )
+    assert result.returncode == 0, result.stderr
+
+    answer = __import__("json").loads(result.stdout)
+    bundle = tmp_path / "agent_runtime"
+    assert answer["package"] == str(bundle), "冻结时包目录应该落在 _MEIPASS 下"
+    assert answer["schema"] == str(bundle / "protocol" / "schema")
+    assert answer["vendor"] == str(bundle / "tools" / "vendor" / "rg")
+
+
+def test_the_runtime_child_is_spawned_without_dash_m_when_frozen(monkeypatch):
+    """冻结产物里，子进程必须是"同一个 exe 直接带 `--runtime-stdio`"。
+
+    界面是父进程，runtime 是它拉起的子进程，而冻结之后 `sys.executable` 就是那个 exe
+    —— 它不是一个通用解释器，`-m agent_runtime.main` 会直接失败。症状是"界面闪一下
+    就退"。这条约定在源码目录里**永远是对的**（那里 `-m` 正是对的写法），所以只能靠
+    测试守。
+    """
+    from agent_runtime.protocol import client
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    frozen = client.default_argv(None, stream=True)
+    assert "-m" not in frozen, f"冻结之后不该再走 -m：{frozen}"
+    assert "agent_runtime.main" not in frozen
+    assert frozen[0] == sys.executable
+    assert "--runtime-stdio" in frozen
+
+    monkeypatch.delattr(sys, "frozen")
+    normal = client.default_argv(None, stream=True)
+    assert "-m" in normal and "agent_runtime.main" in normal, (
+        f"源码 / 安装那一支仍然要走 -m（它比绝对路径稳，见 client.py）：{normal}"
+    )

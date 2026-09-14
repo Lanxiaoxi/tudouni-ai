@@ -69,6 +69,21 @@ uv run python -m agent_runtime.main   # 同上，写全一点
 uv run pytest
 ```
 
+### 发给别人：一个不含源码的压缩包
+
+要把这个程序交给**不装 Python、也不该看到源码**的人，出一条发布包：
+
+```powershell
+uv sync --group build            # 或者：uv pip install pyinstaller
+uv run python scripts/build_release.py
+```
+
+产物是 `dist/tudouni-<版本>-<triple>.zip`，里面没有 `.py`，用户解压后跑
+`install.ps1` / `install.sh` 就能用。**在哪个平台跑就出哪个平台的包**（PyInstaller 不是
+交叉编译器），Windows 和 Linux 各跑一次。
+
+完整流程、产物内容和打包时会验什么，见 [`doc/release.md`](doc/release.md)。
+
 ## 用法
 
 **`tudouni` 在哪个目录里跑，就在操作哪个项目** —— 和 `git` / `npm` 一样。会话、审计日志、
@@ -1370,7 +1385,8 @@ agents/            编排层
 
 ── 其它 ──────────────────────────────────────────────────────────────────
 scripts/verify_tui.py  端到端验收：真 TUI + 真子进程 + 本地 HTTP 桩
-doc/                   design（TUI-design.md）、契约（protocol.md）、输入（TUI.md）
+doc/                   design（TUI-design.md）、契约（protocol.md）、输入（TUI.md）、
+                       出包（release.md）
 tests/                 全套测试（含"每个模块都能导入"的冒烟测试；时间靠注入的假时钟断言）
 ```
 

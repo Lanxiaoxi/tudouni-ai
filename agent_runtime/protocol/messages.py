@@ -21,10 +21,17 @@
 """
 
 import json
-from pathlib import Path
 from typing import Any
 
-SCHEMA_DIR = Path(__file__).resolve().parent / "schema"
+from agent_runtime import paths
+
+# 协议 schema 住在哪。**走 `paths`，不自己算 `__file__`。**
+#
+# 这两者在源码目录里恰好等价，所以自己算一版本来看不出任何问题 —— 而冻结成可执行文件
+# 之后就不等价了：数据文件被搬到 `_MEIPASS` 下面，`__file__` 却指向别处。那时候的症状是
+# 协议校验路径没得可校，属于"能起来但悄悄少了一层"。同一件事只有一份算法，是 `paths.py`
+# 立在那里唯一的理由。
+SCHEMA_DIR = paths.package_dir() / "protocol" / "schema"
 
 # 信封版本。**每条消息都带**，两端各自检查。
 #

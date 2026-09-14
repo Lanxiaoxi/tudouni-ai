@@ -107,8 +107,22 @@ def default_argv(session: str | None = None, *, autopilot: bool = False,
     `stream` 默认**开**：这个入口只服务界面（TUI / ansi），而界面要的就是逐字。
     `--no-stream` 显式传一个 `--stream` 过去关掉它 —— **两个方向都写出来**，
     因为子进程的默认值不需要和父进程的意图一致：这里说了才算。
+
+    ## 冻结成可执行文件之后，前两条要换个说法
+
+    `sys.executable` 在打包产物里就是**我们自己那个 exe**，而它不是一个通用解释器：
+    `-m agent_runtime.main` 解析不了任何模块，`-u` 也不是它认的开关（那个参数会原样
+    落进 `sys.argv`，被 argparse 当成"不认识的参数"）。所以冻结之后改成把同一个 exe
+    重新起一遍、**直接走 `--runtime-stdio` 那一支**（`main.py` 本来就把它当开关）。
+
+    第 2 条（`-u`）在这条路上**不需要替代品**：`codec.write_message` 每条都 flush，
+    而子进程的 stdout 是管道（默认块缓冲）这一条已经在那边解掉了。真去加
+    `PYTHONUNBUFFERED` 反而是在补一个不存在的洞。
     """
-    argv = [sys.executable, "-u", "-m", RUNTIME_MODULE, "--runtime-stdio"]
+    if getattr(sys, "frozen", False):
+        argv = [sys.executable, "--runtime-stdio"]
+    else:
+        argv = [sys.executable, "-u", "-m", RUNTIME_MODULE, "--runtime-stdio"]
     if session is not None:
         argv += ["--session", session]
     if autopilot:
