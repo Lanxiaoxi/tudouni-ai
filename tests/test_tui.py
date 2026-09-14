@@ -2513,7 +2513,15 @@ async def test_ctrl_t_toggles_the_turn_you_are_looking_at(monkeypatch):
 
 @pytest.mark.anyio
 async def test_theme_command_switches_all_fourteen_live(monkeypatch):
-    """`/theme`：14 套在运行中换，而且**换完立刻重画**（不是等下一次事件）。"""
+    """`/theme`：14 套在运行中换，而且**换完立刻重画**（不是等下一次事件）。
+
+    不带参数从前是"列一张清单"，现在弹选择面板（`OptionPicker`）。所以这条测试
+    跟着改成：候选**把 14 套都摆出来**（含序号和 key），选中之后配色**当场**换掉、
+    面板**立刻收掉** —— 配色是本地事实，没有"等 runtime 回话"那一段（和 `/model`
+    的差别见设计稿 18.2）。
+    """
+    from agent_runtime.frontends.tui import widgets
+
     app = _build_app(monkeypatch)
 
     async with app.run_test() as pilot:
@@ -2533,8 +2541,24 @@ async def test_theme_command_switches_all_fourteen_live(monkeypatch):
         assert app.theme == "C"
         assert "没有这套配色" in _log_text(app)
 
-        # 不带参数 = 列清单（14 套都在）。
+        # 不带参数 = 弹选择面板，14 套都在（序号 + key + 名字）。
         app.submit("/theme")
         await _settle(app, pilot)
-        assert "14 套" in _log_text(app)
-        assert "P7 靛夜" in _log_text(app)
+        assert isinstance(app.screen, widgets.OptionPicker)
+        picker_text = "\n".join(str(child.render())
+                                for child in app.screen.query(".option"))
+        for index, key in enumerate(theme_mod.ORDER, 1):
+            assert f"{index:>2} {key} {theme_mod.get(key).name}" in picker_text
+        # 当前那一套带 `●`（候选里一定有它，不标出来"选了却没反应"看起来像坏了）。
+        from agent_runtime.frontends.tui import view_state
+        assert any(option.line.role == view_state.ROLE_WAITING
+                   and "墨绿仪器" in str(option.line)
+                   for option in app._theme_options())
+
+        # 选中当场生效：把光标挪到当前那一套（`C`），按下去之后配色不变但面板收掉
+        # —— "选了一个已经在用的"不该变成一个什么都没发生。
+        app.screen._index = theme_mod.ORDER.index("C")
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert not isinstance(app.screen, widgets.OptionPicker), "选完立刻收掉"
+        assert app.theme == "C"

@@ -2122,6 +2122,236 @@ class SkillsPanel(ModalScreen):
         self.dismiss(None)
 
 
+class OptionPicker(ModalScreen):
+    """**从一份清单里挑一个**：`/model` 和 `/effort` 不带参数时弹这个。
+
+    它替换掉的是"先 `/model` 看一眼清单、再把名字**一个字符不差地**打一遍"——
+    两步里第一步只是为了把名字抄出来，而抄错的后果按设计稿那句是"只在账单上体现"
+    （Pro 的未命中输入是 Flash 的四倍多）。名字可以又长又带 `provider/` 前缀，
+    手抄它不该是唯一的输入方式。
+
+    ## 三条约束，都是从它替代的那条路里学来的
+
+      * **`Enter` = 选了，`Esc` = 什么都不做**（`dismiss(None)`）。`Esc` 刻意没有
+        "关掉顺便做点什么"的语义：这一格决定下一次请求花多少钱、想多久，误触的
+        代价比"没选"大得多（和 `SessionPicker` 同一条）；
+      * **当前那一个带 `●`**：候选里一定有它，而不标出来的话"选了却没反应"看起来
+        像坏了；
+      * **数据是 runtime 给的**（`state.model_catalog` / `state.effort_levels`），
+        界面不自己去读配置、更不写死档位 —— 理由见设计稿 16.2。
+
+    ## 面板**不关**（和 `McpPanel` 同一条，和 `SessionPicker` 相反）
+
+    按 `Enter` 之后面板留着：这一格**只有 runtime 知道成没成**（那条路由上有没有
+    密钥、名字对不对），先关掉的话，"没换成"就只表现为一张关掉的浮层 —— 而那和
+    "换成了一下子没看出来"分不开。出结果时 `App` 调 `show_result(...)` 把那句话
+    原样写在面板底下，**关掉的时机交给用户按 `Esc`**（这一格改错了要花真钱，让人
+    看清那句话再走）。想再选一个的话光标还在原处，再按 `Enter` 就换。
+
+    这条路径上**界面不乐观更新**：`●` 跟着 `state`，而 `state` 只由 runtime 的快照改。
+
+    `↑↓` 用 `on_key` 而不是 `BINDINGS`：和 `SessionPicker` / `QuestionPanel` 同一个
+    理由 —— 这个面板没有焦点在可编辑控件上，键直接落到 screen 上；走绑定反而要和
+    `App` 那一层的 `↑↓`（翻会话流）抢。
+    """
+
+    BINDINGS = [("escape", "close", "取消")]
+
+    class Chosen(Message):
+        """在这个面板里按了 `Enter`。**带的是选中那一项的值**。
+
+        ## 为什么不是 `dismiss(值)`
+
+        `dismiss` 会**立刻把面板收掉**，而这个面板收得比那晚一点：选中的那一刻请求
+        才刚发出去，`/model` 的成败要等 runtime 回话（那条路由有没有密钥）。先收掉的
+        话，"没换成"就只表现为一张空掉的浮层 —— 和"换成了一下子没看出来"分不开。
+
+        所以这里只**报一声**（消息冒泡到 `App`，由它去发那条协议消息），而面板**由
+        用户按 `Esc` 关**（回话由 `App` 写在面板底下，见 `show_result`）。和
+        `PromptArea.Submitted` 是同一条分工。
+        """
+
+        def __init__(self, value: str, screen: "OptionPicker") -> None:
+            self.value = value
+            # 面板自己**也随消息带出去**：`/theme` 那条路要在处理完之后把它收掉
+            # （消息上没有 `.screen` 这个属性，实测 `AttributeError`）。
+            self.picker = screen
+            super().__init__()
+
+    def __init__(self, title: str, options: list[view_state.Option],
+                 palette: theme_mod.Theme, *, hint: str = "",
+                 default_index: int | None = None,
+                 items: Any = None, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.palette = palette
+        self.title = title
+        self.options = list(options)
+        self.hint = hint
+        # 一个"重新算一遍候选"的取数函数（`/model` `/effort` 传，`/theme` 不传）。
+        #
+        # **为什么需要它**：面板选完**不关**（见下面那段），而 `options` 是打开那一刻
+        # 的快照 —— 不重算的话，换完之后 `●` 和那一档的高亮还停在**旧**那一项上，
+        # 看起来像"刚才那一按没生效"（实测被用户一眼看出来）。所以 `App` 在
+        # `ui(state)` 快照到了之后调 `refresh()`，这里拿最新的 state 重新画一遍。
+        self._items = items
+        self._index = self._initial_index(default_index)
+
+    def _initial_index(self, default_index: int | None) -> int:
+        """光标初始停在哪儿。
+
+        **默认停在当前那一个**（`●` 那一条），而调用方可以指定别的：`/model` 传
+        "当前的下一个"，因为打开这个面板的人几乎总是想**换一个**，而模型清单长起来
+        之后（多 provider）从第二项往下找比从中间往下找少按好几次；`/effort` 不传
+        —— 档位只有三四个，"换一个"和"改一档"再按一次键的成本一样，那就干脆停在
+        真值上（"我现在是哪一档"是这个面板要回答的第一个问题）。
+        """
+        if not self.options:
+            return -1
+        if default_index is not None:
+            return default_index % len(self.options)
+        for index, option in enumerate(self.options):
+            if option.line.role == view_state.ROLE_WAITING:
+                return index
+        return 0
+
+    def selected(self) -> view_state.Option | None:
+        if not self.options or self._index < 0:
+            return None
+        return self.options[self._index]
+
+    def show_result(self, text: str, *, ok: bool = True) -> None:
+        """runtime 回话了：把那句话画到底部（**原样**，界面不另写一句）。"""
+        foot = self.query("#option-result")
+        if foot:
+            foot[0].update(Text(text, style=(
+                self.palette.ok if ok else self.palette.warn)))
+
+    def reload_options(self) -> None:
+        """拿**最新的** state 重算候选并重画（`●`、高亮和 note 都跟着走）。
+
+        `App` 在每份 `ui(state)` 快照之后调它。**光标停在原来的序号上不动**：换完
+        之后人往往还要再看一眼或者再换一个，把光标跳走会让"我刚才选的是哪一个"失去
+        锚点 —— 而 `●` 已经把那件事说清楚了。
+
+        没传取数函数的（`/theme`）什么都不做：那一屏选完就关，没有"等回话"这一段。
+
+        **名字里没有 `refresh` 是有意的**：Textual 的 `Widget` 自己有一个
+        `refresh(*, repaint=…)`，覆盖它会炸在"框架调 `self.refresh()` 重画"那一步
+        （实测：`TypeError: got an unexpected keyword argument 'repaint'`）。
+        """
+        if self._items is None:
+            return
+        self.options = list(self._items())
+        if self.options:
+            self._index = min(max(self._index, 0), len(self.options) - 1)
+        else:
+            self._index = -1
+        self._paint()
+
+    # -- 画 -----------------------------------------------------------------
+
+    def compose(self):
+        with Modal("option-body"):
+            yield Horizontal(
+                Static(Text(self.title, style=self.palette.ink + " bold")),
+                Static(Text(f"{len(self.options)} 个", style=self.palette.ink4),
+                       classes="modal-badge"),
+                classes="modal-head",
+            )
+            if self.options:
+                yield Vertical(id="option-options")
+                # 选中那一条的 note（"这条路由没有密钥"之类）画在清单**下面**：
+                # 挂到那一行里会把行撑到折行，而折行会让"名字那一列"对不齐 ——
+                # 那一列正是这个面板唯一要让人一眼扫完的东西。
+                yield Static(Text("", style=self.palette.ink4), classes="modal-hint",
+                             id="option-note")
+            else:
+                yield Static(Text(self.hint, style=self.palette.ink4),
+                             classes="modal-hint")
+            yield Static(Text("", style=self.palette.warn), classes="modal-foot",
+                         id="option-result")
+            yield Static(Text(
+                "↑↓ 选择  ·  Enter 确认  ·  Esc 取消  ·  ● = 当前",
+                style=self.palette.ink4), classes="modal-foot")
+
+    def on_mount(self) -> None:
+        self._paint()
+
+    def _paint(self) -> None:
+        note = self.query("#option-note")
+        chosen = self.selected()
+        if note:
+            # note 为空时**整行收起来**（`display = False`）：留着一个空行会让面板
+            # 底部多出一道说不清来历的空白，而它大多数时候是空的（只有 runtime
+            # 给了 note 的那几条才有字）。
+            text = chosen.note if chosen is not None else ""
+            note[0].display = bool(text)
+            note[0].update(Text(text, style=self.palette.ink4))
+        if not self.options:
+            return
+        options = self.query_one("#option-options", Vertical)
+        options.remove_children()
+        for index, option in enumerate(self.options):
+            selected = index == self._index
+            text = Text()
+            if selected:
+                # 选中那条**不带行内样式**（除了那个块字符）：反白由 CSS 的
+                # `.option.selected` 给，那样底色铺满整行而不是只有文字那么长
+                # （和 `SessionPicker` 同一个坑）。前面补三个空格是让选中和未选中
+                # 两条的**名字那一列对齐**（`▌` 和那三个空格一样宽）。
+                text.append("▌  ")
+                text.append(str(option.line))
+            else:
+                text.append("   ")
+                # 分段着色走 `Line.segments`（和 `paint()` 同一条规矩）。
+                for chunk, role in (option.line.segments
+                                    or [(str(option.line), option.line.role)]):
+                    text.append(chunk, style=style_of(self.palette, role))
+            options.mount(Static(text, classes=(
+                "option selected" if selected else "option")))
+
+    # -- 键 -----------------------------------------------------------------
+
+    def _move(self, delta: int) -> None:
+        if not self.options:
+            return
+        self._index = (self._index + delta) % len(self.options)
+        self._paint()
+
+    def on_key(self, event: Any) -> None:
+        if event.key == "up":
+            self._move(-1)
+            event.stop()
+        elif event.key == "down":
+            self._move(1)
+            event.stop()
+        elif event.key == "enter":
+            self.action_choose()
+            event.stop()
+
+    def on_click(self, event: Any) -> None:
+        widget = getattr(event, "widget", None)
+        if widget is None or "option" not in getattr(widget, "classes", ()):
+            return
+        for index, child in enumerate(self.query(".option")):
+            if child is widget:
+                self._index = index
+                self._paint()
+                return
+
+    def action_choose(self) -> None:
+        option = self.selected()
+        if option is None:
+            return
+        # **只报"选了哪一个"**：发请求、关面板、画回话都由 `App` 那一层做 ——
+        # 和 `/resume` 那条分工一模一样。这里不能 `dismiss`（理由见 `Chosen`）。
+        self.post_message(self.Chosen(option.value, self))
+
+    def action_close(self) -> None:
+        """`Esc` = **什么都不做**。见类 docstring 第 1 条。"""
+        self.dismiss(None)
+
+
 class SessionPicker(ModalScreen):
     """**选一个会话**（`/resume` 不带参数时弹这个）。
 
@@ -2431,8 +2661,9 @@ class McpPanel(ModalScreen):
 __all__ = [
     "BorderedPanel", "CommandPalette", "ContextRail", "ConversationLog",
     "HINT_KEYS_EXTRA", "HINT_KEYS_FULL", "HINT_KEYS_NARROW", "HintPanel",
-    "LineBlock", "McpPanel", "MessageBlock", "Panel", "PermissionPanel",
-    "QuestionPanel", "RecentPanel", "SessionBar", "SessionPicker", "SkillsPanel",
+    "LineBlock", "McpPanel", "MessageBlock", "OptionPicker", "Panel",
+    "PermissionPanel", "QuestionPanel", "RecentPanel", "SessionBar",
+    "SessionPicker", "SkillsPanel",
     "StartPanel", "StatusBar", "TopBar", "TurnBlock", "TwoPart",
     "WELCOME_BOX_HEIGHT", "WELCOME_HINT_TEXT", "WELCOME_HINT_WIDTH",
     "WELCOME_RIGHT_WIDTH", "WELCOME_STACK_COLUMNS",

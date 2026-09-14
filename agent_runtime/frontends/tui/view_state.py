@@ -1731,7 +1731,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("/exit", "退出"),
     Command("/help", "命令与键位"),
     Command("/theme", "换配色", True,
-            "不带参数列出 14 套；/theme 石墨琥珀 或 /theme a 直接换"),
+            "不带参数打开选择面板（↑↓ 选、Enter 换、Esc 取消）；"
+            "/theme 石墨琥珀 或 /theme a 或 /theme 10 直接换"),
     Command("/skills", "看全部技能"),
     # **这一条推翻了决策 15 的一部分**（那一版明确不给 `/autopilot`，理由是"它是
     # 一次没有人可问，在有人看着的界面里语义矛盾"）。现在它是"**有人在看着，但他
@@ -1746,8 +1747,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("/status", "看现在的状态"),
     Command("/tools", "工具与权限"),
     Command("/model", "换模型", True,
-            "不带参数列出可选模型；/model deepseek-v4-pro 直接换"
-            "（名字要精确，打错不猜）"),
+            "不带参数打开选择面板（↑↓ 选、Enter 换、Esc 取消）；"
+            "/model deepseek-v4-pro 直接换（名字要精确，打错不猜）"),
     # 思考模式那两个旋钮。**分两条命令**（而不是 `effort=off` 兼作开关）：它们是两个
     # 问题 —— "要不要想"和"想多用力" —— 而合成一个之后，"关着的时候强度是什么"就
     # 变成一个必须回答、又没人关心的问题。
@@ -1755,7 +1756,8 @@ COMMANDS: tuple[Command, ...] = (
             "不带参数看现在是开还是关；/thinking on 或 /thinking off 改它"
             "（关掉不清强度，再打开还是原来那个）"),
     Command("/effort", "思考强度", True,
-            "不带参数看现在是哪一档；/effort low、/effort high、/effort max 改它"
+            "不带参数打开选择面板（↑↓ 选、Enter 换、Esc 取消）；"
+            "/effort low、/effort high、/effort max 直接改"
             "（端点还接受 minimal/medium/xhigh/ultra 这些等价写法）"),
     # MCP 那一档。**不带参数弹面板**（和 `/resume` 同一条交互），面板里 ↑↓ 选、
     # Enter 开关某一个 —— **一次一个**，没有 `all` 这种批量写法：批量会把"哪几个
@@ -2070,8 +2072,86 @@ def render_mcp(message: dict[str, Any]) -> list[Line]:
     return out
 
 
+@dataclass(frozen=True)
+class Option:
+    """选择面板（`widgets.OptionPicker`）里的**一个候选项**。
+
+    `value` 是选中之后回给 runtime 的那个字符串（`provider/model` 或档位名）——
+    面板**不自己拼**它，因为"这个名字怎么写才不歧义"是目录的知识。
+
+    `note` 是 runtime 给的那句"选了会怎样"（两条路由同名、这条没密钥…）：它和
+    `line` 分开，是因为**它不该挤在同一行里** —— 面板那一行已经用了三种颜色写
+    "名字 / 摘要 / 窗口"，再挂一段话进去会把那一行撑到折行（`session_row` 那种
+    一行一件事的排法在这里放不下）。所以面板把它画在候选清单**下面**，只说选中
+    那一个的。
+    """
+
+    value: str
+    line: Line
+    note: str = ""
+
+
+def model_option(item: dict[str, Any], width: int = 0) -> Line:
+    """模型清单里的**一行**：`  ● deepseek/deepseek-flash   快、便宜（Flash · 上下文 1M）`
+
+    ## 为什么这一行要从 `render_models` 里抽出来
+
+    它现在有**两个出口**：不带参数弹的那张选择面板（`widgets.OptionPicker`）和
+    `render_models` 兜底画的纯文本清单（runtime 没给目录时）。两处各画一遍的话，
+    "清单里写什么"就会漂成两份 —— 而漂掉的那一份看起来完全正常，只是少一列
+    （比如窗口、比如 `provider/`）。和 `session_row` / `mcp_line` 是同一条规矩。
+
+    `width` 是名字那一列的宽度（调用方从整份清单算出来）：不传就按自己这一行算，
+    单行调用（测试）不会因为宽度 0 而多出两个空格之外的东西。
+    """
+    name = (f"{item.get('provider')}/{item.get('id')}"
+            if item.get("provider") else str(item.get("id", "")))
+    mark = "●" if item.get("current") else " "
+    window = item.get("window")
+    detail = f"{item.get('label', '')}"
+    if window:
+        detail += f" · 上下文 {tokens_text(window)}"
+    line: Line = seg(
+        (f"  {mark} {name}{' ' * max(2, width - cell_len(name) + 2)}",
+         ROLE_WAITING if item.get("current") else ROLE_PROCESS),
+        (item.get("summary", ""), ROLE_PROCESS),
+        (f"   （{detail}）" if detail else "", ROLE_RULE),
+    )
+    # 那一行 note（"这条路由上没有密钥"之类）由 runtime 给。**返回行本身不含它** ——
+    # 面板把它画在清单下面（见 `Option`），会话流那份纯文本清单仍旧单独起一行。
+    return line
+
+
+def model_options(state: ViewState) -> list[Option]:
+    """模型清单 → 选择面板的候选（`(值, 那一行, 那句 note)`）。
+
+    **值写全成 `provider/model`**：同名模型可以在多条路由上，而"选了哪一个"决定
+    请求发到哪个账号上（理由见 `render_models`）。面板拿它当返回值，不自己拼字符串。
+    """
+    rows = list(state.model_catalog)
+    names = [(f"{item.get('provider')}/{item.get('id')}"
+              if item.get("provider") else str(item.get("id", "")))
+             for item in rows]
+    width = max((cell_len(name) for name in names), default=0)
+    return [Option(name, model_option(item, width), str(item.get("note") or ""))
+            for item, name in zip(rows, names)]
+
+
+def effort_options(state: ViewState, levels: tuple[str, ...]) -> list[Option]:
+    """档位清单 → 选择面板的候选。档位**由 runtime 给**（见 `render_effort`）。"""
+    return [
+        Option(level, Line(f"  {'●' if level == state.effort else ' '} {level}",
+                           ROLE_WAITING if level == state.effort else ROLE_PROCESS))
+        for level in levels
+    ]
+
+
 def render_models(state: ViewState, rest: str = "") -> list[Line]:
-    """`/model` 不带参数时那张清单。
+    """`/model` 的**兜底**那份纯文本清单。
+
+    正常路径是弹选择面板（`/model` 不带参数 → `widgets.OptionPicker`，见设计稿
+    18.1）。这个函数留给两条路：runtime 太老、没随 `init` 发 `model_catalog`
+    （那一版没有清单，面板会是一张空表），以及各处的纯函数测试。
 
     ## 为什么打错名字不是"就近匹配一个"
 
@@ -2093,24 +2173,12 @@ def render_models(state: ViewState, rest: str = "") -> list[Line]:
     here = f"{state.provider}/{state.model}" if state.provider and state.model else (
         state.model or "—")
     out: list[Line] = [Line(f"当前模型：{here}", ROLE_WAITING), Line("可选：", ROLE_RULE)]
-    names = [f"{item.get('provider')}/{item.get('id')}"
-             if item.get("provider") else str(item.get("id", ""))
-             for item in state.model_catalog]
-    width = max(cell_len(name) for name in names) if names else 0
-    for item, name in zip(state.model_catalog, names):
-        mark = "●" if item.get("current") else " "
-        window = item.get("window")
-        detail = f"{item.get('label', '')}"
-        if window:
-            detail += f" · 上下文 {tokens_text(window)}"
-        out.append(seg(
-            (f"  {mark} {name}{' ' * max(2, width - cell_len(name) + 2)}",
-             ROLE_WAITING if item.get("current") else ROLE_PROCESS),
-            (item.get("summary", ""), ROLE_PROCESS),
-            (f"   （{detail}）" if detail else "", ROLE_RULE),
-        ))
-        if item.get("note"):
-            out.append(Line(f"      {item['note']}", ROLE_RULE))
+    # 行由 `model_option` 画（和选择面板同一份）：面板那边也要同一列"名字 / 摘要 /
+    # 窗口"，两处各画一遍的话，改了一处另一处就悄悄少一列。
+    for option in model_options(state):
+        out.append(option.line)
+        if option.note:
+            out.append(Line(f"      {option.note}", ROLE_RULE))
     for alias in state.model_aliases:
         # 旧名字单独列：它们是**认下的名字**，不是能选的选项（官方已把对应的模型
         # 下线，请求由新模型提供服务）。列进主清单会摆出两个效果一样的选项。
@@ -2145,7 +2213,11 @@ def render_thinking(state: ViewState, rest: str = "") -> list[Line]:
 
 
 def render_effort(state: ViewState, levels: tuple[str, ...], rest: str = "") -> list[Line]:
-    """`/effort` 不带参数时那几行：现在是哪一档、有哪几档。
+    """`/effort` 的**兜底**那份纯文本清单：现在是哪一档、有哪几档。
+
+    正常路径是弹选择面板（`/effort` 不带参数 → `widgets.OptionPicker`）。这个函数
+    留给两条路：runtime 太老、没随 `init` 发 `effort_levels`（那一版没有档位清单，
+    面板会是一张空表），以及各处的纯函数测试。
 
     档位清单**由 runtime 给**（`levels`），界面不写死 —— 写死的话，将来端点加一档
     就得改两个地方，而漏改的那一处只表现为"这一档选不了"。
@@ -2155,10 +2227,11 @@ def render_effort(state: ViewState, levels: tuple[str, ...], rest: str = "") -> 
              + ("" if state.thinking_on else "（思考关着，打开才用得上）"), ROLE_WAITING),
         Line("可选：", ROLE_RULE),
     ]
-    for level in levels:
-        mark = "●" if level == state.effort else " "
-        lines.append(Line(f"  {mark} {level}", ROLE_PROCESS if mark == " " else ROLE_WAITING))
-    lines.append(Line(f"改：/effort {'  ·  /effort '.join(levels)}", ROLE_RULE))
+    lines.extend(option.line for option in effort_options(state, levels))
+    if not levels:
+        lines.append(Line("（runtime 没给档位清单：这一版协议之前起的子进程？）", ROLE_WARN))
+    lines.append(Line(f"改：/effort {'  ·  /effort '.join(levels)}" if levels
+                      else "改：/effort <档位>", ROLE_RULE))
     if rest:
         lines.append(Line(f"（没有这一档：{rest}）", ROLE_WARN))
     return lines

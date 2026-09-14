@@ -377,8 +377,8 @@ class TuiApp(App[None]):
     }
 
     /* --- 弹层 ------------------------------------------------------------- */
-    PermissionPanel, QuestionPanel, SkillsPanel, SessionPicker { align: center middle; }
-    #permission-body, #question-body, #skills-body, #session-body {
+    PermissionPanel, QuestionPanel, SkillsPanel, SessionPicker, OptionPicker { align: center middle; }
+    #permission-body, #question-body, #skills-body, #session-body, #option-body {
         width: 76;
         max-width: 96%;
         height: auto;
@@ -395,7 +395,8 @@ class TuiApp(App[None]):
     .modal-title { height: auto; margin-bottom: 1; }
     .modal-hint { height: auto; color: $td-ink4; }
     .modal-foot { height: auto; color: $td-ink4; }
-    #permission-args, #question-options, #skill-list, #session-options {
+    #permission-args, #question-options, #skill-list, #session-options,
+    #option-options {
         background: $td-sunk;
         padding: 0 1;
         margin: 1 0;
@@ -464,6 +465,16 @@ class TuiApp(App[None]):
         # `ui state`（`_run_turn` 的 finally），而它可能排在我们那条回应前面 ——
         # 只认"值对上了"才不会把中间那条当成回应（见 `_report_autopilot`）。
         self._autopilot_wanted: bool | None = None
+        # 选择面板（`/model` `/effort` `/theme`）选中之后要调的那个：一个收字符串的
+        # 函数。**它必须活得比面板久**：面板按 `Enter` 时不一定关（`OptionPicker.Chosen`），
+        # 所以没有 `push_screen` 的回调能接住那个值。
+        self._option_pick: Any = None
+        # 那个面板的结果是不是"只有 runtime 知道"（`/model` `/effort` 是，`/theme` 不是）。
+        # 它决定选完之后**面板收不收**：见 `on_option_picker_chosen`。
+        self._option_runtime_backed = True
+        # 那个面板是哪一条命令开的（`model` / `effort` / 空 = 不用重画）。
+        # 它决定 `ui(state)` 快照到了之后**面板按哪份数据重算**：见 `_refresh_option_picker`。
+        self._option_kind = ""
         # 上一次主动问面板快照的时刻（`_maybe_refresh_state` 的节流）。0 表示还没问过
         # —— 第一次遇到"有东西悬着"时应该**立刻**问一次，而不是等满一个间隔。
         self._last_state_refresh = 0.0
@@ -777,6 +788,11 @@ class TuiApp(App[None]):
             level = message.get("level", "info")
             self._say(f"[{level}] {message.get('text', '')}",
                       view_state.ROLE_WARN if level == "warn" else view_state.ROLE_NOTICE)
+            # 选择面板开着的话，那句话同时也写回面板上（并关掉它）—— 见
+            # `_settle_option_picker`：`/model` 的成败只有 runtime 知道，而面板
+            # 要是选完就消失，"没换成"就只表现为一张空掉的浮层。
+            self._settle_option_picker(level, message.get("text", ""),
+                                       str(message.get("code") or ""))
 
     def _on_delta(self, message: dict[str, Any]) -> None:
         """一块流式内容。**逐块追加，不重画整段。**
@@ -1024,6 +1040,10 @@ class TuiApp(App[None]):
             # "你问的 + 它答的"冲稀。左栏就是它的位置。
             view_state.apply_state(self.state, message)
             self._report_autopilot()
+            # 选择面板开着的话，那一屏也要跟着这份快照重画（`/model` `/effort`）
+            # —— 理由见 `_refresh_option_picker`：面板**选完不关**，画的是打开那一刻
+            # 的快照，不重画的话"刚换的那一档左边没有圆点"。
+            self._refresh_option_picker()
             return
         if message.get("kind") == messages.UI_STATUS:
             # `/status` 的回包。**它进会话流**（不是面板）：那是"看一眼就走"的东西，
@@ -1373,24 +1393,44 @@ class TuiApp(App[None]):
         self._client.set_thinking(word == "on")
 
     def _command_effort(self, rest: str) -> None:
-        """`/effort [low|high|max]`。同上：不带参数只列档位。
+        """`/effort [档位]`。**不带参数弹选择面板**，带参数照旧直接发。
 
         档位清单**由 runtime 随协议发**（`effort_levels`），界面不写死也不去 import
         内核 —— 这是决策 18 那条"前端只讲协议"的直接体现：它能长出 Web 前端的前提
-        就是"前端不认识 runtime 的任何 Python 对象"。
+        就是"前端不认识 runtime 的任何 Python 对象"。面板的候选因此也从那一份来：
+        界面只是把"runtime 说有哪几档"摆出来让人挑。
+
+        清单为空（老 runtime 没发这一格）时**退回纯文本**：面板空着比不弹更坏 ——
+        "一个选项都没有的浮层"看起来像界面坏了，而那其实是 runtime 没说。
         """
         if not rest:
-            self._say_lines(view_state.render_effort(self.state, self.state.effort_levels))
+            if self.state.effort_levels:
+                self._push_option_picker(
+                    "思考强度", self._effort_options(), self._pick_effort,
+                    only_current=True, kind="effort")
+            else:
+                self._say_lines(view_state.render_effort(
+                    self.state, self.state.effort_levels))
             return
         if self._client is None:
             return
         self._client.set_effort(rest)
 
     def _command_model(self, rest: str) -> None:
-        """`/model [名字]`。**不带参数只列清单，不做"轮换到下一个"。**
+        """`/model [名字]`。**不带参数弹选择面板**，带参数照旧直接发。
 
-        和 `/theme` 完全同一条交互（理由也一样：轮换会把"我现在用的是哪个"变成一个
-        必须靠记忆的状态，而列一次清单的成本是零）。
+        ## 不带参数为什么是面板（推翻了 15.1 那一版）
+
+        15.1 写的是"`/model` 不带参数时已经有面板的替代品（`/` 那个命令面板本身）"
+        —— 那句话是错的：命令面板只补**命令名**，它一个模型名都补不出来。于是"换
+        模型"的唯一输入方式是**把名字一个字符不差地打一遍**，而名字可以又长又带
+        `provider/` 前缀（`deepseek/deepseek-v4-pro`）。选择面板不是"换了个好看的
+        清单"，它是把那条抄写的路去掉。
+
+        `/theme` 那一条**看错了一眼就看得出来**，所以本来可以先不动它；做它的理由是另一半：
+        清单上那些名字（`石墨琥珀`、`P1 暖橄榄`）此前也只是为了**照着打一遍**，而 14 套的
+        序号和 key 都很容易记错（`/theme 10` 是 `A`，不是 `P10`）。两条的差别落在"选完关不关
+        面板"上（见下面 `runtime_backed`）。
 
         ## 带参数时不自作聪明
 
@@ -1404,11 +1444,146 @@ class TuiApp(App[None]):
         不许乐观更新是同一条规矩。
         """
         if not rest:
-            self._say_lines(view_state.render_models(self.state))
+            if self.state.model_catalog:
+                self._push_option_picker(
+                    "换模型", self._model_options(), self._pick_model, kind="model")
+            else:
+                self._say_lines(view_state.render_models(self.state))
             return
         if self._client is None:
             return
         self._client.set_model(rest)
+
+    # -- 选择面板：`/model` 和 `/effort` 共用一条 ---------------------------------
+
+    def _push_option_picker(self, title: str,
+                            options: list[view_state.Option],
+                            on_pick: Any, *, only_current: bool = False,
+                            runtime_backed: bool = True,
+                            kind: str = "") -> widgets.OptionPicker:
+        """弹一个选择面板，并把"选中之后干什么"接上。
+
+        **`on_pick` 是"发请求 + 等回话"，不是"改显示"** —— 面板报出来的只是选中那一
+        项的值，真正发协议消息的是这里（和 `/resume` 那条分工一样）。显示那一步由
+        `_settle_option_picker` 等 runtime 回话之后做。
+
+        `runtime_backed=True`（`/model` `/effort`）表示"结果只有 runtime 知道"：
+        选完面板**留着**，等它那条 notice 回来把那句话写在面板上，由用户按 `Esc` 关。
+        `runtime_backed=False`（`/theme`）表示换上去当场就生效，选完**立刻关** ——
+        让一个已经完成的操作继续占着屏幕没有意义。
+
+        `kind`（`model` / `effort`）决定"这份候选怎么按最新的 state 重算"，也就是
+        `OptionPicker.reload_options` 那一支 —— 面板选完不关，不重画的话 `●` 和高亮
+        会停在旧的那一项上（见 `_refresh_option_picker`）。`/theme` 不传：它选完就关。
+
+        `only_current=True`（`/effort`）让光标停在**当前那一档**上；`/model` 不停在
+        当前那一个，而是**当前的下一个**：打开这个面板的人几乎总是想换一个（按 `Esc`
+        才是"留在原地"），而模型清单长起来之后从第二项往下找比从中间往下找少按好几下。
+
+        **推屏幕这件事在函数里面做**（而不是 `return` 给调用方去 `push_screen`）：
+        两边各推一次的话，栈上会叠出两个一模一样的面板 —— 上面那个吃按键，于是
+        `Esc` 只关掉一层、看起来"按了没反应"（实测踩过）。
+        """
+        items = {"model": self._model_options,
+                 "effort": self._effort_options}.get(kind) if kind else None
+        picker = widgets.OptionPicker(
+            title, options, self.palette,
+            default_index=(None if only_current
+                           else self._default_option_index(options)),
+            items=items, id="option-picker")
+        # 选中之后干什么**挂在 App 上**（而不是 `push_screen` 的回调）：面板按 `Enter`
+        # 时不一定关（`/model` 那两条要等 runtime 回话，见 `OptionPicker.Chosen`），
+        # 所以没有"dismiss 出来的结果"可接。
+        self._option_pick = on_pick
+        self._option_runtime_backed = runtime_backed
+        self._option_kind = kind
+        self.push_screen(picker)
+        return picker
+
+    # -- 选择面板：候选怎么按最新的 state 重算 ------------------------------------
+
+    def _model_options(self) -> list[view_state.Option]:
+        return view_state.model_options(self.state)
+
+    def _effort_options(self) -> list[view_state.Option]:
+        return view_state.effort_options(self.state, self.state.effort_levels)
+
+    def _refresh_option_picker(self) -> None:
+        """一份 `ui(state)` 快照到了：**选择面板也跟着重画一遍**。
+
+        ## 为什么必须有这一步（它是被用户一眼看出来的）
+
+        面板选完**不关**（等 runtime 那条 notice），而它画的是**打开那一刻**的候选
+        快照。所以 `/effort` 选了 `low` 之后，`●` 和那一行的高亮照旧停在 `high` 上
+        —— 看起来正是"我刚才那一按没生效"，而它其实生效了。
+
+        数据本来就跟得上（`apply_state` 会更新 `state.model` / `state.effort`），
+        跟不上的只有"面板没有按新数据重画"这一件事。
+
+        没开面板（或开的是 `Esc` 就关的那种）时什么都不做。
+        """
+        if not self._option_kind:
+            return
+        screen = self.screen
+        if isinstance(screen, widgets.OptionPicker):
+            screen.reload_options()
+
+    def on_option_picker_chosen(self, message: widgets.OptionPicker.Chosen) -> None:
+        """面板里按了 `Enter`：**把请求发出去**，显示等 runtime 回话（见下）。
+
+        界面在这里**不改任何显示**：`●` 跟着 `state`（模型那两格）或当场重画（配色），
+        而模型那一格只由 runtime 的快照改 —— 和 `/autopilot` 不许乐观更新是同一条规矩。
+        这一格尤其要紧："状态栏写着 pro、请求还发给 flash"正是从这两件事分家开始的。
+
+        **本地那一档选完就把面板收掉**（`/theme`：已经生效了，没有要等的）；runtime
+        那一档留着，等 `_settle_option_picker` 把回话写上去。
+        """
+        pick = self._option_pick
+        if pick is not None:
+            pick(message.value)
+        if not self._option_runtime_backed:
+            message.picker.dismiss(None)
+
+    @staticmethod
+    def _default_option_index(options: list[view_state.Option]) -> int:
+        """`/model` 的初始光标：**当前那一个的下一个**（没有当前就停在第一个）。"""
+        for index, option in enumerate(options):
+            if option.line.role == view_state.ROLE_WAITING:
+                return (index + 1) % len(options)
+        return 0
+
+    def _pick_model(self, name: str) -> None:
+        if self._client is None:
+            return
+        self._client.set_model(name)
+
+    def _pick_effort(self, level: str) -> None:
+        if self._client is None:
+            return
+        self._client.set_effort(level)
+
+    def _settle_option_picker(self, level: str, text: str, code: str) -> None:
+        """选择面板开着时 runtime 回话了：**把那句话原样写在面板上**。
+
+        这是"选中之后面板不立刻关"的另一半（见 `widgets.OptionPicker`）：`/model`
+        的成败只有 runtime 知道（那条路由有没有密钥），而面板要是选完就消失，
+        "没换成"就只表现为一个空掉的浮层 —— 和"换成了一下子没看出来"分不开。
+
+        那句话由 runtime 拼（含"上一个是谁、下一次请求生效"），这里**一个字都不改**
+        地贴上去。**面板留着不关**（和 `McpPanel` 同一条）：关掉的时机交给用户按
+        `Esc` —— 这一格改错了要花真钱，让人看清那句话再走，比替他决定"看够了吧"好。
+        想再选一个的话光标还在原处，按 `Enter` 就换。
+
+        只认 `model` / `effort` 那两个 code：面板开着时别的 notice（启动说明之类）
+        照样会来，而让它们把面板关掉就是"选到一半被一条无关的话挤走"。
+        没开花面板时（走命令行写法）这里什么都不做。
+        """
+        if code not in ("model", "effort"):
+            return
+        screen = self.screen
+        if not isinstance(screen, widgets.OptionPicker):
+            return
+        screen.show_result(text, ok=level != "warn")
 
     def _command_autopilot(self) -> None:
         """`/autopilot`：切换"不再逐条问审批"那个模式。**开关在 runtime 手里。**
@@ -1525,25 +1700,59 @@ class TuiApp(App[None]):
         self.push_screen(panel, chosen)
 
     def _command_theme(self, rest: str) -> None:
-        """`/theme [名字]`。**不带参数就只列清单**（不做"轮换到下一套"）。
+        """`/theme [名字]`。**不带参数弹选择面板**，带参数照旧直接换。
 
         轮换听起来方便，但它把"我现在是哪一套"变成了一个必须靠记忆的状态 ——
-        而列一次清单的成本是零。
+        而列一次清单的成本是零。选择面板比清单更省事：清单上那些名字（`石墨琥珀`、
+        `P1 暖橄榄`）本来也只是为了**照着打一遍**，而 14 套的序号和 key 都很容易记错
+        （`/theme 10` 是 `A`，不是 `P10`）。
+
+        ## 它和 `/model` 那条面板有一处**刻意的不一样**
+
+        **选完立刻关**：配色是本地的，换上去就生效（`_set_theme` 当场重画），没有
+        "等 runtime 回话"这一段。所以它走的是 `runtime_backed=False` 那条路 ——
+        面板收掉，回声由会话流那一行说（`配色换成 A 石墨琥珀（只影响这次运行）`）。
+        `/model` 那边相反（成不成只有 runtime 知道），理由见 18.2。
         """
         if not rest:
-            self._say_lines([
-                view_state.Line(f"当前配色：{self.theme} {self.palette.name}",
-                                view_state.ROLE_WAITING),
-                view_state.Line("14 套：", view_state.ROLE_RULE),
-                *[view_state.Line("  " + part, view_state.ROLE_PROCESS)
-                  for part in theme_mod.listing().split(" · ")],
-                view_state.Line("换一套：/theme 石墨琥珀  ·  /theme a  ·  /theme 10",
-                                view_state.ROLE_RULE),
-            ])
+            self._push_option_picker("换配色", self._theme_options(),
+                                     self._pick_theme, runtime_backed=False)
             return
         key = theme_mod.resolve(rest)
         if key is None:
             self._say(f"没有这套配色：{rest}（/theme）")
+            return
+        self._set_theme(key)
+        self._say_lines([view_state.seg(
+            ("配色换成 ", view_state.ROLE_RULE),
+            (f"{key} {self.palette.name}", view_state.ROLE_WAITING),
+            ("（只影响这次运行）", view_state.ROLE_RULE),
+        )])
+
+    def _theme_options(self) -> list[view_state.Option]:
+        """14 套 → 选择面板的候选。顺序就是展示顺序（`theme_mod.ORDER`）。
+
+        序号那一列也在，因为它就是 `/theme <序号>` 收的那个数（`/theme 10` → `A`）
+        —— 面板上写着 `10 A 石墨琥珀`，命令写法那条路就不用另外解释了。
+        `source`（`色卡⑦` / `F7-D · Tokyo Night 血统`）放进 note：那一句话是"这套
+        从哪来的"，它属于**选中那一条**，挂在每一行里会把名字那一列挤歪。
+        """
+        out: list[view_state.Option] = []
+        for index, key in enumerate(theme_mod.ORDER, 1):
+            theme = theme_mod.THEMES[key]
+            current = key == self.theme
+            out.append(view_state.Option(
+                key,
+                view_state.Line(
+                    f"  {'●' if current else ' '} {index:>2} {key} {theme.name}",
+                    view_state.ROLE_WAITING if current else view_state.ROLE_PROCESS),
+                theme.palette.source,
+            ))
+        return out
+
+    def _pick_theme(self, key: str) -> None:
+        """面板里选了一套：**当场换、当场说**（和带参数那条写法共用同一句回声）。"""
+        if key not in theme_mod.THEMES:
             return
         self._set_theme(key)
         self._say_lines([view_state.seg(

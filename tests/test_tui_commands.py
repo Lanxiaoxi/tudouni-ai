@@ -19,8 +19,44 @@
 
 import pytest
 
-from agent_runtime.frontends.tui import view_state
+from agent_runtime.frontends.tui import view_state, widgets
 from test_tui import _build_app, _log_text, _settle
+
+# 一份"两个模型可选"的 `init`。选择面板那几条测试共用它 —— 两处各抄一份 payload
+# 的话，改了一处另一处就悄悄还在测旧形状。
+CATALOG_INIT = {
+    "v": 1, "t": "init", "session_id": "s", "resumed": True,
+    "model": "deepseek-flash", "provider": "deepseek",
+    "workspace": "C:/w", "max_steps": 80, "context_tokens": 1_000_000,
+    "tools": [], "permissions": {},
+    "audit_path": "C:/w/.tudouni/logs/s.jsonl", "notices": [],
+    "model_catalog": {
+        "models": [{"provider": "deepseek", "id": "deepseek-flash",
+                    "label": "Flash", "window": 1_000_000,
+                    "summary": "快、便宜", "note": "", "current": True},
+                   {"provider": "deepseek", "id": "deepseek-v4-pro",
+                    "label": "Pro", "window": 1_000_000,
+                    "summary": "贵得多", "note": "", "current": False}],
+        "aliases": [],
+    },
+}
+
+
+def _picker_text(app) -> str:
+    """选择面板上**画出来的字**（候选项那一份）。
+
+    断言面板内容必须从控件里读，不能读会话流：面板的意义正是"那些字不随对话滚走"，
+    所以它压根不在 `_log_text(app)` 里 —— 拿会话流去断言只会得到"什么都没发生"。
+    """
+    return "\n".join(str(child.render()) for child in app.screen.query(".option"))
+
+
+def _marked_option(app) -> str:
+    """面板里带 `●` 的那一行（当前那一项）。**用来钉"圆点跟没跟着走"。**"""
+    for option in app.screen.options:
+        if option.line.role == view_state.ROLE_WAITING:
+            return str(option.line)
+    return ""
 
 # --- 第一层：渲染（纯函数）------------------------------------------------------
 
@@ -299,42 +335,272 @@ async def test_the_tools_reply_lands_in_the_conversation_log(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_model_without_arguments_lists_and_with_an_argument_asks_the_runtime(monkeypatch):
-    """不带参数**只列清单**（不做"轮换到下一个"），带参数把名字发给 runtime。
+async def test_model_without_arguments_opens_a_picker_and_with_an_argument_asks_the_runtime(monkeypatch):
+    """不带参数**弹选择面板**，带参数把名字发给 runtime。
 
-    名字**由 runtime 校验**：界面不知道自己有哪些模型（那是目录的知识），所以它
-    连"这个名字对不对"都不判 —— 发出去，等回包（state 或 notice）。
+    面板那一条替代的是"先看一眼清单、再把名字一个字符不差地打一遍"—— 而那个名字
+    可以又长又带 `provider/` 前缀（`deepseek/deepseek-v4-pro`）。所以这条测试盯两件事：
+    面板里的候选**和清单是同一份**（名字写全），以及选中之后回给 runtime 的**就是那个
+    全名**（界面不自己拼、也不猜）。
+
+    带参数时名字**由 runtime 校验**：界面不知道自己有哪些模型（那是目录的知识），所以
+    它连"这个名字对不对"都不判 —— 发出去，等回包（state 或 notice）。
     """
     app = _build_app(monkeypatch)
 
     async with app.run_test(size=(140, 40)) as pilot:
-        app._inbox.put(("message", {
-            "v": 1, "t": "init", "session_id": "s", "resumed": True,
-            "model": "deepseek-flash", "workspace": "C:/w", "max_steps": 80,
-            "context_tokens": 1_000_000, "tools": [], "permissions": {},
-            "audit_path": "C:/w/.tudouni/logs/s.jsonl", "notices": [],
-            "model_catalog": {
-                "models": [{"provider": "deepseek", "id": "deepseek-flash",
-                            "label": "Flash", "window": 1_000_000,
-                            "summary": "快、便宜", "note": "", "current": True},
-                           {"provider": "deepseek", "id": "deepseek-v4-pro",
-                            "label": "Pro", "window": 1_000_000,
-                            "summary": "贵得多", "note": "", "current": False}],
-                "aliases": [],
-            },
-        }))
+        app._inbox.put(("message", dict(CATALOG_INIT)))
         await _settle(app, pilot)
         assert [item["id"] for item in app.state.model_catalog] == \
             ["deepseek-flash", "deepseek-v4-pro"]
 
         app.submit("/model")
         await _settle(app, pilot)
-        assert _log_text(app).count("deepseek-v4-pro") >= 1
-        assert app._client.sent == [], "不带参数只列清单，不进 runtime"
+        assert isinstance(app.screen, widgets.OptionPicker), "不带参数弹面板"
+        # 候选在**面板**里（不是会话流）：名字那一列写全成 provider/model。
+        assert "deepseek/deepseek-v4-pro" in _picker_text(app)
+        assert app._client.sent == [], "还没选，什么都不发"
+
+        # `Enter` = 换到光标那一个。默认光标落在**当前的下一个**（打开面板的人几乎
+        # 总是想换一个），也就是清单里第二个。
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_model",
+                                        "model": "deepseek/deepseek-v4-pro"}
 
         app.submit("/model deepseek-v4-pro")
         await _settle(app, pilot)
         assert app._client.sent[-1] == {"t": "set_model", "model": "deepseek-v4-pro"}
+
+
+@pytest.mark.anyio
+async def test_escape_in_the_model_picker_changes_nothing(monkeypatch):
+    """`Esc` = **什么都不做**，而且一个字节都不发给 runtime。
+
+    模型换错是要花真钱的（Pro 的未命中输入是 Flash 的四倍多），所以"没选"必须是一个
+    零后果的动作 —— 和 `SessionPicker` 那条同源（换会话误触的代价同样大）。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", dict(CATALOG_INIT)))
+        await _settle(app, pilot)
+
+        app.submit("/model")
+        await _settle(app, pilot)
+        assert isinstance(app.screen, widgets.OptionPicker)
+
+        await pilot.press("escape")
+        await _settle(app, pilot)
+        assert not isinstance(app.screen, widgets.OptionPicker), "面板关掉了"
+        assert app._client.sent == [], "什么都没发"
+        assert app.state.model == "deepseek-flash"
+
+
+@pytest.mark.anyio
+async def test_the_model_picker_waits_for_the_runtime_and_says_what_happened(monkeypatch):
+    """选完**面板不马上关**：`/model` 的成败只有 runtime 知道。
+
+    先关掉的话，"这条路由上没有密钥、没换成"就只表现为一张关掉的浮层 —— 和"换成了
+    一下子没看出来"分不开。所以拿到那条 notice 之前，面板照旧开着；notice 到了，
+    它的话**原样**写在面板上（关掉的时机交给用户按 `Esc`）。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", dict(CATALOG_INIT)))
+        await _settle(app, pilot)
+        app.submit("/model")
+        await _settle(app, pilot)
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_model",
+                                        "model": "deepseek/deepseek-v4-pro"}
+        assert isinstance(app.screen, widgets.OptionPicker), "回话之前面板还在"
+
+        app._inbox.put(("message", {"v": 1, "t": "notice", "level": "warn",
+                                    "code": "model",
+                                    "text": "[模型] 没换：acme 这条路由上没有密钥"}))
+        await _settle(app, pilot)
+        # 那句话在**会话流**里也留了一份（notice 那条路没动），往回翻还看得见。
+        assert "没换" in _log_text(app)
+        # 也在面板上（原样）—— 面板这时还开着，人看清了再按 `Esc`。
+        assert isinstance(app.screen, widgets.OptionPicker)
+        result = app.screen.query_one("#option-result").render()
+        assert "这条路由上没有密钥" in str(result)
+
+        await pilot.press("escape")
+        await _settle(app, pilot)
+        assert not isinstance(app.screen, widgets.OptionPicker)
+
+
+@pytest.mark.anyio
+async def test_an_unrelated_notice_does_not_take_the_picker_away(monkeypatch):
+    """别的 notice 不许把选择面板挤走。
+
+    面板开着时启动说明那类 notice 照样会来，而"选到一半被一条无关的话关掉面板"
+    比不弹面板更坏 —— 用户会以为自己按错了什么。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", dict(CATALOG_INIT)))
+        await _settle(app, pilot)
+        app.submit("/model")
+        await _settle(app, pilot)
+
+        app._inbox.put(("message", {"v": 1, "t": "notice", "level": "info",
+                                    "code": "startup", "text": "[启动] 技能目录已扫描"}))
+        await _settle(app, pilot)
+        assert isinstance(app.screen, widgets.OptionPicker), "面板还在"
+
+
+@pytest.mark.anyio
+async def test_the_option_picker_shows_the_note_of_the_selected_row(monkeypatch):
+    """选中那条的 note（"这条路由没有密钥"之类）画在清单下面。
+
+    它不能挤进候选那一行：那一行已经有"名字 / 摘要 / 窗口"三段，再挂一段话上去会
+    折行，而折行会让**名字那一列**对不齐 —— 那一列正是这个面板唯一要一眼扫完的东西。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        payload = dict(CATALOG_INIT)
+        payload["model_catalog"] = {
+            "models": [
+                {"provider": "deepseek", "id": "deepseek-flash", "label": "Flash",
+                 "window": 1_000_000, "summary": "快、便宜", "current": True,
+                 "note": "当前用的就是这个"},
+                {"provider": "acme", "id": "m2", "label": "M2", "window": 200_000,
+                 "summary": "自建网关", "current": False,
+                 "note": "这条路由上没有密钥"},
+            ],
+            "aliases": [],
+        }
+        app._inbox.put(("message", payload))
+        await _settle(app, pilot)
+
+        app.submit("/model")
+        await _settle(app, pilot)
+        note = app.screen.query_one("#option-note").render()
+        assert "这条路由上没有密钥" in str(note), "默认光标那一条的 note 画出来了"
+
+
+@pytest.mark.anyio
+async def test_the_theme_picker_applies_at_once_and_closes(monkeypatch):
+    """`/theme` 那条面板和 `/model` 那条**有一处刻意的不同：选完立刻关**。
+
+    配色是本地的，`_set_theme` 当场就重画了 —— 没有"等 runtime 回话"那一段，让一个
+    已经完成的操作继续占着屏幕没有意义。所以它走 `runtime_backed=False`。
+    """
+    from agent_runtime.frontends.tui import theme as theme_mod
+
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert app.theme == "A"
+
+        app.submit("/theme")
+        await _settle(app, pilot)
+        assert isinstance(app.screen, widgets.OptionPicker)
+        # 14 套都在，而且带展示序号（`/theme 10` 收的就是那个数）。
+        text = _picker_text(app)
+        assert " 1 P1 暖橄榄" in text and "10 A 石墨琥珀" in text
+        assert app._client.sent == [], "本地操作，不进 runtime"
+
+        # 把光标挪到 `C 墨绿仪器` 再确认：配色当场换、面板当场收、回声进会话流。
+        app.screen._index = theme_mod.ORDER.index("C")
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app.theme == "C" and "墨绿" in app.palette.name
+        assert not isinstance(app.screen, widgets.OptionPicker), "选完立刻关"
+        assert "配色换成" in _log_text(app)
+
+
+@pytest.mark.anyio
+async def test_escape_in_the_theme_picker_changes_nothing(monkeypatch):
+    """`Esc` = **什么都不做**：配色一个像素都不动。"""
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app.submit("/theme")
+        await _settle(app, pilot)
+        assert isinstance(app.screen, widgets.OptionPicker)
+
+        await pilot.press("escape")
+        await _settle(app, pilot)
+        assert not isinstance(app.screen, widgets.OptionPicker)
+        assert app.theme == "A"
+
+
+@pytest.mark.anyio
+async def test_the_effort_picker_moves_the_dot_when_the_runtime_confirms(monkeypatch):
+    """换完那一档之后，**面板上的 `●` 和高亮要跟着挪过去**。
+
+    这条是用户一眼看出来的：面板选完**不关**（等 runtime 那条 notice），而它画的是
+    **打开那一刻**的候选快照 —— 不重画的话，选了 `low` 之后圆点照旧停在 `high` 上，
+    看起来正是"我刚才那一按没生效"，而它其实生效了。
+
+    数据本来就跟得上（`apply_state` 会更新 `state.effort`），跟不上的只有"面板没有
+    按新数据重画"这一件事 —— 所以这条钉的是**重画**，不是数据。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "init", "session_id": "s", "resumed": True,
+            "model": "deepseek-flash", "provider": "deepseek",
+            "workspace": "C:/w", "max_steps": 80, "tools": [], "permissions": {},
+            "audit_path": "x", "notices": [],
+            "thinking": True, "effort": "high",
+            "effort_levels": ["low", "high", "max"],
+        }))
+        await _settle(app, pilot)
+
+        app.submit("/effort")
+        await _settle(app, pilot)
+        assert "● high" in _marked_option(app)
+
+        # 光标停在当前那一档，`↑` 一下就到 `low`，回车 → 请求发出去。
+        await pilot.press("up")
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_effort", "effort": "low"}
+        assert "● high" in _marked_option(app), "回话之前圆点还在原处（不许乐观更新）"
+
+        # runtime 的快照到了：圆点和高亮挪到 `low`。
+        app._inbox.put(("message", {"v": 1, "t": "ui", "kind": "state",
+                                    "effort": "low",
+                                    "effort_levels": ["low", "high", "max"]}))
+        await _settle(app, pilot)
+        assert app.state.effort == "low"
+        assert "● low" in _marked_option(app), "圆点跟着挪过去了"
+        assert isinstance(app.screen, widgets.OptionPicker), "面板照旧开着"
+
+
+@pytest.mark.anyio
+async def test_the_model_picker_moves_the_dot_when_the_runtime_confirms(monkeypatch):
+    """`/model` 同理：换完之后 `●` 挪到新模型那一行（也在**面板**上，不只看左栏）。"""
+    app = _build_app(monkeypatch)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        app._inbox.put(("message", dict(CATALOG_INIT)))
+        await _settle(app, pilot)
+        app.submit("/model")
+        await _settle(app, pilot)
+        assert "● deepseek/deepseek-flash" in _marked_option(app)
+
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_model",
+                                        "model": "deepseek/deepseek-v4-pro"}
+
+        app._inbox.put(("message", {"v": 1, "t": "ui", "kind": "state",
+                                    "model": "deepseek-v4-pro",
+                                    "model_provider": "deepseek",
+                                    "model_window": 1_000_000}))
+        await _settle(app, pilot)
+        assert "● deepseek/deepseek-v4-pro" in _marked_option(app)
 
 
 @pytest.mark.anyio
@@ -446,6 +712,8 @@ async def test_the_effort_menu_comes_from_the_runtime_not_the_frontend(monkeypat
 
     这条钉的是决策 18：前端只讲协议。写死一份清单的代价是具体的 —— 端点加一档就得改
     两个地方，而漏改的那一处只表现为"这一档选不了"。
+
+    面板的候选**就是那一份清单**：界面只是把"runtime 说有哪几档"摆出来让人挑。
     """
     app = _build_app(monkeypatch)
 
@@ -464,9 +732,66 @@ async def test_the_effort_menu_comes_from_the_runtime_not_the_frontend(monkeypat
 
         app.submit("/effort")
         await _settle(app, pilot)
-        text = _log_text(app)
+        assert isinstance(app.screen, widgets.OptionPicker), "不带参数弹面板"
+        text = _picker_text(app)
         assert "low" in text and "high" in text and "max" in text
-        assert app._client.sent == [], "不带参数只列档位"
+        assert "● low" in text, "当前那一档标出来"
+        assert app._client.sent == [], "还没选，什么都不发"
+
+
+@pytest.mark.anyio
+async def test_the_effort_picker_starts_on_the_current_level_and_sends_what_was_picked(monkeypatch):
+    """`/effort` 的光标**停在当前那一档**（不像 `/model` 停在下一个）。
+
+    档位只有三四个，"换一档"和"看现在是哪一档"按一次键的成本一样 —— 那就停在真值上。
+    按下 `↓` 之后 `Enter` 回给 runtime 的必须是**那一档的名字**。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "init", "session_id": "s", "resumed": True,
+            "model": "deepseek-flash", "provider": "deepseek",
+            "workspace": "C:/w", "max_steps": 80, "tools": [], "permissions": {},
+            "audit_path": "x", "notices": [],
+            "thinking": True, "effort": "low",
+            "effort_levels": ["low", "high", "max"],
+        }))
+        await _settle(app, pilot)
+
+        app.submit("/effort")
+        await _settle(app, pilot)
+        await pilot.press("down")
+        await pilot.press("enter")
+        await _settle(app, pilot)
+        assert app._client.sent[-1] == {"t": "set_effort", "effort": "high"}
+
+
+@pytest.mark.anyio
+async def test_an_old_runtime_without_a_catalog_falls_back_to_the_text_list(monkeypatch):
+    """runtime 没给清单时**退回纯文本**，不弹一张空面板。
+
+    一个选项都没有的浮层看起来像界面坏了，而那其实是 runtime 那一版协议里没有这一格。
+    """
+    app = _build_app(monkeypatch)
+
+    async with app.run_test() as pilot:
+        app._inbox.put(("message", {
+            "v": 1, "t": "init", "session_id": "s", "resumed": True,
+            "model": "deepseek-flash", "workspace": "C:/w", "max_steps": 80,
+            "tools": [], "permissions": {}, "audit_path": "x", "notices": [],
+        }))
+        await _settle(app, pilot)
+
+        app.submit("/model")
+        await _settle(app, pilot)
+        assert not isinstance(app.screen, widgets.OptionPicker), "不弹空面板"
+        assert "没给模型清单" in _log_text(app)
+
+        app.submit("/effort")
+        await _settle(app, pilot)
+        assert not isinstance(app.screen, widgets.OptionPicker)
+        assert "没给档位清单" in _log_text(app)
 
 
 @pytest.mark.anyio
