@@ -128,7 +128,7 @@ def test_the_console_script_is_declared(wheel):
     assert "agent_runtime.main:main" in text
 
 
-def test_the_installed_layout_is_importable_from_anywhere(tmp_path):
+def test_the_installed_layout_is_importable_from_anywhere(workdir):
     """**装成命令之后，包在哪和工作区在哪是两件事。**
 
     这条不构建 wheel，它验的是同一件事的另一半：从一个**和仓库无关的目录**里
@@ -136,6 +136,9 @@ def test_the_installed_layout_is_importable_from_anywhere(tmp_path):
 
     以前这两个是同一个值（工作区就是包目录），所以任何混用都看不出来 —— 而装成命令之后
     立刻分家：包在 site-packages 里，那不是用户的项目。
+
+    **用 `workdir` 而不是 `tmp_path`**：后者走系统临时目录，在受限环境里连建目录都会被拒
+    （`PermissionError: WinError 5`），而那是一条和被测代码毫无关系的失败。
     """
     script = (
         "import sys, json, pathlib;"
@@ -145,14 +148,14 @@ def test_the_installed_layout_is_importable_from_anywhere(tmp_path):
         " 'workspace': str(paths.workspace_dir())}))"
     )
     result = subprocess.run(
-        [sys.executable, "-c", script], cwd=str(tmp_path),
+        [sys.executable, "-c", script], cwd=str(workdir),
         capture_output=True, encoding="utf-8", errors="replace",
     )
     assert result.returncode == 0, result.stderr
 
     answer = __import__("json").loads(result.stdout)
     assert answer["package"] == str(REPO_ROOT / "agent_runtime")
-    assert answer["workspace"] == str(tmp_path)
+    assert answer["workspace"] == str(workdir)
 
 
 def test_the_installer_scripts_have_the_bytes_their_target_needs():
@@ -192,7 +195,7 @@ def test_the_installer_scripts_have_the_bytes_their_target_needs():
 # 这两条约定在源码目录里跑起来**永远是对的**，所以只能靠测试守。
 
 
-def test_the_code_paths_follow_the_bundle_when_frozen(tmp_path):
+def test_the_code_paths_follow_the_bundle_when_frozen(workdir):
     """冻结之后，随包的数据文件要从 `_MEIPASS` 下找，不能从 `__file__` 算。
 
     它同时是**"收口"的证据**：`messages.py` 和 `grep.py` 原来各自用 `__file__` 算一遍
@@ -202,7 +205,7 @@ def test_the_code_paths_follow_the_bundle_when_frozen(tmp_path):
     script = (
         "import sys, json;"
         f"sys.path.insert(0, {str(REPO_ROOT)!r});"
-        f"sys._MEIPASS = {str(tmp_path)!r};"
+        f"sys._MEIPASS = {str(workdir)!r};"
         "from agent_runtime import paths;"
         "from agent_runtime.protocol import messages;"
         "from agent_runtime.tools.builtin import grep;"
@@ -210,13 +213,13 @@ def test_the_code_paths_follow_the_bundle_when_frozen(tmp_path):
         " 'schema': str(messages.SCHEMA_DIR), 'vendor': str(grep.vendor_dir())}))"
     )
     result = subprocess.run(
-        [sys.executable, "-c", script], cwd=str(tmp_path),
+        [sys.executable, "-c", script], cwd=str(workdir),
         capture_output=True, encoding="utf-8", errors="replace",
     )
     assert result.returncode == 0, result.stderr
 
     answer = __import__("json").loads(result.stdout)
-    bundle = tmp_path / "agent_runtime"
+    bundle = workdir / "agent_runtime"
     assert answer["package"] == str(bundle), "冻结时包目录应该落在 _MEIPASS 下"
     assert answer["schema"] == str(bundle / "protocol" / "schema")
     assert answer["vendor"] == str(bundle / "tools" / "vendor" / "rg")

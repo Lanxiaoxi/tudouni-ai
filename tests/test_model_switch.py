@@ -633,7 +633,6 @@ def _open_isolated(workdir, monkeypatch, registry):
     runtime = composition.open_runtime(
         booted=booted, session_id=session_id, session=session,
         channels=_channels(), resumed=resumed,
-        model_config=_model_config(),
         permission_config=PermissionConfig(), web_config=WebConfig(),
         mcp_config=McpConfig(), catalog_config=registry,
     )

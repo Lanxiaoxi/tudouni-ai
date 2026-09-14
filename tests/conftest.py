@@ -125,8 +125,20 @@ def isolated_user_config(monkeypatch):
 
 
 @pytest.fixture
-def fake_openai():
+def fake_openai(monkeypatch):
     """起一个**假的 OpenAI 兼容端点**，返回 `(基址, 脚本列表, 收到的请求列表)`。
+
+    ## 它同时负责"让子进程真的用上这个假网关"
+
+    `70db71f` 之后配置只有一个来源：**环境变量不再被读**，`DEEPSEEK_BASE_URL` 那条
+    老路已经退休。所以只把这个假端点的地址"传出去"是不够的 —— 子进程读的是
+    `AGENT_CONFIG_FILE` 指的那份文件。这个 fixture 就地把那份文件写出来（假地址 +
+    和隔离配置同一批模型），而不是让每个调用点各写一遍：漏写一处，那条测试就会
+    悄悄去敲真的 `api.deepseek.com`，而症状是一个 401 加一条等满超时的记录 ——
+    看起来像"网关坏了"，不像"我忘了接线"。
+
+    模型表从 `_ISOLATED_CONFIG` 原样搬（只换 `base_url`）：窗口那几条断言在测试进程
+    里读的是同一份文件（`fakes.context_windows()`），两边必须说同一件事。
 
     ## 为什么它住在 conftest 而不是某一个测试文件里
 
@@ -140,6 +152,7 @@ def fake_openai():
 
     脚本的最后一条会被重复使用（那些测试只关心前几步）。
     """
+    from agent_runtime import userconfig
     from test_protocol import _Handler
 
     server = HTTPServer(("127.0.0.1", 0), _Handler)
@@ -147,11 +160,27 @@ def fake_openai():
     _Handler.calls = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+
+    base = f"http://127.0.0.1:{server.server_port}/v1"
+    config = json.loads(json.dumps(_ISOLATED_CONFIG))
+    for provider in config["providers"].values():
+        provider["base_url"] = base
+    path = TESTS_DIR / "_tmp" / f"fake-gateway-{uuid.uuid4().hex[:8]}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    # `AGENT_CONFIG_FILE` 是**全项目仅剩的那个环境变量**，而且它不是配置、是"读哪份
+    # 文件"（见 `userconfig.FILE_ENV`）。子进程没有别的地方能收到这个参数。
+    monkeypatch.setenv(userconfig.FILE_ENV, str(path))
+
     try:
-        yield f"http://127.0.0.1:{server.server_port}/v1", _Handler.scripts, _Handler.calls
+        yield base, _Handler.scripts, _Handler.calls
     finally:
         server.shutdown()
         server.server_close()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 @pytest.fixture

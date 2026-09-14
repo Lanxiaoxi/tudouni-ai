@@ -99,6 +99,32 @@ def two_gateways():
         second.close()
 
 
+def _write_models(workdir: Path, providers: dict) -> Path:
+    """把一段 `providers` 写成配置文件，返回路径（子进程用 `AGENT_CONFIG_FILE` 收）。"""
+    path = workdir / "config.json"
+    path.write_text(json.dumps({"providers": providers}, ensure_ascii=False),
+                    encoding="utf-8")
+    return path
+
+
+def _gateway_config(workdir: Path, gateway, *, model: str = "deepseek-flash",
+                    effort: str = "high", window: int = 100_000) -> Path:
+    """把假网关写成一份配置 —— 思考那一组的子进程要它。
+
+    **模型名和出厂强度都声明在文件里**：`reasoning_effort` 是从目录读的，代码里没有
+    写死的默认值（见 `fakes.model_registry` 的 docstring）。窗口同理，它决定
+    `init.context_tokens`。
+
+    以前这一组靠 `DEEPSEEK_BASE_URL` 把假网关地址塞进子进程 —— 那个环境变量已经退休
+    （配置只有一个来源），所以假网关现在必须**真的写进配置文件**才存在。
+    """
+    return _write_models(workdir, {
+        "fake": {"base_url": gateway.base_url, "api_key": "sk-fake",
+                 "models": [{"id": model, "context_window": window,
+                             "reasoning_effort": effort}]},
+    })
+
+
 def _fresh_session() -> str:
     return f"proto-{uuid.uuid4().hex[:10]}"
 
@@ -110,8 +136,11 @@ def run(inbound, *, env_extra=None, session=None, timeout=60.0, cwd=None):
     （不给就会读到开发机上那份 `~/.tudouni/config.json`，而"哪条路由被选中"正是这一组
     要验的东西）。
 
-    `env_extra` 里给 `None` 表示**把这个变量删掉**（不是设成 "None"）。要验"一把
-    DeepSeek 密钥都没有也能跑"就得这么做 —— 上面那行默认值是给别的用例垫的底。
+    `env_extra` 里给 `None` 表示**把这个变量删掉**（不是设成 "None"）：验"一份配置都
+    没有"那两条首次运行的用例这么做。
+
+    **不再垫 `DEEPSEEK_API_KEY`。** 那个环境变量已经退休（配置只有一个来源），塞一个
+    进去只会让人以为它有用 —— 子进程和 `tests/conftest.py` 都不看它。
 
     `cwd` 默认是仓库根（`-m agent_runtime.main` 靠它找到包）。只有要跟"假 home"错开时
     才需要传 —— 验"首次运行往 home 里写模板"时，home **不能落在工作区里面**：工作区是
@@ -119,7 +148,6 @@ def run(inbound, *, env_extra=None, session=None, timeout=60.0, cwd=None):
     一个和 home 平级的目录，包改由 `PYTHONPATH` 找到。
     """
     env = dict(os.environ)
-    env["DEEPSEEK_API_KEY"] = "sk-test"
     env["PYTHONIOENCODING"] = "utf-8"
     for name, value in (env_extra or {}).items():
         if value is None:
@@ -156,16 +184,17 @@ def _state_with(got, key):
 
 # --- 思考开关与强度：真凭据是请求体 ---------------------------------------------
 
-def test_thinking_is_on_by_default_in_the_request(gateway):
+def test_thinking_is_on_by_default_in_the_request(gateway, workdir):
     """**默认开着，而且这条请求自己说清了它要什么。**
 
     端点的默认行为本来就是开，但我们显式发 `thinking: {type: "enabled"}`：默认值会随
     端点变，而这个配置是用户选的 —— 多一个字段换"这条请求在任何时候都是同样的意思"。
     `reasoning_effort` 走顶层（SDK 的原生参数），带的是目录里声明的出厂强度。
     """
+    models = _gateway_config(workdir, gateway)
     code, got, err = run(
         [{"v": 1, "t": "user_message", "text": "你好"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": gateway.base_url}, session=_fresh_session(),
+        env_extra={"AGENT_CONFIG_FILE": str(models)}, session=_fresh_session(),
     )
     assert code == 0, err
     request = gateway.calls[-1]
@@ -177,18 +206,19 @@ def test_thinking_is_on_by_default_in_the_request(gateway):
     assert init["effort_levels"] == ["low", "high", "max"]
 
 
-def test_turning_thinking_off_changes_the_next_request(gateway):
+def test_turning_thinking_off_changes_the_next_request(gateway, workdir):
     """`/thinking off` 之后**下一个请求里没有思考**，而且之后每一轮都没有。
 
     这是这个功能唯一的真凭据：设置改了而请求体没变，界面上说"关"就是假话。
     同时钉住"关着时**不发** `reasoning_effort`"—— 端点会忽略它，但一个没人读的字段
     只会让抓包的人以为它生效了。
     """
+    models = _gateway_config(workdir, gateway)
     code, got, err = run(
         [{"v": 1, "t": "set_thinking", "on": False},
          {"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": gateway.base_url}, session=_fresh_session(),
+        env_extra={"AGENT_CONFIG_FILE": str(models)}, session=_fresh_session(),
     )
     assert code == 0, err
     request = gateway.calls[-1]
@@ -201,7 +231,7 @@ def test_turning_thinking_off_changes_the_next_request(gateway):
     assert notices and "关" in notices[-1]["text"]
 
 
-def test_effort_reaches_the_request_and_survives_a_disabled_thinking(gateway):
+def test_effort_reaches_the_request_and_survives_a_disabled_thinking(gateway, workdir):
     """`/effort max` 落到请求里；**关着思考时它只被记下来**（不发、也不丢）。
 
     ## 两次跑，因为"关着时设强度"和"开着时用它"是两个时刻
@@ -215,7 +245,7 @@ def test_effort_reaches_the_request_and_survives_a_disabled_thinking(gateway):
     那句话的全部内容。
     """
     session = _fresh_session()
-    env_extra = {"DEEPSEEK_BASE_URL": gateway.base_url}
+    env_extra = {"AGENT_CONFIG_FILE": str(_gateway_config(workdir, gateway))}
 
     code, _got, err = run(
         [{"v": 1, "t": "set_thinking", "on": False},
@@ -243,17 +273,18 @@ def test_effort_reaches_the_request_and_survives_a_disabled_thinking(gateway):
     assert _state_with(got, "effort") == "max"
 
 
-def test_a_bad_effort_changes_nothing_and_says_so(gateway):
+def test_a_bad_effort_changes_nothing_and_says_so(gateway, workdir):
     """认不出的强度**什么都不改**，而且回一条说清能写什么的说明。
 
     什么都不改这一半同样重要：改了一半再报错（比如把强度写进会话、但请求没变）会让
     `/status` 和实际发出去的请求对不上。
     """
+    models = _gateway_config(workdir, gateway)
     code, got, err = run(
         [{"v": 1, "t": "set_effort", "effort": "hgih"},
          {"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": gateway.base_url}, session=_fresh_session(),
+        env_extra={"AGENT_CONFIG_FILE": str(models)}, session=_fresh_session(),
     )
     assert code == 0, err
     assert gateway.calls[-1]["reasoning_effort"] == "high", "没改成 → 还是出厂值"
@@ -262,12 +293,13 @@ def test_a_bad_effort_changes_nothing_and_says_so(gateway):
     assert "low" in notices[-1]["text"] and "max" in notices[-1]["text"]
 
 
-def test_a_non_string_effort_is_refused_at_the_envelope(gateway):
+def test_a_non_string_effort_is_refused_at_the_envelope(gateway, workdir):
     """信封那一层只拦"它得是个字符串"（一个 dict 会把整段报错打给用户看）。"""
+    models = _gateway_config(workdir, gateway)
     code, got, err = run(
         [{"v": 1, "t": "set_effort", "effort": {"level": "max"}},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": gateway.base_url}, session=_fresh_session(),
+        env_extra={"AGENT_CONFIG_FILE": str(models)}, session=_fresh_session(),
     )
     assert code == 0, err
     notices = [item for item in kinds(got, "notice") if item.get("code") == "effort"]
@@ -275,13 +307,6 @@ def test_a_non_string_effort_is_refused_at_the_envelope(gateway):
 
 
 # --- 多 provider：真凭据是"请求落到哪一台" ---------------------------------------
-
-def _write_models(workdir: Path, providers: dict) -> Path:
-    path = workdir / "config.json"
-    path.write_text(json.dumps({"providers": providers}, ensure_ascii=False),
-                    encoding="utf-8")
-    return path
-
 
 def test_a_request_lands_on_the_second_gateway_after_switching(two_gateways, workdir):
     """**多 provider 的端到端验收**：配置两条路由，`/model` 换过去之后请求换了台。
@@ -422,10 +447,10 @@ def test_a_custom_provider_needs_no_deepseek_key_at_all(gateway, workdir):
     这一条盯的是一个真实存在过的绑定：装配期曾经无条件走 `ModelConfig.from_env()`，
     而它缺 `DEEPSEEK_API_KEY` 就抛错 —— 于是接了自家网关的人被一句 DeepSeek 的密钥挡在
     门外，哪怕他的路由是好的、密钥也是好的。而真正发出去的那把密钥来自 `providers`
-    （`chosen.provider_key`），和那个环境变量毫无关系。
+    （`chosen.provider_key`）。
 
-    所以这里把 `DEEPSEEK_API_KEY` **删掉**（不是设成空串 —— 那也仍然是一条"能读到但为
-    空"的记录），只留 `providers` 里的一条路由，然后要求这一轮真的跑完。
+    **那个环境变量现在整个退休了**（配置只有一个来源；`tests/conftest.py` 会把它从环境
+    里清掉），所以这一条比原来更强：跑通它靠的只可能是 `providers` 里那一条路由。
     """
     models = _write_models(workdir, {
         "my-gw": {"base_url": gateway.base_url, "api_key": "sk-mine",
@@ -433,12 +458,12 @@ def test_a_custom_provider_needs_no_deepseek_key_at_all(gateway, workdir):
     })
     code, got, err = run(
         [{"v": 1, "t": "user_message", "text": "你好"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"AGENT_CONFIG_FILE": str(models), "DEEPSEEK_API_KEY": None},
+        env_extra={"AGENT_CONFIG_FILE": str(models)},
         session=_fresh_session(),
     )
     assert code == 0, f"只配自家网关就该能跑，却被拦下了：\n{err}"
     assert [call["model"] for call in gateway.calls] == ["my-model"]
-    assert "没找到 DEEPSEEK_API_KEY" not in err
+    assert "DEEPSEEK_API_KEY" not in err
     # 而且这条路由真的被当成默认那条（配置里第一条有密钥的）。
     assert kinds(got, "init")[0]["provider"] == "my-gw"
 
@@ -447,23 +472,23 @@ def test_nothing_configured_asks_for_a_route_not_for_a_deepseek_key(workdir):
     """一条路由都配不出来时，那句话**先让人写 `providers`**，而不是"去弄把 DeepSeek 密钥"。
 
     新用户看到的第一句话就是它（首次运行时模板也是在这一刻被写出来的）。所以它必须让人
-    看出"接哪家都行"，而第 2 条那条捷径只是捷径。原来的第一句话是"没找到
-    DEEPSEEK_API_KEY，两种给法"（一个已经退休的 `_no_key_message`）—— 换成现在这句的
-    全部理由就是把这个工具说成"某家网关的客户端"是错的。
+    看出"接哪家都行"。原来的第一句话是"没找到 DEEPSEEK_API_KEY，两种给法"（一个已经
+    退休的 `_no_key_message`）—— 那个环境变量现在连读都不读了，所以这条判据反过来钉：
+    报错里**不许**再出现那个名字，它只会让新用户去找一个不存在的东西。
     """
     empty = workdir / "empty-config.json"
     empty.write_text("{}", encoding="utf-8")
 
     code, _got, err = run(
         [{"v": 1, "t": "shutdown"}],
-        env_extra={"AGENT_CONFIG_FILE": str(empty), "DEEPSEEK_API_KEY": None},
+        env_extra={"AGENT_CONFIG_FILE": str(empty)},
         session=_fresh_session(),
     )
     assert code == 2, f"配不出模型就该以 2 收场（用户得先做点事）：\n{err}"
     assert "模型层是抽象的" in err, err
-    assert "providers" in err and "任选其一" in err
-    # 第 1 条必须是 providers（真正的模型配置面），捷径排第 2。
-    assert err.index("providers") < err.index("DEEPSEEK_API_KEY"), err
+    # 它要说清去哪儿写：`providers` 里的一条路由，而密钥就在那条路由自己身上。
+    assert "providers" in err and "api_key" in err, err
+    assert "DEEPSEEK_API_KEY" not in err, "别再把人指去弄一把已经退休的环境变量"
 
 
 # --- 首次运行那一步：写模板的接线 ----------------------------------------------
@@ -493,7 +518,7 @@ def test_a_missing_route_scaffolds_the_config_and_points_at_it(workdir):
 
     code, _got, err = run(
         [{"v": 1, "t": "shutdown"}],
-        env_extra={"AGENT_CONFIG_FILE": None, "DEEPSEEK_API_KEY": None,
+        env_extra={"AGENT_CONFIG_FILE": None,
                    "USERPROFILE": str(home), "HOME": str(home),
                    "PYTHONPATH": str(REPO_ROOT)},
         session=_fresh_session(),
@@ -513,13 +538,22 @@ def test_a_usable_route_scaffolds_nothing(workdir):
     容器和 CI 的 home 常常是临时的、甚至只读的，而我们凭什么在那儿留东西。这也是
     `scaffold()` 被放在"报错那一刻"而不是"每次启动"的全部理由。
 
-    这里让 `run()` 垫上的 `DEEPSEEK_API_KEY` 生效（内置那条兜底路由因此可用），于是
-    装配成功、压根走不到报错那一刻。
+    **路由就写在假 home 的默认位置**（`~/.tudouni/config.json`）：这条验的正是"默认那份
+    配置读得到"这条路，所以不能靠 `AGENT_CONFIG_FILE` 从旁边塞一份进来 —— 那样默认路径
+    压根没被走过。这里只喂 `shutdown`，不碰模型，所以 `base_url` 是个不会被请求的地址。
+
+    （原来这条靠 `run()` 垫的那个 `DEEPSEEK_API_KEY` 让"内置兜底路由"可用 —— 那条兜底
+    随环境变量一起退休了。现在"能用"只可能来自配置文件本身。）
     """
     home = workdir / "home"
     ws = workdir / "ws"
-    home.mkdir()
+    (home / ".tudouni").mkdir(parents=True)
     ws.mkdir()
+
+    (home / ".tudouni" / "config.json").write_text(json.dumps({"providers": {
+        "my-gw": {"base_url": "https://nowhere.invalid/v1", "api_key": "sk-mine",
+                  "models": [{"id": "my-model", "context_window": 4096}]},
+    }}, ensure_ascii=False), encoding="utf-8")
 
     code, _got, err = run(
         [{"v": 1, "t": "shutdown"}],
@@ -531,4 +565,6 @@ def test_a_usable_route_scaffolds_nothing(workdir):
     )
 
     assert code == 0, err
-    assert not (home / ".tudouni").exists(), "有可用路由时不该往别人 home 里写东西"
+    # home 里那个 `.tudouni/` 只有我们自己放进去的那一个文件：没有模板、也没有第二份配置。
+    assert [p.name for p in (home / ".tudouni").iterdir()] == ["config.json"], \
+        "有可用路由时不该往别人 home 里写任何东西"

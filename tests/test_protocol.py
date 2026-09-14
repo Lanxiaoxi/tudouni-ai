@@ -11,9 +11,15 @@ PowerShell 的 `2>&1 |` 不保证跨流顺序，比出来的 diff 大半是噪�
 
 ## 假模型怎么进去
 
-`DEEPSEEK_BASE_URL` 指向一个本地起的 HTTP 桩（见 `fake_openai_server`）。这样
-**不碰真网关**，而链路（httpx → openai SDK → 适配层 → Agent）是真的。用 monkeypatch
-把模型换成假的就测不到"配置从环境变量读进来"这一段了。
+`fake_openai` 起一个本地 HTTP 桩，并且**就地写一份指向它的配置文件**、把
+`AGENT_CONFIG_FILE` 指过去（细节见 `tests/conftest.py` 里那个 fixture）。这样
+**不碰真网关**，而链路（配置文件 → 目录 → httpx → openai SDK → 适配层 → Agent）是真的。
+用 monkeypatch 把模型换成假的就测不到"路由和密钥真的从配置读进来"这一段了。
+
+**这里不再给子进程塞 `DEEPSEEK_BASE_URL`**：那个环境变量已经退休（配置只有一个来源，
+见 `userconfig` 的模块 docstring）。曾经的那些注入不会被读，子进程于是拿着 conftest
+那份隔离配置去敲真的 `api.deepseek.com` —— 症状是一个 401 加一条等满超时的记录，
+看起来像"网关坏了"，不像"这条测试的假网关没接上"。
 
 ## 覆盖面
 
@@ -31,10 +37,8 @@ import subprocess
 import sys
 import threading
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-
-import pytest
 
 from agent_runtime.protocol import messages
 from agent_runtime.state.catalog import load as load_catalog
@@ -155,22 +159,10 @@ def _pieces(text: str, size: int) -> list[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or []
 
 
-@pytest.fixture
-def fake_openai():
-    """起一个本地假端点，返回 (基址, 脚本列表, 收到的请求列表)。
-
-    脚本的最后一条会被重复使用 —— 那些测试只关心前几步。
-    """
-    server = HTTPServer(("127.0.0.1", 0), _Handler)
-    _Handler.scripts = [{"content": "默认回答"}]
-    _Handler.calls = []
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}/v1", _Handler.scripts, _Handler.calls
-    finally:
-        server.shutdown()
-        server.server_close()
+# `fake_openai` **不在这里定义** —— 它在 `tests/conftest.py` 里，因为 `/mcp` 的端到端
+# （`tests/test_mcp_protocol.py`）也要起真子进程、也要一个能回话的网关。这里曾经留着一份
+# 同名副本，而它会**盖住** conftest 那一份：于是"写配置文件、指 `AGENT_CONFIG_FILE`"
+# 那段接线在本文件里从未生效，子进程拿着隔离配置去敲真的 `api.deepseek.com`。
 
 
 # --- 起子进程 -----------------------------------------------------------------
@@ -185,7 +177,6 @@ def run_protocol(inbound: list[dict | str], *, env_extra: dict | None = None,
     新会话"的测试用。
     """
     env = dict(os.environ)
-    env["DEEPSEEK_API_KEY"] = "sk-test"
     env["PYTHONIOENCODING"] = "utf-8"
     env.update(env_extra or {})
 
@@ -230,11 +221,9 @@ def test_every_stdout_line_is_json(fake_openai):
     它挡的是"某处打了一行给 人 的说明" —— 横幅、提示符、`[权限]` 那些。第零期把
     装配的说明变成了 `init.notices`，就是为了这件事。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base},
     )
 
     assert code == 0, err
@@ -244,12 +233,11 @@ def test_every_stdout_line_is_json(fake_openai):
 
 def test_init_carries_the_handshake(fake_openai):
     """`init` **永远是第一条**，而且字段和 schema 对得上。"""
-    base, _, _ = fake_openai
     # **每次一个新会话**：这条测试断言 `resumed is False`，而它必须是真的新 ——
     # 传一个固定 id 时，上一次跑留下的会话文件会让它变成 True（实测踩过，
     # 而且那种"第二次跑才红"的失败最难查）。所以 id 每次现取。
     code, lines, err = run_protocol(
-        [{"v": 1, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        [{"v": 1, "t": "shutdown"}],
         session=None,
     )
     assert code == 0, err
@@ -285,10 +273,9 @@ def test_init_splits_permissions_into_default_and_not(fake_openai):
     而 schema 里那四个键是白名单（不许冒出别的）。判断"什么算非默认"由 runtime 做，
     所以前端不必硬编码一份默认值。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
         [{"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=None,
+        session=None,
     )
     assert code == 0, err
     permissions = parse(lines)[0]["permissions"]
@@ -309,11 +296,9 @@ def test_init_carries_the_context_window(fake_openai):
     `config.context_windows()` 那张按模型名的表。界面拿它算占比；表里没有这个名字时
     它是 null，界面就只报用量、不报占比（错的百分比比没有百分比更坏）。
     """
-    from agent_runtime.runtime.config import context_windows
 
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
-        [{"v": 1, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        [{"v": 1, "t": "shutdown"}],
         session=None,
     )
     assert code == 0, err
@@ -333,9 +318,8 @@ def test_the_state_snapshot_carries_the_rail_data(fake_openai):
     开场那条**带可用技能清单**（要扫目录，所以只发一次），而且它排在 `init` /
     `session_load` 之后。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
-        [{"v": 1, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        [{"v": 1, "t": "shutdown"}],
         session=None,
     )
     assert code == 0, err
@@ -384,10 +368,7 @@ def _open_protocol(fake_openai, *, session: str | None = None,
     import queue
     import threading
 
-    base, _, _ = fake_openai
     env = dict(os.environ)
-    env["DEEPSEEK_API_KEY"] = "sk-test"
-    env["DEEPSEEK_BASE_URL"] = base
     env["PYTHONIOENCODING"] = "utf-8"
 
     argv = [*RUNTIME_ARGV, "--runtime-stdio"]
@@ -710,13 +691,12 @@ def test_one_turn_produces_the_answer_in_the_ui_message(fake_openai):
     这条是决策 1（不做流式）之后界面拿到答案的**唯一**途径：审计里没有正文
     （`Agent.run` 的返回值只交给调用方）。少发它，界面就一片空白。
     """
-    base, scripts, calls = fake_openai
+    _, scripts, calls = fake_openai
     scripts[:] = [{"content": "我很好，谢谢。"}]
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base},
     )
     assert code == 0, err
     got = parse(lines)
@@ -751,13 +731,12 @@ def test_a_streamed_turn_sends_deltas_and_no_second_copy_of_the_answer(fake_open
     它同时钉住了"拼回来的正文和完整答案一致"：适配层和协议各自拼了一遍
     （一条按 chunk、一条按 message），而它们必须说同一件事。
     """
-    base, scripts, calls = fake_openai
+    _, scripts, calls = fake_openai
     scripts[:] = [{"content": "我先检查一下这个文件，然后改掉那一行。"}]
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "改一下 a.py"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base},
     )
     assert code == 0, err
     got = parse(lines)
@@ -790,13 +769,12 @@ def test_no_stream_sends_the_answer_without_any_delta(fake_openai):
     这是**老行为**，也是"流式是可选的加速、不是另一种协议"那句话的验收 ——
     关掉它之后协议上一个字节都不该多。
     """
-    base, scripts, calls = fake_openai
+    _, scripts, calls = fake_openai
     scripts[:] = [{"content": "整段出现。"}]
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base},
         argv_extra=["--no-stream"],
     )
     assert code == 0, err
@@ -816,14 +794,14 @@ def test_deltas_never_enter_the_audit_log(fake_openai):
     审计里记的是**汇总**：`model_call.streamed` / `stream_chunks` / `streamed_chars`。
     这条测试两边都查：jsonl 里没有 kind=delta 的行，而那一行汇总在。
     """
-    base, scripts, _ = fake_openai
+    _, scripts, _ = fake_openai
     scripts[:] = [{"content": "审计里只该有汇总。"}]
 
     session = f"stream-audit-{uuid.uuid4().hex[:8]}"
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+        session=session,
     )
     assert code == 0, err
     got = parse(lines)
@@ -853,7 +831,7 @@ def test_streaming_a_tool_turn_keeps_the_tool_events_intact(fake_openai):
     同样要逐字出来，而**工具事件一条都不能因此丢失或错位** —— 它们的配对靠
     `call_id`，多插了几十条 delta 之后仍然要对得上（这是"两条流不串味"的流式版）。
     """
-    base, scripts, _ = fake_openai
+    _, scripts, _ = fake_openai
     scripts[:] = [
         {"content": "我先看一眼。", "tool_calls": [{
             "id": "call_x", "type": "function",
@@ -865,7 +843,6 @@ def test_streaming_a_tool_turn_keeps_the_tool_events_intact(fake_openai):
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "看看目录"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base},
     )
     assert code == 0, err
     got = parse(lines)
@@ -888,13 +865,12 @@ def test_every_stdout_line_is_still_json_while_streaming(fake_openai):
     而症状是**前端偶尔丢掉一行**（`test_every_stdout_line_is_json` 那条只跑
     非流式，所以这条是它的流式版）。
     """
-    base, scripts, _ = fake_openai
+    _, scripts, _ = fake_openai
     scripts[:] = [{"content": "一二三四五六七八九十" * 30}]
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "写长一点"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base},
     )
     assert code == 0, err
     got = parse(lines)          # 任何一行不是 JSON 都会在这里抛
@@ -908,13 +884,13 @@ def test_the_audit_stream_is_forwarded_verbatim(fake_openai):
     "审计 = 协议"这句话要在字节层面成立，所以这里比对"转发出去的消息"和
     "落到 .jsonl 里的那一行" —— 去掉信封之后应当一模一样。
     """
-    base, scripts, _ = fake_openai
+    _, scripts, _ = fake_openai
     scripts[:] = [{"content": "好"}]
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "嗨"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session="verbatim-probe",
+        session="verbatim-probe",
     )
     assert code == 0, err
     got = parse(lines)
@@ -945,7 +921,7 @@ def test_approval_goes_over_the_protocol(fake_openai):
     所以这条测试自己当客户端：读一行、判断、再写一行。这也正是第二期 Textual
     客户端要做的事的缩影 —— 它是这条协议的第一个真消费者。
     """
-    base, scripts, _ = fake_openai
+    _, scripts, _ = fake_openai
     scripts[:] = [
         # 第一步：要跑一条命令（shell 是 HIGH ⇒ 必定触发审批）。
         {"content": None, "tool_calls": [{
@@ -956,32 +932,20 @@ def test_approval_goes_over_the_protocol(fake_openai):
         {"content": "跑完了"},
     ]
 
-    env = dict(os.environ)
-    env["DEEPSEEK_API_KEY"] = "sk-test"
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["DEEPSEEK_BASE_URL"] = base
-
-    proc = subprocess.Popen(
-        [*RUNTIME_ARGV, "--runtime-stdio", "--session", "approval-probe"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        encoding="utf-8", errors="replace", env=env, cwd=str(REPO_ROOT),
-    )
+    # **读必须是"有上限的读"**（`_open_protocol` 的 `next_line`）。这一条原来用
+    # `for line in proc.stdout` 无超时地等 `ui(run_finished)`，而模型失败的那一轮
+    # **不会发那条消息**（`protocol/channels.py` 的 `ModelError` 分支在发它之前就返回了）
+    # —— 于是它永远等下去：症状是"整套测试跑到一半没动静"，而不是红一条。有上限之后
+    # 同样的原因只需 30 秒就变成一条断言失败。
+    process, next_line, send = _open_protocol(fake_openai, session="approval-probe")
 
     seen: list[dict] = []
     answered: list[dict] = []
 
-    def send(obj: dict) -> None:
-        assert proc.stdin is not None
-        proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        proc.stdin.flush()
-
     try:
         send({"v": 1, "t": "user_message", "text": "跑一下 echo"})
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            if not line.strip():
-                continue
-            message = json.loads(line)
+        while True:
+            message = next_line()
             seen.append(message)
 
             if message.get("t") == "permission_request":
@@ -993,9 +957,9 @@ def test_approval_goes_over_the_protocol(fake_openai):
         send({"v": 1, "t": "shutdown"})
     finally:
         try:
-            proc.wait(timeout=30)
+            process.wait(timeout=30)
         except subprocess.TimeoutExpired:  # pragma: no cover - 失败时给出诊断
-            proc.kill()
+            process.kill()
             raise AssertionError(
                 f"子进程没退出。已经收到的：{[m.get('t') for m in seen]}"
             ) from None
@@ -1090,7 +1054,7 @@ def test_autopilot_turned_on_mid_session_stops_the_asking(fake_openai):
     （见 `agents/agent.py` 里 gate 那一处），只有真的跑一轮才验证得了"这一改走到了
     关卡"。这也是 `--autopilot` 和 `/autopilot` 共用的那一条路。
     """
-    base, scripts, _ = fake_openai
+    _, scripts, _ = fake_openai
     scripts[:] = [
         {"content": None, "tool_calls": [{
             "id": "call_1", "type": "function",
@@ -1102,7 +1066,7 @@ def test_autopilot_turned_on_mid_session_stops_the_asking(fake_openai):
         [{"v": 1, "t": "set_autopilot", "on": True},
          {"v": 1, "t": "user_message", "text": "跑一下 echo"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session="autopilot-e2e",
+        session="autopilot-e2e",
     )
     assert code == 0, err
     got = parse(lines)
@@ -1167,7 +1131,7 @@ def test_the_client_asks_for_streaming_by_default():
     assert "--stream" not in client.default_argv("s", stream=False)
 
 
-def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai, tmp_path):
+def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai, workdir):
     """冒烟：那个 200 行的 ANSI 客户端能起来、能握手、能干净退出。
 
     它**不是** TUI，但它是一个真前端，所以它的启动路径值得跑一遍 ——
@@ -1181,20 +1145,22 @@ def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai, tmp_path):
       * 但 cwd **就是工作区**（`paths.workspace_dir()`），所以把 cwd 设成包的父目录会让
         这条测试在**仓库外面**建一个 `.tudouni/`（实测过：`/repo/echuzhi/.tudouni`）。
 
-    两个要求分开满足：import 路径走 `PYTHONPATH`，工作区走一个临时目录。这也顺带钉住了
-    "工作区是 cwd"这件事 —— 会话文件出现在 `tmp_path` 下面才算对。
+    两个要求分开满足：import 路径走 `PYTHONPATH`，工作区走 `workdir`（`tests/_tmp`
+    下一个自建自删的目录）。这也顺带钉住了"工作区是 cwd"这件事 —— 会话目录出现在
+    `workdir` 下面才算对。
+
+    **不用 `tmp_path`**：它走系统临时目录，在受限环境里连**建目录**都会被拒
+    （`PermissionError: WinError 5`），而那是一条和被测代码毫无关系的失败。
+    `tests/conftest.py` 的 `workdir` 就是为这件事准备的。
     """
-    base, _, _ = fake_openai
     env = dict(os.environ)
-    env["DEEPSEEK_API_KEY"] = "sk-test"
     env["PYTHONIOENCODING"] = "utf-8"
-    env["DEEPSEEK_BASE_URL"] = base
     env["PYTHONPATH"] = str(REPO_ROOT)
 
     result = subprocess.run(
         [sys.executable, "-m", "agent_runtime.frontends.ansi", "--session", "ansi-smoke"],
         input="exit\n", capture_output=True, encoding="utf-8", errors="replace",
-        env=env, cwd=str(tmp_path), timeout=60,
+        env=env, cwd=str(workdir), timeout=60,
     )
 
     assert result.returncode == 0, result.stderr
@@ -1213,13 +1179,13 @@ def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai, tmp_path):
         assert name in tools_line
     # 提示语在，说明它真的进到了交互循环。
     assert "输入内容回车发送" in result.stdout
-    # **工作区就是 cwd**：运行期目录建在临时目录里，而不是包目录、也不是仓库的父目录。
+    # **工作区就是 cwd**：运行期目录建在 `workdir` 里，而不是包目录、也不是仓库的父目录。
     # 这一行同时钉住 `ProtocolClient` 没有把子进程按到别的目录去（它以前传
     # `cwd=repo_root()`，那会让界面和 runtime 在两个工作区里干活）。
     #
     # 断言的是**目录**而不是会话文件：这一轮只喂了 `exit`，一句话都没说，而第一次写盘
     # 发生在说出第一句话之后（"开了不用不会留下空文件"是刻意的，见 `resolve_session`）。
-    assert (tmp_path / ".tudouni" / "sessions").is_dir()
+    assert (workdir / ".tudouni" / "sessions").is_dir()
 
 
 def test_a_bad_version_exits_cleanly(fake_openai):
@@ -1228,9 +1194,8 @@ def test_a_bad_version_exits_cleanly(fake_openai):
     继续读下去只会拿一堆看不懂的消息去驱动 Agent —— 那比早退坏得多。而且必须
     **从 stderr 说清原因**（stdout 是协议通道，不能混人话）。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
-        [{"v": 99, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        [{"v": 99, "t": "shutdown"}],
     )
 
     assert code == 0        # 干净退出，不是崩
@@ -1243,10 +1208,8 @@ def test_bad_lines_are_skipped_and_counted(fake_openai):
 
     坏行在真实情形里更可能是"前端写坏了"，而那是需要看见的。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
         ["这不是 JSON\n", "\n", '{"v":1,"t":"shutdown"}\n'],
-        env_extra={"DEEPSEEK_BASE_URL": base},
     )
 
     assert code == 0
@@ -1289,19 +1252,19 @@ def test_status_answers_with_the_audit_numbers(fake_openai):
     分两个进程之后，这一条同时钉住了"审计是**跨进程**的事实"：第二个进程什么都没
     跑过，它报出来的每一个数都只能来自那份 jsonl。
     """
-    base, scripts, calls = fake_openai
+    _, scripts, calls = fake_openai
     scripts[:] = [{"content": "我很好。"}]
     session = _fresh_session()
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "你好"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+        session=session,
     )
     assert code == 0, err
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "status"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+        session=session,
     )
     assert code == 0, err
     got = parse(lines)
@@ -1334,7 +1297,7 @@ def test_status_does_not_wait_for_a_running_turn(fake_openai):
     `messages` 就少一条。这不是 bug，是"不打断也不等待"的必然结果 —— 测试要钉的是
     "它答了、而且答的是那一刻的真值"，不是某个固定的数。
     """
-    base, scripts, _calls = fake_openai
+    _, scripts, _calls = fake_openai
     scripts[:] = [{"content": "我很好。"}]
     session = _fresh_session()
 
@@ -1342,7 +1305,7 @@ def test_status_does_not_wait_for_a_running_turn(fake_openai):
         [{"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "status"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+        session=session,
     )
     assert code == 0, err
     body = _ui(parse(lines), "status")["status"]
@@ -1360,10 +1323,9 @@ def test_status_works_before_any_turn(fake_openai):
     `summarize([])` 返回的就是零 —— 而"会话确实还没花过钱"和"我们数不出来"在这个
     问题上的处置是一样的。**关键是不能崩**：这是用户按下第一件事就会试的命令。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
         [{"v": 1, "t": "status"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+        session=_fresh_session(),
     )
     assert code == 0, err
     status = _ui(parse(lines), "status")["status"]
@@ -1378,10 +1340,9 @@ def test_tools_lists_every_tool_with_its_permission(fake_openai):
     两处对不上的症状很难查（"启动时列着 shell、`/tools` 里没有它"），所以这里直接
     拿两条消息比对名字集合。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
         [{"v": 1, "t": "tools"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+        session=_fresh_session(),
     )
     assert code == 0, err
     got = parse(lines)
@@ -1413,10 +1374,9 @@ def test_refresh_state_answers_with_a_fresh_panel_snapshot(fake_openai):
     快照**带同一批键** —— 少一个键就等于让"安静时问来的那一份"和"平时那份"形状不同，
     而前端只能按同一套代码吃它们。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
         [{"v": 1, "t": "refresh_state"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+        session=_fresh_session(),
     )
     assert code == 0, err
     got = parse(lines)
@@ -1436,14 +1396,14 @@ def test_set_model_switches_and_says_so(fake_openai):
       * 一条 notice（含"上一个是谁、什么时候生效"—— 界面拼不出这两个事实）；
       * 下一次请求的 `model` 字段变了（**唯一的真凭据**）。
     """
-    base, scripts, calls = fake_openai
+    _, scripts, calls = fake_openai
     scripts[:] = [{"content": "一"}, {"content": "二"}]
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "set_model", "model": "deepseek-v4-pro"},
          {"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+        session=_fresh_session(),
     )
     assert code == 0, err
     got = parse(lines)
@@ -1467,14 +1427,14 @@ def test_set_model_rejects_a_name_outside_the_catalog(fake_openai):
     这条同时钉住"前端发什么 runtime 都得先校验"：界面拿到什么发什么，所以一个
     手写的客户端可以发任何字符串。
     """
-    base, scripts, calls = fake_openai
+    _, scripts, calls = fake_openai
     scripts[:] = [{"content": "一"}]
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "set_model", "model": "gpt-9"},
          {"v": 1, "t": "user_message", "text": "你好"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+        session=_fresh_session(),
     )
     assert code == 0, err
     got = parse(lines)
@@ -1489,11 +1449,10 @@ def test_set_model_rejects_a_name_outside_the_catalog(fake_openai):
 
 def test_set_model_with_a_non_string_is_refused_at_the_envelope(fake_openai):
     """信封那一层只拦"它得是个字符串"（`{"model": {...}}` 会把整个 dict 打给用户看）。"""
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
         [{"v": 1, "t": "set_model", "model": {"id": "x"}},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=_fresh_session(),
+        session=_fresh_session(),
     )
     assert code == 0, err
     notices = [m for m in kinds(parse(lines), "notice") if m.get("code") == "model"]
@@ -1506,7 +1465,7 @@ def test_the_model_choice_survives_a_resume(fake_openai):
     这是"只影响当前会话"那句承诺的另一半 —— 它必须在**下一个进程**里也成立，
     所以这里跑两次子进程，第二次不重新选。
     """
-    base, scripts, calls = fake_openai
+    _, scripts, calls = fake_openai
     scripts[:] = [{"content": "一"}, {"content": "二"}]
     session = _fresh_session()
 
@@ -1514,14 +1473,14 @@ def test_the_model_choice_survives_a_resume(fake_openai):
         [{"v": 1, "t": "set_model", "model": "deepseek-v4-pro"},
          {"v": 1, "t": "user_message", "text": "一"},
          {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+        session=session,
     )
     assert code == 0, err
     assert calls[-1]["model"] == "deepseek-v4-pro"
 
     code, lines, err = run_protocol(
         [{"v": 1, "t": "user_message", "text": "二"}, {"v": 1, "t": "shutdown"}],
-        env_extra={"DEEPSEEK_BASE_URL": base}, session=session,
+        session=session,
     )
     assert code == 0, err
     got = parse(lines)
@@ -1541,9 +1500,8 @@ def test_init_carries_the_model_catalog(fake_openai):
     界面照它渲染、不写死模型名 —— 写死的话，加一个模型要改两个地方，而漏改的那一处
     只表现为"这个模型选不了"。
     """
-    base, _, _ = fake_openai
     code, lines, err = run_protocol(
-        [{"v": 1, "t": "shutdown"}], env_extra={"DEEPSEEK_BASE_URL": base},
+        [{"v": 1, "t": "shutdown"}],
         session=_fresh_session(),
     )
     assert code == 0, err

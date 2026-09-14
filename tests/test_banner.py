@@ -93,8 +93,8 @@ def test_the_two_streams_carry_the_two_kinds_of_text():
     第零期把它从 `main.py` 的一条 print 变成 `Runtime.audit_log_line()`，但没动它的流。
     """
     env = dict(os.environ)
-    # 一个假密钥就够：这条测试问的是"谁打到哪里"，不是"能不能真的调模型"。
-    env["DEEPSEEK_API_KEY"] = "sk-not-used"
+    # 模型那层不用管：路由来自 `AGENT_CONFIG_FILE`（`tests/conftest.py` 的隔离配置已经
+    # 指向一份能读的），而这条测试问的是"谁打到哪里"，不是"能不能真的调模型"。
     result = subprocess.run(
         [*RUNTIME_ARGV, "--session", "stream-check"],
         input="exit\n", capture_output=True, encoding="utf-8", errors="replace",

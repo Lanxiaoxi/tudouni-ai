@@ -59,11 +59,12 @@ def write_mcp_config(workdir: Path, *names: str) -> Path:
 class Session:
     """一个活着的 `--runtime-stdio` 子进程 + 一队列已经收到的消息。"""
 
-    def __init__(self, base_url: str, home: Path):
+    def __init__(self, home: Path):
         env = dict(os.environ)
-        env["DEEPSEEK_API_KEY"] = "sk-test"
-        env["DEEPSEEK_BASE_URL"] = base_url
         env["PYTHONIOENCODING"] = "utf-8"
+        # **模型那一层不再往这里塞环境变量**：`AGENT_CONFIG_FILE` 已经由 `fake_openai`
+        # fixture 指向一份写着假网关的配置（配置只有一个来源，`DEEPSEEK_BASE_URL` 那条
+        # 老路退休了）。这个文件要的是"子进程能起来、能挂 MCP server"，不碰模型。
         # **用户级目录在这里**（`~/.tudouni/mcp.json`）。两个变量都设：`Path.home()`
         # 在 Windows 上看 USERPROFILE、在 POSIX 上看 HOME。
         env["HOME"] = str(home)
@@ -152,13 +153,17 @@ class Session:
 
 @pytest.fixture
 def session_factory(fake_openai, workdir):
-    """造一个会话。`fake_openai` 来自 `test_protocol.py`（同一个目录，pytest 能拿到）。"""
-    base, _, _ = fake_openai
+    """造一个会话。
+
+    `fake_openai`（住在 `tests/conftest.py`）在这里**要的是它的副作用**：它会写一份
+    指向本地假网关的配置并把 `AGENT_CONFIG_FILE` 指过去 —— 子进程没有别的地方能收到
+    这个参数。本文件不碰模型，但子进程必须有一份能读的配置才起得来。
+    """
     made: list[Session] = []
 
     def start(*server_names: str) -> Session:
         home = write_mcp_config(workdir, *server_names)
-        session = Session(base, home)
+        session = Session(home)
         made.append(session)
         return session
 
@@ -279,14 +284,13 @@ def test_a_server_that_cannot_start_shows_up_as_failed(fake_openai, workdir):
     **两处**：会话流里那一条通知，以及 `/mcp` 清单里那一格带着原因 —— 只说一句
     "没连上"而清单里那一格还是 `unload` 的话，用户会以为是自己没按到。
     """
-    base, _, _ = fake_openai
     home = workdir / "home"
     (home / ".tudouni").mkdir(parents=True, exist_ok=True)
     (home / ".tudouni" / "mcp.json").write_text(json.dumps({"servers": {
         "broken": {"command": "definitely-not-a-real-command-xyz", "timeout_seconds": 5},
     }}), encoding="utf-8")
 
-    session = Session(base, home)
+    session = Session(home)
     try:
         session.wait_for("init")
 

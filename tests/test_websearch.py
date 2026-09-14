@@ -493,7 +493,7 @@ def test_the_key_never_leaks_into_a_transport_error_either():
 
 
 def test_a_custom_base_url_is_respected():
-    """网关可以换（和 DEEPSEEK_BASE_URL 同一个理由），末尾多一个斜杠不该拼出 //。"""
+    """网关可以换（和模型层的 `base_url` 同一个理由），末尾多一个斜杠不该拼出 //。"""
     recorder = Recorder(httpx.Response(200, json={"results": []}))
     recorder.backend(base_url="https://gateway.example/v1/")("q", 1)
 
