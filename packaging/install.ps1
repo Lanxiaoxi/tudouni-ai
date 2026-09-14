@@ -43,13 +43,51 @@ if (-not (Test-Path (Join-Path $Source 'tudouni.exe')) -or
 }
 
 # --- 1. 拷贝 ----------------------------------------------------------------
+#
+# ## 先问一句"有没有正在跑的实例"
+#
+# Windows **删不掉被进程映射的 `.pyd` / `.dll`**，而它给的错是"对路径的访问被拒绝"
+# ——**不是**"文件正被使用"。用户看到的是一个文件路径加一句 Access denied，看不出
+# 该干什么。所以在动任何东西之前先查一遍：这一步失败要说人话。
+#
+# 查的是**进程名**（`tudouni`），也就是这个程序自己 —— 它可能停在某个界面窗口里，
+# 也可能是一个还在跑的后台 runtime 子进程。
+$running = @(Get-Process -Name 'tudouni' -ErrorAction SilentlyContinue)
+if ($running.Count -gt 0) {
+    $ids = ($running | ForEach-Object { $_.Id }) -join ', '
+    Write-Host "  检测到 tudouni 正在运行（PID $ids）。" -ForegroundColor Red
+    Write-Host '  请先在那些窗口里按 Ctrl+C 退出（或者用任务管理器结束它），'
+    Write-Host '  然后重新运行这个脚本 —— 覆盖安装要先替换掉它自己的文件。'
+    exit 1
+}
+
+# ## 升级时**不原地删**，先把旧的挪到一边
+#
+# `Remove-Item -Recurse` 是逐个删的：撞上一个删不掉的文件就在半路停下，那时旧目录已经
+# 被删了一半、新的还没拷进来 —— 用户手上剩一个**坏掉的安装**，而这比单纯报错更糟
+# （实测撞上过：一个还开着的界面让 `_pydantic_core...pyd` 删不掉，安装目录从 102 个
+# 文件掉到 71 个）。
+#
+# 改名是同一卷上的一次元数据操作，**即使里面有文件被占用也能成功**（Windows 允许重命名
+# 一个装着打开文件的目录）。于是顺序变成：旧的挪开 → 新的完整落位 → 再收旧的。
+# 收不掉就留着并说一声：那只是一份垃圾，不是故障。
+$aside = $null
 if (Test-Path $Target) {
     Write-Host '  已装过一份，覆盖升级……'
-    Remove-Item -Recurse -Force $Target
+    $aside = "$Target.old-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    Move-Item -Path $Target -Destination $aside
 }
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
 foreach ($item in @('tudouni.exe', '_internal')) {
     Copy-Item -Recurse -Force (Join-Path $Source $item) $Target
+}
+if ($aside) {
+    try {
+        Remove-Item -Recurse -Force $aside -ErrorAction Stop
+    } catch {
+        Write-Host "  （旧的安装在 $aside 收不掉，可以之后手动删掉它 —— 那份已经不用了）" `
+            -ForegroundColor DarkYellow
+    }
 }
 Write-Host '  [1/3] 文件已就位'
 
