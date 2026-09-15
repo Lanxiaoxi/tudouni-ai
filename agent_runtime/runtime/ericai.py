@@ -150,47 +150,74 @@ def _device_code_prompt(verification_uri: str, user_code: str, expires_on: Any) 
     print(f"[ericai]   验证码有效期至 {expires_on}，完成后自动继续……", file=sys.stderr, flush=True)
 
 
-def _obtain_token(authrec: Path) -> str:
-    """取一把新 token。先试非交互（用缓存），缓存不够就交互登录。失败抛异常由调用方降级。"""
-    from azure.identity import (
-        AuthenticationRecord,
-        DeviceCodeCredential,
-        TokenCachePersistenceOptions,
-    )
-    from azure.identity._exceptions import AuthenticationRequiredError
+def _obtain_token(authrec: Path, timeout: float = 30.0) -> str:
+    """取一把新 token。先试非交互（用缓存），缓存不够就交互登录。失败抛异常由调用方降级。
 
-    cache_options = TokenCachePersistenceOptions(
-        name=_CACHE_NAME, allow_unencrypted_storage=True
-    )
-    record = _load_authrecord(authrec)
+    timeout: 单次操作的超时时间（秒）。超过后会抛出 TimeoutError。
+    """
+    import threading
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
 
-    # 1) 非交互：有 authrecord 就带上。disable_automatic_authentication=True 保证
-    #    需要交互时抛 AuthenticationRequiredError，而不是擅自弹登录。
-    noninteractive = DeviceCodeCredential(
-        client_id=_CLIENT_ID,
-        tenant_id=_TENANT_ID,
-        cache_persistence_options=cache_options,
-        authentication_record=record if record is not None else None,
-        disable_automatic_authentication=True,
-    )
-    try:
-        new_record = noninteractive.authenticate(scopes=[_SCOPE])
-        _save_authrecord(authrec, new_record)
-        return noninteractive.get_token(_SCOPE).token
-    except AuthenticationRequiredError:
-        pass  # 缓存不够用，落到交互登录
+    result = {}
+    exc_info = {}
 
-    # 2) 交互登录：device code 流程，在浏览器里验证。验证成功后 authrecord 更新，
-    #    下次 --ericai 就能静默刷新了。
-    interactive = DeviceCodeCredential(
-        client_id=_CLIENT_ID,
-        tenant_id=_TENANT_ID,
-        cache_persistence_options=cache_options,
-        prompt_callback=_device_code_prompt,
-    )
-    new_record = interactive.authenticate(scopes=[_SCOPE])
-    _save_authrecord(authrec, new_record)
-    return interactive.get_token(_SCOPE).token
+    def _do_obtain():
+        """实际的 token 获取逻辑，在子线程中运行。"""
+        try:
+            from azure.identity import (
+                AuthenticationRecord,
+                DeviceCodeCredential,
+                TokenCachePersistenceOptions,
+            )
+            from azure.identity._exceptions import AuthenticationRequiredError
+
+            cache_options = TokenCachePersistenceOptions(
+                name=_CACHE_NAME, allow_unencrypted_storage=True
+            )
+            record = _load_authrecord(authrec)
+
+            # 1) 非交互：有 authrecord 就带上。disable_automatic_authentication=True 保证
+            #    需要交互时抛 AuthenticationRequiredError，而不是擅自弹登录。
+            noninteractive = DeviceCodeCredential(
+                client_id=_CLIENT_ID,
+                tenant_id=_TENANT_ID,
+                cache_persistence_options=cache_options,
+                authentication_record=record if record is not None else None,
+                disable_automatic_authentication=True,
+            )
+            try:
+                new_record = noninteractive.authenticate(scopes=[_SCOPE])
+                _save_authrecord(authrec, new_record)
+                result["token"] = noninteractive.get_token(_SCOPE).token
+                return
+            except AuthenticationRequiredError:
+                pass  # 缓存不够用，落到交互登录
+
+            # 2) 交互登录：device code 流程，在浏览器里验证。验证成功后 authrecord 更新，
+            #    下次 --ericai 就能静默刷新了。
+            interactive = DeviceCodeCredential(
+                client_id=_CLIENT_ID,
+                tenant_id=_TENANT_ID,
+                cache_persistence_options=cache_options,
+                prompt_callback=_device_code_prompt,
+            )
+            new_record = interactive.authenticate(scopes=[_SCOPE])
+            _save_authrecord(authrec, new_record)
+            result["token"] = interactive.get_token(_SCOPE).token
+        except Exception as e:
+            exc_info["exc"] = e
+
+    t = threading.Thread(target=_do_obtain, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        raise TimeoutError(f"登录/刷新超时（>{timeout}秒），可能网络不通或服务不可用")
+    if "exc" in exc_info:
+        raise exc_info["exc"]
+    if "token" not in result:
+        raise RuntimeError("token 获取未返回结果，也未抛出异常（异常）")
+    return result["token"]
 
 
 # --- 写回 config：只动 api_key 一处，原子替换 ------------------------------------
