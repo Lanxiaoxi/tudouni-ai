@@ -150,7 +150,7 @@ def _device_code_prompt(verification_uri: str, user_code: str, expires_on: Any) 
     print(f"[ericai]   验证码有效期至 {expires_on}，完成后自动继续……", file=sys.stderr, flush=True)
 
 
-def _obtain_token(authrec: Path, timeout: float = 30.0) -> str:
+def _obtain_token(authrec: Path, timeout: float = 300.0) -> str:
     """取一把新 token。先试非交互（用缓存），缓存不够就交互登录。失败抛异常由调用方降级。
 
     timeout: 单次操作的超时时间（秒）。超过后会抛出 TimeoutError。
