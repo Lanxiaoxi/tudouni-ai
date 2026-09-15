@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="不询问任何审批：需要审批的工具直接执行。拒绝名单、工作区边界、控制面写入"
              "仍然生效；审计里每次放行记为 outcome=autopilot",
     )
+    parser.add_argument(
+        "--ericai", action="store_true",
+        help="启动时检查 EricAI token（providers.ericai.api_key），快过期就用 config "
+             "的 scripts.ericai_refresh_token 那行命令刷一把新的并写回 config",
+    )
     parser.add_argument("--debug", action="store_true", help="把中间过程打到 stderr")
 
     # 下面两个开关是 TUI 的一对父子（见 doc/TUI-design.md）。**第零期只是把它们声明

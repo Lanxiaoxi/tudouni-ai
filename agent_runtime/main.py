@@ -46,6 +46,7 @@ from agent_runtime.frontends.cli import (
     run_repl,
 )
 from agent_runtime.frontends.cli.args import build_parser
+from agent_runtime.runtime import ericai
 from agent_runtime.runtime.channels import cli_channels
 from agent_runtime.runtime.composition import (
     Notice,
@@ -121,6 +122,14 @@ def main() -> int:
             print(problem, file=sys.stderr)
             return 2
 
+        # `--ericai`：进界面之前把 EricAI token 检查/刷新做掉。放在这里是因为
+        # 界面一起来就接管了备用屏，而刷新脚本的输出要落在普通终端上（和上面
+        # check_config 同一条理由）。失败不拦启动（见 runtime/ericai.py）。
+        # 先打一句进度再干活：刷新脚本可能跑几秒到十几秒，什么都不说就是在空等。
+        if args.ericai:
+            print("[ericai] 正在检查 / 刷新 EricAI token…", file=sys.stderr, flush=True)
+            print(ericai.ensure(), file=sys.stderr, flush=True)
+
         # `--theme` 收的是"人能写出来的一段字"（`p7` / `靛夜` / `7`），而认它的是
         # `theme.resolve` —— 同一个函数也是 `/theme` 用的那个，所以两条入口对
         # "什么算一套配色"的判断不可能分家。认不出就**回默认**，不报错：
@@ -190,6 +199,14 @@ def main() -> int:
     if args.stream is True:
         print("[流式] 老 CLI 不支持逐字输出（它不走协议那条通道）；"
               "要看逐字请用 --tui。已按 --no-stream 继续。", file=sys.stderr)
+
+    # `--ericai`：老 CLI 直连也需要刷 —— 但必须在 `open_runtime` 之前，因为 catalog
+    # 是在 open_runtime 里才读 config（见 composition.py 里那一处 `catalog.load()`）。
+    # 刷完写回 config，open_runtime 拿到的就是新 token。失败不拦启动。
+    # 先打一句进度再干活：刷新脚本可能跑几秒到十几秒，什么都不说就是在空等。
+    if args.ericai:
+        print("[ericai] 正在检查 / 刷新 EricAI token…", file=sys.stderr, flush=True)
+        print(ericai.ensure(), file=sys.stderr, flush=True)
 
     session_id, session, resumed = resolve_session(booted.store, args.session)
 

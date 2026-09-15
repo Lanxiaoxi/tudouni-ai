@@ -14,7 +14,13 @@
     "  context_window 不知道就整行删掉：那样界面只报用量、不报占比。",
     "  错的百分比比没有百分比更坏 —— 它会被当成真的。",
     "",
-    "web：联网搜索那几个键。不填就不注册 web_search（fetch_web 不受影响，缺它不算错误）。"
+    "web：联网搜索那几个键。不填就不注册 web_search（fetch_web 不受影响，缺它不算错误）。",
+    "",
+    "scripts：启动时要跑的外部命令（--ericai 用）。每个键是一条命令行，用平台 shell 执行；",
+    "    ericai_refresh_token   --ericai 启动时若 token 快过期，就跑这一条拿新 token",
+    "                           脚本要求：能非交互拿到 token；stdout 的最后一个非空行必须是",
+    "                           token 本身（前面随便打印多少说明都行；路径带空格就自己加引号）。",
+    "                           不配这个键，--ericai 就只会检查、不会刷新。"
   ],
 
   "providers": {
@@ -30,5 +36,9 @@
 
   "web": {
     "tavily_api_key": ""
+  },
+
+  "scripts": {
+    "ericai_refresh_token": "\"C:\\path\\to\\python.exe\" \"C:\\path\\to\\refresh_token.py\""
   }
 }
