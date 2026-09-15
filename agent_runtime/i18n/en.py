@@ -548,10 +548,10 @@ CATALOG: dict[str, str] = {
                                      "(or its context_window is not configured), so "
                                      "the summary reports usage without a percentage; "
                                      "add that line and it will.",
-    "notice.web.no_key": "[web] No TAVILY_API_KEY found, so web_search is not "
-                         "registered (fetch_web is unaffected). To enable it, write "
-                         "it into the \"env\" section of {path}: "
-                         "\"TAVILY_API_KEY\": \"tvly-...\"",
+    "notice.web.no_key": "[web] No search key is configured, so web_search is not "
+                         "registered (fetch_web is unaffected). To enable it, put this "
+                         "in the \"web\" section of {path}: "
+                         "\"tavily_api_key\": \"tvly-...\"",
     "notice.grep.unsupported_platform": "[search] this platform ({platform}) is not in "
                                         "the grep engine's support list (only x86_64 "
                                         "Windows / Linux so far), so grep is not "

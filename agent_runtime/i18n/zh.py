@@ -509,9 +509,9 @@ CATALOG: dict[str, str] = {
     "notice.context.missing_window": "[上下文] 模型 {model} 不在目录里（或者配置里没写"
                                      "它的 context_window），末尾只报上下文用量、"
                                      "不报占比；把它那一行补上即可。",
-    "notice.web.no_key": "[联网] 没找到 TAVILY_API_KEY，web_search 未注册"
-                         "（fetch_web 不受影响）。要启用就写进 {path} 的 \"env\" 段："
-                         "\"TAVILY_API_KEY\": \"tvly-...\"",
+    "notice.web.no_key": "[联网] 没配置搜索密钥，web_search 未注册"
+                         "（fetch_web 不受影响）。要启用就在 {path} 的 \"web\" 段里写一行："
+                         "\"tavily_api_key\": \"tvly-...\"",
     "notice.grep.unsupported_platform": "[搜索] 这个平台（{platform}）不在 grep 引擎的"
                                         "支持列表里（现在只有 x86_64 的 Windows / "
                                         "Linux），grep 未注册（搜文本只能走 shell，"
