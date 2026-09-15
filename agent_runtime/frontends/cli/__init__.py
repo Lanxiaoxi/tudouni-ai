@@ -21,6 +21,7 @@ import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from agent_runtime import i18n
 from agent_runtime.agents import RunCancelled, StepLimitExceeded
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
@@ -28,6 +29,7 @@ from agent_runtime.runtime.composition import Runtime
 from agent_runtime.runtime.config import MCP_FILE
 from agent_runtime.security.commands import format_rule
 from agent_runtime.skills import SkillLoader
+from agent_runtime.skills import loader
 from agent_runtime.state import JsonSessionStore, Session
 from agent_runtime.state import reasoning
 from agent_runtime.state import status as status_summary
@@ -381,9 +383,9 @@ def print_skills(loader: SkillLoader) -> None:
             print(f"  {'':20} 来自 {skill.path}")
 
     for item in catalog.shadowed:
-        print(f"  [遮蔽] {item}")
+        print(f"  [遮蔽] {loader.render(item, i18n.t)}")
     for problem in catalog.problems:
-        print(f"  [跳过] {problem}")
+        print(f"  [跳过] {loader.render(problem, i18n.t)}")
 
 
 def print_history(session: Session) -> None:

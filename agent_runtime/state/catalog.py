@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_runtime import i18n
 from agent_runtime import userconfig
 from agent_runtime.state import reasoning
 
@@ -274,14 +275,15 @@ def _text(raw: dict, key: str, *, where: str, default: str = "") -> str:
     if value is None:
         return default
     if not isinstance(value, str):
-        raise CatalogError(f"{where} 的 \"{key}\" 必须是字符串，实际是 {type(value).__name__}")
+        raise CatalogError(i18n.t("catalog.error.not_string", where=where, key=key,
+                                  kind=type(value).__name__))
     return value.strip()
 
 
 def _flag(raw: dict, key: str, *, where: str, default: bool = False) -> bool:
     value = raw.get(key, default)
     if not isinstance(value, bool):
-        raise CatalogError(f"{where} 的 \"{key}\" 必须是 true/false")
+        raise CatalogError(i18n.t("catalog.error.not_bool", where=where, key=key))
     return value
 
 
@@ -291,8 +293,8 @@ def _window(raw: dict, key: str, *, where: str) -> int | None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise CatalogError(
-            f"{where} 的 \"{key}\" 必须是一个正整数（token 数），实际是 {value!r}；"
-            f"不知道就整个删掉这一行 —— 那种情况界面只报用量、不报占比"
+            i18n.t("catalog.error.not_positive_int", where=where, key=key,
+                   value=repr(value))
         )
     return int(value)
 
@@ -302,33 +304,32 @@ def _models_from(raw: Any, *, provider: str, where: str) -> tuple[ModelRef, ...]
     if raw is None:
         return ()
     if not isinstance(raw, list):
-        raise CatalogError(f"{where} 的 \"models\" 必须是一个数组")
+        raise CatalogError(i18n.t("catalog.error.models_not_list", where=where))
     out: list[ModelRef] = []
     seen: set[str] = set()
     for index, item in enumerate(raw):
-        spot = f"{where} 的 models[{index}]"
+        spot = i18n.t("catalog.where.model", where=where, index=index)
         if not isinstance(item, dict):
-            raise CatalogError(f"{spot} 必须是一个对象")
+            raise CatalogError(i18n.t("catalog.error.not_object", spot=spot))
         unknown = sorted(set(item) - _MODEL_KEYS)
         if unknown:
-            raise CatalogError(
-                f"{spot} 里有不认识的键：{', '.join(unknown)}\n"
-                f"  认识的只有：{', '.join(sorted(_MODEL_KEYS))}"
-            )
+            raise CatalogError(i18n.t(
+                "catalog.error.unknown_keys", spot=spot,
+                names=", ".join(unknown), known=", ".join(sorted(_MODEL_KEYS))))
         model_id = _text(item, "id", where=spot)
         if not model_id:
-            raise CatalogError(f"{spot} 少了 \"id\"（发给端点的模型名）")
+            raise CatalogError(i18n.t("catalog.error.missing_id", spot=spot))
         if model_id in seen:
-            raise CatalogError(f"{spot} 的 id {model_id!r} 和前面那条重复了")
+            raise CatalogError(i18n.t("catalog.error.duplicate_id", spot=spot,
+                                      id=repr(model_id)))
         seen.add(model_id)
 
         effort = _text(item, "reasoning_effort", where=spot) or reasoning.DEFAULT_EFFORT
         if reasoning.resolve_effort(effort) is None:
-            raise CatalogError(
-                f"{spot} 的 reasoning_effort {effort!r} 不认识；"
-                f"能写的只有 {', '.join(reasoning.EFFORT_LEVELS)}"
-                f"（＋ {', '.join(sorted(reasoning.ALIASES))} 这些等价写法）"
-            )
+            raise CatalogError(i18n.t(
+                "catalog.error.bad_effort", spot=spot, effort=repr(effort),
+                levels=", ".join(reasoning.EFFORT_LEVELS),
+                aliases=", ".join(sorted(reasoning.ALIASES))))
         out.append(ModelRef(
             provider=provider,
             id=model_id,
@@ -372,25 +373,21 @@ def load(path: Path | None = None) -> Registry:
     problems: list[str] = []
     providers: list[Provider] = []
     for name, item in providers_raw.items():
-        where = f"{path.name} 的 providers.{name}"
+        where = i18n.t("catalog.where.provider", file=path.name, name=name)
         if not isinstance(item, dict):
-            raise CatalogError(f"{where} 必须是一个对象")
+            raise CatalogError(i18n.t("catalog.error.not_object", spot=where))
         unknown = sorted(set(item) - _PROVIDER_KEYS)
         if unknown:
-            raise CatalogError(
-                f"{where} 里有不认识的键：{', '.join(unknown)}\n"
-                f"  认识的只有：{', '.join(sorted(_PROVIDER_KEYS))}"
-            )
+            raise CatalogError(i18n.t(
+                "catalog.error.unknown_keys", spot=where,
+                names=", ".join(unknown), known=", ".join(sorted(_PROVIDER_KEYS))))
         base_url = _text(item, "base_url", where=where)
         if not base_url:
-            raise CatalogError(f'{where} 少了 "base_url"（请求发到哪）')
+            raise CatalogError(i18n.t("catalog.error.missing_base_url", where=where))
         key = _api_key(item, where=where)
         models = _models_from(item.get("models"), provider=name, where=where)
         if not models:
-            problems.append(
-                f"[模型] 路由 {name} 一个模型都没声明（\"models\" 是空的），"
-                f"所以它不会出现在 /model 里"
-            )
+            problems.append(i18n.t("catalog.problem.no_models", route=name))
         providers.append(Provider(
             name=name,
             base_url=base_url,
@@ -400,17 +397,13 @@ def load(path: Path | None = None) -> Registry:
             verify=_flag(item, "verify", where=where, default=True),
         ))
         if not key:
-            problems.append(
-                f"[模型] 路由 {name} 没有密钥（{where}），选不了它下面的模型 —— "
-                f'在**这条路由里**写上 "api_key"'
-            )
+            problems.append(i18n.t("catalog.problem.no_key", route=name,
+                                   where=where))
 
     # **没有第二处可看**：密钥、端点、模型清单都只在这份文件里，所以这里不再有"密钥来自
     # 哪个环境变量"那种说明（那是以前留给"两个地方都能放"的线索）。
     if providers and not any(item.usable for item in providers):
-        problems.append(
-            "[模型] 一条可用的路由都没有（每条都缺密钥）—— /model 会摆出一张选不了的清单"
-        )
+        problems.append(i18n.t("catalog.problem.no_usable_route"))
     return Registry(providers=tuple(providers), problems=tuple(problems),
                     source=str(path))
 

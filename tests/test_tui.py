@@ -752,6 +752,44 @@ def test_the_palette_listing_covers_every_theme():
         assert f"{index} {key} {theme_mod.get(key).name}" in listing
 
 
+def test_every_palette_has_an_english_name_and_source():
+    """14 套都要有英文名和英文出处。
+
+    英文名**不走 `i18n` 的两张目录表**（它是长在主题上的数据，和色值同级），所以
+    "两张表键一致"那条测试盯不到它 —— 缺一套的症状是英文界面里冒出一个中文色卡名，
+    而它会一直没人发现（中文是默认值）。
+    """
+    for key in theme_mod.ORDER:
+        palette = theme_mod.get(key).palette
+        assert palette.name_en.strip(), f"{key} 没有英文名"
+        assert palette.source_en.strip(), f"{key} 没有英文出处"
+
+
+def test_the_theme_names_and_matching_follow_the_language():
+    """名字按语言出，而**匹配两套名字都认**。
+
+    后半句是这个功能里最容易漏的一条：切到英文之后，中文用户肌肉记忆里的
+    `/theme 靛夜` 如果突然失灵，看起来像"这个功能被我改坏了"。
+    """
+    from agent_runtime import i18n
+
+    assert theme_mod.get("A").name_in(i18n.ZH) == "石墨琥珀"
+    assert theme_mod.get("A").name_in(i18n.EN) == "Graphite Amber"
+    assert theme_mod.get("A").source_in(i18n.EN) == "F7-A · default"
+
+    # 英文名能选中，而且大小写不敏感。
+    assert theme_mod.resolve("graphite") == "A"
+    assert theme_mod.resolve("Indigo Night") == "P7"
+    # 中文名照旧（这条是"不许为了英文把中文弄丢"）。
+    assert theme_mod.resolve("靛") == "P7"
+    assert theme_mod.resolve("墨绿") == "C"
+
+    with i18n.with_language(i18n.EN):
+        english = theme_mod.listing()
+    assert "1 P1 Warm Olive" in english and "10 A Graphite Amber" in english
+    assert "1 P1 暖橄榄" in theme_mod.listing()
+
+
 def test_the_theme_flag_parses_and_resolves():
     """`--theme` 收的是"人能写出来的一段字"，而认它的是 `theme.resolve` ——
     和 `/theme` 用的是**同一个函数**，所以两条入口对"什么算一套配色"的判断不会分家
@@ -862,6 +900,30 @@ async def test_the_hint_box_holds_the_key_row(monkeypatch):
         # 两行键位，每行四条。
         assert len(hint.children) == 2
         assert "发送" in _welcome_text(app) and "中断本轮" in _welcome_text(app)
+
+
+@pytest.mark.anyio
+async def test_the_hint_box_grows_for_the_english_keys(monkeypatch):
+    """英文那一版键位更长：**框要跟着长高，行数也要跟着变少**。
+
+    这一条量的是几何（真起一个 App）：`HintPanel.on_mount` 里按语言盖上去的那个高度
+    真的生效了吗、行数真的排成了三行吗 —— 只算不量的话，"高度设了但没生效"是看不出来
+    的（屏幕上只是少了几条提示）。
+    """
+    from agent_runtime import i18n
+    from agent_runtime.frontends.tui import widgets as widgets_module
+
+    with i18n.with_language(i18n.EN):
+        app = _build_app(monkeypatch, lang="en")
+        async with app.run_test(size=(140, 40)) as pilot:
+            app._inbox.put(("message", _init_message("s")))
+            await _settle(app, pilot)
+
+            hint = app.query_one(widgets_module.HintPanel)
+            assert hint.region.height == widgets_module.hint_box_height() == 6
+            # 一行三条 → 七条键位排成三行（中文那一版是两行，见上一条测试）。
+            assert len(hint.children) == 3
+            assert "Interrupt this turn" in _welcome_text(app)
 
 
 def test_the_thinking_block_is_a_quote():
@@ -1374,10 +1436,13 @@ class FakeClient:
     exit_code = 0
 
     def __init__(self, hooks, *, session=None, autopilot=False, debug=False,
-                 stream=True, stderr_to=None):
+                 stream=True, lang=None, stderr_to=None):
         self.hooks = hooks
         self.session = session
         self.stream = stream
+        # 界面语言：**它必须被记下来**。子进程那半边要按照同一个值写通知和回话，
+        # 而"父进程定了一套、传下去的是另一套"是这个功能里最难发现的一类错。
+        self.lang = lang
         self.sent: list[dict] = []
         self.started = False
         self.closed = False
@@ -1457,12 +1522,33 @@ class FakeClient:
         return 0
 
 
-def _build_app(monkeypatch):
+def _build_app(monkeypatch, **kwargs):
     """一个 App 实例，**协议客户端已被替成 `FakeClient`**。"""
     from agent_runtime.frontends.tui import app as app_module
 
     monkeypatch.setattr(app_module, "ProtocolClient", FakeClient)
-    return app_module.TuiApp(session="tui-test")
+    return app_module.TuiApp(session="tui-test", **kwargs)
+
+
+@pytest.mark.anyio
+async def test_the_ui_language_reaches_both_sides(monkeypatch):
+    """界面语言**一层都不能丢**：`TuiApp(lang=)` → `ProtocolClient(lang=)` → 子进程。
+
+    这条链和 `--stream` 那条同一个形状，也同样是"丢了不报错、只是行为不对"：
+    父进程按英文画界面、子进程按中文写通知和 `/model` 的回话，用户看到的是**一屏
+    两种语言** —— 而那看起来像"翻译做了一半"，不像"有个参数没传下去"。
+
+    `with_language` 包着整条用例：`TuiApp(lang=)` 改的是**进程级**的语言，
+    不复原的话后面每一条断言中文的用例都会以英文跑。
+    """
+    from agent_runtime import i18n
+
+    with i18n.with_language(i18n.ZH):
+        app = _build_app(monkeypatch, lang="en")
+        assert i18n.current() == "en", "界面这一侧要认出英文"
+        async with app.run_test(size=(140, 30)) as pilot:
+            await _settle(app, pilot)
+            assert app._client.lang == "en", "子进程那一侧也要拿到同一个值"
 
 
 async def _settle(app, pilot, rounds: int = 4) -> None:
@@ -2187,6 +2273,64 @@ def _log_text(app) -> str:
     for block in app.query(widgets.LineBlock):
         parts.extend(str(line) for line in block.lines)
     return "\n".join(parts)
+
+
+def _screen_text(app) -> str:
+    """屏幕上**所有** `Static` 画出来的字（栏、左栏、会话流、欢迎屏、面板）。
+
+    和 `_log_text` 的分工：那个只看会话流里那几块行，这个把整屏扫一遍 —— 用在
+    "整屏不许出现汉字"这类判据上（漏了一个控件就漏了一处漏翻的文案）。
+    """
+    from textual.widgets import Static
+
+    parts = []
+    for widget in app.query(Static):
+        try:
+            parts.append(str(widget.render()))
+        except Exception:  # noqa: BLE001 - 画不出来的控件不该让这条判据失败
+            continue
+    return "\n".join(parts)
+
+
+@pytest.mark.anyio
+async def test_the_whole_screen_is_english_in_en_mode(monkeypatch):
+    """英文模式下**整屏**一个汉字都没有 —— 这是"英文界面"最直接的一条验收。
+
+    喂的是**全 ASCII 的假数据**（会话 id、工具名、命令、答案），所以任何汉字都只能来自
+    界面文案本身（模型/用户的中文数据是真数据，不该被这条判据管 —— 用 ASCII 就是为了
+    把这条线划干净）。扫描范围是屏幕上每一个 `Static`：三条栏、左栏六块、会话流那几行、
+    欢迎屏三框。
+    """
+    import re
+
+    from agent_runtime import i18n
+
+    han = re.compile("[\u4e00-\u9fff]")
+    with i18n.with_language(i18n.EN):
+        app = _build_app(monkeypatch, lang="en")
+        async with app.run_test(size=(140, 40)) as pilot:
+            app._inbox.put(("message", _init_message("s1")))
+            await _settle(app, pilot)
+            for event in (
+                {"kind": "run_started", "run_id": "r1", "step": 0,
+                 "user_input": "do the thing"},
+                {"kind": "model_call", "run_id": "r1", "step": 1, "status": "ok",
+                 "duration_ms": 1200, "prompt_tokens": 900, "cached_tokens": 100},
+                {"kind": "tool_call", "run_id": "r1", "step": 1, "tool": "read_file",
+                 "tool_index": 0, "call_id": "c1", "arguments": '{"path": "a.py"}'},
+                {"kind": "tool_result", "run_id": "r1", "step": 1, "tool": "read_file",
+                 "tool_index": 0, "call_id": "c1", "status": "ok", "chars": 1024,
+                 "duration_ms": 4},
+                {"kind": "run_finished", "run_id": "r1", "step": 2,
+                 "stop_reason": "answered", "duration_ms": 4200},
+            ):
+                app._inbox.put(("message", {"v": 1, "t": "event",
+                                            "session_id": "s1", **event}))
+            await _settle(app, pilot)
+
+            text = _screen_text(app) + "\n" + _log_text(app)
+            assert "Turn 1" in text or "Turn" in text
+            assert not han.search(text), text[:400]
 
 
 @pytest.mark.anyio

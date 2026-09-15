@@ -16,6 +16,7 @@ import sys
 from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 
+from agent_runtime import i18n
 from agent_runtime.security.commands import (
     Rule,
     command_of,
@@ -86,10 +87,13 @@ def _preview(value: Any, limit: int | None) -> str:
 # 高风险不是 —— 对 shell 按 t 意味着你**再也看不见它要执行什么**，而命令原文正是
 # 那道关唯一的判断依据（见上面 _PREVIEW_LIMIT_BY_RISK 那一段）。用同一句"以后不再
 # 询问"盖住这两种情况，等于把最要紧的那半句省掉了。
+#
+# **存的是键**：这两句会经协议发给前端原样显示（`permission_request.remember_hint`，
+# schema 里写着"一个字都不许改"），所以要在**产生它的这一侧**按语言取。
 _REMEMBER_CONSEQUENCE: dict[RiskLevel, str] = {
-    RiskLevel.HIGH: "以后每次都直接执行，你不会再看到它要做什么",
+    RiskLevel.HIGH: "asker.remember.high",
 }
-_REMEMBER_DEFAULT_CONSEQUENCE = "以后不再询问这个工具"
+_REMEMBER_DEFAULT_CONSEQUENCE = "asker.remember.default"
 
 
 def _remember_hint(tool: Tool, target: Rule | str, label: str) -> str:
@@ -99,13 +103,13 @@ def _remember_hint(tool: Tool, target: Rule | str, label: str) -> str:
     量级，而人唯一的判断依据就是这一行。缺省那句跟着风险等级走，新等级忘了配也落在
     安全的说法上。
     """
+    tail = i18n.t("asker.remember.tail", label=label)
     if isinstance(target, tuple):
-        return (
-            f"以后 {' '.join(target)} 开头的命令都直接执行，不会再给你看"
-            f"（写进 {label}，下次启动仍然有效）"
-        )
-    consequence = _REMEMBER_CONSEQUENCE.get(tool.risk, _REMEMBER_DEFAULT_CONSEQUENCE)
-    return f"{consequence}（写进 {label}，下次启动仍然有效）"
+        return i18n.t("asker.remember.prefix",
+                      prefix=" ".join(target)) + tail
+    consequence = i18n.t(_REMEMBER_CONSEQUENCE.get(tool.risk,
+                                                   _REMEMBER_DEFAULT_CONSEQUENCE))
+    return consequence + tail
 
 
 def _trust_all_hint(group: TrustGroup, label: str) -> str:
@@ -116,9 +120,8 @@ def _trust_all_hint(group: TrustGroup, label: str) -> str:
     时分开（前者以为新工具也放行了，后者知道还会被问）。
     """
     return (
-        f"以后 {group.label}都直接执行，你不会再看到它们要做什么"
-        f"（快照：这个 server 以后新加的工具仍然会问你；"
-        f"写进 {label}，下次启动仍然有效）"
+        i18n.t("asker.trust_all", group=group.label)
+        + i18n.t("asker.trust_all.snapshot", label=label)
     )
 
 

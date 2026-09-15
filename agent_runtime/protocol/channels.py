@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from uuid import uuid4
 
+from agent_runtime import i18n
 from agent_runtime.agents import RunCancelled
 from agent_runtime.models.types import ModelError
 from agent_runtime.protocol import codec, messages
@@ -400,7 +401,8 @@ class ProtocolServer:
             try:
                 self.transport.send(message)
             except (BrokenPipeError, OSError, ValueError) as exc:
-                print(f"[warn] 往前端写一行失败（已忽略）：{type(exc).__name__}: {exc}",
+                print(i18n.t("channels.write_failed",
+                             problem=f"{type(exc).__name__}: {exc}"),
                       file=sys.stderr)
 
     def wait(self, pending: _Pending) -> Any:
@@ -496,7 +498,8 @@ class ProtocolServer:
     def _dispatch(self, message: dict[str, Any]) -> bool:
         """处理一条入站消息。返回 False 表示该收摊了。"""
         try:
-            codec.check_version(message, direction="前端发来")
+            codec.check_version(message,
+                                direction=i18n.t("channels.direction.frontend"))
         except codec.ProtocolError as exc:
             # 版本对不上是**唯一**该硬失败的地方：继续读下去只会拿一堆看不懂的消息
             # 去驱动 Agent。说清原因再退，比替对方猜好。
@@ -567,7 +570,7 @@ class ProtocolServer:
             # "目录里没有这个模型"就会把整个 dict 打给用户看。
             name = message.get("model")
             if not isinstance(name, str):
-                self._notice("warn", "model", "[模型] 换模型要一个字符串模型名。/model 看清单。")
+                self._notice("warn", "model", i18n.t("channels.model.needs_string"))
                 return True
             self._set_model(name)
             return True
@@ -583,7 +586,7 @@ class ProtocolServer:
             level = message.get("effort")
             if not isinstance(level, str):
                 self._notice("warn", "effort",
-                             "[思考] 强度要一个字符串（low / high / max）。")
+                             i18n.t("channels.effort.needs_string"))
                 return True
             self._set_effort(level)
             return True
@@ -714,7 +717,7 @@ class ProtocolServer:
              审批拿到上一个会话的记忆。
         """
         if session_id is not None and not isinstance(session_id, str):
-            self._notice("warn", "session", "[会话] 换会话的 id 必须是一个字符串")
+            self._notice("warn", "session", i18n.t("channels.session.needs_string"))
             return
 
         # 合法性在这里查一次（和 `main.py` 那条 `--session` 同一条规矩）。不查的话
@@ -723,8 +726,7 @@ class ProtocolServer:
         if session_id and not is_valid_session_id(session_id):
             self._notice(
                 "warn", "session",
-                f"[会话] 非法 id：{session_id!r} —— 只能用字母、数字、下划线、连字符"
-                f"（1~64 个字符）。/resume 不带参数可以从列表里挑。",
+                i18n.t("channels.session.bad_id", name=repr(session_id)),
             )
             return
 
@@ -736,12 +738,13 @@ class ProtocolServer:
             # 基类：缺密钥（`ConfigError`）和配置文件读不懂（`CatalogError`）都该在
             # 这里变成一条 notice，而不是把整个进程带走。
             self._notice("warn", "session",
-                         f"[会话] 换不过去（当前会话没有变）：{exc}")
+                         i18n.t("channels.session.switch_failed", problem=exc))
             return
         except Exception as exc:  # noqa: BLE001 - 一个坏会话不该让整个进程退出
             self._notice(
                 "warn", "session",
-                f"[会话] 换不过去（当前会话没有变）：{type(exc).__name__}: {exc}",
+                i18n.t("channels.session.switch_failed",
+                       problem=f"{type(exc).__name__}: {exc}"),
             )
             return
 
@@ -749,7 +752,8 @@ class ProtocolServer:
             try:
                 previous.close()
             except Exception as exc:  # noqa: BLE001 - 收旧摊失败不该盖住新会话
-                self._warn(f"收掉上一个会话的 runtime 时出错：{type(exc).__name__}: {exc}")
+                self._warn(i18n.t("channels.session.close_failed",
+                                  problem=f"{type(exc).__name__}: {exc}"))
 
         self.runtime = runtime
         # 换会话时把这几个"上一个会话的残留"清掉：
@@ -784,7 +788,7 @@ class ProtocolServer:
             # 模型失败：`run_finished` 已经在 Agent 里发过了（stop_reason 会说明是
             # 哪一种），这里只说一句人话让界面能显示。
             self._answer = ""
-            self._notice("warn", "model", f"[本轮失败] {exc}")
+            self._notice("warn", "model", i18n.t("channels.run_failed", problem=exc))
             return
         finally:
             # 面板数据在回合收尾时补一份：`todo_write` / `load_skill` 的结果会让
@@ -864,13 +868,14 @@ class ProtocolServer:
         """
         runtime = self.runtime
         if runtime is None:
-            self._notice("warn", "model", "[模型] 还没有会话，换不了模型。")
+            self._notice("warn", "model", i18n.t("channels.model.no_session"))
             return
         ok, message = runtime.select_model(name)
         # 消息**原样**发出去：那句话里含"上一个是谁""下一次请求生效"这些界面拼不出来的
         # 事实（拼的话就是第二份知识，而它漂掉的症状是"提示说换了、其实没换"）。
         self._notice("info" if ok else "warn", "model",
-                     ("[模型] " if ok else "[模型] 没换：") + message)
+                     i18n.t("channels.model.reply" if ok
+                            else "channels.model.not_changed", message=message))
         self.send(self._state_message())
 
     def _set_thinking(self, on: bool) -> None:
@@ -884,22 +889,24 @@ class ProtocolServer:
         """
         runtime = self.runtime
         if runtime is None:
-            self._notice("warn", "thinking", "[思考] 还没有会话。")
+            self._notice("warn", "thinking", i18n.t("channels.thinking.no_session"))
             return
         ok, message = runtime.select_thinking(on)
         self._notice("info" if ok else "warn", "thinking",
-                     ("[思考] " if ok else "[思考] 没改：") + message)
+                     i18n.t("channels.thinking.reply" if ok
+                            else "channels.thinking.not_changed", message=message))
         self.send(self._state_message())
 
     def _set_effort(self, effort: str) -> None:
         """改思考强度（`/effort`）。同上。"""
         runtime = self.runtime
         if runtime is None:
-            self._notice("warn", "effort", "[思考] 还没有会话。")
+            self._notice("warn", "effort", i18n.t("channels.effort.no_session"))
             return
         ok, message = runtime.select_effort(effort)
         self._notice("info" if ok else "warn", "effort",
-                     ("[思考] " if ok else "[思考] 没改：") + message)
+                     i18n.t("channels.effort.reply" if ok
+                            else "channels.effort.not_changed", message=message))
         self.send(self._state_message())
 
     def _send_status(self) -> None:
@@ -916,7 +923,7 @@ class ProtocolServer:
         """
         runtime = self.runtime
         if runtime is None:
-            self._notice("warn", "status", "[状态] 还没有会话。")
+            self._notice("warn", "status", i18n.t("channels.status.no_session"))
             return
         events = list(runtime.logs.read(runtime.session_id))
         summary = status_summary.summarize(events)
@@ -937,7 +944,7 @@ class ProtocolServer:
         """回一份工具清单（`ui` / `kind=tools`）。"""
         runtime = self.runtime
         if runtime is None:
-            self._notice("warn", "tools", "[工具] 还没有会话。")
+            self._notice("warn", "tools", i18n.t("channels.tools.no_session"))
             return
         self.send({
             "v": messages.VERSION,
@@ -974,20 +981,19 @@ class ProtocolServer:
         """
         runtime = self.runtime
         if runtime is None:
-            self._notice("warn", "mcp", "[MCP] 还没有会话。")
+            self._notice("warn", "mcp", i18n.t("channels.mcp.no_session"))
             return
         host = getattr(runtime, "mcp", None)
         if host is None:
-            self._notice("warn", "mcp",
-                         "[MCP] 这个 runtime 没有 MCP 宿主，改不了挂载。")
+            self._notice("warn", "mcp", i18n.t("channels.mcp.no_host"))
             return
 
         action = message.get("action")
         if action not in messages.MCP_ACTIONS:
             self._notice(
                 "warn", "mcp",
-                f"[MCP] 认不出这个动作：{action!r}（只有 "
-                f"{' / '.join(messages.MCP_ACTIONS)}）",
+                i18n.t("channels.mcp.unknown_action", action=repr(action),
+                       actions=" / ".join(messages.MCP_ACTIONS)),
             )
             return
 
@@ -999,11 +1005,11 @@ class ProtocolServer:
 
         notes: list[str] = []
         if action == messages.MCP_LIST:
-            notes.append("[MCP] 当前挂载情况（配置里改了要重启才生效）")
+            notes.append(i18n.t("channels.mcp.list_note"))
         else:
             self._join_turn()
             if not servers:
-                notes.append(f"[MCP] {action} 要给出 server 名字，一次一个")
+                notes.append(i18n.t("channels.mcp.needs_name", action=action))
             for name in servers:
                 if action == messages.MCP_LOAD:
                     notes.append(host.load(name))

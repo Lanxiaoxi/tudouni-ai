@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_runtime import i18n
 from agent_runtime import paths, userconfig
 from agent_runtime.security.commands import Rule, format_rule, parse_rule
 from agent_runtime.tools.mcp import McpConfigError, McpServer, parse_servers
@@ -181,11 +182,10 @@ class PermissionConfig:
 
         unknown = [key for key in raw if key not in _KNOWN_PERMISSION_KEYS]
         if unknown:
-            raise ConfigError(
-                f'{PERMISSION_FILE_NAME} 里有不认识的键：{", ".join(sorted(unknown))}\n'
-                f'  认识的只有：{", ".join(_KNOWN_PERMISSION_KEYS)}\n'
-                f"  （写错一个键名而它静默不生效是最坏的失败形态，所以这里直接停下）"
-            )
+            raise ConfigError(i18n.t(
+                "config.error.unknown_keys", where=PERMISSION_FILE_NAME,
+                names=", ".join(sorted(unknown)),
+                known=", ".join(_KNOWN_PERMISSION_KEYS)))
 
         # "文件里没写这个键"和"写了空数组"必须分开处理：前者是"用内置默认"，后者是
         # "什么都不自动放行"。合成一个的话，见 DEFAULT_AUTO_APPROVE 上面那段。
@@ -196,35 +196,31 @@ class PermissionConfig:
         )
         bad_levels = [lv for lv in levels if lv not in _LEVELS_ALLOWED_IN_FILE]
         if "high" in bad_levels:
-            raise ConfigError(
-                f'{PERMISSION_FILE_NAME} 的 auto_approve 不接受 "high"：等级是工具自己\n'
-                f'  声明的，"放行所有 high" 会随着将来新加的工具自动变宽。要放行 shell\n'
-                f'  就点名它：{{"auto_approve_tools": ["shell"]}}'
-            )
+            raise ConfigError(i18n.t("config.error.auto_approve_high",
+                                     file=PERMISSION_FILE_NAME))
         if bad_levels:
-            raise ConfigError(
-                f'{PERMISSION_FILE_NAME} 的 auto_approve 里有未知等级 '
-                f'{", ".join(bad_levels)}；能按等级放行的只有 '
-                f'{", ".join(_LEVELS_ALLOWED_IN_FILE)}'
-            )
+            raise ConfigError(i18n.t(
+                "config.error.auto_approve_unknown", file=PERMISSION_FILE_NAME,
+                levels=", ".join(bad_levels),
+                allowed=", ".join(_LEVELS_ALLOWED_IN_FILE)))
 
         auto_approve_tools = frozenset(_string_list(raw, "auto_approve_tools", path))
         deny_tools = frozenset(_string_list(raw, "deny_tools", path))
 
         contradictory = auto_approve_tools & deny_tools
         if contradictory:
-            raise ConfigError(
-                f'{PERMISSION_FILE_NAME} 里 {", ".join(sorted(contradictory))} 同时出现在 '
-                f"auto_approve_tools 和 deny_tools —— 这两句互相矛盾，在这里改掉，"
-                f"别让策略去猜哪个算数"
-            )
+            raise ConfigError(i18n.t(
+                "config.error.contradictory", file=PERMISSION_FILE_NAME,
+                names=", ".join(sorted(contradictory))))
 
         shell_allow: list[Rule] = []
         for text in _string_list(raw, "shell_allow", path):
             try:
                 shell_allow.append(parse_rule(text))
             except ValueError as exc:
-                raise ConfigError(f"{PERMISSION_FILE_NAME} 的 shell_allow 里有一条写错的规则：{exc}") from None
+                raise ConfigError(i18n.t("config.error.bad_shell_rule",
+                                         file=PERMISSION_FILE_NAME,
+                                         problem=exc)) from None
 
         return cls(
             auto_approve=tuple(levels),
@@ -303,7 +299,8 @@ class McpConfig:
         except McpConfigError as exc:
             # 形状问题归到 ConfigError 上：它和"缺密钥"是同一档 —— **用户得先做点事**，
             # 而且必须在开出会话之前停下（main.py 里那个 except ConfigError 就是这里）。
-            raise ConfigError(f"{path.name} 有问题：{exc}") from None
+            raise ConfigError(i18n.t("config.error.mcp_problem",
+                                     file=path.name, problem=exc)) from None
 
 
 # --- 联网工具：Tavily 的密钥 ---------------------------------------------
@@ -339,12 +336,10 @@ class WebConfig:
 
         unknown = sorted(key for key in cfg.web if key not in _WEB_KEYS)
         if unknown:
-            raise ConfigError(
-                f'{userconfig.config_file() if config_file is None else config_file} 的 '
-                f'"web" 里有不认识的键：{", ".join(unknown)}\n'
-                f'  认识的只有：{", ".join(sorted(_WEB_KEYS))}\n'
-                f"  （写错一个键名而它静默不生效是最坏的失败形态，所以这里直接停下）"
-            )
+            where = userconfig.config_file() if config_file is None else config_file
+            raise ConfigError(i18n.t(
+                "config.error.unknown_web_keys", path=where,
+                names=", ".join(unknown), known=", ".join(sorted(_WEB_KEYS))))
         return cls(
             tavily_api_key=userconfig.text(cfg.web, "tavily_api_key"),
             tavily_base_url=userconfig.text(
@@ -399,23 +394,20 @@ def _read_json_object(path: Path) -> dict[str, Any]:
         # 的失败，没人猜得到。没有 BOM 时它和 utf-8 完全一样。
         text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError:
-        raise ConfigError(
-            f"{path} 不是 UTF-8 编码，读出来是乱码。用记事本「另存为」时选 UTF-8。"
-        ) from None
+        raise ConfigError(i18n.t("config.error.not_utf8", path=path)) from None
     except OSError as exc:
-        raise ConfigError(f"读不了 {path}：{exc}") from None
+        raise ConfigError(i18n.t("config.error.unreadable", path=path,
+                                 error=exc)) from None
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ConfigError(
-            f"{path} 不是合法 JSON：第 {exc.lineno} 行第 {exc.colno} 列 {exc.msg}"
-        ) from None
+        raise ConfigError(i18n.t("config.error.bad_json", path=path, line=exc.lineno,
+                                 column=exc.colno, message=exc.msg)) from None
 
     if not isinstance(data, dict):
-        raise ConfigError(
-            f"{path} 的最外层必须是一个 JSON 对象（{{...}}），实际是 {type(data).__name__}"
-        )
+        raise ConfigError(i18n.t("config.error.not_object", path=path,
+                                 kind=type(data).__name__))
     return data
 
 
@@ -429,11 +421,11 @@ def _string_list(raw: dict[str, Any], key: str, path: Path) -> list[str]:
     if isinstance(value, str) or not isinstance(value, list) or not all(
         isinstance(item, str) for item in value
     ):
-        raise ConfigError(
-            f'{path.name} 的 "{key}" 必须是字符串数组，例如 ["shell"]'
-        )
+        raise ConfigError(i18n.t("config.error.not_string_list",
+                                 file=path.name, key=key))
 
     cleaned = [item.strip() for item in value]
     if any(not item for item in cleaned):
-        raise ConfigError(f'{path.name} 的 "{key}" 里有空字符串')
+        raise ConfigError(i18n.t("config.error.empty_string_in_list",
+                                 file=path.name, key=key))
     return cleaned

@@ -116,8 +116,13 @@ tudouni --tui                    # TUI 界面（它自己拉起一个 --runtime-
 tudouni --tui --no-stream        # 关掉逐字输出：答案整段出现（和加流式之前一样）
 tudouni --tui --theme 墨绿仪器    # 换配色。14 套：a 石墨琥珀是默认，也能给名字/序号
 tudouni --tui --quiet            # 安静模式：一次工具调用只占一行（见「TUI 的安静模式」）
+tudouni --tui --lang en          # 界面语言（临时给一个；平时写在配置的 ui.language 上）
 tudouni --runtime-stdio          # 协议子进程：stdout 是 JSONL（一般不由人直接跑）
 ```
+
+**界面可以整套换成英文**：配置里 `"ui": {"language": "en"}`（或者临时 `--lang en`）。
+它只换**界面**的语言 —— 模型读到的提示词、工具描述，以及模型自己说什么语言，一个字都不
+变；界面和 runtime 子进程各自翻译自己产生的那一半文案。细节见 `doc/TUI-design.md` 第二十节。
 如果使用ericai模式，在vdi上需要设置代理
 ```bash
 export https_proxy=http://www-proxy.ericsson.se:8080

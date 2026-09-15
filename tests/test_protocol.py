@@ -1131,6 +1131,21 @@ def test_the_client_asks_for_streaming_by_default():
     assert "--stream" not in client.default_argv("s", stream=False)
 
 
+def test_the_ui_language_is_handed_to_the_child():
+    """**`--lang` 要真的拼进 argv**（子进程按它写通知和 `/model` 的回话）。
+
+    语言由父进程定一次、传下去，而不是让两边各读一次配置：两处各读一次的话，
+    用户在两次读之间改了配置，界面和通知就会是两种语言 —— 而那是**一屏上看得见的
+    不一致**。直接手跑 `--runtime-stdio`（ansi 冒烟那条路）时它为空，那时候子进程
+    按配置文件定（见 `i18n.activate`），这就是"两个方向都要成立"的那一半。
+    """
+    from agent_runtime.protocol import client
+
+    assert "--lang" not in client.default_argv("s")
+    argv = client.default_argv("s", lang="en")
+    assert argv[argv.index("--lang") + 1] == "en"
+
+
 def test_the_ansi_client_runs_against_a_real_subprocess(fake_openai, workdir):
     """冒烟：那个 200 行的 ANSI 客户端能起来、能握手、能干净退出。
 

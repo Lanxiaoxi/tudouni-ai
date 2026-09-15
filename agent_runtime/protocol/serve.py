@@ -40,6 +40,7 @@ Agent —— 放这里会让"协议"和"启动"缠在一起，而那正是第零
 import sys
 from collections.abc import Callable
 
+from agent_runtime import i18n
 from agent_runtime.protocol.channels import Bootstrap, ProtocolServer
 from agent_runtime.protocol.transport_stdio import open_stdio
 from agent_runtime.runtime.composition import (
@@ -102,13 +103,26 @@ def make_session_opener(server: ProtocolServer, booted) -> OpenSession:
 
 
 def main(session_id: str | None = None, *, autopilot: bool = False,
-         debug: bool = False, stream: bool = True) -> int:
+         debug: bool = False, stream: bool = True,
+         lang: str | None = None) -> int:
     """跑一个协议会话。返回进程退出码。
 
     `stream` 默认**开**（这个入口只服务界面，而界面要的就是逐字）。协议的老客户端
     收不到伤害：delta 是两条新消息，不认识的 `t` 按协议约定忽略就行，而
     `ui(run_finished).answer` 照旧发一份完整的。
+
+    `lang` 是**界面语言**，由父进程（`--tui`）传下来；直接手跑这个入口时它为空，
+    那就按配置文件那一格定（见 `i18n.activate`）。它必须在**任何一句文案产生之前**
+    定下来 —— 启动通知就是第一句（`channels` 发 `init` 时现算的）。
     """
+    # 认不出的语言要**当场报**，而不是回默认：它是"用户得先做点事"那一档，
+    # 和配置写坏同一个处置（stderr + 退出码 2）。stdout 是协议通道，不能碰。
+    try:
+        i18n.activate(lang)
+    except i18n.LangError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
     transport = open_stdio()
     server = ProtocolServer(transport)
     booted = boot()

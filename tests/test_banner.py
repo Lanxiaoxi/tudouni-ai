@@ -118,3 +118,56 @@ def test_the_two_streams_carry_the_two_kinds_of_text():
     assert "审计日志写到" in result.stderr
     # 工具清单**不准**跑到 stderr 上（它以前就走 stdout，这是历史契约）。
     assert "已注册工具:" not in result.stderr
+
+
+def test_the_language_can_come_from_the_config_too(isolated_user_config):
+    """配置里的 `ui.language` 也管用 —— 而且**子进程那一半**同样跟着它。
+
+    上面那条走的是 `--lang`（父进程定的）；这一条走**配置**，也就是用户的常路：
+    `AGENT_CONFIG_FILE` 指的那份文件里写上 `"ui": {"language": "en"}`，子进程自己读它
+    （`--tui` 那条路上，父进程也会读同一份、再用 `--lang` 把答案传下来）。
+
+    **它跑的是真入口、真子进程**：所以它证明的不只是"配置读得对"，还有"runtime 那一侧
+    的文案真的按它出"。
+    """
+    import json
+
+    data = json.loads(isolated_user_config.read_text(encoding="utf-8"))
+    data["ui"] = {"language": "en"}
+    isolated_user_config.write_text(json.dumps(data, ensure_ascii=False),
+                                    encoding="utf-8")
+
+    result = subprocess.run(
+        [*RUNTIME_ARGV, "--session", "stream-check-cfg-en"],
+        input="exit\n", capture_output=True, encoding="utf-8", errors="replace",
+        env=dict(os.environ), cwd=str(REPO_ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "[permissions] auto-approved by level" in result.stderr
+    assert "Registered tools:" in result.stdout
+    assert "[权限]" not in result.stdout + result.stderr
+
+
+def test_the_runtime_notices_speak_english_with_lang_en():
+    """`--lang en` 时**子进程那一侧**写出来的说明也要是英文。
+
+    这是"两个进程各自本地化自己产生的那半句"唯一的端到端证据：那些 `[权限]` /
+    `[技能]` 说明不是前端写的（`Runtime.notices()` 拼好之后经 `init.notices`
+    **原样显示**），所以只翻 TUI 是看不出来的。这条跑的是真入口、真装配、真子进程。
+    """
+    result = subprocess.run(
+        [*RUNTIME_ARGV, "--session", "stream-check-en", "--lang", "en"],
+        input="exit\n", capture_output=True, encoding="utf-8", errors="replace",
+        env=dict(os.environ), cwd=str(REPO_ROOT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "[permissions] auto-approved by level" in result.stderr
+    assert "Registered tools:" in result.stdout
+    assert "risk=low" in result.stdout
+    assert "Audit log written to" in result.stderr
+    # 中文那几条**一处都不该再冒出来**（漏翻一句就会在这儿现形）。
+    for leaked in ("[权限]", "[技能]", "[任务]", "[MCP]", "[联网]", "[上下文]",
+                   "审计日志写到", "已注册工具:"):
+        assert leaked not in result.stdout + result.stderr, f"{leaked} 还是中文"

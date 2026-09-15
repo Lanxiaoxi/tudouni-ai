@@ -55,6 +55,7 @@ from typing import Any
 # 而 `len()` 数字符。欢迎屏上"把一行字居中"这件事只有按列数算才是对的。
 from rich.cells import cell_len
 
+from agent_runtime import i18n
 from agent_runtime.protocol import state as agent_state
 
 # 工具结果正文在界面上**一个字符都不显示**，只有一行"多少字符、多久"（决策 3：
@@ -97,24 +98,42 @@ ROLE_QUOTE = "quote"          # 引用块左边那条竖线（思考正文）
 
 # 审批结果的措辞。**key 是 `security/gate.py` 里那几个 outcome 字面量**，
 # 而值是给人看的说法 —— 界面不认识"approve 是什么意思"，它只是翻译。
-OUTCOME_TEXT = {
-    "approved": "批准",
-    "autopilot": "自动放行",
-    "command_allowed": "批准",
-    "user_denied": "拒绝",
-    "policy_denied": "策略禁止",
-    "no_asker": "没有审批通道",
+#
+# 文案在 `i18n` 的目录表里（`outcome.*`），这里只留"哪个枚举对应哪一条"。
+_OUTCOME_KEYS = {
+    "approved": "outcome.approved",
+    "autopilot": "outcome.autopilot",
+    "command_allowed": "outcome.approved",
+    "user_denied": "outcome.user_denied",
+    "policy_denied": "outcome.policy_denied",
+    "no_asker": "outcome.no_asker",
 }
 
 # 回合的结局。**它必须和"答完了"分得清**（`StepLimitExceeded` 那个类存在的
 # 全部理由），所以三种结局的措辞一个都不重合。
-STOP_REASON_TEXT = {
-    "answered": "已答",
-    "max_steps": "步数用尽",
-    "cancelled": "已中断",
-    "model_error": "模型失败",
-    "model_fatal": "模型失败",
+_STOP_REASON_KEYS = {
+    "answered": "stop.answered",
+    "max_steps": "stop.max_steps",
+    "cancelled": "stop.cancelled",
+    "model_error": "stop.model_error",
+    "model_fatal": "stop.model_error",
 }
+
+
+def outcome_text(outcome: str) -> str:
+    """审批结果的**说法**（`approved` → 「批准」/「Approved」）。
+
+    认不出的 outcome **原样显示**（老 runtime 发了新枚举时，屏幕上出现一个
+    `auto_something` 比出现一句"未知"有用 —— 前者能照着搜，后者什么都说明不了）。
+    """
+    key = _OUTCOME_KEYS.get(outcome)
+    return i18n.t(key) if key else (outcome or "?")
+
+
+def stop_reason_text(reason: str) -> str:
+    """回合结局的说法。认不出的同样原样显示（理由见 `outcome_text`）。"""
+    key = _STOP_REASON_KEYS.get(reason)
+    return i18n.t(key) if key else (reason or "?")
 
 # 任务状态的记号。和 `tools/builtin/todo.py` 的三个状态一一对应。
 TODO_MARK = {"completed": "✓", "in_progress": "◐", "pending": "○"}
@@ -325,13 +344,13 @@ def time_ago(seconds: float) -> str:
         # 时钟回拨（或文件的 mtime 来自另一台机器）→ 当成"刚刚"，别显示"-3分钟前"。
         seconds = 0
     if seconds < 60:
-        return "刚刚"
+        return i18n.t("time.just_now")
     if seconds < 3600:
-        return f"{int(seconds // 60)}分钟前"
+        return i18n.tn("time.minutes_ago", int(seconds // 60))
     if seconds < 86_400:
-        return f"{int(seconds // 3600)}小时前"
+        return i18n.tn("time.hours_ago", int(seconds // 3600))
     if seconds < 7 * 86_400:
-        return f"{int(seconds // 86_400)}天前"
+        return i18n.tn("time.days_ago", int(seconds // 86_400))
     # 一周以前用**日期**。`time_ago` 拿到的是一个时长，所以这里要回推一个时刻 ——
     # 这一档说的是"哪天"（相对时间到这儿已经不说明问题了），那几个小时的时区/夏令时
     # 误差看不出来。
@@ -344,23 +363,10 @@ def time_ago(seconds: float) -> str:
 #
 # 规矩：**一句话，别超一行**（窄屏会折成两行，那也还行）。不要写项目自夸，也不要
 # 写需要上下文才懂的话 —— 它是开机问候，不是公告。
-MOTTOS: tuple[str, ...] = (
-    "先想清楚要什么，再动手。",
-    "能写下判据的，才算想明白了。",
-    "改一处，就只改那一处。",
-    "看不懂的代码，先别改。",
-    "小步走，常回头。",
-    "把话说给下一个读它的人听。",
-    "失败要响，别悄悄吞掉。",
-    "重复第三遍的时候，就该抽出来了。",
-    "先让它对，再让它快。",
-    "名字错了，代码就跟着错。",
-    "留下的注释要解释为什么，不是是什么。",
-    "没跑过的东西，不算做完。",
-    "接口比实现活得久。",
-    "删掉一行代码，和写一行一样值钱。",
-    "今天的决定，明天的默认值。",
-)
+#
+# 文案本身在 `i18n` 的目录表里（`motto.1` …），这里只留**顺序**：次序换了，
+# "哪一天看到哪一句"就跟着换，而那句话是给人看的、两种语言各一份。
+_MOTTO_KEYS: tuple[str, ...] = tuple(f"motto.{index}" for index in range(1, 16))
 
 
 def motto_of_day(day: int | None = None) -> str:
@@ -372,7 +378,7 @@ def motto_of_day(day: int | None = None) -> str:
     """
     if day is None:
         day = int(time.time() // 86_400)
-    return MOTTOS[day % len(MOTTOS)]
+    return i18n.t(_MOTTO_KEYS[day % len(_MOTTO_KEYS)])
 
 
 # --- 回合 ----------------------------------------------------------------------
@@ -391,7 +397,7 @@ class Turn:
     user_input: str = ""
     steps: int = 0                  # 这一轮跑了几次模型往返
     duration_ms: int = 0
-    outcome: str = ""               # `STOP_REASON_TEXT` 里的那个说法
+    outcome: str = ""               # 已经翻好的一句话（`stop_reason_text`）
     finished: bool = False
     # 界面自己数秒用的起点。**它由 App 写**（`time.monotonic()`）—— 纯函数里
     # 不取时间，"本轮 1.4s"这种实时读数才不至于让渲染函数变成不纯的。
@@ -684,17 +690,18 @@ class ViewState:
         if spin and self.agent.is_busy:
             mark = spin
         settled = {
-            agent_state.FINISHED: "已答",
-            agent_state.LIMITED: "步数用尽",
-            agent_state.FAILED: "本轮失败",
-            agent_state.CANCELLED: "已中断",
+            agent_state.FINISHED: i18n.t("status.settled.answered"),
+            agent_state.LIMITED: i18n.t("status.settled.limited"),
+            agent_state.FAILED: i18n.t("status.settled.failed"),
+            agent_state.CANCELLED: i18n.t("status.settled.cancelled"),
         }.get(self.agent.phase, "")
         text = self.agent.activity or settled
         if self.agent.phase == agent_state.IDLE:
-            text = "空闲 · 说出一句话后才开始" if not self.turns else "空闲"
+            text = i18n.t("status.idle.new" if not self.turns else "status.idle")
         parts = [f"{mark} {text}".rstrip()]
         if self.agent.step and self.max_steps:
-            parts.append(f"第 {self.agent.step} / {self.max_steps} 步")
+            parts.append(i18n.t("status.step", step=self.agent.step,
+                                total=self.max_steps))
         return "    ".join(parts)
 
     def status_right(self, now: float | None = None,
@@ -711,21 +718,23 @@ class ViewState:
         """
         used = tokens_text(self.prompt_tokens)
         if self.prompt_tokens is None:
-            context = "上下文  —"
+            context = i18n.t("status.context.none")
         elif self.context_tokens and not compact:
             percent = self.prompt_tokens / self.context_tokens * 100
-            context = (f"上下文 {used} / {tokens_text(self.context_tokens)}"
-                       f"（{percent:.1f}%）")
+            context = i18n.t("status.context.percent", used=used,
+                             total=tokens_text(self.context_tokens),
+                             percent=f"{percent:.1f}")
         elif self.context_tokens:
-            context = f"上下文 {used} / {tokens_text(self.context_tokens)}"
+            context = i18n.t("status.context.plain", used=used,
+                             total=tokens_text(self.context_tokens))
         else:
             # 表里没有这个模型：**只报用量，不猜分母**（错的百分比比没有百分比更坏）。
-            context = f"上下文 {used}"
+            context = i18n.t("status.context.used", used=used)
 
         if self.prompt_tokens and self.cached_tokens is not None:
-            hit = f"命中 {self.cached_tokens / self.prompt_tokens * 100:.0f}%"
+            hit = i18n.t("status.hit", percent=f"{self.cached_tokens / self.prompt_tokens * 100:.0f}")
         else:
-            hit = "命中  —"
+            hit = i18n.t("status.hit.none")
 
         if compact:
             return "  ·  ".join([context, hit])
@@ -733,26 +742,34 @@ class ViewState:
         turn = self.current_turn
         if self.agent.is_busy and turn is not None and turn.started_at is not None \
                 and now is not None:
-            span = f"本轮 {ms_text(int((now - turn.started_at) * 1000))}"
+            span = i18n.t("status.turn", duration=ms_text(int((now - turn.started_at) * 1000)))
         elif turn is not None and turn.duration_ms:
-            span = f"本轮 {ms_text(turn.duration_ms)}"
+            span = i18n.t("status.turn", duration=ms_text(turn.duration_ms))
         elif self.steps or self.messages > 1:
             # **"还没有会话"和"会话里有东西"要分得开**：新会话的 `messages` 是 1
             # （那条 system 消息），照抄成"会话 1 条 · 0 步"会让人以为已经聊过了
             # （实测：用户截图里那一行就是这么读的）。所以 `>1` 才算有内容 ——
             # 和 `resumed` 那条"新会话也带一条 system 消息"的坑是同一个。
-            span = f"会话 {self.messages} 条 · {self.steps} 步"
+            #
+            # 两个数各有各的单复数，所以**拼两段**再套外层模板：一个 `{n}` 的
+            # 单复数规则套不住两个独立的数（`1 message · 3 steps`）。
+            span = i18n.t(
+                "status.session.span",
+                messages=i18n.tn("status.session.messages", self.messages),
+                steps=i18n.tn("status.session.steps", self.steps),
+            )
         else:
-            span = "会话  —"
-        return "  ·  ".join([context, hit, span, f"审计 {self.audit_dir_short()}"])
+            span = i18n.t("status.session.none")
+        return "  ·  ".join([context, hit, span,
+                             i18n.t("status.audit", path=self.audit_dir_short())])
 
     def autopilot_badge(self, compact: bool = False) -> Line:
         """状态栏左边那枚 autopilot 指示灯：`自动放行 开` / `自动放行 关`。
 
         **两个状态都要显示**，不做成"开着才显示"：那样"这一格空着"既可能是关掉了、
         也可能是没画出来，而这一格的语义恰恰是"接下来还会不会问你" —— 它不允许有
-        歧义。用词跟着 `OUTCOME_TEXT` 里那条（`autopilot` → 「自动放行」），
-        所以它和审批结果里那个说法是同一句话。
+        歧义。说法和审批结果里那条（`outcome.autopilot` → 「自动放行」）**是一套词**：
+        两句在目录表里挨着放，改的时候一起改。
 
         颜色：开着是 `warn`（它意味着工具会在没有人点头的情况下执行），关着是
         最暗那档 —— 常态不该抢眼。
@@ -761,10 +778,9 @@ class ViewState:
         每一列都从**左段**身上扣，而左段被裁成半句正是 F5 那次踩过的坑
         （实测：显示成 `● 要调用 edit_file（第`，那句话的意思整个没了）。
         """
-        word = "放行" if compact else "自动放行"
-        if self.autopilot:
-            return Line(f"{word} 开", ROLE_WARN)
-        return Line(f"{word} 关", ROLE_RULE)
+        key = "status.autopilot." + ("on" if self.autopilot else "off") \
+            + ("_short" if compact else "")
+        return Line(i18n.t(key), ROLE_WARN if self.autopilot else ROLE_RULE)
 
     def quiet_badge(self) -> Line | None:
         """状态栏那一枚「安静」指示灯；**关着时返回 None（一格都不占）**。
@@ -779,7 +795,7 @@ class ViewState:
         （`--quiet` 起的那一次也一样看得见：状态栏写着「安静」，于是"为什么这次
         工具输出这么少"在屏幕上就有答案。）
         """
-        return Line("安静", ROLE_RULE) if self.quiet else None
+        return Line(i18n.t("status.quiet"), ROLE_RULE) if self.quiet else None
 
     def jobs_badge(self, compact: bool = False) -> Line | None:
         """状态栏那一枚后台任务徽标；**一件都不悬着时返回 None**（一格都不占）。
@@ -805,12 +821,12 @@ class ViewState:
         if not outstanding:
             # 全都收过了：留一枚安静的"历史"记号，而不是整格消失 —— 消失之后
             # "起过又收干净了"和"从来没起过"长得一模一样，而前者是值得知道的事实。
-            return Line(f"后台 {len(self.jobs)} 已收", ROLE_RULE)
+            return Line(i18n.tn("status.jobs.collected", len(self.jobs)), ROLE_RULE)
         uncollected = sum(1 for job in self.jobs
                           if str(job.get("state", "")) == "uncollected")
-        text = f"后台 {len(outstanding)}"
+        text = i18n.tn("status.jobs.running", len(outstanding))
         if uncollected and not compact:
-            text += f" · {uncollected} 条待收"
+            text += i18n.tn("status.jobs.uncollected", uncollected)
         return Line(text, ROLE_WARN if uncollected else ROLE_PROCESS)
 
     def audit_short(self) -> str:
@@ -879,8 +895,9 @@ def render_event(state: ViewState, message: dict[str, Any]) -> list[Line]:
         if status != "ok":
             attempt = message.get("attempt", 1)
             backoff = message.get("backoff_ms")
-            tail = f"，{backoff}ms 后重试" if backoff else ""
-            out.append(Line(f"  · 模型调用失败（第 {attempt} 次）{tail}", ROLE_WARN))
+            tail = i18n.t("event.model_retry_wait", backoff=backoff) if backoff else ""
+            out.append(Line(i18n.t("event.model_retry", attempt=attempt, tail=tail),
+                            ROLE_WARN))
         else:
             if turn is not None:
                 turn.steps += 1
@@ -923,7 +940,7 @@ def render_event(state: ViewState, message: dict[str, Any]) -> list[Line]:
                 # **拒绝要单独说一句**：它是"没执行"，和"执行了但出错"完全不同，
                 # 而两者在 `chars` 上看不出来。（安静模式下那一行自己写着"被拒绝"，
                 # 所以这里不用补。）
-                out.append(Line("      （被拒绝，没有执行）", ROLE_DENIED))
+                out.append(Line(i18n.t("event.denied"), ROLE_DENIED))
 
     elif kind == "permission":
         if not (state.quiet and _permission_is_silent(message)):
@@ -934,8 +951,8 @@ def render_event(state: ViewState, message: dict[str, Any]) -> list[Line]:
         wall = message.get("wall_ms")
         out.append(seg(
             ("  · ", ROLE_PROCESS),
-            (f"{calls} 个只读工具并发执行完毕", ROLE_PROCESS),
-            (f"（{wall}ms）", ROLE_RULE),
+            (i18n.tn("event.tool_batch", calls), ROLE_PROCESS),
+            (i18n.t("event.tool_batch_wall", wall=wall), ROLE_RULE),
         ))
 
     elif kind == "run_finished":
@@ -953,8 +970,8 @@ def _turn_header(turn: Turn) -> Line:
     它不该去猜"哪一段是标题"（按 `str` 找第一个空格会在标题里带空格时切错）。
     """
     return seg(
-        (f"回合 {turn.index}", ROLE_TURN_START),
-        ("进行中 · 第 1 步", ROLE_WAITING),
+        (i18n.t("turn.head", index=turn.index), ROLE_TURN_START),
+        (i18n.t("turn.running"), ROLE_WAITING),
     )
 
 
@@ -976,16 +993,18 @@ def turn_head_parts(line: Line) -> tuple[str, str, str]:
 def _model_line(state: ViewState, message: dict[str, Any]) -> Line:
     """过程行：`· 模型 1.2s  上下文 12.4k token（命中 10.1k · 88%）`。"""
     parts: list[tuple[str, str]] = [
-        ("  · 模型 ", ROLE_PROCESS),
+        (i18n.t("event.model_prefix"), ROLE_PROCESS),
         (ms_text(message.get("duration_ms")), ROLE_PROCESS),
     ]
     tokens = message.get("prompt_tokens")
     cached = message.get("cached_tokens")
     if tokens is not None:
-        parts.append((f"  上下文 {tokens_text(tokens)} token", ROLE_PROCESS))
+        parts.append((i18n.t("event.context_tokens", tokens=tokens_text(tokens)),
+                      ROLE_PROCESS))
         if cached:
             percent = cached / tokens * 100
-            parts.append((f"（命中 {tokens_text(cached)} · {percent:.0f}%）", ROLE_RULE))
+            parts.append((i18n.t("event.cache_hit", cached=tokens_text(cached),
+                                 percent=f"{percent:.0f}"), ROLE_RULE))
     return seg(*parts)
 
 
@@ -1010,8 +1029,8 @@ def folded_thinking(text: str, anchor: str = "") -> Line:
     别的调用方不给，于是那些行不参与回填 —— 这是对的，它们各自只画一次。
     """
     return seg(
-        ("  ▸ 思考过程", ROLE_THINK_HEAD),
-        (f"（{len(text)} 字符 · Ctrl+T 展开）", ROLE_RULE),
+        (i18n.t("think.prefix_folded"), ROLE_THINK_HEAD),
+        (i18n.tn("think.folded_tail", len(text), chars=len(text)), ROLE_RULE),
         anchor=anchor,
     )
 
@@ -1034,18 +1053,19 @@ def live_thinking_line(text: str, spin: str, anchor: str) -> Line:
     字符数从 `text` 来（**调用方给**，可能是流式累计、也可能是 `model_call` 带回来的
     完整那份），所以它是一路涨上去的：看得见它在长，比转圈本身更让人放心。
     """
-    parts: list[tuple[str, str]] = [("  ▸ 思考过程", ROLE_THINK_HEAD)]
+    parts: list[tuple[str, str]] = [(i18n.t("think.prefix_folded"), ROLE_THINK_HEAD)]
     if spin:
         parts.append((f" {spin}", ROLE_WAITING))
-    parts.append((f" {count_text(len(text))} 字符", ROLE_RULE))
+    parts.append((i18n.tn("think.live_chars", len(text),
+                          chars=count_text(len(text))), ROLE_RULE))
     return seg(*parts, role=ROLE_THINK_HEAD, anchor=anchor)
 
 
 def expanded_thinking_head() -> Line:
     """展开形态的块头：`  ▾ 思考过程（展开 · Ctrl+T 收起）`。"""
     return seg(
-        ("  ▾ 思考过程", ROLE_THINK_HEAD),
-        ("（展开 · Ctrl+T 收起）", ROLE_RULE),
+        (i18n.t("think.prefix_expanded"), ROLE_THINK_HEAD),
+        (i18n.t("think.expanded_tail"), ROLE_RULE),
     )
 
 
@@ -1108,9 +1128,9 @@ def _risk_suffix(state: ViewState, tool: str) -> list[tuple[str, str]]:
     """
     risk = state.tool_risks.get(tool, "")
     if risk == "high":
-        return [("   HIGH 风险", ROLE_RISK_HIGH)]
+        return [(i18n.t("risk.high"), ROLE_RISK_HIGH)]
     if risk == "medium":
-        return [("   MEDIUM 风险", ROLE_RISK_MEDIUM)]
+        return [(i18n.t("risk.medium"), ROLE_RISK_MEDIUM)]
     return []
 
 
@@ -1160,8 +1180,9 @@ _BRIEF_FALLBACK_KEYS: tuple[str, ...] = (
     "path", "file", "command", "pattern", "query", "url", "name", "question", "prompt",
 )
 
-# 列表类参数的说法：任务列表说"条任务"，别的说"项"。
-_BRIEF_LIST_TEXT: dict[str, str] = {"todo_write": "条任务"}
+# 列表类参数的说法：任务列表说"条任务"，别的说"项"。**这里只留"哪几个工具算任务列表"**
+# —— 说法本身在目录表里（`brief.todo_items` / `brief.items`），见 `tool_brief`。
+_BRIEF_LIST_TOOLS: frozenset[str] = frozenset({"todo_write"})
 
 # 这一行的长度预算。**它是给"一行"定的**：状态栏左边、工具行、回合头挤在同一屏上，
 # 而一串 200 字符的命令会把这一行撑到折行（折了就又变成两行了）。
@@ -1180,9 +1201,9 @@ def _brief_value(value: Any) -> str:
         text = " ".join(value.split())
         return text if len(text) <= BRIEF_LIMIT else text[:BRIEF_LIMIT] + "…"
     if isinstance(value, list):
-        return f"{len(value)} 项"
+        return i18n.tn("brief.items", len(value))
     if isinstance(value, bool):
-        return "是" if value else "否"
+        return i18n.t("brief.yes" if value else "brief.no")
     if value is None:
         return ""
     return str(value)
@@ -1253,7 +1274,9 @@ def tool_brief(tool: str, arguments: str) -> str:
         return _brief_from_preview(tool, arguments)
     _key, value = picked
     if isinstance(value, list):
-        return f"{len(value)} {_BRIEF_LIST_TEXT.get(tool, '项')}"
+        # 任务列表那一格说"几件事"，别的列表参数说"几项"（见 `_BRIEF_LIST_TOOLS`）。
+        key = "brief.todo_items" if tool in _BRIEF_LIST_TOOLS else "brief.items"
+        return i18n.tn(key, len(value))
     return _brief_value(value)
 
 
@@ -1306,13 +1329,17 @@ def _tool_brief_done_line(tool: str, message: dict[str, Any]) -> Line:
     chars = count_text(message.get("chars", 0))
     span = ms_text(message.get("duration_ms"))
     if status == "ok":
-        parts = [("✓ ", ROLE_RESULT), (f"{chars} 字符   {span}", ROLE_RULE)]
+        parts = [("✓ ", ROLE_RESULT),
+                 (i18n.tn("tool.ok_tail", int(message.get("chars", 0) or 0),
+                          chars=chars, span=span), ROLE_RULE)]
     elif status == "denied":
-        parts = [("✗ ", ROLE_DENIED), ("被拒绝，没有执行", ROLE_RULE)]
+        parts = [("✗ ", ROLE_DENIED), (i18n.t("tool.denied"), ROLE_RULE)]
     elif status == "invalid_args":
-        parts = [("✗ ", ROLE_DENIED), ("参数不合法，没有执行", ROLE_RULE)]
+        parts = [("✗ ", ROLE_DENIED), (i18n.t("tool.invalid_args"), ROLE_RULE)]
     else:
-        parts = [("! ", ROLE_WARN), (f"执行出错（{chars} 字符）", ROLE_RULE)]
+        parts = [("! ", ROLE_WARN),
+                 (i18n.tn("tool.error", int(message.get("chars", 0) or 0),
+                          chars=chars), ROLE_RULE)]
     return seg(*parts, role=ROLE_TOOL_BRIEF_DONE, anchor=call_id)
 
 
@@ -1328,7 +1355,8 @@ def _tool_result_line(index: Any, tool: str, message: dict[str, Any]) -> Line:
         ("  ← ", ROLE_PROCESS),
         (at, ROLE_RULE),
         (f"{mark} ", role),
-        (f"{count_text(message.get('chars', 0))} 字符", ROLE_PROCESS),
+        (i18n.tn("tool.result_chars", int(message.get("chars", 0) or 0),
+                 chars=count_text(message.get("chars", 0))), ROLE_PROCESS),
         (f"   {ms_text(message.get('duration_ms'))}", ROLE_RULE),
     )
 
@@ -1359,19 +1387,22 @@ def _permission_line(message: dict[str, Any]) -> Line:
     outcome = message.get("outcome", "")
     extras: list[str] = []
     if message.get("rule"):
-        extras.append(f"命中规则 {' '.join(message['rule'])}")
+        extras.append(i18n.t("permission.rule_hit", rule=" ".join(message["rule"])))
     if message.get("remembered"):
-        extras.append(f"已记住 {'、'.join(message['remembered'])}")
+        extras.append(i18n.t("permission.remembered",
+                             remembered=i18n.t("list.separator").join(
+                                 message["remembered"])))
     if message.get("waited_ms"):
-        extras.append(f"你看了 {ms_text(message['waited_ms'])}")
-    tail = f"（{' · '.join(extras)}）" if extras else ""
+        extras.append(i18n.t("permission.waited",
+                             duration=ms_text(message["waited_ms"])))
+    tail = i18n.t("permission.tail", extras=" · ".join(extras)) if extras else ""
     role = ROLE_WARN if outcome in ("user_denied", "policy_denied", "no_asker") \
         else ROLE_PROCESS
     return seg(
-        ("  · 权限 ", ROLE_PROCESS),
+        (i18n.t("permission.line_prefix"), ROLE_PROCESS),
         (str(message.get("tool", "")), ROLE_TOOL),
         (" → ", ROLE_PROCESS),
-        (OUTCOME_TEXT.get(outcome, outcome or "?"), role),
+        (outcome_text(outcome), role),
         (tail, ROLE_RULE),
     )
 
@@ -1380,7 +1411,7 @@ def _finish_turn(state: ViewState, message: dict[str, Any]) -> list[Line]:
     """`run_finished`：把回合头改成最终形态，并说清结局。"""
     turn = state.turn_for(message.get("run_id", ""))
     reason = message.get("stop_reason", "")
-    outcome = STOP_REASON_TEXT.get(reason, reason or "?")
+    outcome = stop_reason_text(reason)
     duration = message.get("duration_ms", 0)
     if turn is not None:
         turn.finished = True
@@ -1388,18 +1419,16 @@ def _finish_turn(state: ViewState, message: dict[str, Any]) -> list[Line]:
         turn.outcome = outcome
     index = turn.index if turn is not None else len(state.turns)
     head = seg(
-        (f"回合 {index}", ROLE_TURN_END),
-        (f"{turn.steps if turn else 0} 步 · {ms_text(duration)} · {outcome}",
-         ROLE_RULE),
+        (i18n.t("turn.head", index=index), ROLE_TURN_END),
+        (i18n.tn("turn.state", turn.steps if turn else 0,
+                 duration=ms_text(duration), outcome=outcome), ROLE_RULE),
     )
     if reason == "max_steps":
         # **必须和 answered 长得不一样。** 这是 `StepLimitExceeded` 那个类存在的
         # 全部理由：不许让人分不清"答完了"和"被砍断了"。
-        return [head, Line(
-            "  ! 步数用尽，这一轮**没有**收尾 —— 会话是好的，可以接着跑。", ROLE_WARN)]
+        return [head, Line(i18n.t("turn.max_steps_warning"), ROLE_WARN)]
     if reason == "cancelled":
-        return [head, Line(
-            "  ! 已按你的要求停下（停在两步之间，会话是完好的）。", ROLE_WARN)]
+        return [head, Line(i18n.t("turn.cancelled_warning"), ROLE_WARN)]
     return [head]
 
 
@@ -1440,15 +1469,15 @@ def waiting_line(request: dict[str, Any]) -> Line:
     键去按。
     """
     parts: list[tuple[str, str]] = [
-        ("  · 等待你的批准", ROLE_WAITING),
-        ("   [y] 允许", ROLE_RULE),
-        ("   [n] 拒绝", ROLE_RULE),
+        (i18n.t("waiting.prompt"), ROLE_WAITING),
+        (i18n.t("waiting.allow"), ROLE_RULE),
+        (i18n.t("waiting.deny"), ROLE_RULE),
     ]
     if request.get("remember_hint"):
-        parts.append(("   [t] 总是允许", ROLE_RULE))
+        parts.append((i18n.t("waiting.always"), ROLE_RULE))
     if request.get("allow_trust_all") and request.get("trust_all_hint"):
-        parts.append(("   [a] 都允许", ROLE_RULE))
-    parts.append(("   [Esc] 拒绝", ROLE_RULE))
+        parts.append((i18n.t("waiting.allow_all"), ROLE_RULE))
+    parts.append((i18n.t("waiting.escape"), ROLE_RULE))
     text = "".join(chunk for chunk, _role in parts)
     return Line(text, ROLE_WAITING, list(parts))
 
@@ -1502,10 +1531,13 @@ _STREAM_BODY_ROLE = {"text": ROLE_ANSWER, "reasoning": ROLE_THINK_BODY}
 # 正文用的是 `ROLE_ANSWER` 而不是另立一个角色：流式正文块本身走 Markdown，
 # 这几个字符被包成行内代码（见 `TurnBlock.add_stream`），颜色由 CSS 的
 # `.answer MarkdownBlock > .code_inline` 决定 —— 再立一个角色也没人去用。
-STREAM_HEAD = {
-    "text": ("  ● ", ROLE_ANSWER),
-    "reasoning": ("  ▸ 思考过程", ROLE_THINK_HEAD),
-}
+# **它是函数而不是一张表**：表在 import 时就把文案冻住了，而那两条前缀是给用户看的
+# （`widgets` 每次画流式块都要读一次）。
+def stream_head(channel: str) -> tuple[str, str]:
+    """流式那一块开头的记号与角色：正文 `  ● `、思考链 `  ▸ 思考过程`。"""
+    if channel == "reasoning":
+        return i18n.t("think.prefix_folded"), ROLE_THINK_HEAD
+    return "  ● ", ROLE_ANSWER
 
 
 def stream_delta(state: ViewState, message: dict[str, Any]) -> None:
@@ -1774,21 +1806,21 @@ def _mcp_block(state: ViewState) -> tuple[str, str, list[Line]]:
     """
     loaded = [item for item in state.mcp if item.get("state") == "loaded"]
     if not loaded:
-        return ("后台 MCP", "", [
-            Line("当前没有挂载 MCP server", ROLE_RULE),
-            Line("/mcp 可以看清单并逐个挂载", ROLE_RULE),
+        return (i18n.t("rail.mcp"), "", [
+            Line(i18n.t("rail.mcp.empty"), ROLE_RULE),
+            Line(i18n.t("rail.mcp.empty_hint"), ROLE_RULE),
         ])
     lines = [
         seg(
             (f"{_MCP_MARK['loaded']} ", ROLE_ANSWER),
             (str(item.get("name", "?")), ROLE_PROCESS),
-            (f"  {item.get('tools', 0)} 个工具", ROLE_RULE),
+            (i18n.tn("rail.mcp.tools", item.get("tools", 0)), ROLE_RULE),
         )
         for item in loaded
     ]
     # 右侧那个计数报 `在跑的 / 配置里的总数`：分母让"我没开的那几个"也一眼看得见，
     # 而不会让人以为"配了三个却只挂上一个"是坏了。
-    return ("后台 MCP", f"{len(loaded)} / {len(state.mcp)}", lines)
+    return (i18n.t("rail.mcp"), f"{len(loaded)} / {len(state.mcp)}", lines)
 
 
 def _jobs_block(state: ViewState) -> tuple[str, str, list[Line]]:
@@ -1804,8 +1836,8 @@ def _jobs_block(state: ViewState) -> tuple[str, str, list[Line]]:
     """
     jobs = state.jobs
     if not jobs:
-        return ("后台任务", "", [Line("当前没有后台任务", ROLE_RULE),
-                                 Line("shell_background 起的会在这里", ROLE_RULE)])
+        return (i18n.t("rail.jobs"), "", [Line(i18n.t("rail.jobs.empty"), ROLE_RULE),
+                                          Line(i18n.t("rail.jobs.empty_hint"), ROLE_RULE)])
     outstanding = sum(1 for job in jobs if _job_role(job) != ROLE_RULE)
     lines = [
         seg((f"{_JOB_MARK.get(str(job.get('state', '')), '·')} ", _job_role(job)),
@@ -1813,7 +1845,7 @@ def _jobs_block(state: ViewState) -> tuple[str, str, list[Line]]:
             (f"  {_job_tail(job)}", ROLE_RULE))
         for job in jobs
     ]
-    return ("后台任务", f"{outstanding} / {len(jobs)}", lines)
+    return (i18n.t("rail.jobs"), f"{outstanding} / {len(jobs)}", lines)
 
 
 # 后台任务的记号。**四档各有各的形状**，因为它们要回答的问题不同：还在跑的、
@@ -1850,21 +1882,22 @@ def _job_tail(job: dict[str, Any]) -> str:
     seconds = job.get("seconds")
     span = f"{int(seconds)}s" if isinstance(seconds, int) else ""
     if state == "running":
-        return f"在跑 {span}".strip()
+        return i18n.t("rail.job.running", span=span).strip()
     if state == "uncollected":
         code = job.get("exit_code")
-        return f"已结束（退出码 {code}）· 结果还没收"
+        return i18n.t("rail.job.uncollected", code=code)
     if state == "killed":
-        return "已被收掉"
+        return i18n.t("rail.job.killed")
     code = job.get("exit_code")
-    return f"已结束（退出码 {code}）· 已收"
+    return i18n.t("rail.job.done", code=code)
 
 
 def _todo_block(state: ViewState) -> tuple[str, str, list[Line]]:
     todos = state.todos
     if not todos:
-        return ("任务", "", [Line("当前还没有任务", ROLE_RULE),
-                             Line("agent 创建的任务会在这里", ROLE_RULE)])
+        return (i18n.t("rail.tasks"), "",
+                [Line(i18n.t("rail.tasks.empty"), ROLE_RULE),
+                 Line(i18n.t("rail.tasks.empty_hint"), ROLE_RULE)])
     done = sum(1 for item in todos if item.get("status") == "completed")
     lines = [_bar(done, len(todos))]
     for item in todos:
@@ -1873,7 +1906,7 @@ def _todo_block(state: ViewState) -> tuple[str, str, list[Line]]:
         if item.get("status") == "in_progress":
             role = ROLE_WAITING
         lines.append(seg((f"{mark} ", role), (item.get("content", ""), ROLE_PROCESS)))
-    return ("任务", f"{done} / {len(todos)}", lines)
+    return (i18n.t("rail.tasks"), f"{done} / {len(todos)}", lines)
 
 
 def _bar(done: int, total: int, width: int = 20) -> Line:
@@ -1910,10 +1943,11 @@ def _skill_block(state: ViewState) -> tuple[str, str, list[Line]]:
     自己那一块的事。要看可用清单，`Ctrl+S` 就是那个出口。
     """
     if not state.skills:
-        return ("已加载技能", "0", [Line("还没有加载技能", ROLE_RULE),
-                                    Line("load_skill 读过的会一直生效", ROLE_RULE)])
+        return (i18n.t("rail.skills"), "0",
+                [Line(i18n.t("rail.skills.empty"), ROLE_RULE),
+                 Line(i18n.t("rail.skills.empty_hint"), ROLE_RULE)])
     lines = [Line(entry.get("name", "?"), ROLE_SKILL) for entry in state.skills]
-    return ("已加载技能", str(len(state.skills)), lines)
+    return (i18n.t("rail.skills"), str(len(state.skills)), lines)
 
 
 def _permission_block(state: ViewState) -> tuple[str, str, list[Line]]:
@@ -1923,7 +1957,7 @@ def _permission_block(state: ViewState) -> tuple[str, str, list[Line]]:
     （`risk_scope`），界面不认识"默认只有 low"这件事 —— 那是 config 的知识。
     """
     lines: list[Line] = []
-    label = {"auto": "自动放行", "ask": "询问"}
+    label = {"auto": i18n.t("rail.permission.auto"), "ask": i18n.t("rail.permission.ask")}
     for item in state.risk_scope:
         risk = item.get("risk", "")
         disposition = item.get("disposition", "")
@@ -1944,22 +1978,27 @@ def _permission_block(state: ViewState) -> tuple[str, str, list[Line]]:
     # **文本一个字没变**（`str(line)` 仍是 `点名免问 fetch_web`），所以"左栏已经显示
     # 着它、旁白就别再说一遍"那条断言照旧成立。
     if state.granted_tools:
-        lines.append(seg(("点名免问", ROLE_RULE),
-                         (" " + "、".join(state.granted_tools), ROLE_PROCESS)))
+        lines.append(seg((i18n.t("rail.permission.granted"), ROLE_RULE),
+                         (" " + i18n.t("list.separator").join(state.granted_tools),
+                          ROLE_PROCESS)))
     if state.granted_prefixes:
-        lines.append(seg(("命令规则", ROLE_RULE),
-                         (" " + "、".join(state.granted_prefixes), ROLE_PROCESS)))
+        lines.append(seg((i18n.t("rail.permission.prefixes"), ROLE_RULE),
+                         (" " + i18n.t("list.separator").join(state.granted_prefixes),
+                          ROLE_PROCESS)))
     if state.denied_tools:
-        lines.append(Line("直接拒绝 " + "、".join(state.denied_tools), ROLE_DENIED))
+        lines.append(Line(i18n.t("rail.permission.denied")
+                          + i18n.t("list.separator").join(state.denied_tools),
+                          ROLE_DENIED))
     if not lines:
-        lines.append(Line("按等级（runtime 没报范围）", ROLE_RULE))
-    return ("权限范围", "", lines)
+        lines.append(Line(i18n.t("rail.permission.by_level"), ROLE_RULE))
+    return (i18n.t("rail.permissions"), "", lines)
 
 
 def _session_block(state: ViewState) -> tuple[str, str, list[Line]]:
     if not state.session_id:
-        return ("本次会话", "", [Line("还没有会话", ROLE_RULE),
-                                 Line("说出第一句话之后才有文件", ROLE_RULE)])
+        return (i18n.t("rail.session"), "",
+                [Line(i18n.t("rail.session.empty"), ROLE_RULE),
+                 Line(i18n.t("rail.session.empty_hint"), ROLE_RULE)])
     lines = [Line(state.session_id, ROLE_PROCESS)]
     # **这个会话在用哪个模型**，常驻在它下面一行。
     #
@@ -1975,20 +2014,25 @@ def _session_block(state: ViewState) -> tuple[str, str, list[Line]]:
     # 思考模式**只在关着的时候占一行**。开着是常态（端点的默认行为就是开），为它常驻
     # 一行会让左栏那几块里的信息密度掉下来 —— 而"关着"是个例外，值得被看见。
     if not state.thinking_on:
-        lines.append(seg(("思考 关", ROLE_WARN),
-                         (f"  强度 {state.effort}", ROLE_RULE)))
+        lines.append(seg((i18n.t("rail.session.thinking_off"), ROLE_WARN),
+                         (i18n.t("rail.session.effort", effort=state.effort),
+                          ROLE_RULE)))
     if state.messages:
-        lines.append(Line(f"{state.messages} 条消息 · {state.steps} 步", ROLE_RULE))
+        lines.append(Line(i18n.t(
+            "rail.session.size",
+            messages=i18n.tn("rail.session.messages", state.messages),
+            steps=i18n.tn("rail.session.steps", state.steps)), ROLE_RULE))
     if state.prompt_tokens is not None:
         used = tokens_text(state.prompt_tokens)
         if state.context_tokens:
             percent = state.prompt_tokens / state.context_tokens * 100
             lines.append(Line(
-                f"上下文 {used} / {tokens_text(state.context_tokens)}"
-                f"（{percent:.1f}%）", ROLE_RULE))
+                i18n.t("status.context.percent", used=used,
+                       total=tokens_text(state.context_tokens),
+                       percent=f"{percent:.1f}"), ROLE_RULE))
         else:
-            lines.append(Line(f"上下文 {used}", ROLE_RULE))
-    lines.append(Line(f"审计 {state.audit_dir_short()}", ROLE_RULE))
+            lines.append(Line(i18n.t("status.context.used", used=used), ROLE_RULE))
+    lines.append(Line(i18n.t("status.audit", path=state.audit_dir_short()), ROLE_RULE))
     # 这个会话的 system 消息里注入了哪几份 AGENT.md。**放进"本次会话"这一块**（而不是
     # 新开一块）：它和"这个会话 id 是什么、走了几步"是同一档事实 —— 都由会话创建那一刻
     # 决定，也都在会话之间各不相同。开场那条 notice 说的是同一次加载，但那一条会随
@@ -1999,12 +2043,13 @@ def _session_block(state: ViewState) -> tuple[str, str, list[Line]]:
         # 截断过的用 `…` 标出来：**它和"读失败"不是一回事**（内容进去了，只是不全），
         # 所以不能和 failed 共用那个 `!` —— 那会让人以为这份说明整个没生效。
         mark = "! " if failed else ("… " if item.get("truncated") else "")
-        detail = item.get("reason") if failed else f"{item.get('lines', 0)} 行"
+        detail = item.get("reason") if failed \
+            else i18n.tn("rail.session.agent_md_lines", int(item.get("lines", 0) or 0))
         lines.append(seg(
             (f"{mark}{name}", ROLE_WARN if failed else ROLE_RULE),
             (f"  {detail}" if detail else "", ROLE_RULE),
         ))
-    return ("本次会话", "", lines)
+    return (i18n.t("rail.session"), "", lines)
 
 
 def rail_summary(state: ViewState) -> str:
@@ -2013,28 +2058,30 @@ def rail_summary(state: ViewState) -> str:
     它必须**说清收起之后少了什么**：任务几条、技能几个、权限是什么档 ——
     否则"收起"就等于"看不见"，而左栏存在的全部理由就是让它们常驻可见。
     """
-    parts = ["Ctrl+B 展开上下文栏"]
+    parts = [i18n.t("rail.summary.expand")]
     if state.jobs:
         outstanding = sum(1 for job in state.jobs
                           if str(job.get("state", "")) in ("running", "uncollected"))
-        parts.append(f"{outstanding} 个后台任务" if outstanding
-                     else f"{len(state.jobs)} 个后台任务（都收过了）")
+        parts.append(i18n.tn("rail.summary.jobs", outstanding) if outstanding
+                     else i18n.tn("rail.summary.jobs_collected", len(state.jobs)))
     # MCP 那一格**只报在跑的**（和左栏那块同一个口径），而且和模型/权限那几格一样，
     # "没有"时一个字都不写 —— 收起左栏之后这一行的预算是有限的，而"零个 MCP"没有信息量。
     mounted = sum(1 for item in state.mcp if item.get("state") == "loaded")
     if mounted:
-        parts.append(f"{mounted} 个 MCP server")
+        parts.append(i18n.tn("rail.summary.mcp", mounted))
     if state.todos:
         done = sum(1 for item in state.todos if item.get("status") == "completed")
-        parts.append(f"{done}/{len(state.todos)} 个任务")
+        parts.append(i18n.tn("rail.summary.tasks", len(state.todos),
+                             done=done, total=len(state.todos)))
     if state.skills:
-        parts.append(f"{len(state.skills)} 个技能")
+        parts.append(i18n.tn("rail.summary.skills", len(state.skills)))
     asking = [item.get("risk", "") for item in state.risk_scope
               if item.get("disposition") == "ask"]
     if asking:
-        parts.append("、".join(asking) + " 询问")
+        parts.append(i18n.t("rail.summary.asking",
+                            risks=i18n.t("list.separator").join(asking)))
     elif state.risk_scope:
-        parts.append("全部自动放行")
+        parts.append(i18n.t("rail.summary.all_auto"))
     return " · ".join(parts)
 
 
@@ -2083,31 +2130,53 @@ def should_auto_open(state: ViewState) -> bool:
 
 @dataclass(frozen=True)
 class Command:
-    """一条 `/` 命令。**它是数据，不是分支**：面板按它渲染、按它执行。"""
+    """一条 `/` 命令。**它是数据，不是分支**：面板按它渲染、按它执行。
+
+    `hint` / `detail` 是**属性**而不是字段：它们是**文案**，从 `i18n` 的目录表里取
+    （键由命令名算出来：`/resume` → `cmd.resume.hint`）。留成字段的话，一句话要在
+    代码里写一遍、两种语言各一份，而它们漂掉的那天没有任何东西会报。
+
+    **字段只装"事实"**：有哪些命令、哪一条收参数。那些不随语言变。
+    """
 
     name: str
-    hint: str
     takes_arg: bool = False
-    # 带参数时会怎样、有哪几种写法。**只有 `/help` 读它** —— 面板那一行是一句短语
-    # （见下面 `hint` 那段），而"`/model flash` 打错一个字会怎样"这种话面板放不下，
-    # 也不该放：那属于单条命令的详细说明。
-    #
-    # 它和 `takes_arg` 分开是有意的：`takes_arg` 是**功能上的事实**（这条命令收参数），
-    # 而 `detail` 是**文案**。合成一个的话，"参数必须精确、不做模糊匹配"这类只在
-    # `/model` 上成立的规矩就会被硬塞进一个通用字段里。
-    detail: str = ""
+
+    @property
+    def key(self) -> str:
+        """文案表里的前缀：`/resume` → `cmd.resume`。"""
+        return f"cmd.{self.name.lstrip('/')}"
+
+    @property
+    def hint(self) -> str:
+        """面板里跟在命令名后面的那一句（**一行之内，不是说明书**）。"""
+        return i18n.t(f"{self.key}.hint")
+
+    @property
+    def detail(self) -> str:
+        """`/help` 里那句"怎么用"。**没有就返回空串。**
+
+        它和 `takes_arg` 分开是有意的：`takes_arg` 是**功能上的事实**（这条命令收
+        参数），`detail` 是**文案**。合成一个的话，"参数必须精确、不做模糊匹配"这类
+        只在 `/model` 上成立的规矩就会被硬塞进一个通用字段里。
+        """
+        key = f"{self.key}.detail"
+        return i18n.t(key) if i18n.has(key) else ""
 
 
 # 命令集。v1 那六条是决策 15 定下来的，**顺序也照设计稿 F2 的面板**；
 # 后面五条是后来加的（面板、技能清单、配色、状态/工具/模型），加在末尾而不是插在
 # 中间 —— 那六条的位置是用户已经见过的肌肉记忆。
 #
-# ## 带参数的那三条：`detail` 是给 `/help` 的，`hint` 仍然是一句短语
+# ## 带参数的那几条：`detail` 是给 `/help` 的，`hint` 仍然是一句短语
 #
 # `/resume` `/theme` `/model` 都收参数，而"参数写错的后果"各不相同（切到一个不存在的
 # 会话 = 开一个新会话；配色名认不出来 = 就近提示；模型名认不出来 = **拒绝**）。
-# 那三句都放不进面板那一列，所以它们进 `detail`，只有 `/help` 读 —— 而 `/help`
+# 那几句都放不进面板那一列，所以它们进 `detail`，只有 `/help` 读 —— 而 `/help`
 # 是那个"详细说明"本来就该在的地方。
+#
+# **文案本身在 `agent_runtime/i18n/` 的两张目录表里**（键是 `cmd.<名字>.hint` /
+# `.detail`），这张表只剩下"有哪些命令、哪条收参数"。理由见 `Command` 的 docstring。
 #
 # **`/list` 在第二期被去掉了**（设计决策，见 doc/TUI-design.md 13.3）：它和
 # "`/resume` 不带参数"说的是同一件事，而两条命令指向同一个出口时，人会先猜哪一条
@@ -2121,55 +2190,42 @@ class Command:
 # 这些要么在那一行里读得出来（按一下就知道），要么属于单条命令的详细说明
 # （`/help` 末尾那几行、`doc/TUI-design.md`）。
 COMMANDS: tuple[Command, ...] = (
-    Command("/new", "开一个新会话"),
-    Command("/resume", "换一个会话", True,
-            "不带参数弹出会话清单；/resume <id> 直接切过去"),
-    Command("/audit", "审计日志在哪"),
-    Command("/exit", "退出"),
-    Command("/help", "命令与键位"),
-    Command("/theme", "换配色", True,
-            "不带参数打开选择面板（↑↓ 选、Enter 换、Esc 取消）；"
-            "/theme 石墨琥珀 或 /theme a 或 /theme 10 直接换"),
-    Command("/skills", "看全部技能"),
+    Command("/new"),
+    Command("/resume", True),
+    Command("/audit"),
+    Command("/exit"),
+    Command("/help"),
+    Command("/theme", True),
+    Command("/skills"),
     # **这一条推翻了决策 15 的一部分**（那一版明确不给 `/autopilot`，理由是"它是
     # 一次没有人可问，在有人看着的界面里语义矛盾"）。现在它是"**有人在看着，但他
     # 选择不看每一条**"—— 语义变了所以结论才改，理由留在 app.py 的
     # `_command_autopilot` 和 doc/TUI-design.md 那一节里。
-    Command("/autopilot", "自动放行开关"),
+    Command("/autopilot"),
     # 安静模式。**它和 `/autopilot` 长得像，但一个字的语义都不共用**：那一格是
     # runtime 的模式（工具要不要问人），这一格是这个界面怎么画（一次调用占几行）。
     # 所以它不带"开关在谁手里"那套讲究 —— 界面当场改、当场回声。
-    Command("/quiet", "安静模式开关", True,
-            "不带参数切换；/quiet on 或 /quiet off 直接设成那个值"),
+    Command("/quiet", True),
     # 下面三条是**只读**的（`/model` 带参数才会改一个会话级设置）。
     #
     # `/status` 和 `/tools` 此前只有"另开一个终端跑 `--audit` / 看启动横幅"这两条
     # 出口 —— 而"它现在到底在用什么、放行了什么、花了多少"是随时会想看一眼的问题，
     # 不该需要离开这个界面。
-    Command("/status", "看现在的状态"),
-    Command("/tools", "工具与权限"),
-    Command("/model", "换模型", True,
-            "不带参数打开选择面板（↑↓ 选、Enter 换、Esc 取消）；"
-            "/model deepseek-v4-pro 直接换（名字要精确，打错不猜）"),
+    Command("/status"),
+    Command("/tools"),
+    Command("/model", True),
     # 思考模式那两个旋钮。**分两条命令**（而不是 `effort=off` 兼作开关）：它们是两个
     # 问题 —— "要不要想"和"想多用力" —— 而合成一个之后，"关着的时候强度是什么"就
     # 变成一个必须回答、又没人关心的问题。
-    Command("/thinking", "思考模式开关", True,
-            "不带参数看现在是开还是关；/thinking on 或 /thinking off 改它"
-            "（关掉不清强度，再打开还是原来那个）"),
-    Command("/effort", "思考强度", True,
-            "不带参数打开选择面板（↑↓ 选、Enter 换、Esc 取消）；"
-            "/effort low、/effort high、/effort max 直接改"
-            "（端点还接受 minimal/medium/xhigh/ultra 这些等价写法）"),
+    Command("/thinking", True),
+    Command("/effort", True),
     # MCP 那一档。**不带参数弹面板**（和 `/resume` 同一条交互），面板里 ↑↓ 选、
     # Enter 开关某一个 —— **一次一个**，没有 `all` 这种批量写法：批量会把"哪几个
     # 成了、哪几个没成"揉成一句话，而那句话正是用户要看的。
     #
     # 带参数那两种写法（`/mcp load github`）是给"我已经知道要开哪个"的人的快捷方式，
     # 也是 CLI 那侧唯一的形状（它没有面板）。两处按的是**同一个入口**，所以不会漂。
-    Command("/mcp", "MCP 服务器开关", True,
-            "不带参数打开面板（↑↓ 选、Enter 开关、Esc 关闭）；"
-            "/mcp load <名字> 或 /mcp unload <名字> 直接改一个"),
+    Command("/mcp", True),
 )
 
 # 命令名那一列的宽度。**从最长的那条算出来，不手写数字。**
@@ -2197,12 +2253,39 @@ COMMAND_NAME_WIDTH = max(len(command.name) for command in COMMANDS) + 3
 # 占 4 列、"累计输入"占 8 列而"累计输出"占 8 列，但 `f"{'会话':<10}"` 会补 8 个空格、
 # `工作区` 补 7 个，于是值那一列**歪一格**（实测：`会话        2026…` 和
 # `工作区       C:/…` 差一列）。这个文件里唯一的宽度口径是 `cell_len`（见文件头）。
+#
+# **它是下限，不是全部**：英文标签长得多（`Total input` 11 列、`Workspace` 9 列），
+# 写死 10 会让标签和值**粘在一起**。所以那一列的宽度按当前语言量一遍（`_label_width`），
+# 而中文量出来恰好还是 10 —— 中文版一个像素都不动。
 _LABEL_WIDTH = 10
+
+# 参与那一列的全部标签（用来量宽度）。**它必须和 `render_status` 里用到的键一致**：
+# 漏一个，最宽的那个标签就会顶穿那一列。
+_STATUS_LABEL_KEYS: tuple[str, ...] = (
+    "status.kv.session", "status.kv.workspace", "status.kv.size",
+    "status.kv.model", "status.kv.endpoint", "status.kv.thinking",
+    "status.kv.context", "status.kv.input_total", "status.kv.output_total",
+    "status.kv.usage_total", "status.kv.turns", "status.kv.run",
+    "status.kv.tools", "status.kv.audit",
+)
+
+_LABEL_WIDTH_CACHE: dict[str, int] = {}
+
+
+def _label_width() -> int:
+    """标签那一列有多宽：**最宽的那个标签 + 2 格**，再不小于 10。"""
+    lang = i18n.current()
+    cached = _LABEL_WIDTH_CACHE.get(lang)
+    if cached is None:
+        widest = max(cell_len(i18n.t(key)) for key in _STATUS_LABEL_KEYS)
+        cached = max(_LABEL_WIDTH, widest + 2)
+        _LABEL_WIDTH_CACHE[lang] = cached
+    return cached
 
 
 def _kv(label: str, value: str, role: str = ROLE_PROCESS) -> Line:
     """`模型        deepseek-flash` 这样的一行。标签和值分色。"""
-    pad = max(1, _LABEL_WIDTH - cell_len(label))
+    pad = max(1, _label_width() - cell_len(label))
     return seg((f"  {label}{' ' * pad}", ROLE_RULE), (value, role))
 
 
@@ -2251,19 +2334,26 @@ def render_status(state: ViewState, message: dict[str, Any]) -> list[Line]:
     # 会话还没起来（一轮都没跑过）：不编一份空状态出来 —— 那会让人以为
     # "0 轮 0 调用"是事实，而事实是"还没问过"。
     if not session:
-        return [Line("（还没有状态：这个会话一步都没走过）", ROLE_RULE)]
+        return [Line(i18n.t("status.no_state"), ROLE_RULE)]
 
-    out: list[Line] = [Line("状态", ROLE_RULE)]
+    out: list[Line] = [Line(i18n.t("status.title"), ROLE_RULE)]
 
     where = workspace_short(str(session.get("workspace", "")))
-    length = f"{session.get('messages', 0)} 条消息 · {session.get('steps', 0)} 步"
+    length = i18n.t(
+        "rail.session.size",
+        messages=i18n.tn("rail.session.messages", int(session.get("messages", 0) or 0)),
+        steps=i18n.tn("rail.session.steps", int(session.get("steps", 0) or 0)),
+    )
     # **"这次启动：继续/新建"说的是这次进程怎么开起来的，不是这个会话有多满。**
     # 写成"（继续）"会让"继续一个新会话"读起来自相矛盾（实测：恢复一个从没聊过的
     # 会话时那一行长这样），而规模和步数就在下面一行，那才是"有多满"的答案。
-    started = "这次启动：继续" if session.get("resumed") else "这次启动：新建"
-    out.append(_kv("会话", f"{session.get('id', '?')}（{started}）"))
-    out.append(_kv("工作区", where))
-    out.append(_kv("规模", length, ROLE_RULE))
+    started = i18n.t("status.started.resumed" if session.get("resumed")
+                     else "status.started.new")
+    out.append(_kv(i18n.t("status.kv.session"),
+                   i18n.t("status.session_id", name=session.get("id", "?"),
+                          started=started)))
+    out.append(_kv(i18n.t("status.kv.workspace"), where))
+    out.append(_kv(i18n.t("status.kv.size"), length, ROLE_RULE))
 
     current = str(model.get("current") or "—")
     provider = str(model.get("provider") or "")
@@ -2273,19 +2363,20 @@ def render_status(state: ViewState, message: dict[str, Any]) -> list[Line]:
     # 用户会以为"换了但没生效"是坏了 —— 而它其实是设计好的时序。
     pending = bool(selected and selected != current)
     if pending:
-        current = f"{current}（换成 {selected} 的，下一次请求生效）"
+        current = i18n.t("status.model.pending", current=current, selected=selected)
     if provider:
         # 路由名跟在一起。**两条路由可以有同名模型**，所以"它到底在哪跑"必须看得见
         # —— 而它不只是个装饰：账单和合规都跟着它走。
         current = f"{current}  @{provider}"
-    out.append(_kv("模型", current, ROLE_WAITING if pending else ROLE_PROCESS))
+    out.append(_kv(i18n.t("status.kv.model"), current,
+                   ROLE_WAITING if pending else ROLE_PROCESS))
 
     # 端点**只在不是默认那个时**单独写一行。理由和"默认权限不占一行"一样：官方端点
     # 是绝大多数会话的样子，常驻一行只会把真正该看一眼的东西（自建网关、代理）淹掉 ——
     # 而那种情况下"请求发到哪儿"正是最该确认的一件事。
     base_url = str(model.get("base_url") or "")
     if base_url and "api.deepseek.com" not in base_url:
-        out.append(_kv("端点", base_url, ROLE_RULE))
+        out.append(_kv(i18n.t("status.kv.endpoint"), base_url, ROLE_RULE))
 
     # 思考模式那两个旋钮。**关着的时候不写强度**：`关 · high` 会让人以为 high 还在
     # 生效。强度并没有被丢掉（`/thinking on` 之后还是它），只是这一行不撒谎。
@@ -2293,8 +2384,9 @@ def render_status(state: ViewState, message: dict[str, Any]) -> list[Line]:
     thinking = reasoning.get("thinking", True)
     effort = str(reasoning.get("effort") or "")
     out.append(_kv(
-        "思考",
-        f"开 · {effort}" if thinking else "关（强度记着，/thinking on 回来）",
+        i18n.t("status.kv.thinking"),
+        i18n.t("status.thinking.on", effort=effort) if thinking
+        else i18n.t("status.thinking.off"),
         ROLE_PROCESS if thinking else ROLE_WAITING,
     ))
 
@@ -2303,22 +2395,28 @@ def render_status(state: ViewState, message: dict[str, Any]) -> list[Line]:
     used = message.get("last_prompt_tokens")
     window = message.get("context_tokens")
     if used is None:
-        context = "—（还没成功调用过模型）"
+        context = i18n.t("status.context.unknown")
     elif window:
-        context = (f"{tokens_text(used)} / {tokens_text(window)}"
-                   f"（{used / window * 100:.1f}%）")
+        context = i18n.t("status.context.ratio", used=tokens_text(used),
+                         window=tokens_text(window),
+                         percent=f"{used / window * 100:.1f}")
     else:
-        context = f"{tokens_text(used)}（这个模型的窗口不在目录里，不报占比）"
-    out.append(_kv("上下文", context))
+        context = i18n.t("status.context.no_window", used=tokens_text(used))
+    out.append(_kv(i18n.t("status.kv.context"), context))
 
     if usage.get("prompt"):
         rate = f"{usage.get('cached', 0) / usage['prompt']:.0%}"
-        out.append(_kv("累计输入", f"{tokens_text(usage.get('prompt'))} token"
-                                   f"（命中缓存 {tokens_text(usage.get('cached'))}、"
-                                   f"命中率 {rate}）"))
-        out.append(_kv("累计输出", f"{tokens_text(usage.get('completion'))} token", ROLE_RULE))
+        out.append(_kv(i18n.t("status.kv.input_total"),
+                       i18n.t("status.usage.input",
+                              tokens=tokens_text(usage.get("prompt")),
+                              cached=tokens_text(usage.get("cached")), rate=rate)))
+        out.append(_kv(i18n.t("status.kv.output_total"),
+                       i18n.t("status.usage.output",
+                              tokens=tokens_text(usage.get("completion"))),
+                       ROLE_RULE))
     else:
-        out.append(_kv("累计用量", "还没有成功调用过模型", ROLE_RULE))
+        out.append(_kv(i18n.t("status.kv.usage_total"),
+                       i18n.t("status.usage.none"), ROLE_RULE))
 
     # 轮次与调用。**"工具调用 N 次"里含被拒绝的那几次** —— 这个数回答的是"跑了多少活"，
     # 不是"成功了几次"（后者 `--audit` 里逐条看得到）。
@@ -2326,27 +2424,38 @@ def render_status(state: ViewState, message: dict[str, Any]) -> list[Line]:
     asks = counters.get("asks", 0)
     tail = ""
     if waits or asks:
-        tail = f"（其中审批 {waits} 次"
-        tail += f"、提问 {asks} 次）" if asks else "）"
-    out.append(_kv("轮次", f"{counters.get('runs', 0)} 轮 · "
-                           f"{counters.get('model_calls', 0)} 次模型调用 · "
-                           f"{counters.get('tool_calls', 0)} 次工具调用{tail}"))
+        tail = i18n.t("status.turns.waits", waits=waits)
+        tail += i18n.t("status.turns.asks", asks=asks) if asks \
+            else i18n.t("status.turns.close")
+    out.append(_kv(i18n.t("status.kv.turns"),
+                   i18n.t("status.turns.value",
+                          runs=counters.get("runs", 0),
+                          model_calls=counters.get("model_calls", 0),
+                          tool_calls=counters.get("tool_calls", 0), tail=tail)))
 
-    flags = [f"最多 {meta.get('max_steps', 0)} 步",
-             "流式" if meta.get("stream") else "非流式"]
-    flags.append("自动放行" if meta.get("autopilot") else "逐条审批")
-    out.append(_kv("这次运行", " · ".join(flags), ROLE_RULE))
-    out.append(_kv("工具", f"{meta.get('tool_count', 0)} 个（/tools 看清单）", ROLE_RULE))
-    out.append(_kv("审计", str(meta.get("audit_path") or "—"), ROLE_RULE))
+    flags = [i18n.t("status.run.max_steps", n=meta.get("max_steps", 0)),
+             i18n.t("status.run.stream" if meta.get("stream")
+                    else "status.run.no_stream")]
+    flags.append(i18n.t("status.run.autopilot" if meta.get("autopilot")
+                        else "status.run.ask"))
+    out.append(_kv(i18n.t("status.kv.run"), " · ".join(flags), ROLE_RULE))
+    out.append(_kv(i18n.t("status.kv.tools"),
+                   i18n.t("status.tools.count", n=meta.get("tool_count", 0)),
+                   ROLE_RULE))
+    out.append(_kv(i18n.t("status.kv.audit"),
+                   str(meta.get("audit_path") or "—"), ROLE_RULE))
     return out
 
 
 # 权限那一列的说法。**"会问你"和"不问"要一眼分得开** —— 这一列的全部价值就是
 # "接下来这条会不会弹审批"。
+# **这里存的是键，不是文案。** 在模块级调 `i18n.t()` 会把语言**冻在 import 那一刻**
+# ——`/lang` 那类改动（现在是"启动时定一次"，但测试用 `with_language` 换来换去）就
+# 全都失效，而症状是"这几行永远是中文"。所以取值一律发生在调用时。
 _TOOL_DISPOSITION = {
-    "auto": ("自动放行", ROLE_RULE),
-    "ask": ("需要审批", ROLE_WAITING),
-    "deny": ("直接拒绝", ROLE_DENIED),
+    "auto": ("tools.disposition.auto", ROLE_RULE),
+    "ask": ("tools.disposition.ask", ROLE_WAITING),
+    "deny": ("tools.disposition.deny", ROLE_DENIED),
 }
 
 
@@ -2369,30 +2478,32 @@ def render_tools(state: ViewState, message: dict[str, Any]) -> list[Line]:
     if not rows:
         # 一个都没有：`load_skill` / `web_search` / `grep` 都会因为缺件而不注册。
         # 这不是空清单，而是"这次运行什么都没注册"—— 说清楚，别让屏幕空着。
-        return [Line("这次运行一个工具都没注册（缺引擎/密钥时会这样，启动那几行里有原因）",
-                     ROLE_WARN)]
+        return [Line(i18n.t("tools.none"), ROLE_WARN)]
 
-    out: list[Line] = [Line("工具", ROLE_RULE)]
+    out: list[Line] = [Line(i18n.t("status.kv.tools"), ROLE_RULE)]
     # 名字那一列也按**列数**对齐：`mcp__kb__search` 是 ASCII（一层 `cell_len` 就等于
     # 字符数），而将来若出现非 ASCII 的工具名，`len()` 会把它算短、整张表跟着歪。
     width = max(cell_len(str(row.get("name", ""))) for row in rows)
     for row in rows:
         name = str(row.get("name", "?"))
-        word, role = _TOOL_DISPOSITION.get(str(row.get("disposition")), ("?", ROLE_RULE))
+        word_key, role = _TOOL_DISPOSITION.get(str(row.get("disposition")),
+                                               ("", ROLE_RULE))
+        word = i18n.t(word_key) if word_key else "?"
         marks: list[str] = []
         if row.get("granted"):
-            marks.append("按过 t")
+            marks.append(i18n.t("tools.mark.granted"))
         if row.get("external"):
-            marks.append("外部")
+            marks.append(i18n.t("tools.mark.external"))
         if row.get("interactive"):
-            marks.append("会问你")
+            marks.append(i18n.t("tools.mark.interactive"))
         elif row.get("parallel_safe"):
-            marks.append("可并发")
+            marks.append(i18n.t("tools.mark.parallel"))
         out.append(seg(
             (f"  {name}{' ' * max(2, width - cell_len(name) + 2)}", ROLE_PROCESS),
             (f"{row.get('risk', '?'):<7}", ROLE_RULE),
             (word, role),
-            (("  ·  " + "、".join(marks)) if marks else "", ROLE_RULE),
+            (("  ·  " + i18n.t("list.separator").join(marks)) if marks else "",
+             ROLE_RULE),
         ))
 
     prefixes = message.get("granted_prefixes") or []
@@ -2400,10 +2511,10 @@ def render_tools(state: ViewState, message: dict[str, Any]) -> list[Line]:
         # 命令前缀规则只对**参数里有命令行**的工具生效（今天只有 shell）。
         # 那句话必须跟着一起说：不说的话，用户会以为 "git add" 这条规则能放开
         # read_file。
-        out.append(Line(f"  命令规则（按前缀放行，只对 shell 这类有命令行的工具生效）："
-                        f"{'、'.join(prefixes)}", ROLE_RULE))
-    out.append(Line("  改这些去 .tudouni/permissions.json；审批时按 t 会写进去",
-                    ROLE_RULE))
+        out.append(Line(i18n.t("tools.prefixes",
+                               rules=i18n.t("list.separator").join(prefixes)),
+                        ROLE_RULE))
+    out.append(Line(i18n.t("tools.footer"), ROLE_RULE))
     return out
 
 
@@ -2430,12 +2541,13 @@ def mcp_line(item: dict[str, Any], width: int = 0) -> Line:
     pad = " " * max(2, width - cell_len(name) + 2) if width else "  "
     state = str(item.get("state", ""))
     if state == "loaded":
-        detail = f"{item.get('tools', 0)} 个工具"
+        detail = i18n.tn("mcp.tools", item.get("tools", 0))
     elif state == "failed":
         # **原因跟在后面**：没有它，"没连上"这三个字帮不上任何忙。
-        detail = f"没连上：{item.get('error') or '（没说原因）'}"
+        detail = i18n.t("mcp.not_connected",
+                        error=item.get("error") or i18n.t("mcp.no_reason"))
     else:
-        detail = "未加载"
+        detail = i18n.t("mcp.not_loaded")
     return seg(
         (f"{mark} ", role),
         (f"{name}{pad}", ROLE_PROCESS),
@@ -2466,10 +2578,16 @@ def render_mcp(message: dict[str, Any]) -> list[Line]:
         return []
     loaded = [item for item in rows if item.get("state") == "loaded"]
     out: list[Line] = [Line(
-        f"MCP：{len(loaded)} 个在跑 / 共 {len(rows)} 个（/mcp 打开面板逐个开关）",
+        i18n.t("mcp.summary", running=len(loaded), total=len(rows)),
         ROLE_RULE,
     )]
-    out.extend(Line(text, ROLE_WARN if "没连上" in text else ROLE_PROCESS)
+    # **按文字认"这一条是不是失败"** —— 这句话是 runtime 拼的，而它没有随句子发一个
+    # "这是坏消息"的字段（`ui(mcp)` 的 `mcp_notes` 是裸字符串）。这里先照旧，等
+    # runtime 那一侧本地化时**顺手把它改成结构化的**（那才是这条判据该有的样子：
+    # 项目里"按 code 分流、不解析文字"的规矩在这里是唯一一处例外）。
+    warn_marks = ("没连上", "not connected")
+    out.extend(Line(text, ROLE_WARN if any(m in text for m in warn_marks)
+                    else ROLE_PROCESS)
                for text in notes)
     return out
 
@@ -2512,12 +2630,12 @@ def model_option(item: dict[str, Any], width: int = 0) -> Line:
     window = item.get("window")
     detail = f"{item.get('label', '')}"
     if window:
-        detail += f" · 上下文 {tokens_text(window)}"
+        detail += i18n.t("model.window", window=tokens_text(window))
     line: Line = seg(
         (f"  {mark} {name}{' ' * max(2, width - cell_len(name) + 2)}",
          ROLE_WAITING if item.get("current") else ROLE_PROCESS),
         (item.get("summary", ""), ROLE_PROCESS),
-        (f"   （{detail}）" if detail else "", ROLE_RULE),
+        (i18n.t("model.detail_tail", detail=detail) if detail else "", ROLE_RULE),
     )
     # 那一行 note（"这条路由上没有密钥"之类）由 runtime 给。**返回行本身不含它** ——
     # 面板把它画在清单下面（见 `Option`），会话流那份纯文本清单仍旧单独起一行。
@@ -2571,10 +2689,11 @@ def render_models(state: ViewState, rest: str = "") -> list[Line]:
     `current` 那一格由 runtime 标好（它要对账别名折算），界面不自己比字符串。
     """
     if not state.model_catalog:
-        return [Line("（runtime 没给模型清单：这一版协议之前起的子进程？）", ROLE_WARN)]
+        return [Line(i18n.t("model.no_catalog"), ROLE_WARN)]
     here = f"{state.provider}/{state.model}" if state.provider and state.model else (
         state.model or "—")
-    out: list[Line] = [Line(f"当前模型：{here}", ROLE_WAITING), Line("可选：", ROLE_RULE)]
+    out: list[Line] = [Line(i18n.t("model.current", name=here), ROLE_WAITING),
+                       Line(i18n.t("list.available"), ROLE_RULE)]
     # 行由 `model_option` 画（和选择面板同一份）：面板那边也要同一列"名字 / 摘要 /
     # 窗口"，两处各画一遍的话，改了一处另一处就悄悄少一列。
     for option in model_options(state):
@@ -2584,13 +2703,13 @@ def render_models(state: ViewState, rest: str = "") -> list[Line]:
     for alias in state.model_aliases:
         # 旧名字单独列：它们是**认下的名字**，不是能选的选项（官方已把对应的模型
         # 下线，请求由新模型提供服务）。列进主清单会摆出两个效果一样的选项。
-        out.append(Line(f"  认下的旧名字：{alias.get('id')} → {alias.get('of')}", ROLE_RULE))
-    out.append(Line("换一个：/model <名字>（名字要精确；两条路由同名时写 provider/model）",
-                    ROLE_RULE))
+        out.append(Line(i18n.t("model.aliases", old=alias.get("id"),
+                               new=alias.get("of")), ROLE_RULE))
+    out.append(Line(i18n.t("model.howto"), ROLE_RULE))
     if rest:
         # 带参数走到这里 = 名字没认出来（`app._command_model` 只在没换成时才调它）。
         # 那句话由 app 负责说，这里只补一句"清单在上面"。
-        out.append(Line("（清单里没有那个名字）", ROLE_WARN))
+        out.append(Line(i18n.t("model.unknown"), ROLE_WARN))
     return out
 
 
@@ -2604,13 +2723,16 @@ def render_thinking(state: ViewState, rest: str = "") -> list[Line]:
     "我刚才设的 max 是不是没了"。
     """
     lines = [
-        Line(f"思考模式：{'开' if state.thinking_on else '关'}", ROLE_WAITING),
-        Line(f"  强度：{state.effort}"
-             + ("" if state.thinking_on else "（关着时用不上，但记着）"), ROLE_RULE),
-        Line("改：/thinking on   ·   /thinking off", ROLE_RULE),
+        Line(i18n.t("thinking.mode",
+                    state=i18n.t("thinking.on" if state.thinking_on
+                                 else "thinking.off")), ROLE_WAITING),
+        Line(i18n.t("thinking.effort", effort=state.effort)
+             + ("" if state.thinking_on else i18n.t("thinking.effort_off_note")),
+             ROLE_RULE),
+        Line(i18n.t("thinking.howto"), ROLE_RULE),
     ]
     if rest:
-        lines.append(Line(f"（认不出这个写法：{rest}）", ROLE_WARN))
+        lines.append(Line(i18n.t("thinking.unknown", rest=rest), ROLE_WARN))
     return lines
 
 
@@ -2625,17 +2747,17 @@ def render_effort(state: ViewState, levels: tuple[str, ...], rest: str = "") -> 
     就得改两个地方，而漏改的那一处只表现为"这一档选不了"。
     """
     lines = [
-        Line(f"思考强度：{state.effort}"
-             + ("" if state.thinking_on else "（思考关着，打开才用得上）"), ROLE_WAITING),
-        Line("可选：", ROLE_RULE),
+        Line(i18n.t("effort.current", effort=state.effort)
+             + ("" if state.thinking_on else i18n.t("effort.off_note")), ROLE_WAITING),
+        Line(i18n.t("list.available"), ROLE_RULE),
     ]
     lines.extend(option.line for option in effort_options(state, levels))
     if not levels:
-        lines.append(Line("（runtime 没给档位清单：这一版协议之前起的子进程？）", ROLE_WARN))
-    lines.append(Line(f"改：/effort {'  ·  /effort '.join(levels)}" if levels
-                      else "改：/effort <档位>", ROLE_RULE))
+        lines.append(Line(i18n.t("effort.no_catalog"), ROLE_WARN))
+    lines.append(Line(i18n.t("effort.howto", levels="  ·  /effort ".join(levels))
+                      if levels else i18n.t("effort.howto_bare"), ROLE_RULE))
     if rest:
-        lines.append(Line(f"（没有这一档：{rest}）", ROLE_WARN))
+        lines.append(Line(i18n.t("effort.unknown", rest=rest), ROLE_WARN))
     return lines
 
 
@@ -2652,12 +2774,18 @@ def session_row(item: dict[str, Any], *, conflict: bool = False) -> Line:
     name = str(item.get("session_id", ""))
     count = int(item.get("messages") or 0)
     steps = int(item.get("steps") or 0)
-    preview = str(item.get("preview") or "") or "（还没说过话）"
+    preview = str(item.get("preview") or "") or i18n.t("session.row.untitled")
     todos = str(item.get("todos") or "")
     return Line(
-        f"  {'● ' if conflict else '  '}{name:<22} "
-        f"{count:>3} 条消息 · {steps:>3} 步   {preview}"
-        + (f"   [任务 {todos}]" if todos else ""),
+        i18n.t(
+            "session.row",
+            mark="● " if conflict else "  ",
+            name=f"{name:<22}",
+            messages=i18n.tn("session.row.messages", count),
+            steps=i18n.tn("session.row.steps", steps),
+            preview=preview,
+            todos=i18n.t("session.row.todos", todos=todos) if todos else "",
+        ),
         ROLE_WAITING if conflict else ROLE_PROCESS,
     )
 

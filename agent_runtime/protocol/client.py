@@ -89,7 +89,8 @@ RUNTIME_MODULE = "agent_runtime.main"
 
 
 def default_argv(session: str | None = None, *, autopilot: bool = False,
-                 debug: bool = False, stream: bool = True) -> list[str]:
+                 debug: bool = False, stream: bool = True,
+                 lang: str | None = None) -> list[str]:
     """起 runtime 子进程的命令行。
 
     **三件事都是踩过才知道的**（完整理由见 `doc/protocol.md` 和
@@ -130,6 +131,11 @@ def default_argv(session: str | None = None, *, autopilot: bool = False,
     if debug:
         argv.append("--debug")
     argv.append("--stream" if stream else "--no-stream")
+    # 界面语言：**父进程已经定过一次了，这里是把那个答案传下去**。子进程自己也能从
+    # 配置文件读（`i18n.activate` 的兜底），但"这一次运行用哪种语言"只该有一个答案 ——
+    # 两处各读一次的话，用户在两次读之间改了配置，界面和通知就会是两种语言。
+    if lang:
+        argv += ["--lang", lang]
     return argv
 
 
@@ -144,6 +150,7 @@ class ProtocolClient:
         autopilot: bool = False,
         debug: bool = False,
         stream: bool = True,
+        lang: str | None = None,
         stderr_to: Any = None,
     ):
         self.hooks = hooks
@@ -156,11 +163,12 @@ class ProtocolClient:
         # 子进程以非 0 退出时的那句话（父进程要把它显示出来，而不是当成崩溃）。
         self.exit_code: int | None = None
         self._spawn(session, autopilot=autopilot, debug=debug, stream=stream,
-                    stderr_to=stderr_to)
+                    lang=lang, stderr_to=stderr_to)
 
-    def _spawn(self, session, *, autopilot, debug, stream, stderr_to) -> None:
+    def _spawn(self, session, *, autopilot, debug, stream, lang, stderr_to) -> None:
         self._process = subprocess.Popen(
-            default_argv(session, autopilot=autopilot, debug=debug, stream=stream),
+            default_argv(session, autopilot=autopilot, debug=debug, stream=stream,
+                         lang=lang),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             # stderr **继承**（None）：子进程的 traceback 和 `[warn]` 直接落在终端上。

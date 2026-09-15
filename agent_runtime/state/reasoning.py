@@ -39,6 +39,8 @@ DeepSeek 的 OpenAI 兼容端点接受 `none / minimal / low / medium / high / x
 
 from __future__ import annotations
 
+from agent_runtime import i18n
+
 # 思考模式的开关。**默认开** —— 端点的默认行为就是开（实测：不带任何参数时
 # `reasoning_content` 照样返回），而不改默认值的接口才不需要解释。
 DEFAULT_THINKING = True
@@ -96,8 +98,13 @@ def resolve_thinking(text: str) -> bool | None:
 
 
 def thinking_text(value: bool) -> str:
-    """开关在界面上的说法。**两个状态都要能读出来**（不是"关着就不显示"）。"""
-    return "开" if value else "关"
+    """开关在界面上的说法。**两个状态都要能读出来**（不是"关着就不显示"）。
+
+    **它只翻"说法"，不翻"输入"**：`resolve_thinking` 认的那几个词（`on` / `开` /
+    `off` / `关`）是用户敲进来的，和界面语言无关 —— 英文界面里 `/thinking 开` 照样
+    该管用（那是**协议上的等价写法**，不是一句文案）。
+    """
+    return i18n.t("thinking.on" if value else "thinking.off")
 
 
 def request_fields(*, thinking: bool, effort: str) -> dict:
@@ -130,7 +137,8 @@ def summary(*, thinking: bool, effort: str) -> str:
     关掉思考时**不写强度**（写"关 · high"会让人以为 high 还在生效）—— 但强度并没有
     被丢掉，`/thinking on` 之后它还是原来那个。
     """
-    return f"{thinking_text(thinking)} · {effort}" if thinking else thinking_text(thinking)
+    return i18n.t("reasoning.summary", state=thinking_text(thinking), effort=effort) \
+        if thinking else thinking_text(thinking)
 
 
 __all__ = [

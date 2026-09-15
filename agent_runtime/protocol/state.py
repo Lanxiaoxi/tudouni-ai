@@ -19,9 +19,18 @@ doc/TUI-design.md 的 10.1。
 
 滚动位置、哪些面板折叠着、焦点在哪 —— 那些是**显示状态**，属于前端自己
 （TUI 的 `view_state.py`）。它们**不许参与任何判定**，也**不许**出现在这个模块里。
+
+## 它多依赖了一样东西：界面语言
+
+`activity` 是**给人看的字**（"模型在想"），所以它要按 `ui.language` 出中文或英文
+（见 `agent_runtime/i18n/`）。于是这个模块从"只吃参数"变成"还读一个进程级的语言
+设置"—— 它仍然是纯的（没有 I/O、不打印、不改入参），而"同一个事件在两种语言下
+给出两句话"正是它该有的行为。测试要钉死某一句话时用 `i18n.with_language("zh")`。
 """
 
 from dataclasses import dataclass, replace
+
+from agent_runtime import i18n
 
 # 状态。**刻意比第一版的十二个少得多**，因为决策 1（无流式）和决策 3（不渲染工具
 # 卡片）拿掉了它们的来源：没有 delta 就没有 STREAMING/THINKING，不渲染卡片就不需要
@@ -96,40 +105,55 @@ def _on_event(state: State, message: dict) -> State:
     step = message.get("step", state.step)
 
     if kind == "run_started":
-        return State(phase=WORKING, run_id=run_id, step=step, activity="准备中")
+        return State(phase=WORKING, run_id=run_id, step=step,
+                     activity=i18n.t("activity.preparing"))
 
     if kind == "model_call":
         if message.get("status") == "error":
             # 重试退避中。**它仍然属于 working** —— 加一个 RETRYING 状态只会让
             # 界面多一个必须和 working 保持同步的维度，而 activity 已经说清了。
-            return replace(state, run_id=run_id, step=step, activity="模型调用失败，重试中")
-        return replace(state, run_id=run_id, step=step, activity="模型在想")
+            return replace(state, run_id=run_id, step=step,
+                           activity=i18n.t("activity.retrying"))
+        return replace(state, run_id=run_id, step=step,
+                       activity=i18n.t("activity.thinking"))
 
     if kind == "tool_call":
-        n = message.get("tool", "工具")
+        n = message.get("tool") or i18n.t("activity.some_tool")
         idx = message.get("tool_index")
-        at = f"（第 {idx + 1} 个）" if isinstance(idx, int) else ""
-        return replace(state, run_id=run_id, step=step, activity=f"要调用 {n}{at}")
+        at = i18n.t("activity.tool_call_index", n=idx + 1) \
+            if isinstance(idx, int) else ""
+        return replace(state, run_id=run_id, step=step,
+                       activity=i18n.t("activity.tool_call", tool=n, index=at))
 
     if kind == "tool_result":
-        n = message.get("tool", "工具")
+        n = message.get("tool") or i18n.t("activity.some_tool")
         status = message.get("status", "")
-        verb = {"ok": "返回了", "denied": "被拒绝", "invalid_args": "参数不合法"}.get(
-            status, "出错"
-        )
-        return replace(state, run_id=run_id, step=step, activity=f"{n} {verb}")
+        verb = {
+            "ok": i18n.t("activity.result.ok"),
+            "denied": i18n.t("activity.result.denied"),
+            "invalid_args": i18n.t("activity.result.invalid_args"),
+        }.get(status, i18n.t("activity.result.error"))
+        return replace(state, run_id=run_id, step=step,
+                       activity=i18n.t("activity.tool_result", tool=n, verb=verb))
 
     if kind == "tool_batch":
         calls = message.get("calls", 0)
         return replace(state, run_id=run_id, step=step,
-                       activity=f"{calls} 个只读工具并发执行中")
+                       activity=i18n.tn("activity.tool_batch", calls))
 
     if kind == "permission":
         outcome = message.get("outcome", "")
-        waited = {"approved": "已批准", "user_denied": "已拒绝",
-                  "policy_denied": "策略禁止", "no_asker": "没有审批通道"}.get(outcome, "")
+        # 认不出的 outcome 是空串：那句话就只剩工具名（老行为，见下面 `.strip()`）。
+        waited = {
+            "approved": i18n.t("activity.permission.approved"),
+            "user_denied": i18n.t("activity.permission.user_denied"),
+            "policy_denied": i18n.t("activity.permission.policy_denied"),
+            "no_asker": i18n.t("activity.permission.no_asker"),
+        }.get(outcome, "")
+        tool = message.get("tool") or i18n.t("activity.some_tool")
         return replace(state, run_id=run_id, step=step,
-                       activity=f"{message.get('tool', '工具')} {waited}".strip())
+                       activity=i18n.t("activity.permission", tool=tool,
+                                       outcome=waited).strip())
 
     if kind == "run_finished":
         reason = message.get("stop_reason", "")

@@ -26,9 +26,10 @@
 算。写的那一侧在 tools/builtin/skills.py 的 SkillBoard —— 两边共用 loader.SKILLS_KEY。
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
+from . import loader
 from .loader import MAX_ACTIVE_SKILLS, MAX_NOTE_CHARS, SKILLS_KEY, Skill, SkillCatalog
 
 
@@ -73,19 +74,21 @@ def catalog_entries(catalog: SkillCatalog) -> list[str]:
     return [f"{skill.name}（{skill.path}）" for skill in catalog.skills]
 
 
-def source_lines(catalog: SkillCatalog) -> list[str]:
+def source_lines(catalog: SkillCatalog, t: Callable[..., str]) -> list[str]:
     """`--skills` 要打的来源信息：扫了哪些目录 + 哪些同名技能被遮住了。
 
     这两件事都属于"不看就猜不到"的那一类：用户级目录在工作区外面，不列出来人根本
     想不到去那儿找；而被遮住的那份更要紧 —— 它在磁盘上明明存在、内容却不算数，
     静默遮蔽会让人反复改一份永远不生效的文件。
+
+    **`t` 由调用方注入**（叶子包不认识 `i18n`，见 `loader.Problem`）。
     """
-    lines = [f"  扫描目录（优先级从低到高）："]
+    lines = [t("skills.scan_dirs")]
     lines += [f"    {path}" for path in catalog.roots]
     if not catalog.roots:
-        lines.append("    （一个都不存在）")
+        lines.append(t("skills.scan_none"))
     for item in catalog.shadowed:
-        lines.append(f"  [遮蔽] {item}")
+        lines.append(t("skills.shadowed_line", item=loader.render(item, t)))
     return lines
 
 
@@ -175,15 +178,20 @@ def skill_note(metadata: Mapping[str, Any], catalog: SkillCatalog) -> str | None
     )
 
 
-def active_line(metadata: Mapping[str, Any]) -> str | None:
+def active_line(metadata: Mapping[str, Any], *, label: str = "已加载技能：",
+                joiner: str = "、") -> str | None:
     """一行"已加载什么"，**给人看的**：CLI 启动、每轮末尾、--list、--skills。
 
     顺序即加载顺序。它不带正文 —— 人不需要读步骤，只需要知道"它现在按哪份说明在做"。
+
+    **`label` / `joiner` 由调用方给**（界面语言是它的知识，不是这里的）：这个包是
+    叶子（`tests/test_imports.py` 那条"skills 只准 import paths"盯着它），所以它
+    不认识 `i18n`。默认值就是中文那份，CLI 那一路不用传。
     """
     names = active_names(metadata)
     if not names:
         return None
-    return f"已加载技能：{'、'.join(names)}"
+    return f"{label}{joiner.join(names)}"
 
 
 def note_chars(metadata: Mapping[str, Any], catalog: SkillCatalog) -> int:

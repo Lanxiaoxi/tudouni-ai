@@ -48,6 +48,7 @@ from textual.containers import Horizontal, Vertical
 from textual.theme import Theme as TextualTheme
 from textual.widgets import Static
 
+from agent_runtime import i18n
 from agent_runtime import version
 from agent_runtime.frontends.tui import theme as theme_mod
 from agent_runtime.frontends.tui import view_state, widgets
@@ -313,7 +314,11 @@ class TuiApp(App[None]):
     /* 提示框横跨上面两个框（32 + 1 + 42 = 75）。高度 = 2 行键位 —— **这个框没有上下
        `padding`**（不像上面那两个）：那两行键位自己就是全部内容，再垫两行空白会让它比
        里面装的东西高出一截。Textual 还会从 `height` 里扣掉边框占的那两行，所以写 4
-       正好画得出 2 行正文（实测）。 */
+       正好画得出 2 行正文（实测）。
+
+       **这里的 4 是中文那一档**：英文的键位长得多，需要 4 行正文 —— 那个数由
+       `widgets.hint_box_height()` 在挂载时按当前语言盖上去（CSS 是类属性、在 import
+       时就固化了，写不进语言判断）。 */
     .hint-box { width: 75; height: 4; padding: 0 1; }
     /* 叠起来时三个框都占满整行（那时候 `#welcome-row` 的 `layout` 是 vertical）。 */
     WelcomeBlock.stacked .start-box,
@@ -427,21 +432,31 @@ class TuiApp(App[None]):
         "{_PALETTE_MAX_ROWS - 3}", str(_PALETTE_MAX_ROWS - 3),
     )
 
+    # 第三格是**文案键**，`on_mount` 里按当前语言换成说明（见
+    # `widgets.localize_bindings`：Textual 在类创建时就把 BINDINGS 合并好了，
+    # 写在类体里等于把语言冻在 import 那一刻）。
     BINDINGS = [
-        ("ctrl+c", "quit_app", "退出"),
-        ("ctrl+t", "toggle_thinking", "思考"),
-        ("ctrl+b", "toggle_rail", "上下文栏"),
-        ("ctrl+k", "command_palette", "命令面板"),
-        ("ctrl+s", "skills", "全部技能"),
-        ("escape", "escape_key", "中断/关闭"),
-        ("up", "palette_up", "上一条"),
-        ("down", "palette_down", "下一条"),
+        ("ctrl+c", "quit_app", "bindings.quit"),
+        ("ctrl+t", "toggle_thinking", "bindings.thinking"),
+        ("ctrl+b", "toggle_rail", "bindings.rail"),
+        ("ctrl+k", "command_palette", "bindings.palette"),
+        ("ctrl+s", "skills", "bindings.skills"),
+        ("escape", "escape_key", "bindings.escape"),
+        ("up", "palette_up", "bindings.up"),
+        ("down", "palette_down", "bindings.down"),
     ]
 
     def __init__(self, session: str | None = None, *, autopilot: bool = False,
                  theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True,
-                 quiet: bool = False):
+                 quiet: bool = False, lang: str | None = None):
         super().__init__()
+        # 界面语言。**默认 None = "按当前进程已定的那套"**（父进程在 `main.py` 里读过
+        # 配置了），传值就是"这一条路临时指定"（测试、以及将来别的入口）。
+        # 它和 `--theme` 的分别：配色只影响 TUI 一家，而语言要**跟着 `--lang` 传给
+        # 子进程**（通知和回话也是人读的）。
+        if lang is not None:
+            i18n.set_language(lang)
+        self._lang = i18n.current()
         self._session = session
         self._autopilot = autopilot
         # 要不要让子进程出流。**默认开**（`--tui` 的意义就在这里），`--no-stream`
@@ -566,18 +581,20 @@ class TuiApp(App[None]):
             with Horizontal(id="input-row"):
                 yield Static(">", id="prompt")
                 yield widgets.PromptArea(
-                    placeholder="说点什么，回车发送（/ 看命令，/resume 换会话，Shift+Enter 换行）",
+                    placeholder=i18n.t("input.placeholder"),
                     id="input", highlight_cursor_line=False,
                 )
         # 键位提示**不在这里**：它住在欢迎屏底下那个「提示」框里（`widgets.HintPanel`）
         # —— 说过第一句话之后这一屏就收了，而 `/help` 仍然列着完整的键位表。
 
     def on_mount(self) -> None:
+        # 键位说明按**当前语言**换一遍（类体里那三格是文案键，见 `BINDINGS` 上面那段）。
+        widgets.localize_bindings(self, widgets.translated_bindings(self.BINDINGS))
         # `/` 打开的命令面板和输入行是同一个东西的两面：面板默认藏着。
         self.query_one("#palette", widgets.CommandPalette).display = False
         self._client = ProtocolClient(self, session=self._session,
                                       autopilot=self._autopilot,
-                                      stream=self._stream)
+                                      stream=self._stream, lang=self._lang)
         self._client.start()
         # 消息泵。见模块 docstring 第 1 条：**不用 call_from_thread**。
         self.set_interval(0.05, self._pump)
@@ -1018,9 +1035,11 @@ class TuiApp(App[None]):
             # `session_list`，runtime 回一条 `sessions`）。**只在空态要它**：恢复会话
             # 时那一屏根本不会画，列一次几百个会话文件是白跑。
             self._ask_for_recent_sessions()
-        resumed = "（继续）" if state.resumed else "（新的）"
-        lines = [view_state.Line(f"（会话 {state.session_id}{resumed}）",
-                                 view_state.ROLE_RULE)]
+        resumed = i18n.t("session.bar.resumed") if state.resumed \
+            else i18n.t("init.session_new")
+        lines = [view_state.Line(
+            i18n.t("init.session_id", name=state.session_id, state=resumed),
+            view_state.ROLE_RULE)]
         for notice in message.get("notices") or []:
             code = notice.get("code", "")
             if view_state.notice_is_redundant(code):
@@ -1037,7 +1056,7 @@ class TuiApp(App[None]):
         # 跟着改 —— 界面里指一条做不到的路，比不说更坏。
         if not state.resumed:
             lines.append(view_state.Line(
-                "想回到这个会话：/resume（在列表里挑，● 标着当前这个）",
+                i18n.t("init.return_hint"),
                 view_state.ROLE_RULE))
         log.add_lines(lines, self.palette)
         if not state.resumed:
@@ -1060,8 +1079,8 @@ class TuiApp(App[None]):
         if not restored:
             return
         lines = [view_state.Line(
-            f"（恢复 {len(message.get('messages') or [])} 条历史，"
-            f"下面是你说过的和 agent 答过的）", view_state.ROLE_RULE)]
+            i18n.tn("session_load.restored", len(message.get("messages") or [])),
+            view_state.ROLE_RULE)]
         for msg in restored:
             role = view_state.ROLE_USER if msg["role"] == "user" else view_state.ROLE_ANSWER
             lines.append(view_state.Line(str(msg["content"]), role))
@@ -1202,10 +1221,9 @@ class TuiApp(App[None]):
             return
         self._autopilot_wanted = None
         if self.state.autopilot:
-            self._say("自动放行：开（需要审批的工具直接执行，审计里记 autopilot；"
-                      "再执行一次 /autopilot 关闭）", view_state.ROLE_WARN)
+            self._say(i18n.t("autopilot.report_on"), view_state.ROLE_WARN)
         else:
-            self._say("自动放行：关（恢复逐条询问）", view_state.ROLE_RULE)
+            self._say(i18n.t("autopilot.report_off"), view_state.ROLE_RULE)
 
     def _on_sessions(self, message: dict[str, Any]) -> None:
         """会话清单到了：**欢迎屏要的那一份就喂给它，否则弹选择面板**。
@@ -1422,7 +1440,7 @@ class TuiApp(App[None]):
         elif command == "/help":
             self._say_lines(self._help_lines())
         elif command == "/audit":
-            self._say(f"审计日志：{self.state.audit_path}")
+            self._say(i18n.t("cmd.audit.line", path=self.state.audit_path))
         elif command == "/new":
             self.switch_session(None)
         elif command == "/resume":
@@ -1449,7 +1467,7 @@ class TuiApp(App[None]):
         elif command == "/mcp":
             self._command_mcp(rest)
         else:
-            self._say(f"没有这个命令：{command}（/help）")
+            self._say(i18n.t("cmd.unknown", name=command))
 
     def _command_status(self) -> None:
         """`/status`：**请 runtime 说，别自己拼。**
@@ -1495,7 +1513,7 @@ class TuiApp(App[None]):
             return
         word = rest.strip().lower()
         if word not in ("on", "off"):
-            self._say(f"认不出这个写法：{rest}（用 /thinking on 或 /thinking off）")
+            self._say(i18n.t("cmd.thinking.unknown", rest=rest))
             return
         if self._client is None:
             return
@@ -1515,8 +1533,8 @@ class TuiApp(App[None]):
         if not rest:
             if self.state.effort_levels:
                 self._push_option_picker(
-                    "思考强度", self._effort_options(), self._pick_effort,
-                    only_current=True, kind="effort")
+                    i18n.t("cmd.effort.title"), self._effort_options(),
+                    self._pick_effort, only_current=True, kind="effort")
             else:
                 self._say_lines(view_state.render_effort(
                     self.state, self.state.effort_levels))
@@ -1555,7 +1573,8 @@ class TuiApp(App[None]):
         if not rest:
             if self.state.model_catalog:
                 self._push_option_picker(
-                    "换模型", self._model_options(), self._pick_model, kind="model")
+                    i18n.t("cmd.model.title"), self._model_options(),
+                    self._pick_model, kind="model")
             else:
                 self._say_lines(view_state.render_models(self.state))
             return
@@ -1748,8 +1767,7 @@ class TuiApp(App[None]):
         if word in ("on", "off"):
             want = word == "on"
         elif word:
-            self._say(f"认不出这个写法：{rest}（/quiet 直接切换，"
-                      f"或者 /quiet on / /quiet off）")
+            self._say(i18n.t("cmd.quiet.unknown", rest=rest))
             return
         else:
             want = not self.state.quiet
@@ -1757,21 +1775,18 @@ class TuiApp(App[None]):
         if want:
             self._say_lines([
                 view_state.seg(
-                    ("安静模式 ", view_state.ROLE_RULE),
-                    ("开", view_state.ROLE_WAITING),
-                    ("（工具调用压成一行、结果显示在同一行里；思考过程只留一行）",
-                     view_state.ROLE_RULE),
+                    (i18n.t("quiet.name"), view_state.ROLE_RULE),
+                    (i18n.t("quiet.on"), view_state.ROLE_WAITING),
+                    (i18n.t("quiet.on_note"), view_state.ROLE_RULE),
                 ),
                 view_state.Line(
-                    "  只影响之后画出来的东西；再执行一次 /quiet 关掉"
-                    "（/quiet off 也行）", view_state.ROLE_RULE),
+                    i18n.t("quiet.on_extra"), view_state.ROLE_RULE),
             ])
         else:
             self._say_lines([view_state.seg(
-                ("安静模式 ", view_state.ROLE_RULE),
-                ("关", view_state.ROLE_WAITING),
-                ("（恢复逐条显示：工具调用、权限、结果各占一行）",
-                 view_state.ROLE_RULE),
+                (i18n.t("quiet.name"), view_state.ROLE_RULE),
+                (i18n.t("quiet.off"), view_state.ROLE_WAITING),
+                (i18n.t("quiet.off_note"), view_state.ROLE_RULE),
             )])
         # 状态栏那一枚「安静」只在开着时占一格（`quiet_badge`），所以这里要重画一次
         # —— 下一拍（50ms 后）也会画，但"按了键要立刻有反应"是这一屏的规矩。
@@ -1798,8 +1813,7 @@ class TuiApp(App[None]):
             return
         action, _, name = rest.partition(" ")
         if action not in ("load", "unload") or not name.strip():
-            self._say(f"认不出这个写法：{rest}（用 /mcp load <名字> 或 "
-                      f"/mcp unload <名字>）")
+            self._say(i18n.t("cmd.mcp.unknown", rest=rest))
             self.push_screen(widgets.McpPanel(self.state, self.palette, id="mcp"))
             return
         self.mcp_action(action, name.strip())
@@ -1817,7 +1831,8 @@ class TuiApp(App[None]):
         """
         if self._client is None:
             return
-        self._say(f"（{action} {name}：正在请 runtime 处理…）", view_state.ROLE_RULE)
+        self._say(i18n.t("mcp.pending", action=action, name=name),
+                  view_state.ROLE_RULE)
         self._client.mcp(action, (name,))
 
     def _command_resume(self, rest: str) -> None:
@@ -1837,7 +1852,7 @@ class TuiApp(App[None]):
         # 启动时发出的那一条还没回来，它回来的那一份就会被欢迎屏吃掉，而面板永远
         # 不弹 —— 屏幕上一个变化都没有，看起来像 `/resume` 坏了（实测踩过）。
         self._welcome_request_pending = False
-        self._say("正在取会话列表…")
+        self._say(i18n.t("resume.loading"))
         self._client.list_sessions()
 
     def switch_session(self, session_id: str | None) -> None:
@@ -1850,7 +1865,8 @@ class TuiApp(App[None]):
         """
         if self._client is None:
             return
-        self._say(f"正在切到{'会话 ' + session_id if session_id else '新会话'}…")
+        self._say(i18n.t("switch.to_session",
+                         name=session_id or i18n.t("switch.new_session")))
         self._client.switch_session(session_id)
 
     def _show_session_picker(self, sessions: list[dict[str, Any]]) -> None:
@@ -1880,18 +1896,18 @@ class TuiApp(App[None]):
         `/model` 那边相反（成不成只有 runtime 知道），理由见 18.2。
         """
         if not rest:
-            self._push_option_picker("换配色", self._theme_options(),
+            self._push_option_picker(i18n.t("theme.picker_title"), self._theme_options(),
                                      self._pick_theme, runtime_backed=False)
             return
         key = theme_mod.resolve(rest)
         if key is None:
-            self._say(f"没有这套配色：{rest}（/theme）")
+            self._say(i18n.t("theme.unknown", name=rest))
             return
         self._set_theme(key)
         self._say_lines([view_state.seg(
-            ("配色换成 ", view_state.ROLE_RULE),
-            (f"{key} {self.palette.name}", view_state.ROLE_WAITING),
-            ("（只影响这次运行）", view_state.ROLE_RULE),
+            (i18n.t("theme.switched"), view_state.ROLE_RULE),
+            (f"{key} {self.palette.name_in(i18n.current())}", view_state.ROLE_WAITING),
+            (i18n.t("theme.only_this_run"), view_state.ROLE_RULE),
         )])
 
     def _theme_options(self) -> list[view_state.Option]:
@@ -1909,9 +1925,10 @@ class TuiApp(App[None]):
             out.append(view_state.Option(
                 key,
                 view_state.Line(
-                    f"  {'●' if current else ' '} {index:>2} {key} {theme.name}",
+                    f"  {'●' if current else ' '} {index:>2} {key} "
+                    f"{theme.name_in(i18n.current())}",
                     view_state.ROLE_WAITING if current else view_state.ROLE_PROCESS),
-                theme.palette.source,
+                theme.source_in(i18n.current()),
             ))
         return out
 
@@ -1921,13 +1938,13 @@ class TuiApp(App[None]):
             return
         self._set_theme(key)
         self._say_lines([view_state.seg(
-            ("配色换成 ", view_state.ROLE_RULE),
-            (f"{key} {self.palette.name}", view_state.ROLE_WAITING),
-            ("（只影响这次运行）", view_state.ROLE_RULE),
+            (i18n.t("theme.switched"), view_state.ROLE_RULE),
+            (f"{key} {self.palette.name_in(i18n.current())}", view_state.ROLE_WAITING),
+            (i18n.t("theme.only_this_run"), view_state.ROLE_RULE),
         )])
 
     def _help_lines(self) -> list[view_state.Line]:
-        lines = [view_state.Line("命令（输入 / 会打开面板，↑↓ 选、Enter 执行）：",
+        lines = [view_state.Line(i18n.t("help.commands_title"),
                                  view_state.ROLE_RULE)]
         for command in view_state.COMMANDS:
             lines.append(view_state.seg(
@@ -1943,10 +1960,10 @@ class TuiApp(App[None]):
                 lines.append(view_state.Line(
                     f"  {'':<{view_state.COMMAND_NAME_WIDTH}}{command.detail}",
                     view_state.ROLE_RULE))
-        lines.append(view_state.Line("键位：", view_state.ROLE_RULE))
+        lines.append(view_state.Line(i18n.t("help.keys_title"), view_state.ROLE_RULE))
         # **和欢迎屏底下那个「提示」框读的是同一份表**（`widgets.HINT_KEYS_*`）：
         # 两处各写一遍的话，"改了键位、忘了改提示"早晚会发生。
-        for key, what in [*widgets.HINT_KEYS_FULL, *widgets.HINT_KEYS_EXTRA]:
+        for key, what in [*widgets.hint_keys(), *widgets.extra_hint_keys()]:
             lines.append(view_state.seg(
                 (f"  {key:<12}", view_state.ROLE_WAITING),
                 (what, view_state.ROLE_PROCESS),
@@ -1978,16 +1995,16 @@ class TuiApp(App[None]):
             return
         block = log.turn_under_viewport()
         if block is None:
-            self._say("（还没有回合）")
+            self._say(i18n.t("thinking.no_turn"))
             return
         run_id = block.turn.run_id
         text, _expanded = self.state.thinking.get(run_id, ("", False))
         if not text:
-            self._say("（这一轮没有思考过程）")
+            self._say(i18n.t("thinking.no_reasoning"))
             return
         self.state.toggle_thinking(run_id)
         if not block.toggle_thinking(text):
-            self._say("（这一轮的思考已经不在画面上了）")
+            self._say(i18n.t("thinking.gone"))
 
     def action_skills(self) -> None:
         """`Ctrl+S`：全部技能（可用的 + 已加载的）。"""
@@ -2013,10 +2030,9 @@ class TuiApp(App[None]):
         if self.state.agent.is_busy:
             if self._client is not None:
                 self._client.interrupt()
-            self._say("已请求停下这一轮（会在当前这一步结束后停）",
-                      view_state.ROLE_WARN)
+            self._say(i18n.t("escape.interrupting"), view_state.ROLE_WARN)
             return
-        self._say("（这一轮没在跑 —— Esc 在弹层里是拒绝/跳过）")
+        self._say(i18n.t("escape.idle"))
 
     def action_quit_app(self) -> None:
         self.exit()
@@ -2036,7 +2052,7 @@ class TuiApp(App[None]):
 
 def run_tui(session: str | None = None, *, autopilot: bool = False,
             theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True,
-            quiet: bool = False) -> int:
+            quiet: bool = False, lang: str | None = None) -> int:
     """`main.py --tui` 走这里。
 
     ## 配置错时压根走不到这里
@@ -2058,7 +2074,7 @@ def run_tui(session: str | None = None, *, autopilot: bool = False,
     返回值是子进程的退出码（界面正常收场时是 0）。
     """
     app = TuiApp(session=session, autopilot=autopilot, theme_key=theme_key,
-                 stream=stream, quiet=quiet)
+                 stream=stream, quiet=quiet, lang=lang)
     app.run()
     client = app._client
     return 0 if client is None or client.exit_code in (None, 0) else client.exit_code

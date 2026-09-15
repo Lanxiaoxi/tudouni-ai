@@ -28,13 +28,41 @@ from typing import Any
 from rich.cells import cell_len
 from rich.text import Text
 from textual import events
+from textual.binding import BindingsMap
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Markdown, Static, TextArea
 
+from agent_runtime import i18n
 from agent_runtime.frontends.tui import theme as theme_mod
 from agent_runtime.frontends.tui import view_state
+
+
+def translated_bindings(pairs: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """`(键, 动作, 文案键)` → `(键, 动作, 说明)`，说明按当前语言取好。"""
+    return [(key, action, i18n.t(text_key)) for key, action, text_key in pairs]
+
+
+def localize_bindings(widget: Any, pairs: list[tuple[str, str, str]]) -> None:
+    """把一个控件的 `BINDINGS` 换成**当前语言**的那一份。`pairs` 是 `(键, 动作, 说明)`。
+
+    ## 为什么不能直接在类体里写 `i18n.t(...)`
+
+    Textual 在**类创建时**就把 `BINDINGS` 合并进 `_merged_bindings`
+    （`DOMNode.__init_subclass__` → `_merge_bindings`），而那发生在 import 的那一刻
+    —— 写在类体里的文案会被冻成 import 时的语言。真实那条路（`main.py` 先
+    `i18n.activate` 再 import TUI）恰好对得上，但测试里 `with_language` 换的那一套
+    对不上，于是"界面上写着 A、按下去是 B"这种没人查得出来的不一致就有机会出现。
+
+    所以：类体里只留 `(键, 动作, 文案键)`，实例化之后用 `translated_bindings` 换来
+    这里。`DOMNode.__init__` 建的是 `_merged_bindings` 的一份**拷贝**，覆盖实例这
+    一格不影响别的界面。
+
+    （这些说明文字露面很少 —— Textual 自带的按键面板和它的 `Ctrl+P` 命令面板会显示
+    它们，而这个界面自己有 `Ctrl+K` 那一套。但"很少露面"不等于可以写错语言。）
+    """
+    widget._bindings = BindingsMap(list(pairs))
 
 # 行的角色 → 主题里的哪个角色。**这是整份设计稿"色彩 Token"那一节的落地处**：
 # 上面（view_state）只回答"这一行是哪一类"，这里才回答"那一类是什么颜色"。
@@ -191,7 +219,7 @@ class TopBar(TwoPart):
         if payload is not None and payload < view_state.NARROW_COLUMNS:
             return name, Text("")
         right = Text(state.workspace or "", style=palette.ink4)
-        right.append("    Ctrl+K 命令面板", style=palette.ink4)
+        right.append(i18n.t("top.command_palette"), style=palette.ink4)
         return name, right
 
 
@@ -212,27 +240,32 @@ class SessionBar(TwoPart):
         narrow = payload is not None and payload < view_state.NARROW_COLUMNS
         left = Text()
         left.append("● ", style=palette.accent)
-        left.append(f"会话 {state.session_id or '（未命名）'}", style=palette.ink2)
+        left.append(i18n.t("session.bar.session",
+                           name=state.session_id or i18n.t("session.bar.unnamed")),
+                    style=palette.ink2)
         if state.resumed and not narrow:
-            left.append("（继续）", style=palette.ink4)
+            left.append(i18n.t("session.bar.resumed"), style=palette.ink4)
         if state.model and not narrow:
             left.append(f"  ·  {state.model}", style=palette.ink3)
         if state.max_steps and not narrow:
-            left.append(f"  ·  最多 {state.max_steps} 步", style=palette.ink3)
+            left.append(i18n.t("session.bar.max_steps", n=state.max_steps),
+                        style=palette.ink3)
 
         right = Text()
         if narrow:
-            right.append("Ctrl+B 上下文栏", style=palette.ink4)
+            right.append(i18n.t("session.bar.rail_hint"), style=palette.ink4)
             return left, right
         asking = [item.get("risk", "") for item in state.risk_scope
                   if item.get("disposition") == "ask"]
         if not state.risk_scope:
-            right.append("权限 —", style=palette.ink4)
+            right.append(i18n.t("session.bar.no_permissions"), style=palette.ink4)
         elif asking:
-            right.append("、".join(asking) + " 询问", style=palette.warn)
+            right.append(i18n.t("rail.summary.asking",
+                                risks=i18n.t("list.separator").join(asking)),
+                         style=palette.warn)
         else:
-            right.append("全部自动放行", style=palette.ok)
-        right.append("    Ctrl+B 上下文栏", style=palette.ink4)
+            right.append(i18n.t("rail.summary.all_auto"), style=palette.ok)
+        right.append(i18n.t("session.bar.rail_hint_indent"), style=palette.ink4)
         return left, right
 
 
@@ -311,22 +344,41 @@ class StatusBar(TwoPart):
 #
 # **顺序本身就是优先级**：`Esc` 排在 `Ctrl+S` 前面，因为前一个是"有东西要停下来"，
 # 后一个是可以另找入口的（输入 `/skills`）。
-HINT_KEYS_FULL: tuple[tuple[str, str], ...] = (
-    ("Enter", "发送"), ("/", "命令面板"), ("Ctrl+T", "思考过程"), ("Ctrl+B", "上下文栏"),
-    ("Esc", "中断本轮"), ("Ctrl+S", "全部技能"), ("Ctrl+K", "命令面板"),
-)
 # 窄屏那一版用更短的措辞：那几列连"思考过程"四个字都嫌长。
-HINT_KEYS_NARROW: tuple[tuple[str, str], ...] = (
-    ("Enter", "发送"), ("/", "命令"), ("Ctrl+T", "思考"), ("Ctrl+B", "上下文"),
-    ("Esc", "中断"), ("Ctrl+S", "技能"), ("Ctrl+K", "面板"),
+#
+# **它们不能在模块级调 `i18n.t()`**：那会把语言冻在 import 那一刻。所以这里存的是
+# 键，取值的口子见 `hint_keys()` —— 那个函数才是这两张表的读者。
+HINT_KEYS_FULL_KEYS: tuple[tuple[str, str], ...] = (
+    ("Enter", "hint.enter"), ("/", "hint.slash"),
+    ("Ctrl+T", "hint.thinking"), ("Ctrl+B", "hint.rail"),
+    ("Esc", "hint.escape"), ("Ctrl+S", "hint.skills"),
+    ("Ctrl+K", "hint.palette"),
 )
-# 这两条**不进那个框**（框里只放得下最常用的几条），但 `/help` 要列出来：
-# `Shift+Enter` 只在输入框里有意义（而输入框的占位符已经写着它），`↑ ↓` 是面板里的
-# 操作。**键位表要全，提示要短。**
-HINT_KEYS_EXTRA: tuple[tuple[str, str], ...] = (
-    ("Shift+Enter", "输入框里换行（回车是发送）"),
-    ("↑ ↓", "面板选候选 / 光标移动 / 翻会话流"),
+HINT_KEYS_NARROW_KEYS: tuple[tuple[str, str], ...] = (
+    ("Enter", "hint.enter_short"), ("/", "hint.slash_short"),
+    ("Ctrl+T", "hint.thinking_short"), ("Ctrl+B", "hint.rail_short"),
+    ("Esc", "hint.escape_short"), ("Ctrl+S", "hint.skills_short"),
+    ("Ctrl+K", "hint.palette_short"),
 )
+HINT_KEYS_EXTRA_KEYS: tuple[tuple[str, str], ...] = (
+    ("Shift+Enter", "hint.shift_enter"),
+    ("↑ ↓", "hint.arrows"),
+)
+
+
+def hint_keys(narrow: bool = False) -> list[tuple[str, str]]:
+    """键位提示（`(键, 这一键干什么)`），按当前语言取好。
+
+    **两张表共用这一个出口**：欢迎屏底下那个框按宽度挑窄/宽两版，`/help` 列的是
+    宽版 + 那两条"框里放不下但必须列出来"的（`HINT_KEYS_EXTRA_KEYS`）。
+    """
+    keys = HINT_KEYS_NARROW_KEYS if narrow else HINT_KEYS_FULL_KEYS
+    return [(key, i18n.t(text_key)) for key, text_key in keys]
+
+
+def extra_hint_keys() -> list[tuple[str, str]]:
+    """`/help` 要列、但欢迎屏那个框放不下的那两条。"""
+    return [(key, i18n.t(text_key)) for key, text_key in HINT_KEYS_EXTRA_KEYS]
 
 
 class LineBlock(Static):
@@ -537,7 +589,7 @@ class TurnBlock(Vertical):
 
     def __init__(self, turn: view_state.Turn, palette: theme_mod.Theme,
                  *args: Any, **kwargs: Any):
-        self.head_line = view_state.Line(f"回合 {turn.index}",
+        self.head_line = view_state.Line(i18n.t("turn.head", index=turn.index),
                                          view_state.ROLE_TURN_START)
         head = Static("", classes="turn-head")
         body = Vertical(classes="turn-body")
@@ -656,9 +708,9 @@ class TurnBlock(Vertical):
             # 流到一半时 `**` 还没闭合是常态 —— 把那一段和 `● ` 拼在同一行，
             # 记号会被当成语法的一部分（`**` 吞掉后面的 ` ` 之类），看起来像"记号
             # 自己会乱跳"。所以记号独占一行，反引号围起来（免得它自己被解析）。
-            new_block.feed(f"`{view_state.STREAM_HEAD['text'][0].strip()}`\n{line}")
+            new_block.feed(f"`{view_state.stream_head('text')[0].strip()}`\n{line}")
         else:
-            head_text, head_role = view_state.STREAM_HEAD["reasoning"]
+            head_text, head_role = view_state.stream_head("reasoning")
             new_block = LineBlock(
                 [view_state.Line(head_text, head_role), view_state.quote_line(str(line))],
                 self._palette, classes="think-body",
@@ -1013,6 +1065,33 @@ WELCOME_HINT_WIDTH = 75
 # 几条键位。
 WELCOME_HINT_TEXT = WELCOME_HINT_WIDTH - 4
 
+# --- 提示框那一行怎么排：**两种语言不一样** --------------------------------
+#
+# 中文 4 条一行正好两行（每条约 17 列），而英文那几条长得多（`Esc Interrupt this
+# turn` 一条就 22 列）—— 4 条一行会**折成四行**，而框只有两行高，多出来的会被
+# Textual 静默裁掉（没有报错、没有滚动条，看起来只是"提示框里少了几条"）。那正是
+# `.welcome-box` 那条注释里记过的同类事故。
+#
+# 所以英文：一行 3 条（最宽那三种组合量下来 ≤ 69 列，文字宽 71），三行放完 7 条，
+# 框高留到 6（= 4 行正文 + 上下边框）—— 比需要的多一行余量，防的是以后某条文案
+# 再长一点。
+HINT_PER_ROW = 4
+HINT_PER_ROW_EN = 3
+HINT_BOX_LINES = 2
+HINT_BOX_LINES_EN = 4
+
+
+def hint_per_row() -> int:
+    """提示框一行放几条键位（按当前语言）。"""
+    return HINT_PER_ROW_EN if i18n.current() == i18n.EN else HINT_PER_ROW
+
+
+def hint_box_height() -> int:
+    """提示框有多高。**Textual 会从 `height` 里扣掉边框那两行**，所以它是"正文行数
+    + 2"（见 `.hint-box` 那条 CSS 里同一个数）。"""
+    lines = HINT_BOX_LINES_EN if i18n.current() == i18n.EN else HINT_BOX_LINES
+    return lines + 2
+
 
 class WelcomeBlock(Vertical):
     """空态：**新会话还没说第一句话时那一屏**。
@@ -1185,13 +1264,14 @@ class StartPanel(BorderedPanel):
         for line in self.LOGO:
             rows.append(Text(line, style=palette.accent))
         rows.append(Text(""))
-        rows.append(Text(f"欢迎回来 {user_name()}", style=palette.ink + " bold"))
+        rows.append(Text(i18n.t("welcome.back", name=user_name()),
+                         style=palette.ink + " bold"))
         rows.append(Text(""))
         rows.append(Text(f"tudouni {payload or ''}".strip(), style=palette.ink2))
         rows.append(Text(model_and_workspace(state), style=palette.ink3))
         rows.append(Text("", style=palette.ink4))
-        rows.append(Text("命令面板：/", style=palette.ink4))
-        return Text("开始", style=palette.ink3), [
+        rows.append(Text(i18n.t("welcome.palette_hint"), style=palette.ink4))
+        return Text(i18n.t("welcome.box.start"), style=palette.ink3), [
             _centered_row(row) for row in rows
         ]
 
@@ -1210,20 +1290,20 @@ class RecentPanel(BorderedPanel):
     def render_parts(self, state, palette, payload=None, width=0):
         # **正好 `BOX_LINES` 行**（和 `StartPanel` 那边一样多，这是两个框等高的全部
         # 理由）：标题 1 + 会话 4 + 空行 1 + 箴言标题 1 + 箴言 1 = 8，末尾再补 2 个空行。
-        rows: list[Text] = [Text("最近活动", style=palette.ink3)]
+        rows: list[Text] = [Text(i18n.t("welcome.recent.title"), style=palette.ink3)]
         items = _most_recent(state.recent_sessions, WelcomeBlock.RECENT_LIMIT)
         for item in items:
             rows.append(_recent_row(item, palette, self._now))
         for index in range(WelcomeBlock.RECENT_LIMIT - len(items)):
             # **空位也要占住**（见 `WelcomeBlock` 的 docstring）：没有会话时第一格
             # 写"（还没有会话）"，其余空格 —— 这样框的高度不随硬盘上有几个会话变。
-            blank = "（还没有会话）" if not items and index == 0 else ""
+            blank = i18n.t("welcome.recent.empty") if not items and index == 0 else ""
             rows.append(Text(blank, style=palette.ink4))
         rows.append(Text(""))
-        rows.append(Text("箴言", style=palette.ink3))
+        rows.append(Text(i18n.t("welcome.recent.motto"), style=palette.ink3))
         rows.append(Text(view_state.motto_of_day(), style=palette.line))
         rows.extend(Text("") for _ in range(WelcomeBlock.BOX_LINES - len(rows)))
-        return Text("最近", style=palette.ink3), [
+        return Text(i18n.t("welcome.box.recent"), style=palette.ink3), [
             Static(row, classes="welcome-line") for row in rows
         ]
 
@@ -1243,16 +1323,19 @@ class HintPanel(BorderedPanel):
     框在并排和叠起来两版里的宽度不一样。
     """
 
-    # 一行放几条：4 条 × 约 17 列 ≈ 68 列，正好塞进 71 列的文字宽（见
-    # `WELCOME_HINT_TEXT`）。
-    PER_ROW = 4
+    # 一行放几条：**按语言算**（见 `hint_per_row`）。中文 4 条一行两行放完；英文那几条
+    # 长得多，4 条一行会折成四行、被框高裁掉。
+    def on_mount(self) -> None:
+        # 框高也按语言定：CSS 里那个 `height: 4` 是中文那一档（两行正文）。
+        self.styles.height = hint_box_height()
 
     def render_parts(self, state, palette, payload=None, width=0):
-        pairs = HINT_KEYS_NARROW if width < WELCOME_HINT_WIDTH else HINT_KEYS_FULL
+        pairs = hint_keys(narrow=width < WELCOME_HINT_WIDTH)
+        per_row = hint_per_row()
         rows: list[Static] = []
-        for start in range(0, len(pairs), self.PER_ROW):
+        for start in range(0, len(pairs), per_row):
             row = Text()
-            for key, what in pairs[start:start + self.PER_ROW]:
+            for key, what in pairs[start:start + per_row]:
                 if row.cell_len:
                     row.append("   ")
                 row.append(key, style=palette.ink3)
@@ -1260,7 +1343,7 @@ class HintPanel(BorderedPanel):
             # `hint-line` 而不是 `welcome-line`：提示那一行的**换行由它自己决定**
             # （`height: auto` + 软换行），而方框里其它行都是"一行就是一行"。
             rows.append(Static(row, classes="hint-line"))
-        return Text("提示", style=palette.ink3), rows
+        return Text(i18n.t("welcome.box.hint"), style=palette.ink3), rows
 
 
 def _most_recent(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -1320,20 +1403,38 @@ def _recent_row(item: dict[str, Any], palette: theme_mod.Theme,
         stamp = ""
     # 还没说过话的会话（preview 是空串）在面板里也写"（还没说过话）"，这里照抄那个
     # 口径：**一行完全空白看起来像渲染坏了**。
-    title = str(item.get("preview") or "") or "（还没说过话）"
+    title = str(item.get("preview") or "") or i18n.t("session.row.untitled")
     row = Text(stamp, style=palette.ink4)
-    row.append(" " * max(1, STAMP_WIDTH - row.cell_len + 1))
-    row.append(_clip_cells(title, TITLE_WIDTH), style=palette.ink2)
+    row.append(" " * max(1, stamp_width() - row.cell_len + 1))
+    row.append(_clip_cells(title, title_width()), style=palette.ink2)
     return row
 
 
 # "12分钟前" 的显示宽（列）：7 个汉字/数字混排 = 3 + 2 + 2 + 2 ≈ 11，留一位余量。
 # 它是右栏第一列的固定宽 —— 四行的时间因此右对齐、标题因此对齐成一条竖线。
+#
+# **两种语言不一样**，所以下面那个 `stamp_width()` 才是读者：英文 `12 minutes ago`
+# 是 14 列，按中文的 12 写死会让时间戳**顶着标题**（那个框一共只有 38 列）。
 STAMP_WIDTH = 12
-# 右栏标题那一列的宽（列）：`38 - 12(时间戳) - 1(分隔)` = 25。**取奇数不是随手定的**，
-# 见 `_recent_row` 的 docstring：截断的形态是"若干个整字 + 一个 1 列的 `…`"，而全宽
-# 字符一次占两列 —— 所以只有奇数列数能正好铺满。原先那个 `- 2` 让这一列是 24（偶数），
-# 一个全汉字的标题因此只能到 23 列，四行的右边差一列。
+STAMP_WIDTH_EN = 14
+
+
+def stamp_width() -> int:
+    """时间那一列在**当前语言**下的宽（列）。"""
+    return STAMP_WIDTH_EN if i18n.current() == i18n.EN else STAMP_WIDTH
+
+
+def title_width() -> int:
+    """标题那一列的宽（列）：`38 - 时间戳 - 1(分隔)`。**它必须是奇数**，
+    见 `_recent_row` 的 docstring：截断的形态是"若干个整字 + 一个 1 列的 `…`"，
+    而全宽字符一次占两列 —— 只有奇数列数能正好铺满。
+
+    两种语言下都是奇数（中文 25、英文 23），所以这条性质不随语言变。
+    """
+    return WelcomeBlock.RIGHT_WIDTH - stamp_width() - 1
+
+
+# 中文那一档的值，给"两种语言都要对得上"的测试与文档用（改它们要看上面那段说明）。
 TITLE_WIDTH = WelcomeBlock.RIGHT_WIDTH - STAMP_WIDTH - 1
 
 
@@ -1745,11 +1846,11 @@ class PromptArea(TextArea):
     """
 
     BINDINGS = [
-        ("shift+enter", "newline", "换行"),
-        ("ctrl+k", "palette", "命令面板"),
-        ("ctrl+c", "quit_app", "退出"),
-        ("up", "up_or_palette", "上一条"),
-        ("down", "down_or_palette", "下一条"),
+        ("shift+enter", "newline", i18n.t("bindings.newline")),
+        ("ctrl+k", "palette", i18n.t("bindings.palette")),
+        ("ctrl+c", "quit_app", i18n.t("bindings.quit")),
+        ("up", "up_or_palette", i18n.t("bindings.up")),
+        ("down", "down_or_palette", i18n.t("bindings.down")),
     ]
 
     class Submitted(Message):
@@ -1869,8 +1970,8 @@ class CommandPalette(Vertical):
 
     def repaint(self, palette: theme_mod.Theme) -> None:
         self._palette = palette
-        title = Text("命令面板", style=palette.ink3 + " bold")
-        title.append("    输入命令名筛选  ·  ↑↓ 选择  ·  Enter 执行  ·  Esc 关闭",
+        title = Text(i18n.t("palette.title"), style=palette.ink3 + " bold")
+        title.append(i18n.t("palette.hint"),
                      style=palette.ink4)
         self._title.update(title)
         self._options.remove_children()
@@ -1918,12 +2019,13 @@ class PermissionPanel(ModalScreen):
 
     # 字母键。**F6 的键位表把 `[y] [n] [t] [a]` 列成审批的四个答案**，而按钮上
     # 也印着它们 —— 两边说的是同一件事，所以它们必须是同一份绑定。
+    # 第三格是**文案键**，实例化时按当前语言取（见 `localize_bindings`）。
     BINDINGS = [
-        ("escape", "deny", "拒绝"),
-        ("y", "allow", "允许"),
-        ("n", "deny", "拒绝"),
-        ("t", "always", "总是允许"),
-        ("a", "always_group", "都允许"),
+        ("escape", "deny", "bindings.deny"),
+        ("y", "allow", "bindings.allow"),
+        ("n", "deny", "bindings.deny"),
+        ("t", "always", "bindings.always"),
+        ("a", "always_group", "bindings.allow_all"),
     ]
 
     def __init__(self, request: dict[str, Any], tools: dict[str, dict[str, Any]],
@@ -1932,18 +2034,22 @@ class PermissionPanel(ModalScreen):
         self.request = request
         self.tools = tools
         self.palette = palette
+        localize_bindings(self, translated_bindings(self.BINDINGS))
 
     def compose(self):
         info = self.tools.get(self.request.get("tool", ""), {})
         tool = self.request.get("tool", "?")
         risk = (self.request.get("risk") or info.get("risk") or "?").upper()
-        kind = "外部工具（MCP）" if tool.startswith("mcp__") else "内置工具"
+        kind = i18n.t("permission_dialog.kind_external") if tool.startswith("mcp__") \
+            else i18n.t("permission_dialog.kind_builtin")
         hint = self.request.get("remember_hint")
         trust = self.request.get("trust_all_hint")
         with Modal("permission-body"):
             yield Horizontal(
-                Static(Text("⛨ 需要审批", style=self.palette.danger + " bold")),
-                Static(Text(f"{risk} 风险", style=self.palette.danger),
+                Static(Text(i18n.t("permission_dialog.head"),
+                            style=self.palette.danger + " bold")),
+                Static(Text(i18n.t("permission_dialog.risk_badge", risk=risk),
+                            style=self.palette.danger),
                        classes="modal-badge badge-danger"),
                 classes="modal-head",
             )
@@ -1955,13 +2061,16 @@ class PermissionPanel(ModalScreen):
             if trust:
                 yield Static(self._hint("a", trust), classes="modal-hint")
             with Horizontal(id="permission-buttons"):
-                yield Button("允许 y", id="allow", variant="success")
-                yield Button("拒绝 n", id="deny", variant="error")
+                yield Button(i18n.t("permission_dialog.allow"), id="allow",
+                             variant="success")
+                yield Button(i18n.t("permission_dialog.deny"), id="deny",
+                             variant="error")
                 # 只有后端说"这次能记住"时才给按钮。
                 if hint:
-                    yield Button("总是允许 t", id="always")
+                    yield Button(i18n.t("permission_dialog.always"), id="always")
                 if self.request.get("allow_trust_all") and trust:
-                    yield Button("都允许 a", id="always_group")
+                    yield Button(i18n.t("permission_dialog.allow_all"),
+                                 id="always_group")
             yield Static(self._footer(), classes="modal-foot")
 
     def _title(self, tool: str, kind: str, risk: str, info: dict[str, Any]) -> Text:
@@ -1974,11 +2083,14 @@ class PermissionPanel(ModalScreen):
         """
         text = Text()
         text.append(tool, style=self.palette.ink + " bold")
-        text.append(f"   {kind}  ·  风险等级 {risk}", style=self.palette.ink3)
+        text.append(i18n.t("permission_dialog.title", kind=kind, risk=risk),
+                    style=self.palette.ink3)
         if info and not info.get("parallel_safe", True):
-            text.append("  ·  不可与其他工具并发", style=self.palette.ink3)
+            text.append(i18n.t("permission_dialog.no_parallel"),
+                        style=self.palette.ink3)
         if info.get("interactive"):
-            text.append("  ·  会占用你的输入", style=self.palette.ink3)
+            text.append(i18n.t("permission_dialog.interactive"),
+                        style=self.palette.ink3)
         return text
 
     def _arguments(self) -> Text:
@@ -1991,7 +2103,7 @@ class PermissionPanel(ModalScreen):
         text = Text()
         arguments = self.request.get("arguments") or {}
         if not arguments:
-            return Text("（没有参数）", style=self.palette.ink4)
+            return Text(i18n.t("permission_dialog.no_args"), style=self.palette.ink4)
         width = max(len(name) for name in arguments) + 2
         for index, (name, value) in enumerate(arguments.items()):
             if index:
@@ -2007,11 +2119,7 @@ class PermissionPanel(ModalScreen):
         return out
 
     def _footer(self) -> Text:
-        return Text(
-            "Esc = 拒绝：fail-closed，和读不到输入那一支同一个方向"
-            "  ·  裁决写进审计的 permission 事件",
-            style=self.palette.ink4,
-        )
+        return Text(i18n.t("permission_dialog.footer"), style=self.palette.ink4)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id)
@@ -2050,8 +2158,8 @@ class QuestionPanel(ModalScreen):
     """
 
     BINDINGS = [
-        ("escape", "skip", "跳过"),
-        *[(str(number), f"choose('{number}')", f"选 {number}")
+        ("escape", "skip", "bindings.skip"),
+        *[(str(number), f"choose('{number}')", "bindings.choose")
           for number in range(1, 10)],
     ]
 
@@ -2062,11 +2170,16 @@ class QuestionPanel(ModalScreen):
         self.request = request
         self._options: list[str] = list(request.get("options") or [])
         self._index = 0
+        localize_bindings(self, [
+            *translated_bindings([("escape", "skip", "bindings.skip")]),
+            *[(str(number), f"choose('{number}')",
+               i18n.t("bindings.choose", n=number)) for number in range(1, 10)],
+        ])
 
     def compose(self):
         with Modal("question-body"):
             yield Horizontal(
-                Static(Text("▣ agent 需要你的判断",
+                Static(Text(i18n.t("question_dialog.head"),
                             style=self.palette.accent + " bold")),
                 Static(Text("ask_user", style=self.palette.ink4),
                        classes="modal-badge"),
@@ -2080,10 +2193,10 @@ class QuestionPanel(ModalScreen):
             if self._options:
                 yield Vertical(id="question-options")
             else:
-                yield Static(Text("（这个问题没有给选项，直接在输入行回答）",
+                yield Static(Text(i18n.t("question_dialog.no_options"),
                                   style=self.palette.ink4), classes="modal-hint")
             with Horizontal(id="question-buttons"):
-                yield Button("跳过 Esc", id="skip")
+                yield Button(i18n.t("question_dialog.skip"), id="skip")
             # 那两句**各占一行**：它们说的是两件事（跳过为什么必须是显式的键 /
             # 回给后端的是什么），挤在按钮旁边会折成两行半，读起来像一句话。
             for line in self._footer_lines():
@@ -2097,10 +2210,8 @@ class QuestionPanel(ModalScreen):
 
     def _footer_lines(self) -> list[Text]:
         return [
-            Text("回车是最容易做的动作，所以跳过必须是显式的一个键",
-                 style=self.palette.ink4),
-            Text("回给后端的是选项原文，不是编号 —— 编号只是界面的表示法",
-                 style=self.palette.ink4),
+            Text(i18n.t("question_dialog.footer1"), style=self.palette.ink4),
+            Text(i18n.t("question_dialog.footer2"), style=self.palette.ink4),
         ]
 
     def on_mount(self) -> None:
@@ -2193,22 +2304,24 @@ class SkillsPanel(ModalScreen):
     这里说"工作区里有什么" —— 后者此前只有 `main.py --skills` 那一条出口。
     """
 
-    BINDINGS = [("escape", "close", "关闭"), ("q", "close", "关闭")]
+    BINDINGS = [("escape", "close", "bindings.close"), ("q", "close", "bindings.close")]
 
     def __init__(self, state: view_state.ViewState, palette: theme_mod.Theme,
                  **kwargs: Any):
         super().__init__(**kwargs)
         self.palette = palette
         self.state = state
+        localize_bindings(self, translated_bindings(self.BINDINGS))
 
     def compose(self):
         loaded = {entry.get("name") for entry in self.state.skills}
         with Modal("skills-body"):
-            yield Static(Text("技能", style=self.palette.ink + " bold"),
+            yield Static(Text(i18n.t("skills.title"),
+                              style=self.palette.ink + " bold"),
                          classes="modal-title")
             if not self.state.skill_catalog:
                 yield Static(Text(
-                    "工作区里没有技能（.tudouni/skills/<名字>/SKILL.md）",
+                    i18n.t("skills.empty"),
                     style=self.palette.ink4), classes="modal-hint")
             for skill in self.state.skill_catalog:
                 name = skill.get("name", "?")
@@ -2220,7 +2333,7 @@ class SkillsPanel(ModalScreen):
                             style=self.palette.ink4)
                 yield Static(text, classes="skill-row")
             yield Static(Text(
-                "✓ = 已加载  ·  Esc 关闭  ·  完整清单：main.py --skills",
+                i18n.t("skills.footer"),
                 style=self.palette.ink4), classes="modal-foot")
 
     def action_close(self) -> None:
@@ -2260,7 +2373,7 @@ class OptionPicker(ModalScreen):
     `App` 那一层的 `↑↓`（翻会话流）抢。
     """
 
-    BINDINGS = [("escape", "close", "取消")]
+    BINDINGS = [("escape", "close", "bindings.cancel")]
 
     class Chosen(Message):
         """在这个面板里按了 `Enter`。**带的是选中那一项的值**。
@@ -2300,6 +2413,7 @@ class OptionPicker(ModalScreen):
         # `ui(state)` 快照到了之后调 `refresh()`，这里拿最新的 state 重新画一遍。
         self._items = items
         self._index = self._initial_index(default_index)
+        localize_bindings(self, translated_bindings(self.BINDINGS))
 
     def _initial_index(self, default_index: int | None) -> int:
         """光标初始停在哪儿。
@@ -2359,7 +2473,8 @@ class OptionPicker(ModalScreen):
         with Modal("option-body"):
             yield Horizontal(
                 Static(Text(self.title, style=self.palette.ink + " bold")),
-                Static(Text(f"{len(self.options)} 个", style=self.palette.ink4),
+                Static(Text(i18n.tn("option.count", len(self.options)),
+                            style=self.palette.ink4),
                        classes="modal-badge"),
                 classes="modal-head",
             )
@@ -2376,7 +2491,7 @@ class OptionPicker(ModalScreen):
             yield Static(Text("", style=self.palette.warn), classes="modal-foot",
                          id="option-result")
             yield Static(Text(
-                "↑↓ 选择  ·  Enter 确认  ·  Esc 取消  ·  ● = 当前",
+                i18n.t("option.footer"),
                 style=self.palette.ink4), classes="modal-foot")
 
     def on_mount(self) -> None:
@@ -2480,7 +2595,7 @@ class SessionPicker(ModalScreen):
     的 `↑↓`（翻会话流）抢。
     """
 
-    BINDINGS = [("escape", "close", "取消")]
+    BINDINGS = [("escape", "close", "bindings.cancel")]
 
     def __init__(self, sessions: list[dict[str, Any]], current: str,
                  palette: theme_mod.Theme, **kwargs: Any):
@@ -2489,6 +2604,7 @@ class SessionPicker(ModalScreen):
         self.sessions = list(sessions)
         self.current = current
         self._index = self._default_index()
+        localize_bindings(self, translated_bindings(self.BINDINGS))
 
     def _default_index(self) -> int:
         """默认选中**最新建的那个会话**（清单是按创建时间、最新的在前给的）。
@@ -2502,18 +2618,20 @@ class SessionPicker(ModalScreen):
     def compose(self):
         with Modal("session-body"):
             yield Horizontal(
-                Static(Text("◱ 换一个会话", style=self.palette.ink + " bold")),
-                Static(Text(f"{len(self.sessions)} 个", style=self.palette.ink4),
+                Static(Text(i18n.t("session_dialog.head"),
+                            style=self.palette.ink + " bold")),
+                Static(Text(i18n.tn("option.count", len(self.sessions)),
+                            style=self.palette.ink4),
                        classes="modal-badge"),
                 classes="modal-head",
             )
             if not self.sessions:
-                yield Static(Text("还没有保存过会话 —— 说过第一句话才会有。",
+                yield Static(Text(i18n.t("session_dialog.empty"),
                                   style=self.palette.ink4), classes="modal-hint")
             else:
                 yield Vertical(id="session-options")
             yield Static(Text(
-                "↑↓ 选择  ·  Enter 切过去  ·  Esc 取消  ·  ● = 当前会话",
+                i18n.t("session_dialog.footer"),
                 style=self.palette.ink4), classes="modal-foot")
 
     def on_mount(self) -> None:
@@ -2610,7 +2728,7 @@ class McpPanel(ModalScreen):
     （用户会以为在这里关掉就是永久关了）。
     """
 
-    BINDINGS = [("escape", "close", "关闭"), ("q", "close", "关闭")]
+    BINDINGS = [("escape", "close", "bindings.close"), ("q", "close", "bindings.close")]
 
     def __init__(self, state: view_state.ViewState, palette: theme_mod.Theme,
                  **kwargs: Any):
@@ -2620,6 +2738,7 @@ class McpPanel(ModalScreen):
         self._index = 0
         # "有一件事在等 runtime"：那一条的名字（没有就是 None）。见类 docstring 第 2 条。
         self._pending: str | None = None
+        localize_bindings(self, translated_bindings(self.BINDINGS))
 
     # -- 数据 ---------------------------------------------------------------
 
@@ -2643,21 +2762,20 @@ class McpPanel(ModalScreen):
     def compose(self):
         with Modal("mcp-body"):
             yield Horizontal(
-                Static(Text("◱ MCP 服务器", style=self.palette.ink + " bold")),
+                Static(Text(i18n.t("mcp_dialog.head"),
+                            style=self.palette.ink + " bold")),
                 Static(Text("", style=self.palette.ink4), classes="modal-badge",
                        id="mcp-count"),
                 classes="modal-head",
             )
             if not self.rows:
                 yield Static(Text(
-                    "没有配置任何 MCP server。清单在 ~/.tudouni/mcp.json"
-                    "（服务器地址或要启动的命令都写在那里）。",
+                    i18n.t("mcp_dialog.empty"),
                     style=self.palette.ink4), classes="modal-hint")
             else:
                 yield Vertical(id="mcp-options")
             yield Static(Text(
-                "↑↓ 选择  ·  Enter 挂载 / 卸载  ·  Esc 关闭  ·  "
-                "开关只影响这次运行，不改 mcp.json",
+                i18n.t("mcp_dialog.footer"),
                 style=self.palette.ink4), classes="modal-foot",
                 id="mcp-foot")
 
@@ -2668,7 +2786,8 @@ class McpPanel(ModalScreen):
         count = self.query("#mcp-count")
         if count:
             loaded = sum(1 for item in self.rows if item.get("state") == "loaded")
-            count[0].update(Text(f"{loaded} / {len(self.rows)} 在跑",
+            count[0].update(Text(i18n.t("mcp_dialog.running", loaded=loaded,
+                                        total=len(self.rows)),
                                  style=self.palette.ink4))
         foot = self.query("#mcp-foot")
         if foot:
@@ -2676,11 +2795,9 @@ class McpPanel(ModalScreen):
             # 要几百毫秒到几秒（`npx` 冷启动更久），而正撞上一轮在跑时可能几十秒 ——
             # 这期间屏幕一动不动只会让人以为自己没按到。
             foot[0].update(Text(
-                f"正在等 runtime 处理 `{self._pending}`…"
-                f"（连服务器可能要几秒；撞上一轮在跑就等它跑完）"
+                i18n.t("mcp_dialog.pending", name=self._pending)
                 if self._pending else
-                "↑↓ 选择  ·  Enter 挂载 / 卸载  ·  Esc 关闭  ·  "
-                "开关只影响这次运行，不改 mcp.json",
+                i18n.t("mcp_dialog.footer"),
                 style=self.palette.ink4,
             ))
         if not self.rows:
@@ -2765,7 +2882,8 @@ class McpPanel(ModalScreen):
 
 __all__ = [
     "BorderedPanel", "CommandPalette", "ContextRail", "ConversationLog",
-    "HINT_KEYS_EXTRA", "HINT_KEYS_FULL", "HINT_KEYS_NARROW", "HintPanel",
+    "HintPanel", "extra_hint_keys", "hint_box_height", "hint_keys",
+    "hint_per_row",
     "LineBlock", "McpPanel", "MessageBlock", "OptionPicker", "Panel",
     "PermissionPanel", "QuestionPanel", "RecentPanel", "SessionBar",
     "SessionPicker", "SkillsPanel",

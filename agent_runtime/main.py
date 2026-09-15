@@ -37,6 +37,7 @@ import sys
 # `paths.workspace_dir()`）。以前那段注释说"agent 的文件工作区必须是项目自身"，那句话
 # 在装成命令之后是错的 —— 工作区是 cwd，理由见 `paths.py`。
 
+from agent_runtime import i18n
 from agent_runtime.frontends.cli import (
     print_audit,
     print_banner,
@@ -82,6 +83,24 @@ def _emit(notices: list[Notice], *, audit_line: str | None = None) -> None:
 def main() -> int:
     """返回退出码：配置缺失是"用户得先做点事"，脚本调用方应该能看出失败。"""
     args = build_parser().parse_args()
+
+    # ---- 界面语言：**在所有分支之前定下来** ----
+    #
+    # 它排在这里，是因为**四类路径都要它**：`--tui` 的父进程（画界面）、它拉起的
+    # `--runtime-stdio` 子进程（写通知和回话）、老 CLI（同一进程里打通知）、以及
+    # `--list` / `--audit` 这些只读子命令（它们也打人读的字）。
+    #
+    # 来源是"命令行 > 配置文件 > 默认"（见 `i18n.activate`）。**认不出的值当场报**，
+    # 退出码 2 —— 和配置写坏同一个处置：一个静默回退的 `en_US` 让人看到的是"我配的
+    # 英文没生效"，而他会去查一个不存在的 bug。
+    #
+    # 配置**读不动**时这一层不报错（退回默认语言）：那份错误有它自己的那一站
+    # （下面的 `check_config` / `open_runtime`），抢着报会让用户看到两句话。
+    try:
+        i18n.activate(args.lang)
+    except i18n.LangError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
     # ---- 工作区能不能用：**在所有分支之前** ----
     #
@@ -141,7 +160,7 @@ def main() -> int:
         want_stream = True if args.stream is None else args.stream
         return run_tui(args.session, autopilot=args.autopilot,
                        theme_key=key or tui_theme.DEFAULT_THEME,
-                       stream=want_stream, quiet=args.quiet)
+                       stream=want_stream, quiet=args.quiet, lang=i18n.current())
 
     # ---- `--runtime-stdio`：协议子进程 ----
     #
@@ -153,7 +172,8 @@ def main() -> int:
     if args.runtime_stdio:
         from agent_runtime.protocol.serve import main as serve
         return serve(args.session, autopilot=args.autopilot, debug=args.debug,
-                     stream=True if args.stream is None else args.stream)
+                     stream=True if args.stream is None else args.stream,
+                     lang=i18n.current())
 
     # 会话 id 的合法性在这里一次查清，早于任何会碰它的东西。--list 不看这个参数，
     # 但传了非法值仍然报错 —— 一个地方查一次，比让三条子命令各自去猜自己会不会

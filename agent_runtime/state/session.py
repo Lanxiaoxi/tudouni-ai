@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_runtime import i18n
 from agent_runtime import paths
 from agent_runtime.state import agents_md
 
@@ -68,10 +69,7 @@ def load_system_prompt(path: Path | None = None) -> str:
     file = path or SYSTEM_PROMPT_PATH
     if not file.exists():
         # 裸的 FileNotFoundError 只给一个路径；这里多给一句「那是什么、该在哪」。
-        raise FileNotFoundError(
-            f"系统提示词文件不存在：{file}\n"
-            f"它不是一个可选文件 —— agent 每轮都要把它发给模型。"
-        )
+        raise FileNotFoundError(i18n.t("session.prompt_missing", file=file))
     return file.read_text(encoding="utf-8").strip()
 
 

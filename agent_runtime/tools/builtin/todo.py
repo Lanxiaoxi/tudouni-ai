@@ -24,6 +24,8 @@ from typing import Any, Literal
 
 from pydantic import Field
 
+from agent_runtime import i18n
+
 from ..tool import ToolArgs, ToolResult
 
 # 会话 metadata 里存任务列表的那个键。**读写两侧共用这一个常量**（写入在 TodoBoard，
@@ -139,9 +141,9 @@ def progress_line(metadata: Mapping[str, Any], limit: int = 40) -> str | None:
     current = next(
         (item["content"] for item in items if item["status"] == IN_PROGRESS), None
     )
-    text = f"{done}/{len(items)} 完成"
+    text = i18n.t("todo.progress", done=done, total=len(items))
     if current:
-        text += f"，当前：{_clip(current, limit)}"
+        text += i18n.t("todo.progress.current", what=_clip(current, limit))
     return text
 
 

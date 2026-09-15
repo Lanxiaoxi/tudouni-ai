@@ -1,4 +1,4 @@
-﻿"""技能：发现（skills/ 包）+ 装载（tools/builtin/skills.py）。
+"""技能：发现（skills/ 包）+ 装载（tools/builtin/skills.py）。
 
 这一组测试盯的是五件容易被无声破坏的事：
 
@@ -130,6 +130,19 @@ def test_default_roots_cover_the_six_conventional_dirs():
     assert roots[-1].priority > roots[2].priority
 
 
+def text(problem) -> str:
+    """问题 → 给人看的那一句。
+
+    **测试断的是那句话，不是 code**：`skills/` 是叶子包（不许 import i18n），它只把
+    "哪个毛病 + 参数"交出来，拼句子是消费方的事（`loader.render`）。所以这里也照那条
+    路走 —— 而不是去看 dataclass 的 repr。
+    """
+    from agent_runtime import i18n
+    from agent_runtime.skills import loader
+
+    return loader.render(problem, i18n.t)
+
+
 def test_personal_skills_beat_project_skills(workdir):
     """**个人级压项目级**，和 Claude Code 的层级一致（也同 git config 的"用户配置覆盖
     仓库配置"）：机器是人的，仓库是别人的。
@@ -147,7 +160,7 @@ def test_personal_skills_beat_project_skills(workdir):
     assert catalog.skills[0].description == "我个人那份"
     # 被遮住的那份**没消失**，只是不算数：它带着路径进 catalog，由入口报给人看。
     assert len(catalog.skills[0].locations) == 2
-    assert catalog.shadowed and "被它遮住了" in catalog.shadowed[0]
+    assert catalog.shadowed and "被它遮住了" in text(catalog.shadowed[0])
 
 
 def test_a_shadowed_skill_is_reported_with_both_paths(workdir):
@@ -162,7 +175,7 @@ def test_a_shadowed_skill_is_reported_with_both_paths(workdir):
     catalog = SkillLoader(project, home=home).reload()
 
     assert len(catalog.shadowed) == 1
-    message = catalog.shadowed[0]
+    message = text(catalog.shadowed[0])
     assert str(project) in message and str(home) in message
 
 
@@ -324,8 +337,29 @@ def test_missing_description_is_reported_not_raised(workdir):
 
     assert catalog.skills == ()
     assert len(catalog.problems) == 1
-    assert "broken" in catalog.problems[0]
-    assert "description" in catalog.problems[0]
+    assert "broken" in text(catalog.problems[0])
+    assert "description" in text(catalog.problems[0])
+
+
+def test_a_problem_speaks_the_ui_language(workdir):
+    """同一个坏技能在英文下说英文 —— 问题带的是 **code + 参数**，语言由消费方定。
+
+    这条同时是"`skills/` 仍然是叶子"的证据：它要能翻，只能靠调用方把译者注入进来
+    （`loader.render(problem, i18n.t)`），而不是自己 import i18n。
+    """
+    from agent_runtime import i18n
+
+    write_skill(workdir, "broken", text="---\nname: broken\n---\n## 步骤\n1. x\n")
+    catalog = SkillLoader(workdir).reload()
+    assert len(catalog.problems) == 1
+
+    chinese = text(catalog.problems[0])
+    with i18n.with_language(i18n.EN):
+        english = text(catalog.problems[0])
+
+    assert english != chinese
+    assert "description" in english and "frontmatter" in english
+    assert not any("\u4e00" <= char <= "\u9fff" for char in english), english
 
 
 def test_name_mismatch_with_directory_is_reported(workdir):
@@ -335,7 +369,7 @@ def test_name_mismatch_with_directory_is_reported(workdir):
     catalog = SkillLoader(workdir).reload()
 
     assert catalog.skills == ()
-    assert "不一致" in catalog.problems[0]
+    assert "不一致" in text(catalog.problems[0])
 
 
 def test_one_bad_skill_does_not_hide_the_others(workdir):
@@ -381,8 +415,8 @@ def test_oversized_skill_is_refused_not_truncated(workdir):
     catalog = SkillLoader(workdir).reload()
 
     assert catalog.skills == ()
-    assert str(MAX_SKILL_BYTES) in catalog.problems[0]
-    assert "超过上限" in catalog.problems[0]
+    assert str(MAX_SKILL_BYTES) in text(catalog.problems[0])
+    assert "超过上限" in text(catalog.problems[0])
 
 
 def test_frontmatter_rejects_what_it_cannot_read():
@@ -426,7 +460,7 @@ def test_bad_name_shape_is_rejected(workdir):
     catalog = SkillLoader(workdir).reload()
 
     assert catalog.skills == ()
-    assert "不合法" in catalog.problems[0]
+    assert "不合法" in text(catalog.problems[0])
 
 
 # --- 2. 装载：三条出口与 metadata -----------------------------------------
@@ -776,7 +810,7 @@ def test_a_symlinked_skill_directory_cannot_escape(workdir):
     catalog = SkillLoader(root).reload()
 
     assert catalog.skills == ()
-    assert "越界" in catalog.problems[0]
+    assert "越界" in text(catalog.problems[0])
 
 
 # --- 6. 审计 ---------------------------------------------------------------

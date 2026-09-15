@@ -61,8 +61,10 @@ builtin/__init__.py）同构。
 
 import hashlib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 # 这个运行时的**私有目录名**。技能住它下面的 skills/，会话住 sessions/，
 # 审计日志住 logs/，权限策略是 permissions.json。
@@ -165,11 +167,51 @@ class Skill:
 
 
 @dataclass(frozen=True, slots=True)
+class Problem:
+    """一个技能文件的问题：**机器认的 code + 参数**，不是一句拼好的话。
+
+    ## 为什么不是字符串
+
+    给人看的那句在**消费方**拼（`render(problem, t)`，`t` 就是 `i18n.t`）：这个包是
+    叶子（`tests/test_imports.py` 那条"skills 只准 import paths"盯着它），它不认识
+    界面语言，也不该认识 —— 而 `[技能] …` 那几条通知是**要翻的**（它们出现在会话流
+    里）。拼好的中文串到了那边就没救了。
+
+    它和 `tools/mcp.py` 里 `McpError` 的处置不同，原因很实在：那边能 import i18n，
+    这边不能。**这不是"两个地方各写一套"，是同一个约束下的两种落点**：谁能翻就在
+    谁那儿翻，谁不能翻就把原料交出去。
+
+    `params` 里可以嵌另一个 `Problem`（"x 被跳过：<内层原因>"），渲染时递归。
+    """
+
+    code: str
+    params: tuple[tuple[str, Any], ...] = ()
+
+    def with_(self, **extra: Any) -> "Problem":
+        """补几个参数（外层要包住内层时用，例如 `skipped` 包一个解析错误）。"""
+        return Problem(self.code, self.params + tuple(extra.items()))
+
+
+def render(problem: Problem, t: Callable[..., str]) -> str:
+    """问题 → 给人看的一句话。`t` 是 `i18n.t`（**由调用方注入**）。
+
+    递归那一条是必须的：`skipped` 的参数里装着内层的 `Problem`（"读不了 SKILL.md"
+    或某个 frontmatter 错误），而内层那句话同样要按当前语言出。
+    """
+    fields = {
+        key: (render(value, t) if isinstance(value, Problem) else value)
+        for key, value in problem.params
+    }
+    return t(f"skills.problem.{problem.code}", **fields)
+
+
+@dataclass(frozen=True, slots=True)
 class SkillCatalog:
     """一次扫描的结果：能用的技能 + 读懂的毛病 + 扫过哪些目录。
 
     problems 里的每一条都是**给写技能的人看的**，所以它必须带文件名和具体毛病 ——
-    只说"有个技能加载失败"等于什么也没说。
+    只说"有个技能加载失败"等于什么也没说。它们现在是 `Problem`（code + 参数），
+    由消费方渲染（见那个类）。
 
     `roots` 是这次真的扫了的目录（按扫描顺序，低优先级在前）。它存在的理由和 problems
     一样：答得出"它是在哪儿找到这个技能的"——用户级目录在工作区外面，不列出来，
@@ -177,9 +219,9 @@ class SkillCatalog:
     """
 
     skills: tuple[Skill, ...] = ()
-    problems: tuple[str, ...] = ()
+    problems: tuple[Problem, ...] = ()
     roots: tuple[Path, ...] = ()
-    shadowed: tuple[str, ...] = ()
+    shadowed: tuple[Problem, ...] = ()
 
     def by_name(self, name: str) -> Skill | None:
         for skill in self.skills:
@@ -189,7 +231,16 @@ class SkillCatalog:
 
 
 class FrontmatterError(ValueError):
-    """技能头读不懂。它的消息会原样进 problems（也就是会原样打给人看）。"""
+    """技能头读不懂。**它带的是 code + 参数**，不是一句拼好的话（见 `Problem`）。
+
+    它仍然是 `ValueError`：`_skill_file` 那条"软链越界"也走同一个 except，
+    而那个 except 在 `_scan` 里。
+    """
+
+    def __init__(self, code: str, **params: Any) -> None:
+        self.code = code
+        self.params = params
+        super().__init__(code)
 
 
 def _strip_quotes(value: str) -> str:
@@ -255,16 +306,14 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     """
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
-        raise FrontmatterError(
-            "文件开头必须有 frontmatter，第一行是三个连字符（---）"
-        )
+        raise FrontmatterError("no_frontmatter")
 
     closing = next(
         (index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"),
         None,
     )
     if closing is None:
-        raise FrontmatterError("frontmatter 没有闭合：缺少第二行三个连字符（---）")
+        raise FrontmatterError("unclosed_frontmatter")
 
     entries: dict[str, str] = {}
     open_list: str | None = None
@@ -286,23 +335,16 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
                 if line.endswith("]"):
                     open_list = None
                 continue
-            raise FrontmatterError(
-                f"这一行有缩进：{line!r}。本解析器只认顶格的 `键: 值`，"
-                f"不接受嵌套结构或 `- ` 列表项（`metadata` 之下除外）"
-            )
+            raise FrontmatterError("indented", line=repr(line))
 
         if ":" not in line:
-            raise FrontmatterError(
-                f"看不懂这一行：{line!r}（只支持顶格的 `键: 值`）"
-            )
+            raise FrontmatterError("unparsable", line=repr(line))
         key, value = (part.strip() for part in line.split(":", 1))
         if not key:
-            raise FrontmatterError(f"这一行缺少键名：{line!r}")
+            raise FrontmatterError("missing_key", line=repr(line))
         if key not in _KNOWN_FRONTMATTER_KEYS:
-            raise FrontmatterError(
-                f"不认识的键 {key!r}；本程序认识的只有 "
-                f"{'、'.join(_KNOWN_FRONTMATTER_KEYS)}"
-            )
+            raise FrontmatterError("unknown_key", key=repr(key),
+                                   known="、".join(_KNOWN_FRONTMATTER_KEYS))
 
         in_metadata = key == "metadata" and not value
         if key not in entries:
@@ -311,18 +353,13 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
             # allowed-tools 允许分多行写（规范里是一串，写长了自然会折行）。
             entries[key] = f"{entries[key]} {value}".strip()
         else:
-            raise FrontmatterError(f"键 {key!r} 写了两遍 —— 哪一遍算数没有答案")
+            raise FrontmatterError("duplicate_key", key=repr(key))
 
         if value in ("|", ">"):
-            raise FrontmatterError(
-                f"{key} 用了多行块写法（{value}），本解析器不支持；写成一行"
-            )
+            raise FrontmatterError("multiline_block", key=key, value=value)
         # 引号里的值是明确的，所以跳过字符检查（见 _is_quoted）。
         if not _is_quoted(value) and any(c in value for c in _UNSUPPORTED_IN_VALUE):
-            raise FrontmatterError(
-                f"{key} 的值里有本解析器不支持的字符（{_UNSUPPORTED_IN_VALUE}）；"
-                f"值写成简单的一行文本，或者整个用引号包起来，需要说明就写进正文"
-            )
+            raise FrontmatterError("bad_chars", key=key, chars=_UNSUPPORTED_IN_VALUE)
 
         open_list = key if value.startswith("[") and not value.endswith("]") else None
         if key not in _IGNORED_KEYS and key != "metadata":
@@ -346,34 +383,22 @@ def parse_skill(directory_name: str, path: Path, text: str) -> Skill:
 
     declared = _as_text(entries, "name")
     if not declared:
-        raise FrontmatterError("frontmatter 缺少 name")
+        raise FrontmatterError("missing_name")
     if declared != directory_name:
-        raise FrontmatterError(
-            f"name={declared!r} 和目录名 {directory_name!r} 不一致 —— "
-            f"两者必须相同，否则模型看到的技能名和文件路径对不上"
-        )
+        raise FrontmatterError("name_mismatch", name=repr(declared),
+                               directory=repr(directory_name))
     if not _NAME_RE.fullmatch(declared):
-        raise FrontmatterError(
-            f"name={declared!r} 不合法：只能用小写字母、数字和连字符，"
-            f"且不能以连字符开头/结尾或连着两个（例如 pdf-extract）"
-        )
+        raise FrontmatterError("bad_name", name=repr(declared))
     if len(declared) > 64:
-        raise FrontmatterError(f"name 超过 64 个字符（{len(declared)}）")
+        raise FrontmatterError("name_too_long", length=len(declared))
 
     description = _as_text(entries, "description")
     if not description:
-        raise FrontmatterError(
-            "frontmatter 缺少 description —— 它是模型判断「什么时候该用这个技能」的"
-            "唯一依据（技能正文在被加载之前是看不见的）"
-        )
+        raise FrontmatterError("missing_description")
 
     size = len(text.encode("utf-8"))
     if size > MAX_SKILL_BYTES:
-        raise FrontmatterError(
-            f"文件 {size} 字节，超过上限 {MAX_SKILL_BYTES} —— 正文会拼进每一次请求，"
-            f"所以超限时拒绝加载而不截断；把细节挪到同目录的另一个文件里，"
-            f"让模型需要时自己用 read_file 读"
-        )
+        raise FrontmatterError("too_big", size=size, limit=MAX_SKILL_BYTES)
 
     return Skill(
         name=declared,
@@ -461,10 +486,10 @@ class SkillLoader:
         """
         target = (entry / SKILL_FILE_NAME).resolve()
         if target.parent.parent != root.resolve():
-            raise ValueError(f"技能目录越界（软链指到了技能目录外面）：{entry}")
+            raise FrontmatterError("escape", path=str(entry))
         return target
 
-    def _scan(self, root: Path, problems: list[str]) -> list[Skill]:
+    def _scan(self, root: Path, problems: list[Problem]) -> list[Skill]:
         """扫一个目录，把读懂的毛病 append 进 problems，返回认出来的技能。
 
         problems 是**参数**而不是实例状态：扫一个目录这件事没有"记忆"，攒问题的是
@@ -480,8 +505,9 @@ class SkillLoader:
                 continue
             try:
                 path = self._skill_file(root, entry)
-            except ValueError as exc:
-                problems.append(f"{entry.name} 被跳过：{exc}")
+            except FrontmatterError as exc:
+                problems.append(Problem("skipped", (("name", entry.name),
+                                                    ("reason", Problem(exc.code, tuple(exc.params.items()))))))
                 continue
             if not path.is_file():
                 # 目录建了但还没写 SKILL.md：跳过就好。它是"正在写"的中间状态，
@@ -496,15 +522,20 @@ class SkillLoader:
                 # 这条和 config._read_json_object 里那条是同一个坑的两次踩中。
                 text = path.read_text(encoding="utf-8-sig")
             except (OSError, UnicodeDecodeError) as exc:
-                problems.append(
-                    f"{entry.name} 被跳过：读不了 {SKILL_FILE_NAME}（{exc}）"
-                )
+                problems.append(Problem("skipped", (
+                    ("name", entry.name),
+                    ("reason", Problem("unreadable", (("file", SKILL_FILE_NAME),
+                                                      ("problem", str(exc))))),
+                )))
                 continue
 
             try:
                 found.append(parse_skill(entry.name, path, text))
             except FrontmatterError as exc:
-                problems.append(f"{entry.name} 被跳过：{exc}")
+                problems.append(Problem("skipped", (
+                    ("name", entry.name),
+                    ("reason", Problem(exc.code, tuple(exc.params.items()))),
+                )))
         return found
 
     def reload(self) -> SkillCatalog:
@@ -519,7 +550,7 @@ class SkillLoader:
         进 `shadowed` 报给人看 —— 静默遮蔽会让人改了项目里那份技能却发现"没生效"，
         而真正生效的在另一个盘上。
         """
-        problems: list[str] = []
+        problems: list[Problem] = []
         # 低优先级在前地扫，所以后面的同名会把前面的顶掉。
         collected: dict[str, list[tuple[int, Skill]]] = {}
         scanned: list[Path] = []
@@ -531,18 +562,18 @@ class SkillLoader:
                 collected.setdefault(skill.name, []).append((root.priority, skill))
 
         skills: list[Skill] = []
-        shadowed: list[str] = []
+        shadowed: list[Problem] = []
         for name, candidates in sorted(collected.items()):
             # 优先级高的在前：第一个是生效的，其余是被它遮住的。
             candidates.sort(key=lambda item: item[0], reverse=True)
             winner = candidates[0][1]
             locations = tuple(item[1].path for item in candidates)
             if len(locations) > 1:
-                shadowed.append(
-                    f"{name} 取 {locations[0]}，"
-                    + "、".join(str(path) for path in locations[1:])
-                    + " 被它遮住了"
-                )
+                shadowed.append(Problem("shadowed", (
+                    ("name", name),
+                    ("winner", str(locations[0])),
+                    ("losers", "、".join(str(path) for path in locations[1:])),
+                )))
             skills.append(
                 Skill(
                     name=winner.name,

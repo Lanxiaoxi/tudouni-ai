@@ -69,6 +69,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from agent_runtime import i18n
 from agent_runtime.process import start as start_process
 from agent_runtime.process import terminate_all, terminate_tree
 
@@ -655,11 +656,13 @@ class JobBoard:
             return None
         parts = []
         if live:
-            parts.append(f"{live} 个在跑")
+            parts.append(i18n.tn("jobs.progress.running", live))
         if uncollected:
-            parts.append(f"{uncollected} 个结果还没收")
-        ids = "、".join(job.id for job in self._snapshot() if job.running or job.uncollected)
-        return f"{'、'.join(parts)}（{ids}）—— 明细 job_list"
+            parts.append(i18n.tn("jobs.progress.uncollected", uncollected))
+        ids = i18n.t("list.separator").join(
+            job.id for job in self._snapshot() if job.running or job.uncollected)
+        return i18n.t("jobs.progress.line",
+                      parts=i18n.t("list.separator").join(parts), ids=ids)
 
     def panel(self) -> list[dict[str, object]]:
         """面板快照：给界面看的那几条（`ui(kind:"state")` 里的 `jobs`）。

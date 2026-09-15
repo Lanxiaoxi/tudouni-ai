@@ -76,6 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="TUI 的配色（14 套：a 石墨琥珀是默认；也能给名字，如 --theme 靛夜）。"
              "运行中还能用 /theme 换",
     )
+    # 界面语言。**它不是给 TUI 一家用的**：runtime 子进程也要照同一套语言写它自己
+    # 那几句（启动通知、/model 的回话），所以父进程定了之后要用 `--lang` 传下去
+    # （见 `protocol/client.default_argv`）。运行中不能换 —— 理由写在 `i18n` 的
+    # 模块 docstring 里（子进程那半边跟不上）。
+    #
+    # 主入口是配置文件那一格（`ui.language`）；这个开关是"临时换一次"和测试用的。
+    parser.add_argument(
+        "--lang", default=None, metavar="LANG",
+        help="界面语言：zh（默认）或 en。平时写在配置文件的 ui.language 上",
+    )
     # 安静模式：**它只是 TUI 的显示偏好**（不进协议、不影响 runtime），所以它和
     # `--theme` 排在一起，而不是和 `--autopilot` —— 后者是 runtime 那一侧的模式。
     # 它管的是"一次工具调用占几行、思考过程铺不铺开"，理由见 `view_state.ViewState.quiet`。

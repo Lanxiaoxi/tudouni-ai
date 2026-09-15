@@ -37,6 +37,7 @@ from agent_runtime.agents import Agent
 from agent_runtime.audit import JsonlSink
 from agent_runtime.models import OpenAICompatibleModel
 from agent_runtime.runtime.channels import Channels, resolve_memory_factory
+from agent_runtime import i18n
 from agent_runtime import userconfig
 from agent_runtime.runtime.config import (
     DEFAULT_AUTO_APPROVE,
@@ -216,18 +217,11 @@ def check_workspace() -> str | None:
     # 每一条都说清**三件事**：这是哪儿、为什么不行、下一步敲什么。
     # 只说"拒绝"的报错会让人以为程序坏了。
     what = {
-        paths.UNSAFE_HOME: f"{here} 是你的 home 目录",
-        paths.UNSAFE_ROOT: f"{here} 是文件系统的根",
-        paths.UNSAFE_ABOVE_HOME: f"{here} 在 home 的上层（它下面是所有人的 home）",
+        paths.UNSAFE_HOME: i18n.t("check.workspace.home", here=here),
+        paths.UNSAFE_ROOT: i18n.t("check.workspace.root", here=here),
+        paths.UNSAFE_ABOVE_HOME: i18n.t("check.workspace.above_home", here=here),
     }[reason]
-    return (
-        f"不能把这里当工作区：{what}。\n"
-        f"  工作区就是当前目录，而 agent 的文件工具**只能读写工作区里的东西** ——\n"
-        f"  在这里启动等于把它下面的一切都交出去（.ssh、别的项目的 .env、"
-        f"浏览器数据……），\n"
-        f"  而 read_file 是免审批的，你不会被问第二次。\n"
-        f"  先 cd 进一个具体的项目目录再跑。"
-    )
+    return i18n.t("check.workspace.refused", what=what)
 
 
 def check_config() -> str | None:
@@ -296,13 +290,8 @@ def check_session_id(session_id: str | None) -> str | None:
     """
     if session_id is None or is_valid_session_id(session_id):
         return None
-    return (
-        f"非法的 --session：{session_id!r}\n"
-        f"  会话 id 只能由字母、数字、下划线、连字符组成，长度 1~64 ——\n"
-        f"  因为它会被拿去拼文件名（{RUNTIME_DIR_NAME}/sessions/<id>.jsonl 和"
-        f" {RUNTIME_DIR_NAME}/logs/<id>.jsonl）。\n"
-        f"  用 --list 看一下有哪些现成的 id。"
-    )
+    return i18n.t("check.session_id.invalid", name=repr(session_id),
+                  dir=RUNTIME_DIR_NAME)
 
 
 def resolve_session(
@@ -433,7 +422,9 @@ def session_summaries(
         except Exception as exc:  # noqa: BLE001 - 坏文件只影响它自己那一行
             item = {
                 "session_id": session_id, "messages": 0, "steps": 0,
-                "todos": "", "preview": f"（读不出来：{type(exc).__name__}）",
+                "todos": "",
+                "preview": i18n.t("session.preview.unreadable",
+                                  kind=type(exc).__name__),
                 "modified_at": _modified_at(path),
             }
             loaded.append(((0.0, session_id), item))
@@ -654,7 +645,7 @@ class McpHost:
         if state is not None and state.state == MCP_LOADED:
             # **幂等**：连着按两下不该起两个进程、更不该在注册表上撞名。
             return self._say(
-                f"server `{name}` 已经挂上了（{state.tools} 个工具），没有重复加载",
+                i18n.t("mcp.host.already_loaded", name=name, n=state.tools),
                 level="info",
             )
 
@@ -665,7 +656,8 @@ class McpHost:
         state = self._find(name)
 
         if state is None:
-            return self._say(f"清单里没有 server `{name}`：{self._known_names()}")
+            return self._say(i18n.t("mcp.host.unknown_server", name=name,
+                                    known=self._known_names()))
 
         outcome = load_server(state.server, self._factory, on_problem=self._on_problem)
         if outcome.error:
@@ -673,7 +665,8 @@ class McpHost:
             state.tools = 0
             state.error = outcome.error
             return self._say(
-                f"server `{name}` 没连上（{outcome.error}）；再按一次是重试",
+                i18n.t("mcp.host.load_failed", name=name,
+                       problem=outcome.error),
                 level="warn",
             )
 
@@ -692,8 +685,7 @@ class McpHost:
         self._toolsets[name] = outcome
         self._tools_by_server[name] = tuple(tool.name for tool in outcome.tools)
         return self._say(
-            f"server `{name}` 挂上了：{state.tools} 个工具"
-            f"（风险一律 high，每次调用都要你批准）"
+            i18n.t("mcp.host.loaded", name=name, n=state.tools)
         )
 
     def unload(self, name: str) -> str:
@@ -704,9 +696,11 @@ class McpHost:
         """
         state = self._find(name)
         if state is None:
-            return self._say(f"清单里没有 server `{name}`：{self._known_names()}")
+            return self._say(i18n.t("mcp.host.unknown_server", name=name,
+                                    known=self._known_names()))
         if state.state == MCP_UNLOAD and not state.error:
-            return self._say(f"server `{name}` 本来就没在跑", level="info")
+            return self._say(i18n.t("mcp.host.not_running", name=name),
+                             level="info")
 
         removed = len(self._tools_by_server.get(name, ()))
         self._forget(name)
@@ -715,8 +709,7 @@ class McpHost:
         # `error` **不清**：如果上一次加载失败过，那句"为什么"在下一次尝试之前
         # 仍然是对的事实。清掉它，用户再打开面板就只能看见一个光秃秃的 unload。
         return self._say(
-            f"server `{name}` 卸下了（摘掉 {removed} 个工具）；"
-            f"配置里那一行还在（下次启动不会自己挂上 —— 启动时不自动挂，要用就再 load 一次）"
+            i18n.t("mcp.host.unloaded", name=name, n=removed)
         )
 
     def close(self) -> None:
@@ -740,8 +733,8 @@ class McpHost:
 
     def _known_names(self) -> str:
         if not self._states:
-            return f"（{self._config_path.name} 里一个 server 都没配）"
-        return "、".join(self._states)
+            return i18n.t("mcp.host.no_servers", file=self._config_path.name)
+        return i18n.t("list.separator").join(self._states)
 
     def _forget(self, name: str) -> None:
         """把一个 server 从"挂着"变成"没挂着"：摘工具、关通道、清映射。
@@ -757,7 +750,8 @@ class McpHost:
         try:
             toolset.connection.channel.close()
         except Exception as exc:  # noqa: BLE001 - 收摊失败不往上抛
-            _warn(f"关闭 MCP server `{name}` 时出错：{type(exc).__name__}: {exc}")
+            _warn(i18n.t("mcp.host.close_failed", name=name,
+                         problem=f"{type(exc).__name__}: {exc}"))
 
     def _reread(self) -> None:
         """重读配置文件，**只新增**（不认识删除）。
@@ -772,8 +766,8 @@ class McpHost:
             # **走 `on_problem` 而不是直接 `_warn`**：那条通道是调用方注入的，装配期
             # 它落到 stderr，而注入一个收集列表的测试能因此断言"这句话说出来了"。
             self._say(
-                f"重读 {self._config_path.name} 时出错（这一次的新增认不出来）："
-                f"{type(exc).__name__}: {exc}",
+                i18n.t("mcp.host.reread_failed", file=self._config_path.name,
+                       problem=f"{type(exc).__name__}: {exc}"),
                 level="warn",
             )
             return
@@ -990,7 +984,7 @@ class Runtime:
         """
         wanted = (name or "").strip()
         if not wanted:
-            return False, "没给模型名。/model 不带参数看清单。"
+            return False, i18n.t("model.select.no_name")
 
         provider_name = (provider or "").strip()
         if "/" in wanted and not provider_name:
@@ -1006,58 +1000,51 @@ class Runtime:
         if not wanted and provider_name:
             found = self.model_registry.provider(provider_name)
             if found is None:
-                return False, f"没有这条路由：{provider_name} —— /model 不带参数看清单。"
+                return False, i18n.t("model.select.no_route", route=provider_name)
             if not found.models:
-                return False, f"路由 {provider_name} 一个模型都没声明。"
+                return False, i18n.t("model.select.route_empty", route=provider_name)
             wanted = found.models[0].id
         elif not provider_name and self.model_registry.provider(wanted) is not None:
             found = self.model_registry.provider(wanted)
             if not found.models:
-                return False, f"路由 {wanted} 一个模型都没声明。"
+                return False, i18n.t("model.select.route_empty", route=wanted)
             provider_name, wanted = wanted, found.models[0].id
 
         ref = self.model_registry.find(wanted, provider=provider_name or None)
         if ref is None:
             hits = self.model_registry.ambiguous(wanted)
             if hits:
-                names = "、".join(item.qualified for item in hits)
-                return False, (
-                    f"{wanted} 在多条路由上都有（{names}）—— "
-                    f"写全一点：/model provider/model"
-                )
-            known = "、".join(item.id for item in self.model_registry.models()) or "（一条都没有）"
-            return False, (
-                f"目录里没有这个模型：{wanted} —— /model 不带参数看清单。"
-                f"（清单是配置里写死的几个名字，不会把任意名字转给网关："
-                f"那样打错一个字母只会在下一次请求时才炸。）现在有：{known}"
-            )
+                names = i18n.t("list.separator").join(item.qualified for item in hits)
+                return False, i18n.t("model.select.ambiguous", name=wanted, names=names)
+            known = i18n.t("list.separator").join(
+                item.id for item in self.model_registry.models()) \
+                or i18n.t("model.select.none_known")
+            return False, i18n.t("model.select.unknown", name=wanted, known=known)
 
         target = self.model_registry.provider(ref.provider)
         if target is None:  # pragma: no cover - find() 就是从 providers 里找出来的
-            return False, f"那条路由不见了：{ref.provider}"
+            return False, i18n.t("model.select.route_gone", route=ref.provider)
         if not target.usable:
-            return False, (
-                f"路由 {ref.provider} 没有密钥，选不了它下面的模型 —— 在 "
-                f"{userconfig.config_file()} 里**那条路由上**写一个 \"api_key\"。"
-            )
+            return False, i18n.t("model.select.no_key", route=ref.provider,
+                                 path=userconfig.config_file())
 
         if self.current_model == ref.id and self.current_provider == ref.provider:
-            return True, f"已经是 {ref.qualified} 了。"
+            return True, i18n.t("model.select.already", name=ref.qualified)
 
-        previous = self.current_route or "（未知）"
+        previous = self.current_route or i18n.t("model.select.unknown_previous")
         if not self.agent.switch_model(
             ref.id, provider=ref.provider,
             api_key=target.api_key, base_url=target.base_url,
         ):
-            return False, (
-                f"这个会话的模型适配器不支持中途换模型（{type(self.agent.model).__name__}）"
-                f"—— 只能重启时在 {userconfig.config_file()} 里改默认值。"
-            )
+            return False, i18n.t("model.select.no_switch",
+                                 kind=type(self.agent.model).__name__,
+                                 path=userconfig.config_file())
 
-        self._save_now("换模型")
+        self._save_now("model")
         # 回报必须带上"上一个是谁"：那句话里同时有"上面那些轮次是谁写的"和"从这里
         # 开始是谁"，而界面拼不出来（它不知道上一轮用了谁）。
-        return True, f"换成 {ref.qualified}（上一个：{previous}）—— 下一次请求生效。"
+        return True, i18n.t("model.select.switched", name=ref.qualified,
+                            previous=previous)
 
     def select_thinking(self, on: bool) -> tuple[bool, str]:
         """开关思考模式（`/thinking`）。返回 `(改了吗, 说给用户听的一句话)`。
@@ -1068,12 +1055,11 @@ class Runtime:
         （见 `state/reasoning.request_fields`），但那不代表要把用户的选择删掉。
         """
         if not self.agent.set_reasoning(thinking=on, effort=None):
-            return False, "这个会话的模型适配器不支持改思考模式。"
-        self._save_now("改思考模式")
+            return False, i18n.t("thinking.select.no_support")
+        self._save_now("thinking")
         if on:
-            return True, (f"思考模式：开（强度 {self.agent.effort}）"
-                          f"—— 下一次请求生效。")
-        return True, "思考模式：关（强度记着，/thinking on 回来还是它）—— 下一次请求生效。"
+            return True, i18n.t("thinking.select.on", effort=self.agent.effort)
+        return True, i18n.t("thinking.select.off")
 
     def select_effort(self, effort: str) -> tuple[bool, str]:
         """改思考强度（`/effort`）。返回 `(改了吗, 说给用户听的一句话)`。
@@ -1083,24 +1069,21 @@ class Runtime:
         """
         level = reasoning.resolve_effort(effort)
         if level is None:
+            levels = i18n.t("list.separator").join(reasoning.EFFORT_LEVELS)
             if reasoning.is_off(effort):
                 # `none` 是端点认的"关掉思考"的写法，而它在这一版里是**另一个旋钮**。
                 # 指路而不是照做：把 `/effort none` 当成 `/thinking off` 会让人以为
                 # 强度变成了 none（而清单里根本没有那一档）。
-                return False, ("`none` 是关掉思考，不是一档强度 —— 用 /thinking off"
-                               "（强度会留着），或者 /effort "
-                               f"{'、'.join(reasoning.EFFORT_LEVELS)}。")
-            return False, (
-                f"没有这一档强度：{effort} —— 能写的只有 "
-                f"{'、'.join(reasoning.EFFORT_LEVELS)}"
-                f"（端点还接受 {'、'.join(sorted(reasoning.ALIASES))} 这些等价写法）。"
-            )
+                return False, i18n.t("effort.select.off_word", levels=levels)
+            return False, i18n.t(
+                "effort.select.unknown", effort=effort, levels=levels,
+                aliases=i18n.t("list.separator").join(sorted(reasoning.ALIASES)))
         if not self.agent.set_reasoning(thinking=None, effort=level):
-            return False, "这个会话的模型适配器不支持改思考强度。"
-        self._save_now("改思考强度")
+            return False, i18n.t("effort.select.no_support")
+        self._save_now("effort")
         if self.agent.thinking:
-            return True, f"思考强度：{level} —— 下一次请求生效。"
-        return True, f"思考强度记成 {level} 了，但思考模式关着（/thinking on 才用得上）。"
+            return True, i18n.t("effort.select.ok", level=level)
+        return True, i18n.t("effort.select.ok_off", level=level)
 
     def _save_now(self, what: str) -> None:
         """把这几个会话级设置立刻落盘。**失败不当失败，但必须说。**
@@ -1109,12 +1092,15 @@ class Runtime:
         —— 那一块平时靠回合里的检查点落盘。等着下一个检查点的话，最自然的用法之一
         （进去、改一下、退出）会丢掉这次改动，而恢复会话时我们报的是旧值 —— 那和刚
         给过的承诺相反。
+
+        `what` 是**动作的键**（`model` / `thinking` / `effort`），不是一句话：这句警告
+        要按界面语言出，而"哪个动作"是事实（见 `i18n` 里 `save.action.*`）。
         """
         try:
             self.store.save(self.session)
         except Exception as exc:  # noqa: BLE001
-            _warn(f"{what}之后落盘失败（这一次仍然生效，重开会话会回到配置里那个）："
-                  f"{type(exc).__name__}: {exc}")
+            _warn(i18n.t("save.failed", what=i18n.t(f"save.action.{what}"),
+                         problem=f"{type(exc).__name__}: {exc}"))
 
     def model_rows(self) -> tuple[list[dict], list[dict]]:
         """`/model` 那张清单：目录里能选的模型 + "现在用的是哪个"。
@@ -1253,16 +1239,14 @@ class Runtime:
         # （错的百分比比没有百分比更坏）。
         if self.context_tokens is None:
             out.append(Notice("err", code="context",
-                text=f"[上下文] 模型 {self.current_model!r} 不在目录里（或者配置里没写"
-                f"它的 context_window），末尾只报上下文用量、不报占比；"
-                f"把它那一行补上即可。"))
+                text=i18n.t("notice.context.missing_window",
+                            model=repr(self.current_model))))
 
         # 缺搜索密钥不是配置错误（不像"一条能用的模型路由都没有"）：只是不注册那一个工具。
         if not self.web_cfg.tavily_api_key:
             out.append(Notice("err", code="web",
-                text="[联网] 没找到 TAVILY_API_KEY，web_search 未注册（fetch_web 不受影响）。"
-                f'要启用就写进 {userconfig.config_file()} 的 "env" 段：'
-                f'"TAVILY_API_KEY": "tvly-..."'))
+                text=i18n.t("notice.web.no_key",
+                            path=userconfig.config_file())))
 
         # [搜索]：**它和上面那条不是一类问题**，所以语气也不同。
         #
@@ -1281,15 +1265,11 @@ class Runtime:
             triple = host_triple()
             if triple is None:
                 out.append(Notice("err", code="grep",
-                    text=f"[搜索] 这个平台（{sys.platform}）不在 grep 引擎的支持列表里"
-                    f"（现在只有 x86_64 的 Windows / Linux），grep 未注册"
-                    f"（搜文本只能走 shell，每次都要审批）。"
-                    f"要支持它是两步，见 tools/vendor/rg/README.md。"))
+                    text=i18n.t("notice.grep.unsupported_platform",
+                                platform=sys.platform)))
             else:
                 out.append(Notice("err", code="grep",
-                    text=f"[搜索] tools/vendor/rg/ 里少了 {triple} 这一份 ripgrep，"
-                    f"grep 未注册（搜文本只能走 shell，每次都要审批）。"
-                    f"跑 `uv run python scripts/fetch_rg.py` 补上。"))
+                    text=i18n.t("notice.grep.missing_binary", triple=triple)))
 
         # [MCP]：**配了几个和挂了几个是两件事**，而这句话必须把两者都说清。
         #
@@ -1299,9 +1279,10 @@ class Runtime:
         # （连同"每次调用都要你批准"那句解释）。
         if self.mcp_cfg.servers:
             out.append(Notice("err", code="mcp",
-                text=f"[MCP] {MCP_FILE} 里配了 {len(self.mcp_cfg.servers)} 个 server："
-                f"{'、'.join(server.name for server in self.mcp_cfg.servers)}"
-                f"（都还没挂载 —— /mcp 看清单并逐个挂上）"))
+                text=i18n.t("notice.mcp.configured", file=MCP_FILE,
+                            n=len(self.mcp_cfg.servers),
+                            names=i18n.t("list.separator").join(
+                                server.name for server in self.mcp_cfg.servers))))
         if self._mcp is not None:
             # 逐行由**当前状态**说，而不是启动时那一份快照：`/mcp` 能中途挂载和卸载，
             # 而这几行会在下一次 `ui(state)` 快照里跟着变。`notices()` 只在启动时
@@ -1309,8 +1290,8 @@ class Runtime:
             for row in self._mcp.rows():
                 if row["state"] == MCP_LOADED:
                     out.append(Notice("err", code="mcp",
-                        text=f"[MCP] server {row['name']}：连上了，提供 {row['tools']} 个工具"
-                        f"（风险一律 high，每次调用都要你批准）"))
+                        text=i18n.t("notice.mcp.loaded", name=row["name"],
+                                    n=row["tools"])))
 
         # 工作区里那份 mcp.json 是**故意不读**的（理由写在 config.McpConfig 上），
         # 所以它存在就等于"有人按旧位置写了一份"。这和坏技能是同一类症状：
@@ -1318,10 +1299,8 @@ class Runtime:
         ignored = project_dir() / RUNTIME_DIR_NAME / "mcp.json"
         if ignored.is_file():
             out.append(Notice("err", code="mcp", level="warn",
-                text=f"[MCP] 忽略了 {ignored}：server 清单只从用户级 {MCP_FILE} 读。"
-                f"理由是这里的 command 是启动时就要执行的代码，而工作区里的文件可能"
-                f"随仓库一起被 clone 进来（见 config.McpConfig 上面的说明）。"
-                f"要用就把它挪到 {MCP_FILE}"))
+                text=i18n.t("notice.mcp.ignored_workspace_file",
+                            path=ignored, file=MCP_FILE)))
 
         # 旧位置那份 `.env` 也是同一类症状，而且更要紧：它里面装着**密钥**，而"我明明
         # 填了 key 却说没找到"是它失效之后唯一的表现。
@@ -1331,9 +1310,9 @@ class Runtime:
         # 同一条规矩）。不读可以，不出声不行。
         if LEGACY_ENV_FILE.is_file():
             out.append(Notice("err", code="config", level="warn",
-                text=f"[配置] 忽略了 {LEGACY_ENV_FILE}：这个程序现在**不读任何环境变量、"
-                f"也不读 .env**。密钥写在 {userconfig.config_file()} 里那条路由的 "
-                f"\"api_key\" 上，搬完就可以删掉这个文件了。"))
+                text=i18n.t("notice.config.legacy_env",
+                            path=LEGACY_ENV_FILE,
+                            config=userconfig.config_file())))
 
         # [后台] 两条，而且必须分开说 —— 它们的补救办法完全不同。
         #
@@ -1344,33 +1323,32 @@ class Runtime:
         # 坏得多。所以这里给的是"你自己去看一眼"，而不是一个我们不敢做的动作。
         if self._jobs is not None and self._jobs.leftovers:
             out.append(Notice("err", code="jobs", level="warn",
-                text=f"[后台] 上次会话留下了 {self._jobs.leftovers} 个后台任务的输出，"
-                f"已经清掉了。这说明那一次没有正常退出（关掉了窗口、或者进程被强杀），"
-                f"所以**那几个命令可能还在跑**，而它们不在这次会话的管辖里 —— "
-                f"如果端口或 CPU 对不上，自己确认一下。"))
+                text=i18n.t("notice.jobs.leftovers", n=self._jobs.leftovers)))
 
         # 第二条：**收树那层保证没建起来**（Windows 的作业对象）。它是"用户以为自己有"
         # 的一层，所以静默降级等于骗人 —— 和 mcp.py 里"收不掉也要大声说"同一条。
         # 没有它不等于一定会泄漏：正常退出、异常、Ctrl+C 都还能走 close()。
         if (problem := job_object_problem()) is not None:
             out.append(Notice("err", code="jobs", level="warn",
-                text=f"[后台] Windows 上那层「关掉窗口也把后台任务一起收掉」的保证没建起来"
-                     f"（{problem}）。正常退出仍然会收干净，但**强杀本进程时后台命令可能"
-                     f"变成孤儿**。"))
+                text=i18n.t("notice.jobs.no_job_object", problem=problem)))
 
         if with_tools:
-            out.append(Notice("out", code="tools", text="已注册工具:"))
+            out.append(Notice("out", code="tools",
+                              text=i18n.t("notice.tools.header")))
             for tool in self.tools.all():
                 out.append(Notice("out", code="tools",
-                                  text=f"  - {tool.name:16} 风险={tool.risk.value}"))
+                                  text=i18n.t("notice.tools.row",
+                                              name=f"{tool.name:16}",
+                                              risk=tool.risk.value)))
 
         # 名单里那些**没有被注册**的工具名：把 shell 写成 shall 的人以为自己放行了。
         # 这是唯一能告诉他的地方 —— 不该拦启动，但绝不能不说。
         unknown = self.permissions.unknown_tools(t.name for t in self.tools.all())
         if unknown:
             out.append(Notice("err", code="permissions", level="warn",
-                text=f"[权限] {PERMISSION_FILE_NAME} 里这些工具没有注册，规则不会生效："
-                     f"{', '.join(sorted(unknown))}"))
+                text=i18n.t("notice.permissions.unknown_tools",
+                            file=PERMISSION_FILE_NAME,
+                            names=", ".join(sorted(unknown)))))
 
         # [权限]：**每次启动都说一遍。**「按一次 t 就永久生效」是最容易忘掉的那类
         # 设置，而这份文件攒上几条之后，光盯着它已经答不出"现在到底还有什么会问我"。
@@ -1379,22 +1357,26 @@ class Runtime:
         # `low` 自动放行、其余三个键都空。**判断在这里做，不在界面里做** ——
         # "什么算默认"是 config 的知识（`DEFAULT_AUTO_APPROVE` 就在那儿），让前端
         # 自己硬编码一份默认值就是第二份事实，而它漂掉的症状是"该显示的没显示"。
-        levels = ", ".join(sorted(self.policy.auto_approve)) or "（无）"
-        named = ", ".join(sorted(self.memory.tools())) or "（无）"
+        levels = ", ".join(sorted(self.policy.auto_approve)) \
+            or i18n.t("notice.permissions.none")
+        named = ", ".join(sorted(self.memory.tools())) \
+            or i18n.t("notice.permissions.none")
         out.append(Notice(
             "err", code="permissions",
-            text=f"[权限] 按等级自动放行 {levels}；点名免问 {named}",
+            text=i18n.t("notice.permissions.levels", levels=levels, named=named),
             is_default=self._permissions_at_default,
         ))
         if self.policy.deny_tools:
             out.append(Notice("err", code="permissions",
-                text=f"[权限] 直接拒绝 {', '.join(sorted(self.policy.deny_tools))}"))
+                text=i18n.t("notice.permissions.deny",
+                            names=", ".join(sorted(self.policy.deny_tools)))))
 
         # 命令行规则单列一行：它是"按一次 t 记住哪条前缀"的产物，也最容易被忘掉 ——
         # 印象里只批准过一次 git add，而它此后一直静默生效。
-        rules = ", ".join(format_rule(rule) for rule in sorted(self.memory.prefixes())) or "（无）"
+        rules = ", ".join(format_rule(rule) for rule in sorted(self.memory.prefixes())) \
+            or i18n.t("notice.permissions.none")
         out.append(Notice("err", code="permissions",
-                          text=f"[权限] 命令规则（按前缀放行）{rules}"))
+                          text=i18n.t("notice.permissions.rules", rules=rules)))
 
         # [模型]：**只在"这个会话选过模型"时说**。目录里那个默认值不是新闻 ——
         # 启动横幅和 `init.model` 都写着它，再说一遍就是噪音。而"恢复一个会话、它用的是
@@ -1403,8 +1385,9 @@ class Runtime:
         session_model = self.agent.session_model
         if session_model is not None and session_model.selection is not None:
             out.append(Notice("err", code="model",
-                text=f"[模型] 这个会话选的是 {session_model.route_name()}"
-                     f"（{self.current_base_url}）—— /model 可以换，/status 看现在这个。"))
+                text=i18n.t("notice.model.session",
+                            route=session_model.route_name(),
+                            base_url=self.current_base_url)))
 
         # [思考]：**同样只在"这个会话改过"时说**。默认是开 + 目录里声明的那个强度 ——
         # 那是常态，为它加一行噪音会把上面那些真警告淹掉。而"这个会话把思考关了"必须
@@ -1414,10 +1397,11 @@ class Runtime:
             if (not session_model.thinking
                     or session_model.effort != reasoning.DEFAULT_EFFORT):
                 out.append(Notice("err", code="reasoning",
-                    text=f"[思考] 这个会话："
-                         f"{reasoning.summary(thinking=session_model.thinking, effort=session_model.effort)}"
-                         f"（默认是开 · {reasoning.DEFAULT_EFFORT}）—— "
-                         f"/thinking 开关、/effort 改强度。"))
+                    text=i18n.t("notice.reasoning.session",
+                                summary=reasoning.summary(
+                                    thinking=session_model.thinking,
+                                    effort=session_model.effort),
+                                default=reasoning.DEFAULT_EFFORT)))
 
         # [目录]：`notes` 非空时说一句。这些行是"我改的配置怎么没生效"唯一的答案 ——
         # 没有它的时候，用户看到的现象只是"模型少了几个"。
@@ -1434,20 +1418,29 @@ class Runtime:
         # 会话时不说的话，用户看到的会是"它怎么突然开始更新一个我从没见过的列表"。
         todo = progress_line(self.session.metadata)
         if todo:
-            out.append(Notice("err", code="todos", text=f"[任务] {todo}"))
+            out.append(Notice("err", code="todos",
+                              text=i18n.t("notice.todos", line=todo)))
 
         if self.skill_catalog.skills:
             out.append(Notice("err", code="skills",
-                text=f"[技能] 可用 {len(self.skill_catalog.skills)} 个："
-                     f"{'、'.join(skill.name for skill in self.skill_catalog.skills)}"))
+                text=i18n.t("notice.skills.available",
+                            n=len(self.skill_catalog.skills),
+                            names=i18n.t("list.separator").join(
+                                skill.name for skill in self.skill_catalog.skills))))
         for item in self.skill_catalog.shadowed:
-            out.append(Notice("err", code="skills", text=f"[技能] 同名遮蔽：{item}"))
+            out.append(Notice("err", code="skills",
+                              text=i18n.t("notice.skills.shadowed",
+                                          item=loader.render(item, i18n.t))))
         for problem in self.skill_catalog.problems:
             out.append(Notice("err", code="skills", level="warn",
-                              text=f"[技能] {problem}"))
-        line = active_line(self.session.metadata)
+                              text=i18n.t("notice.skills.problem",
+                                          problem=loader.render(problem, i18n.t))))
+        line = active_line(self.session.metadata,
+                           label=i18n.t("skills.active_label"),
+                           joiner=i18n.t("list.separator"))
         if line:
-            out.append(Notice("err", code="skills", text=f"[技能] {line}"))
+            out.append(Notice("err", code="skills",
+                              text=i18n.t("notice.skills.active", line=line)))
 
         # [AGENT.md]：工作区里那份项目说明读进来了没有。**和 [技能] 是同一类事实**
         # ——"agent 手里有哪些别人写的说明"—— 所以形状（`[标签] 一句话`）、流向
@@ -1467,9 +1460,7 @@ class Runtime:
         # 启动时大声说一次，而且**不做成配置项** —— 一次性的决定不该悄悄变成永久默认。
         if self.autopilot:
             out.append(Notice("err", code="autopilot", level="warn",
-                text="[权限] autopilot：不询问任何审批，需要审批的工具会直接执行；"
-                     "也不会向你提问 —— 模型调 ask_user 会拿到「没有人回答」，"
-                     "并被告知自己决定、把假设说出来（拒绝名单、工作区边界、控制面写入仍然生效）"))
+                text=i18n.t("notice.autopilot")))
 
         return out
 
@@ -1620,7 +1611,8 @@ class Runtime:
         所以这一行得能单独拎到 notices 之后打；同时"路径怎么拼"是装配的知识
         （`logs.directory` + `session_id`），不该让前端自己拼一遍 —— 那会是第二份事实。
         """
-        return f"审计日志写到 {self.logs.directory}\\{self.session_id}.jsonl"
+        return i18n.t("notice.audit_line",
+                      path=f"{self.logs.directory}\\{self.session_id}.jsonl")
 
     # -- 生命周期 --------------------------------------------------------------
 
@@ -1647,12 +1639,14 @@ class Runtime:
             try:
                 self._jobs.close()
             except Exception as exc:  # noqa: BLE001
-                _warn(f"收后台任务时出错：{type(exc).__name__}: {exc}")
+                _warn(i18n.t("close.jobs_failed",
+                             problem=f"{type(exc).__name__}: {exc}"))
         if self._http is not None:
             try:
                 self._http.close()
             except Exception as exc:  # noqa: BLE001
-                _warn(f"关闭 http client 时出错：{type(exc).__name__}: {exc}")
+                _warn(i18n.t("close.http_failed",
+                             problem=f"{type(exc).__name__}: {exc}"))
         if self._mcp is not None:
             self._mcp.close()
 
@@ -1779,24 +1773,14 @@ def _no_model_message(registry: catalog.Registry, *, created: Path | None = None
     缺密钥、哪条一个模型都没声明），而那是用户此刻唯一需要的信息。
     """
     if created is not None:
-        lead = (
-            "一条能用的模型路由都没有 —— 配不出模型就什么都干不了。\n"
-            "\n"
-            "我已经在这儿给你建好了一份配置，打开它、填上你的模型和密钥：\n"
-            f"    {created}\n"
-        )
+        lead = i18n.t("no_model.created", path=created)
     else:
-        lead = (
-            "一条能用的模型路由都没有 —— 配不出模型就什么都干不了。\n"
-            "\n"
-            f"配置写在 {userconfig.config_file()}"
-            f"（模板见 {userconfig.example_file()}）。\n"
-        )
+        lead = i18n.t("no_model.missing", config=userconfig.config_file(),
+                      example=userconfig.example_file())
 
     lines = [
         lead,
-        "模型层是抽象的：端点、模型名、密钥全由配置里的 providers 决定，",
-        "代码里没有写死任何一家。在 \"providers\" 里加一条路由就能用：",
+        *i18n.t("no_model.intro").split("\n"),
         "",
         "        {",
         '          "providers": {',
@@ -1808,13 +1792,14 @@ def _no_model_message(registry: catalog.Registry, *, created: Path | None = None
         "          }",
         "        }",
         "",
-        "    一条路由给三样东西：base_url（请求发到哪）、api_key（密钥就写在这条路由里）、",
-        "    models（这条路上有什么）。**第一条有密钥的路由就是默认路由**，顺序由你排。",
+        *i18n.t("no_model.route_fields").split("\n"),
     ]
     if registry.notes:
-        lines += ["", "这次读到的路由：", *[f"  {item}" for item in registry.notes]]
+        lines += ["", i18n.t("no_model.notes"),
+                  *[f"  {item}" for item in registry.notes]]
     if registry.problems:
-        lines += ["", "逐条问题：", *[f"  {item}" for item in registry.problems]]
+        lines += ["", i18n.t("no_model.problems"),
+                  *[f"  {item}" for item in registry.problems]]
     return "\n".join(lines)
 
 
@@ -2039,7 +2024,8 @@ def open_runtime(
             if len(names) < 2:
                 return None
             return TrustGroup(
-                label=f"MCP server {server} 的 {len(names)} 个工具", tools=names,
+                label=i18n.t("asker.trust_group", server=server,
+                             n=len(names)), tools=names,
             )
 
         # asker 由通道那份工厂造 —— 它要 memory 和 trust_group，而那两个刚刚才造出来。

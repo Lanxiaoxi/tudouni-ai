@@ -72,6 +72,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from agent_runtime import i18n
 from agent_runtime.process import terminate_tree
 from agent_runtime.tools.tool import InvalidArgsError, RiskLevel, Tool
 
@@ -212,94 +213,81 @@ def parse_servers(raw: Mapping[str, Any]) -> tuple[McpServer, ...]:
     """
     unknown = [key for key in raw if key != "servers"]
     if unknown:
-        raise McpConfigError(
-            f"不认识的键：{', '.join(sorted(unknown))}；最外层只有 servers 一个键"
-        )
+        raise McpConfigError(i18n.t("mcp.cfg.unknown_top_keys",
+                                    names=", ".join(sorted(unknown))))
 
     servers_raw = raw.get("servers", {})
     if not isinstance(servers_raw, Mapping):
-        raise McpConfigError('"servers" 必须是一个对象：{"名字": {"command": ...}}')
+        raise McpConfigError(i18n.t("mcp.cfg.servers_not_object"))
 
     servers: list[McpServer] = []
     for name, spec in servers_raw.items():
         if not isinstance(name, str) or not SERVER_NAME_RE.match(name):
-            raise McpConfigError(
-                f"服务器名 {name!r} 不合法：只能用字母、数字、下划线、连字符，"
-                f"长度 1~24 —— 它要拼进给模型看的工具名（{NAME_PREFIX}<名字>__<工具>）"
-            )
+            raise McpConfigError(i18n.t("mcp.cfg.bad_name", name=repr(name),
+                                        prefix=NAME_PREFIX))
         if not isinstance(spec, Mapping):
-            raise McpConfigError(f'servers["{name}"] 必须是一个对象')
+            raise McpConfigError(i18n.t("mcp.cfg.server_not_object", name=name))
 
         bad_keys = [key for key in spec if key not in _KNOWN_SERVER_KEYS]
         if bad_keys:
-            raise McpConfigError(
-                f'servers["{name}"] 里有不认识的键：{", ".join(sorted(bad_keys))}\n'
-                f'  认识的只有：{", ".join(_KNOWN_SERVER_KEYS)}'
-            )
+            raise McpConfigError(i18n.t(
+                "mcp.cfg.unknown_server_keys", name=name,
+                names=", ".join(sorted(bad_keys)),
+                known=", ".join(_KNOWN_SERVER_KEYS)))
 
         command = spec.get("command", "")
         if command and not isinstance(command, str):
-            raise McpConfigError(f'servers["{name}"].command 必须是一个字符串')
+            raise McpConfigError(i18n.t("mcp.cfg.command_not_string", name=name))
         command = (command or "").strip()
 
         url = spec.get("url", "")
         if url and not isinstance(url, str):
-            raise McpConfigError(f'servers["{name}"].url 必须是一个字符串')
+            raise McpConfigError(i18n.t("mcp.cfg.url_not_string", name=name))
         url = (url or "").strip()
 
         # **恰好给一个**：两个都给是"到底连哪个"看运气，两个都没给是"连什么都不知道"。
         # 前者比后者更坏（它看起来是配好的），所以两种都当场说清。
         if bool(command) == bool(url):
-            given = "两个都给了" if command else "两个都没给"
-            raise McpConfigError(
-                f'servers["{name}"] 必须恰好给出一种连接方式（现在是{given}）：\n'
-                f'  本地：{{"command": "npx", "args": [...]}}；'
-                f'远程：{{"url": "https://example.com/mcp", "headers": {{...}}}}'
-            )
+            given = i18n.t("mcp.cfg.both_given" if command
+                           else "mcp.cfg.neither_given")
+            raise McpConfigError(i18n.t("mcp.cfg.both_or_neither", name=name,
+                                        given=given))
 
         if url:
             scheme = urlparse(url).scheme.lower()
             if scheme not in _URL_SCHEMES:
-                raise McpConfigError(
-                    f'servers["{name}"].url 要是一个完整的 http(s) 地址'
-                    f"（现在这个的 scheme 是 {scheme or '空'}）：{url!r}"
-                )
+                raise McpConfigError(i18n.t(
+                    "mcp.cfg.bad_url", name=name,
+                    scheme=scheme or i18n.t("mcp.cfg.empty_scheme"), url=repr(url)))
             for local_only in ("args", "env"):
                 if local_only in spec:
-                    raise McpConfigError(
-                        f'servers["{name}"] 是远程 server（给了 url），'
-                        f"而 {local_only} 只对本地 server（command）有意义"
-                    )
+                    raise McpConfigError(i18n.t(
+                        "mcp.cfg.local_only_key", name=name, key=local_only))
 
         args = spec.get("args", [])
         if isinstance(args, str) or not isinstance(args, (list, tuple)) or not all(
             isinstance(item, str) for item in args
         ):
-            raise McpConfigError(f'servers["{name}"].args 必须是字符串数组，例如 ["-y", "包名"]')
+            raise McpConfigError(i18n.t("mcp.cfg.args_not_list", name=name))
 
         env = spec.get("env", {})
         if not isinstance(env, Mapping) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in env.items()
         ):
-            raise McpConfigError(f'servers["{name}"].env 必须是"字符串 → 字符串"的对象')
+            raise McpConfigError(i18n.t("mcp.cfg.env_not_map", name=name))
 
         headers = spec.get("headers", {})
         if not isinstance(headers, Mapping) or not all(
             isinstance(key, str) and isinstance(value, str)
             for key, value in headers.items()
         ):
-            raise McpConfigError(
-                f'servers["{name}"].headers 必须是"字符串 → 字符串"的对象'
-                f'（凭据写在这里，例如 {{"Authorization": "Bearer …"}}）'
-            )
+            raise McpConfigError(i18n.t("mcp.cfg.headers_not_map", name=name))
         # 头名必须是**可发送的 ASCII**：httpx 会在真要发的时候抛一句
         # `LocalProtocolError`，而那时候错误信息里没有"是哪个 server"。
         for header in headers:
             if not header.isascii() or not header.strip():
-                raise McpConfigError(
-                    f'servers["{name}"].headers 里的头名 {header!r} 不合法：'
-                    f"HTTP 头名只能是 ASCII"
-                )
+                raise McpConfigError(i18n.t("mcp.cfg.bad_header_name", name=name,
+                                            header=repr(header)))
 
         timeout = spec.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
         # bool 是 int 的子类，所以要单独挡一次：`true` 落在这里会变成一个 1 秒的超时。
@@ -308,10 +296,9 @@ def parse_servers(raw: Mapping[str, Any]) -> tuple[McpServer, ...]:
             or not isinstance(timeout, (int, float))
             or not (MIN_TIMEOUT_SECONDS <= timeout <= MAX_TIMEOUT_SECONDS)
         ):
-            raise McpConfigError(
-                f'servers["{name}"].timeout_seconds 必须在 '
-                f"{MIN_TIMEOUT_SECONDS:g}~{MAX_TIMEOUT_SECONDS:g} 之间"
-            )
+            raise McpConfigError(i18n.t(
+                "mcp.cfg.bad_timeout", name=name,
+                low=f"{MIN_TIMEOUT_SECONDS:g}", high=f"{MAX_TIMEOUT_SECONDS:g}"))
 
         servers.append(
             McpServer(
@@ -407,7 +394,8 @@ class StdioChannel:
                 bufsize=1,
             )
         except OSError as exc:
-            raise McpError(f"起不来 `{' '.join(argv)}`：{exc}") from None
+            raise McpError(i18n.t("mcp.spawn_failed", command=" ".join(argv),
+                                  problem=exc)) from None
 
         self._reader = threading.Thread(
             target=self._read_loop, name=f"mcp-{server.name}", daemon=True
@@ -439,7 +427,8 @@ class StdioChannel:
             with self._lock:
                 self._pending.pop(request_id, None)
             raise McpTimeout(
-                f"等 {method} 超过 {self.server.timeout_seconds:g} 秒没有回应"
+                i18n.t("mcp.timeout", method=method,
+                       seconds=f"{self.server.timeout_seconds:g}")
             )
 
         # 通道自己坏了（进程没了）优先于"server 拒绝了这个请求"：两者给模型看的话
@@ -466,7 +455,8 @@ class StdioChannel:
             self._proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError, ValueError) as exc:
-            self._dead = f"往 server `{self.server.name}` 写数据失败：{exc}"
+            self._dead = i18n.t("mcp.write_failed", name=self.server.name,
+                                problem=exc)
             raise McpServerDown(self._dead) from None
 
     # -- 收 ---------------------------------------------------------------
@@ -490,7 +480,7 @@ class StdioChannel:
                     # server 往 stdout 打了非协议的东西（有些实现会混日志）。这不是
                     # 我们能修的事，也不能因此丢掉整条通道 —— 说一句，继续读。
                     print(
-                        f"[MCP] server `{self.server.name}` 的 stdout 上有一行不是 JSON，已跳过",
+                        i18n.t("mcp.stdout.not_json", name=self.server.name),
                         file=sys.stderr,
                     )
                     continue
@@ -503,9 +493,10 @@ class StdioChannel:
         finally:
             code = self._proc.poll()
             reason = (
-                f"MCP server `{self.server.name}` 的 stdout 关了（进程退出码 {code}）"
+                i18n.t("mcp.stdout.closed_with_code", name=self.server.name,
+                       code=code)
                 if code is not None
-                else f"MCP server `{self.server.name}` 的 stdout 关了"
+                else i18n.t("mcp.stdout.closed", name=self.server.name)
             )
             self._dead = reason
             self._fail_all(McpServerDown, reason)
@@ -587,12 +578,11 @@ class StdioChannel:
                 pass
         else:
             print(
-                f"[MCP] server `{self.server.name}` 没能收掉（进程仍在），"
-                f"它可能继续占着管道",
+                i18n.t("mcp.close_failed", name=self.server.name),
                 file=sys.stderr,
             )
 
-        self._dead = self._dead or f"MCP server `{self.server.name}` 已关闭"
+        self._dead = self._dead or i18n.t("mcp.closed", name=self.server.name)
         self._fail_all(McpServerDown, self._dead)
 
     def _exited(self, timeout: float) -> bool:
@@ -704,7 +694,7 @@ class HttpChannel:
     def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
         with self._lock:
             if self._closed:
-                raise McpServerDown(f"MCP server `{self.server.name}` 已关闭")
+                raise McpServerDown(i18n.t("mcp.closed", name=self.server.name))
             self._next_id += 1
             request_id = self._next_id
         message = {
@@ -728,7 +718,7 @@ class HttpChannel:
     def notify(self, method: str, params: Mapping[str, Any] | None = None) -> None:
         with self._lock:
             if self._closed:
-                raise McpServerDown(f"MCP server `{self.server.name}` 已关闭")
+                raise McpServerDown(i18n.t("mcp.closed", name=self.server.name))
         # 通知**没有 id、也没有回应**：规范说 server 收到就回 202 无正文。
         # 所以这里不看正文、也不等结果 —— 只确认它收下了。
         self._post({"jsonrpc": "2.0", "method": method, "params": dict(params or {})})
@@ -756,20 +746,20 @@ class HttpChannel:
             # `ConnectError`），所以顺序在这里是语义 —— 放错一支，一句"等 initialize
             # 超过 2 秒没有回应"会指向完全错误的方向（实测踩到过：端口没人听）。
             raise McpError(
-                f"连不上 server `{self.server.name}`（连接超时）："
-                f"{self.server.where()}"
+                i18n.t("mcp.http.connect_timeout", name=self.server.name,
+                       problem=self.server.where())
             ) from None
         except httpx.TimeoutException:
             raise McpTimeout(
-                f"等 {message.get('method')} 超过 "
-                f"{self.server.timeout_seconds:g} 秒没有回应"
+                i18n.t("mcp.http.timeout", method=message.get("method"),
+                       seconds=f"{self.server.timeout_seconds:g}")
             ) from None
         except httpx.HTTPError as exc:
             # 连不上/DNS/TLS/读中断都在这一支。**不把 URL 原样带出去**（可能有令牌
             # 或内网地址），但 server 名要有 —— 用户配置里就是按名字认的。
             raise McpError(
-                f"连不上 server `{self.server.name}`"
-                f"（{type(exc).__name__}）：{exc}"
+                i18n.t("mcp.http.connect_failed", name=self.server.name,
+                       problem=f"{type(exc).__name__}: {exc}")
             ) from None
 
         # 会话 id 只在握手那一条上出现。**认它，但不因为它缺席就退出** ——
@@ -780,8 +770,9 @@ class HttpChannel:
 
         if response.status_code >= 400:
             raise McpError(
-                f"server `{self.server.name}` 回了 HTTP {response.status_code}"
-                f"：{_shorten(_body_text(response))}"
+                i18n.t("mcp.http.status", name=self.server.name,
+                       status=response.status_code,
+                       body=_shorten(_body_text(response)))
             )
         return response
 
@@ -830,7 +821,8 @@ def _body_text(response: httpx.Response) -> str:
         total += len(chunk)
         if total > MAX_HTTP_BODY_BYTES:
             raise McpError(
-                f"回应的正文超过 {MAX_HTTP_BODY_BYTES // (1024 * 1024)}MB，放弃"
+                i18n.t("mcp.http.body_too_big",
+                       mb=MAX_HTTP_BODY_BYTES // (1024 * 1024))
             )
         chunks.append(chunk)
     return b"".join(chunks).decode("utf-8", "replace")
@@ -871,7 +863,7 @@ def _decode_body(response: httpx.Response, server: McpServer) -> Mapping[str, An
                 payload = candidate
         if payload is None:
             raise McpError(
-                f"server `{server.name}` 的 SSE 流里没有一条 JSON-RPC 回应"
+                i18n.t("mcp.http.no_sse_response", name=server.name)
             )
         return payload
 
@@ -879,10 +871,10 @@ def _decode_body(response: httpx.Response, server: McpServer) -> Mapping[str, An
         decoded = json.loads(body)
     except json.JSONDecodeError:
         raise McpError(
-            f"server `{server.name}` 回了不是 JSON 的正文：{_shorten(body)}"
+            i18n.t("mcp.http.not_json", name=server.name, body=_shorten(body))
         ) from None
     if not isinstance(decoded, Mapping):
-        raise McpError(f"server `{server.name}` 回的不是一个 JSON 对象")
+        raise McpError(i18n.t("mcp.http.not_object", name=server.name))
     return decoded
 
 
@@ -897,10 +889,11 @@ def _result_or_raise(
     if "error" in message:
         error = message.get("error") or {}
         code = error.get("code")
-        text = str(error.get("message") or "（server 没有给出说明）")
+        text = str(error.get("message") or i18n.t("mcp.result.no_message"))
         if method == "tools/call" and code == INVALID_PARAMS:
             raise InvalidArgsError(text)
-        raise McpError(f"{who} 拒绝了 {method}：{text}（code={code}）")
+        raise McpError(i18n.t("mcp.result.refused", who=who, method=method,
+                              text=text, code=code))
     return message.get("result")
 
 
@@ -971,7 +964,7 @@ class McpConnection:
         for _ in range(MAX_LIST_PAGES):
             result = self.channel.request("tools/list", {"cursor": cursor} if cursor else {})
             if not isinstance(result, Mapping):
-                raise McpError("tools/list 的回应该是一个对象")
+                raise McpError(i18n.t("mcp.list_tools.not_object"))
 
             for raw in result.get("tools") or []:
                 if not isinstance(raw, Mapping):
@@ -996,7 +989,8 @@ class McpConnection:
                 return found
             cursor = next_cursor
 
-        raise McpError(f"tools/list 翻了 {MAX_LIST_PAGES} 页还没到底，放弃")
+        raise McpError(i18n.t("mcp.list_tools.too_many_pages",
+                              pages=MAX_LIST_PAGES))
 
     def call(self, tool_name: str, arguments: Mapping[str, Any]) -> str:
         """调一次工具，把结果渲染成给模型看的文本。
@@ -1007,13 +1001,13 @@ class McpConnection:
             "tools/call", {"name": tool_name, "arguments": dict(arguments)}
         )
         if not isinstance(result, Mapping):
-            raise McpError("tools/call 的回应该是一个对象")
+            raise McpError(i18n.t("mcp.call.not_object"))
 
         text = render_content(result.get("content"), result.get("structuredContent"))
         if result.get("isError"):
             # 工具跑了、但失败了。这不是协议错误，而是"这次调用的结果" —— 所以它
             # 带着 server 自己的说明（通常正是模型改参数需要的依据）。
-            raise McpToolError(text or f"{tool_name} 执行失败（server 没有给出说明）")
+            raise McpToolError(text or i18n.t("mcp.call.failed", name=tool_name))
         return text
 
 
@@ -1121,8 +1115,8 @@ class McpToolset:
                 connection.channel.close()
             except Exception as exc:  # 收摊失败不该盖住"任务本身"的结果
                 print(
-                    f"[MCP] 关闭 server `{connection.server.name}` 时出错："
-                    f"{type(exc).__name__}: {exc}",
+                    i18n.t("mcp.close_error", name=connection.server.name,
+                           problem=f"{type(exc).__name__}: {exc}"),
                     file=sys.stderr,
                 )
 
@@ -1221,16 +1215,15 @@ def load_server(
         if connection.capabilities and "tools" not in connection.capabilities:
             _report(
                 on_problem,
-                f"[MCP] server `{server.name}` 的 capabilities 里没有 tools，"
-                f"它不提供任何工具（已连上，工具数为 0）",
+                i18n.t("mcp.no_tools_capability", name=server.name),
             )
             return _Loaded(connection=connection)
         listed = connection.list_tools()
     except Exception as exc:
         _report(
             on_problem,
-            f"[MCP] server `{server.name}` 没连上（{type(exc).__name__}: {exc}）；"
-            f"它提供的工具这次都不可用",
+            i18n.t("mcp.load_failed", name=server.name,
+                   problem=f"{type(exc).__name__}: {exc}"),
         )
         if channel is not None:
             try:
@@ -1250,8 +1243,8 @@ def load_server(
             # 都用上，但撞了的那一个必须说出来"。
             _report(
                 on_problem,
-                f"[MCP] server `{server.name}` 的 `{item.name}` 暴露名和另一个工具"
-                f"撞了（{name}），这一个这次装不上",
+                i18n.t("mcp.name_clash", name=server.name, tool=item.name,
+                       other=name),
             )
             continue
         taken.add(name)

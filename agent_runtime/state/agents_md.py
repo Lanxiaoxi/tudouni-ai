@@ -31,6 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_runtime import i18n
 from agent_runtime import paths
 
 # 工作区。**它在这里只是一个默认值，唯一的权威是 `paths.workspace_dir()`**（装配层
@@ -213,13 +214,13 @@ def load_agent_md(workspace: str | Path | None = None) -> tuple[str, Report]:
     if not path.is_file():
         # 有一个**叫这个名字的目录**。这不是"没有文件"，而是一个几乎肯定写错了的
         # 工作区 —— 但它的后果仅仅是"什么都没注入"，所以降级 + 说一声。
-        report.failures.append(Failure(str(path), "这是一个目录，不是文件"))
+        report.failures.append(Failure(str(path), i18n.t("agents_md.reason.is_dir")))
         return "", report
 
     if stat.st_size > MAX_BYTES:
         report.failures.append(Failure(
             str(path),
-            f"{stat.st_size} 字节，超过 {MAX_BYTES} 字节的上限，没有注入",
+            i18n.t("agents_md.reason.too_big", size=stat.st_size, limit=MAX_BYTES),
         ))
         return "", report
 
@@ -232,7 +233,7 @@ def load_agent_md(workspace: str | Path | None = None) -> tuple[str, Report]:
     decoded = _decode(raw)
     if decoded is None:
         report.failures.append(Failure(
-            str(path), "不是 UTF-8 文本，没有注入（用 UTF-8 重存一次就好）"))
+            str(path), i18n.t("agents_md.reason.not_utf8")))
         return "", report
 
     lines = _norm(decoded).split("\n")
@@ -263,7 +264,7 @@ def _reason(exc: OSError) -> str:
     """把一个 OSError 说成人话。`PermissionError` 单独说是因为它最常见、
     而且补救办法和别的都不一样。"""
     if isinstance(exc, PermissionError):
-        return "没有读取权限"
+        return i18n.t("agents_md.reason.permission")
     return f"{type(exc).__name__}"
 
 
@@ -365,26 +366,30 @@ def notices(report: Report, *, relative_to: str | Path) -> list[tuple[str, str, 
     """
     out: list[tuple[str, str, str]] = []
     if report.loaded:
-        listed = "、".join(
-            f"{display_path(item.path, relative_to)}（{item.lines} 行）"
+        listed = i18n.t("list.separator").join(
+            i18n.t("agents_md.notice.loaded_item",
+                   path=display_path(item.path, relative_to), n=item.lines)
             for item in report.loaded
         )
-        out.append(("info", "agent_md", f"[AGENT.md] 读取了 {listed}"))
+        out.append(("info", "agent_md", i18n.t("agents_md.notice.loaded",
+                                               listed=listed)))
     for item in report.loaded:
         if item.truncated:
             detail = []
             if item.dropped:
-                detail.append(f"只注入了前 {item.lines} 行（共 {item.total_lines} 行）")
+                detail.append(i18n.t("agents_md.notice.truncated_lines",
+                                     lines=item.lines, total=item.total_lines))
             if item.omitted:
-                detail.append(f"文本还被截掉 {item.omitted} 个字符，末尾是断的")
-            out.append(("warn", "agent_md", (
-                f"[AGENT.md] {display_path(item.path, relative_to)} 超过注入额度，"
-                f"{'；'.join(detail)}；完整的要模型用 read_file 去读。"
-            )))
+                detail.append(i18n.t("agents_md.notice.truncated_chars",
+                                     omitted=item.omitted))
+            out.append(("warn", "agent_md", i18n.t(
+                "agents_md.notice.truncated",
+                path=display_path(item.path, relative_to),
+                detail=i18n.t("list.separator_semicolon").join(detail))))
     for item in report.failures:
-        out.append(("warn", "agent_md", (
-            f"[AGENT.md] 读不了 {display_path(item.path, relative_to)}：{item.reason}"
-        )))
+        out.append(("warn", "agent_md", i18n.t(
+            "agents_md.notice.failed",
+            path=display_path(item.path, relative_to), reason=item.reason)))
     return out
 
 

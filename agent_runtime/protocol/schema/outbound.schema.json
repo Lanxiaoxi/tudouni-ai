@@ -328,7 +328,7 @@
       },
       "remember_hint": {
         "type": "string",
-        "doc": "**怎么把这件事说给人听**：那一整句后果说明，出自 asker.py 的 _remember_hint。**前端原样显示，一个字都不许改。**",
+        "doc": "**怎么把这件事说给人听**：那一整句后果说明，出自 asker.py 的 _remember_hint。**前端原样显示，一个字都不许改** —— 语言由发起端按 `ui.language` 决定（它已经把这句话翻好了）。",
         "nullable": true
       },
       "allow_trust_all": {
@@ -337,7 +337,7 @@
       },
       "trust_all_hint": {
         "type": "string",
-        "doc": "那一整句说明，出自 asker.py 的 _trust_all_hint。它比 remember_hint 多担一件事：**说清这是快照**（server 以后新加的工具仍然会问）。",
+        "doc": "那一整句说明，出自 asker.py 的 _trust_all_hint。它比 remember_hint 多担一件事：**说清这是快照**（server 以后新加的工具仍然会问）。同样是**原样显示**，语言由发起端决定。",
         "nullable": true
       }
     },

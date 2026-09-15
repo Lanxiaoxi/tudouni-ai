@@ -75,6 +75,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 
+from agent_runtime import i18n
+
 from .session import Session, is_valid_session_id
 
 
@@ -130,7 +132,7 @@ class JsonSessionStore:
         "../../evil" 能把文件写到目录外面去。
         """
         if not is_valid_session_id(session_id):
-            raise ValueError(f"非法 session_id: {session_id!r}")
+            raise ValueError(i18n.t("store.bad_session_id", name=repr(session_id)))
         return self.directory / f"{session_id}{SUFFIX}"
 
     def exists(self, session_id: str) -> bool:
@@ -183,8 +185,8 @@ class JsonSessionStore:
         # "看起来正常、其实少了几条"的状态上，而那种错误没有任何症状。
         if len(session.messages) < watermark:
             raise ValueError(
-                f"会话 {session.session_id!r} 的消息从 {watermark} 条变成了 "
-                f"{len(session.messages)} 条；这份存储只支持追加，不支持删改。"
+                i18n.t("store.shrunk", name=repr(session.session_id),
+                       before=watermark, after=len(session.messages))
             )
 
         # metadata 每次落盘都记一条全量快照 —— 理由见模块 docstring
@@ -252,9 +254,8 @@ class JsonSessionStore:
             version = 1
         if version > STATE_VERSION:
             raise ValueError(
-                f"会话 {session_id!r} 是更新版本写的（文件 version={version}，"
-                f"本程序认识的最高版本是 {STATE_VERSION}）；升级程序再打开它，"
-                f"否则可能读错格式。"
+                i18n.t("store.newer_version", name=repr(session_id), version=version,
+                       known=STATE_VERSION)
             )
 
         # 只挑自己认识的字段。会话文件躺在硬盘上，比代码活得久 —— 直接
@@ -276,7 +277,7 @@ class JsonSessionStore:
         try:
             handle = path.open(encoding="utf-8")
         except FileNotFoundError:
-            raise FileNotFoundError(f"会话文件不存在：{path}") from None
+            raise FileNotFoundError(i18n.t("store.missing_file", path=path)) from None
 
         head: dict[str, Any] | None = None
         messages: list[dict[str, Any]] = []
