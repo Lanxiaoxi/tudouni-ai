@@ -127,7 +127,8 @@ def main() -> int:
         # check_config 同一条理由）。失败不拦启动（见 runtime/ericai.py）。
         # 先打一句进度再干活：刷新脚本可能跑几秒到十几秒，什么都不说就是在空等。
         if args.ericai:
-            print("[ericai] 正在检查 / 刷新 EricAI token…", file=sys.stderr, flush=True)
+            print("[ericai] 正在检查 EricAI token（需要时会自动登录/刷新）…",
+                  file=sys.stderr, flush=True)
             print(ericai.ensure(), file=sys.stderr, flush=True)
 
         # `--theme` 收的是"人能写出来的一段字"（`p7` / `靛夜` / `7`），而认它的是
@@ -205,7 +206,8 @@ def main() -> int:
     # 刷完写回 config，open_runtime 拿到的就是新 token。失败不拦启动。
     # 先打一句进度再干活：刷新脚本可能跑几秒到十几秒，什么都不说就是在空等。
     if args.ericai:
-        print("[ericai] 正在检查 / 刷新 EricAI token…", file=sys.stderr, flush=True)
+        print("[ericai] 正在检查 EricAI token（需要时会自动登录/刷新）…",
+              file=sys.stderr, flush=True)
         print(ericai.ensure(), file=sys.stderr, flush=True)
 
     session_id, session, resumed = resolve_session(booted.store, args.session)

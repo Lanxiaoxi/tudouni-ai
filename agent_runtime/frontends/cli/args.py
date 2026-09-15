@@ -55,8 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ericai", action="store_true",
-        help="启动时检查 EricAI token（providers.ericai.api_key），快过期就用 config "
-             "的 scripts.ericai_refresh_token 那行命令刷一把新的并写回 config",
+        help="启动时检查 EricAI token（providers.ericai.api_key），快过期就自动登录/刷新"
+             "（azure-identity 内置实现，无需外部脚本）并写回 config",
     )
     parser.add_argument("--debug", action="store_true", help="把中间过程打到 stderr")
 

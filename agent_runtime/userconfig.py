@@ -16,7 +16,6 @@
 
     ~/.tudouni/config.json
       ├─ "providers"   路由 + 模型清单 + 密钥（原来的 models.local.json，形状基本没变）
-      ├─ "scripts"     启动时要跑的外部命令（--ericai 的刷新脚本 key）
       └─ "web"         联网工具那几个键（tavily 的密钥与端点）
 
 ## 配置只有一个来源：这份文件
@@ -40,8 +39,7 @@
 理由也没了，而"一个叫 env 的段里放着不来自环境变量的东西"是个会被反复追问的命名。
 
 现在是**一节一个主人**：`web` 归联网工具（`runtime/config.py` 的 `WebConfig` 读它），
-`providers` 归模型目录（`state/catalog.py` 读它），`scripts` 归"启动时要跑的外部命令"
-（`runtime/ericai.py` 的 `--ericai` 读它）。这个模块只保证它们都是
+`providers` 归模型目录（`state/catalog.py` 读它）。这个模块只保证它们都是
 "字符串 → 字符串"的形状，**不解释里面的键** —— 那是各自主人的知识。
 
 ## `.env` 不再被读，而且这件事要出声
@@ -92,7 +90,7 @@ FILE_ENV = "AGENT_CONFIG_FILE"
 
 # 顶层认识的**全部**键。多一个不认识的就报错，不忽略 —— 和 `permissions.json` /
 # `mcp.json` / frontmatter 同一条规矩：写错一个键名而它静默不生效，是最坏的失败形态。
-_KNOWN_TOP_KEYS = frozenset({"providers", "scripts", "web", "$comment"})
+_KNOWN_TOP_KEYS = frozenset({"providers", "web", "$comment"})
 
 
 class UserConfigError(Exception):
@@ -135,9 +133,6 @@ class UserConfig:
     providers: dict[str, Any] = field(default_factory=dict)
     # 原样的 `web` 段。由 `WebConfig` 解释里面的键，这里只保证是"字符串 → 字符串"。
     web: dict[str, str] = field(default_factory=dict)
-    # 原样的 `scripts` 段。由 `runtime/ericai.py` 解释（`--ericai` 要跑的外部命令），
-    # 这里只保证是"字符串 → 字符串"。
-    scripts: dict[str, str] = field(default_factory=dict)
 
     @property
     def exists(self) -> bool:
@@ -277,8 +272,7 @@ def read(path: Path | None = None) -> UserConfig:
         )
 
     return UserConfig(path=target, found=True, providers=providers,
-                      web=_string_map(raw.get("web"), target, section="web"),
-                      scripts=_string_map(raw.get("scripts"), target, section="scripts"))
+                      web=_string_map(raw.get("web"), target, section="web"))
 
 
 def text(mapping: dict[str, str], name: str, default: str = "") -> str:

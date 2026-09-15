@@ -1,84 +1,82 @@
-"""`--ericai`：启动时自动刷新 Ericsson AI 的 token。
+r"""`--ericai`：内置的 Ericsson AI 登录与 token 刷新。
 
 ## 它解决什么
 
 `providers.ericai.api_key` 里存的是一把 JWT，EricSSO 签发，大约 1 小时过期。过期之后
-模型请求会返回鉴权失败，而"刷新"这个动作本身不难（用缓存的 MSAL 凭据非交互换一把
-新的），难在它每次都要人手动跑一遍、再把结果抄回 config —— 于是它被拖成了隔一小时
-一次的手工活。
-
-这个模块让 `tudouni --tui --ericai`（或老 CLI 直连那支）在启动时把这件事做掉：
-检查 token 还新不新，不新就调用外部刷新脚本，拿到新 token **原子写回**
+模型请求会返回鉴权失败。这个模块让 `tudouni --tui --ericai`（或老 CLI `--ericai`）
+在启动时把这件事做掉：检查 token 还新不新，不新就取一把新的 **原子写回**
 `~/.tudouni/config.json`，然后才进界面。
 
-## 刷新脚本从哪来：config 的 `scripts` 段，不写死在代码里
+## 不依赖 ericai 包，也不依赖任何外部脚本
 
-刷新要用 `ericai` 包（Ericsson 内部包，tudouni 自己的依赖里没有）。与其把它装进来，
-不如调外部进程 —— 但**脚本路径不写死在代码里**，而是放在 config 的 `scripts` 段：
+这套 SSO 的本质是微软标准的 MSAL 流程（ericai 包只是给它包了层壳）。我们用
+`azure-identity`（PyPI 公共包）直接实现，参数是 ericai 公开的常量（tenant / client /
+scope），不 import ericai、也不调用外面的刷新脚本。`azure-identity` 在**函数内延迟
+import**：只有真正跑 `--ericai` 才会加载它，没装 azure-identity 时其它路径不受影响
+（`tests/test_imports.py` 那条"每个模块都能导入"也是据此成立的）。
 
-```jsonc
-{
-  "scripts": {
-    "ericai_refresh_token": "\"C:\\...\\python.exe\" \"C:\\...\\refresh_token.py\""
-  }
-}
-```
+## 登录 vs 刷新：一套流程，两级处置
 
-契约（`config.example.json` 的 `$comment` 里也写着，这里是实现依据）：
+- **刷新（非交互）**：已有登录会话（`%LOCALAPPDATA%\.IdentityService\EricAI.cache.nocae`
+  里的 refresh token + 用户目录里的 `ericai_authrecord`）时，静默换新 token，全程不打扰；
+- **登录（交互）**：缓存里没有可用的会话、或 refresh token 已失效时，走 device code
+  流程 —— 打印验证链接和验证码，你在浏览器里验证后自动继续，并把新的 authrecord
+  存到 `~/.tudouni/ericai_authrecord`，之后就一直静默刷新。
 
-  1. 值是一条**命令行**，用平台 shell 执行（Windows 上是 cmd.exe；路径带空格就自己
-     用引号包起来）；
-  2. 脚本要能**非交互**地拿到一把新 token —— 它自己负责把 cwd 切到能读到认证凭据的
-     地方（见下面"为什么是外部脚本"）；
-  3. 新 token 打在 **stdout 的最后一个非空行**：前面随便打印多少说明文字都行，最后
-     一行必须是 token 本身。
+## 复用的关键：缓存名沿用 `EricAI.cache`
 
-## 为什么是"外部脚本"，而不是直接 import ericai
-
-tudouni 的依赖里没有 `ericai`，也不该有：它是 Ericsson 内部包，把它装进 tudouni 等于
-让这个运行时依赖一个公司内网才有的东西。而调外部进程的一条代价是**认证上下文在脚本
-那一侧** —— 非交互刷新靠的是 MSAL 持久化缓存（Windows 上是 Credential Manager）＋
-cwd 附近的 `.ericai_authrecord`，这两样都存在 ericAiClientDemo 那个目录里，tudouni
-从任意目录启动都够不着。所以契约 2 才写"脚本自己负责"：用户写的那个脚本（比如
-ericAiClientDemo 里的 refresh_token.py）第一步 `os.chdir(脚本所在目录)`，就绕开了
-"tudouni 不知道凭据在哪"这件事。tudouni 只负责：调用它、读它 stdout 最后一行、写回
-config。
+微软的持久化缓存名决定了"和谁共享登录会话"。沿用名字，就能直接复用你之前用 ericai
+登录过的那份会话 —— 首次跑 `--ericai` 都不用重新登录，缓存里那把 refresh token 直接
+能用。换成别的名字反而要重新登录一次。名字里带 "EricAI" 只是沿用文件名，内容是完全
+标准的微软缓存，谁写谁读，这不构成对 ericai 包的依赖。
 
 ## 失败处置：绝不拦启动
 
-刷新失败（脚本没配、跑挂了、输出不是 JWT）一律**降级出声**：打一句说明到 stderr，
-保留旧 token 继续启动。因为 token 是否真的废了，最终由模型请求报错时才知道 ——
-为一把还没废的 token 让整个 TUI 起不来，是最坏的取舍。真正该停下的事（config 写坏、
-providers 形状错）由 `userconfig` / `catalog` 的校验本来就拦在装配之前。
+刷新/登录失败一律**降级出声**：打一句说明到 stderr，保留旧 token 继续启动。因为 token
+是否真的废了，最终由模型请求报错时才知道 —— 为一把还没废的 token 让整个 TUI 起不来，
+是最坏的取舍。真正该停下的事（config 写坏、providers 形状错）由 `userconfig` / `catalog`
+的校验本来就拦在装配之前。
 """
 
 from __future__ import annotations
 
 import base64
 import json
-import os
-import subprocess
-import tempfile
+import sys
 import time
 from pathlib import Path
+from typing import Any
 
-from agent_runtime import userconfig
+from agent_runtime import paths, userconfig
 
 # 刷新哪条路由。EricAI 的 base_url / api_key 就住在这里。
 PROVIDER = "ericai"
-# scripts 段里的键名。**脚本路径只从配置来，代码里不写死任何路径。**
-SCRIPT_KEY = "ericai_refresh_token"
-# 剩余有效时间低于这个秒数就刷新。用户拍板采纳的默认：10 分钟。
+
+# --- EricAI 后端的公开常量（ericai 包 constants 里的同一个值，这里不再 import 它） ---
+_TENANT_ID = "92e84ceb-fbfd-47ab-be52-080c6b87953f"
+_CLIENT_ID = "b46aa582-485a-4a7d-b30e-552dbd790b16"
+_SCOPE = f"api://{_CLIENT_ID}/API"
+# 沿用 ericai 的缓存名，见模块 docstring "复用的关键"。
+_CACHE_NAME = "EricAI.cache"
+# authrecord 在用户级目录下的文件名（原来 ericai 放 cwd 相对路径，这里搬到 user_config_dir）。
+_AUTHREC_NAME = "ericai_authrecord"
+
+# 剩余有效时间低于这个秒数就刷新。
 REFRESH_THRESHOLD = 600.0
-# 外部脚本最多跑多久。刷新是启动路径上的一步，不该让一个挂死的脚本拖住整个启动。
-SCRIPT_TIMEOUT = 120
+
+
+def _authrec() -> Path:
+    return paths.user_config_dir() / _AUTHREC_NAME
+
+
+# --- 过期判断：JWT 自己解，不依赖第三方 jwt 库（azure 只负责拿 token） -------------
 
 
 def decode_expiry(token: str, now: float | None = None) -> float | None:
     """从 JWT 里解出 `exp`（Unix 秒）。解不出返回 `None`。
 
-    不依赖第三方 jwt 库（tudouni 的依赖里没有）：JWT 的 payload 就是一段 base64url
-    的 JSON，自己解。`now` 参数只给测试用 —— 正常调用不传，用真实时间。
+    不依赖第三方 jwt 库：JWT 的 payload 就是一段 base64url 的 JSON，自己解。
+    `now` 参数只给测试用 —— 正常调用不传，用真实时间。
     """
     text = (token or "").strip()
     if not text:
@@ -105,7 +103,7 @@ def needs_refresh(token: str, now: float | None = None,
     """这把 token 该不该刷新。
 
     - 空串 / 解不出 `exp`：**按"该刷"处理**。解不出说明它现在长什么样我们不知道，
-      让刷新脚本去碰一次运气，比留着它赌"可能还好"更实在（反正失败不拦启动）；
+      让刷新流程去碰一次运气，比留着它赌"可能还好"更实在（反正失败不拦启动）；
     - 剩余时间 < threshold：刷；
     - 否则：不刷。
     """
@@ -116,36 +114,86 @@ def needs_refresh(token: str, now: float | None = None,
     return exp - current < threshold
 
 
-def _run_script(command: str, *, timeout: float = SCRIPT_TIMEOUT) -> str:
-    """执行刷新命令行，返回 **stdout 的最后一个非空行**（那就是 token）。
+def _remaining(token: str, now: float | None = None) -> float | None:
+    exp = decode_expiry(token, now=now)
+    if exp is None:
+        return None
+    current = time.time() if now is None else now
+    return exp - current
 
-    契约见模块 docstring。失败一律抛 `RuntimeError`，由调用方降级处理。
-    """
+
+# --- 登录 / 刷新核心（azure-identity，延迟 import） ------------------------------
+
+
+def _load_authrecord(authrec: Path) -> Any:
+    """读 authrecord；不存在或损坏都按"没有"处理（返回 None，交给登录流程）。"""
+    from azure.identity import AuthenticationRecord
+
+    if not authrec.is_file():
+        return None
     try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"刷新脚本超时（{timeout:.0f} 秒还没跑完）") from None
-    except OSError as exc:
-        raise RuntimeError(f"跑刷新脚本失败：{exc}") from None
+        return AuthenticationRecord.deserialize(authrec.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
-    if proc.returncode != 0:
-        tail = (proc.stderr or "").strip().splitlines()
-        tail = tail[-3:] if tail else [""]
-        raise RuntimeError(
-            f"刷新脚本退出码 {proc.returncode}（stderr 末尾：{' / '.join(tail)}）"
-        )
 
-    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
-    if not lines:
-        raise RuntimeError("刷新脚本跑完了，但 stdout 上一行都没有（最后一行应是新 token）")
-    return lines[-1]
+def _save_authrecord(authrec: Path, record: Any) -> None:
+    authrec.parent.mkdir(parents=True, exist_ok=True)
+    authrec.write_text(record.serialize(), encoding="utf-8")
+
+
+def _device_code_prompt(verification_uri: str, user_code: str, expires_on: Any) -> None:
+    """把 device code 的登录指引打到 stderr（进界面之前，普通终端上看得到）。"""
+    print("\n[ericai] 需要完成一次 Eric AI 登录（之后就一直静默刷新）：", file=sys.stderr, flush=True)
+    print(f"[ericai]   打开： {verification_uri}", file=sys.stderr, flush=True)
+    print(f"[ericai]   验证码： {user_code}", file=sys.stderr, flush=True)
+    print(f"[ericai]   验证码有效期至 {expires_on}，完成后自动继续……", file=sys.stderr, flush=True)
+
+
+def _obtain_token(authrec: Path) -> str:
+    """取一把新 token。先试非交互（用缓存），缓存不够就交互登录。失败抛异常由调用方降级。"""
+    from azure.identity import (
+        AuthenticationRecord,
+        DeviceCodeCredential,
+        TokenCachePersistenceOptions,
+    )
+    from azure.identity._exceptions import AuthenticationRequiredError
+
+    cache_options = TokenCachePersistenceOptions(
+        name=_CACHE_NAME, allow_unencrypted_storage=True
+    )
+    record = _load_authrecord(authrec)
+
+    # 1) 非交互：有 authrecord 就带上。disable_automatic_authentication=True 保证
+    #    需要交互时抛 AuthenticationRequiredError，而不是擅自弹登录。
+    noninteractive = DeviceCodeCredential(
+        client_id=_CLIENT_ID,
+        tenant_id=_TENANT_ID,
+        cache_persistence_options=cache_options,
+        authentication_record=record if record is not None else None,
+        disable_automatic_authentication=True,
+    )
+    try:
+        new_record = noninteractive.authenticate(scopes=[_SCOPE])
+        _save_authrecord(authrec, new_record)
+        return noninteractive.get_token(_SCOPE).token
+    except AuthenticationRequiredError:
+        pass  # 缓存不够用，落到交互登录
+
+    # 2) 交互登录：device code 流程，在浏览器里验证。验证成功后 authrecord 更新，
+    #    下次 --ericai 就能静默刷新了。
+    interactive = DeviceCodeCredential(
+        client_id=_CLIENT_ID,
+        tenant_id=_TENANT_ID,
+        cache_persistence_options=cache_options,
+        prompt_callback=_device_code_prompt,
+    )
+    new_record = interactive.authenticate(scopes=[_SCOPE])
+    _save_authrecord(authrec, new_record)
+    return interactive.get_token(_SCOPE).token
+
+
+# --- 写回 config：只动 api_key 一处，原子替换 ------------------------------------
 
 
 def _write_back(path: Path, new_key: str) -> None:
@@ -159,6 +207,9 @@ def _write_back(path: Path, new_key: str) -> None:
     的 —— 写到一半断电不会留下一份半截的 config（这个文件里装着密钥，半截文件
     等于数据丢失）。
     """
+    import os
+    import tempfile
+
     raw = userconfig._read_json_object(path)
     providers = raw.setdefault("providers", {})
     item = providers.setdefault(PROVIDER, {})
@@ -180,17 +231,12 @@ def _write_back(path: Path, new_key: str) -> None:
         raise
 
 
-def _remaining(token: str, now: float | None = None) -> float | None:
-    exp = decode_expiry(token, now=now)
-    if exp is None:
-        return None
-    current = time.time() if now is None else now
-    return exp - current
+# --- 启动动作 ------------------------------------------------------------------
 
 
 def ensure(config: userconfig.UserConfig | None = None,
            *, threshold: float = REFRESH_THRESHOLD) -> str:
-    """`--ericai` 的启动动作：检查，必要时刷新，写回 config。
+    """`--ericai` 的启动动作：检查，必要时刷新（缓存不够就交互登录），写回 config。
 
     返回一句给人看的话（打印到 stderr 或 stdout 由调用方定）。**任何失败都不抛异常**
     —— 返回说明文字，旧 token 原样留着，启动继续。
@@ -213,29 +259,27 @@ def ensure(config: userconfig.UserConfig | None = None,
         mins = max(0.0, remain or 0.0) / 60
         return f"[ericai] token 还有效（剩余约 {mins:.0f} 分钟），不用刷新"
 
-    command = (cfg.scripts.get(SCRIPT_KEY) or "").strip() if cfg.scripts else ""
-    if not command:
+    # 需要新 token。
+    try:
+        new_key = _obtain_token(_authrec())
+    except Exception as exc:
+        # 登录/刷新失败。可能的原因：网络、缓存锁、用户取消登录……
+        # 保留旧 token 继续启动，并把怎么修说清楚。
         return (
-            f"[ericai] token 需要刷新，但 config 的 scripts 段没配 {SCRIPT_KEY!r} —— "
-            f"旧 token 继续用，手动刷新一次吧"
+            f"[ericai] 登录/刷新失败：{exc}（旧 token 继续用；"
+            f"可重跑本命令让登录流程再走一遍）"
         )
 
-    try:
-        new_key = _run_script(command)
-    except RuntimeError as exc:
-        return f"[ericai] 刷新失败：{exc}（旧 token 继续用）"
-
-    # 新 token 至少要能被解出 exp —— 脚本 stdout 最后一行不是 JWT 的话，宁可拒收：
+    # 新 token 至少要能被解出 exp —— 不是 JWT 的话，宁可拒收：
     # 把一把解不出过期时间的字符串写进 config，会让人在鉴权失败时无从排查。
     new_exp = decode_expiry(new_key)
     if new_exp is None:
         return (
-            f"[ericai] 脚本输出了东西，但最后一行不像 JWT（解不出 exp）—— 没写回，"
-            f"旧 token 继续用"
+            f"[ericai] 拿到的 token 解不出 exp —— 没写回，旧 token 继续用"
         )
     if new_exp <= time.time():
         return (
-            f"[ericai] 脚本给的 token 已经过期（可能还是旧的那把）—— 没写回，"
+            f"[ericai] 拿到的 token 已经过期（可能还是旧的那把）—— 没写回，"
             f"旧 token 继续用"
         )
 
@@ -249,9 +293,7 @@ def ensure(config: userconfig.UserConfig | None = None,
 
 __all__ = [
     "PROVIDER",
-    "SCRIPT_KEY",
     "REFRESH_THRESHOLD",
-    "SCRIPT_TIMEOUT",
     "decode_expiry",
     "ensure",
     "needs_refresh",
