@@ -117,7 +117,13 @@ tudouni --tui --no-stream        # 关掉逐字输出：答案整段出现（和
 tudouni --tui --theme 墨绿仪器    # 换配色。14 套：a 石墨琥珀是默认，也能给名字/序号
 tudouni --runtime-stdio          # 协议子进程：stdout 是 JSONL（一般不由人直接跑）
 ```
-
+如果使用ericai模式，在vdi上需要设置代理
+```bash
+export https_proxy=http://www-proxy.ericsson.se:8080
+export http_proxy=http://www-proxy.ericsson.se:8080
+export no_proxy=ray.sero.gic.ericsson.se,sero.gic.ericsson.se
+tudouni --tui --ericai
+```
 **有三个目录它不肯当工作区**：你的 home、文件系统根、以及 home 的上层。那不是洁癖 ——
 文件工具的围栏就是工作区，而在 `~` 下启动等于把 `.ssh/`、别的项目的密钥、浏览器数据
 全交给一个**免审批**的 `read_file`。撞上时它会说清是哪一种、并让你 `cd` 进一个项目目录。
