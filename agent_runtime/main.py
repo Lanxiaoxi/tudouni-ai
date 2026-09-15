@@ -141,7 +141,7 @@ def main() -> int:
         want_stream = True if args.stream is None else args.stream
         return run_tui(args.session, autopilot=args.autopilot,
                        theme_key=key or tui_theme.DEFAULT_THEME,
-                       stream=want_stream)
+                       stream=want_stream, quiet=args.quiet)
 
     # ---- `--runtime-stdio`：协议子进程 ----
     #
@@ -200,6 +200,13 @@ def main() -> int:
     if args.stream is True:
         print("[流式] 老 CLI 不支持逐字输出（它不走协议那条通道）；"
               "要看逐字请用 --tui。已按 --no-stream 继续。", file=sys.stderr)
+
+    # `--quiet` 同一条规矩：**显式传了就说一句**。它只换 TUI 的画法，而老 CLI 的
+    # 输出本来就是一行的（"一次工具调用占几行"在这里无从谈起）—— 静默忽略的话，
+    # 用户会以为"安静模式没生效"，而它其实压根不该在这一支上生效。
+    if args.quiet:
+        print("[安静] --quiet 只作用于 TUI（--tui）：它换的是界面怎么画，"
+              "而老 CLI 的输出本来就是一行的。", file=sys.stderr)
 
     # `--ericai`：老 CLI 直连也需要刷 —— 但必须在 `open_runtime` 之前，因为 catalog
     # 是在 open_runtime 里才读 config（见 composition.py 里那一处 `catalog.load()`）。

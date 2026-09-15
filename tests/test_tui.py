@@ -1332,7 +1332,7 @@ def test_commands_with_arguments_explain_them_in_help_not_in_the_palette():
     """
     with_args = [c for c in view_state.COMMANDS if c.takes_arg]
     assert {c.name for c in with_args} == {
-        "/resume", "/theme", "/model", "/thinking", "/effort", "/mcp"}
+        "/resume", "/theme", "/model", "/thinking", "/effort", "/mcp", "/quiet"}
     assert all(c.detail for c in with_args), "带参数的命令要在 /help 里说清怎么用"
     # 不带参数的那些没有 detail —— 空字符串不会被 `_help_lines` 渲染成空行。
     assert all(not c.detail for c in view_state.COMMANDS if not c.takes_arg)

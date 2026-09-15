@@ -76,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="TUI 的配色（14 套：a 石墨琥珀是默认；也能给名字，如 --theme 靛夜）。"
              "运行中还能用 /theme 换",
     )
+    # 安静模式：**它只是 TUI 的显示偏好**（不进协议、不影响 runtime），所以它和
+    # `--theme` 排在一起，而不是和 `--autopilot` —— 后者是 runtime 那一侧的模式。
+    # 它管的是"一次工具调用占几行、思考过程铺不铺开"，理由见 `view_state.ViewState.quiet`。
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="TUI 的安静模式：工具调用压成一行（结果显示在同一行里）、思考过程只留"
+             "一行并带转圈。运行中还能用 /quiet 切换",
+    )
     # 流式：**两个方向都写成显式开关**，因为它有两个默认值 —— TUI 默认开、老 CLI
     # 默认关（见 main.py 那一支）。用 `store_true` + `store_false` 的一对而不是
     # `BooleanOptionalAction`：后者在 `--help` 里显示成 `--stream | --no-stream`，

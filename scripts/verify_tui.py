@@ -4,6 +4,7 @@
 所以它验的是"这条链路真的通"，而不是"函数能跑"。
 
     python scripts/verify_tui.py
+    python scripts/verify_tui.py --quiet     # 安静模式那一遍（见 `main()` 里那个开关）
 
 三件事，每件都是这一期必须成立的：
 
@@ -32,7 +33,13 @@ from pathlib import Path
 
 # `scripts/` 在包**外面**，所以要上两级才是"包所在目录"（仓库根）——
 # 和 `main.py` 里那句 `sys.path.insert` 同一个道理，而它们算的是同一个目录。
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+#
+# **这里是 `parent.parent`，不是 `.parent.parent.parent`。** 后者往仓库的**上一层**
+# 插了一段路径，而那一段里恰好也有一个叫 `agent_runtime` 的目录（就是这个仓库本身，
+# 但没有 `__init__.py`）—— 于是 `import agent_runtime` 拿到的是一个命名空间包，
+# 报 `cannot import name 'userconfig' from 'agent_runtime' (unknown location)`，
+# 而栈上完全指不到这一行（实测）。包从仓库根搬进 `agent_runtime/` 子目录时漏改的。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -196,7 +203,14 @@ async def main() -> int:
 
     from agent_runtime.frontends.tui.app import TuiApp
 
-    app = TuiApp(session=first)
+    # `python scripts/verify_tui.py --quiet` 跑**安静模式**那一遍。
+    #
+    # 它值得有：安静模式改的是"一次调用占几行、结果回填到哪一行"，而那条路要真的
+    # 走一遍协议（真 tool_call / tool_result 事件）才验得出来 —— 单测里那两条消息是
+    # 手写的。剩下的检查两种模式**一字不差地共用**（思考收尾后是同一行、`Ctrl+T`
+    # 展开的是同一份正文），所以这里只多一处断言，不做第二份脚本。
+    quiet = "--quiet" in sys.argv[1:]
+    app = TuiApp(session=first, quiet=quiet)
     ok = True
     try:
         async with app.run_test(size=(100, 30)) as pilot:
@@ -328,6 +342,20 @@ async def main() -> int:
                 print(f"  工具结果：{str(tool_msgs[-1].get('content'))[:60]!r}")
                 assert "退出码 0" in str(tool_msgs[-1].get("content")), \
                     "审批放行之后命令应该真的执行了"
+
+            # --- 3b. 安静模式：那次调用只占一行，结果回填在同一行上 ---
+            #
+            # 判据是"屏幕上 `[shell]` 只出现一次，而且那一行同时有结果"：另起一行的
+            # 实现会让它出现两次（一次调用、一次结果），而**回填错了对象**在这里
+            # 看不出来 —— 那是单测里按 `call_id` 钉的那条（同批两条一样的调用）。
+            if quiet:
+                lines = [line for line in _log_text(app).splitlines()
+                         if "[shell]" in line]
+                print("=== 安静模式 ===")
+                print(f"  {lines}")
+                assert len(lines) == 1, f"一次调用只该占一行：{lines}"
+                assert "字符" in lines[0], lines[0]
+                assert "←" not in lines[0], "结果该接在那一行上，不是另起一行"
 
             # --- 4. Esc 中断这一轮 ---
             #

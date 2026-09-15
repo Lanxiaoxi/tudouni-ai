@@ -439,7 +439,8 @@ class TuiApp(App[None]):
     ]
 
     def __init__(self, session: str | None = None, *, autopilot: bool = False,
-                 theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True):
+                 theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True,
+                 quiet: bool = False):
         super().__init__()
         self._session = session
         self._autopilot = autopilot
@@ -447,7 +448,16 @@ class TuiApp(App[None]):
         # 能关掉。它只是"我们请求什么"，真正生效与否以 `init.stream` 为准 ——
         # 界面不拿这个值当事实（见 `view_state.ViewState.stream_enabled`）。
         self._stream = stream
-        self.state = view_state.ViewState()
+        # 安静模式（`--quiet` 起的那一次，运行中还能用 `/quiet` 切）。**它是显示偏好，
+        # 不进协议** —— 和 `autopilot` 那一格的分别写在 `ViewState.quiet` 里。
+        self.state = view_state.ViewState(quiet=quiet)
+        # 安静模式下**还在长的那一行思考**属于哪个 run（空 = 现在没有）。
+        #
+        # 为什么要在 App 上记一个：那一行每 50ms 要换一帧转圈，而"现在有没有一行
+        # 正在长"是**界面自己的记忆**（`state.stream_reasoning` 说的只是"累计了多少
+        # 字"）。它同时是那一行动效的开关 —— 一轮收尾之后必须缴掉，否则转圈会一直
+        # 转下去（那时候屏幕上是一个"还在想"的假象）。
+        self._live_think_run = ""
         # 协议回调往这里放（**任何线程都能放**），界面定时排空它。
         self._inbox: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._client: ProtocolClient | None = None
@@ -633,6 +643,10 @@ class TuiApp(App[None]):
                 self._ask_permission(payload)
             elif kind == "question":
                 self._ask_question(payload)
+        # 安静模式那一行的动效（转圈/定格）跟着这一拍走 —— 它**不能挂在 delta 上**：
+        # 思考链断流那几秒（一次模型往返、一次工具执行）屏幕上不能是死的，而那时候
+        # 恰恰没有 delta 可等。见 `_tick_quiet`。
+        self._tick_quiet()
         self._refresh_chrome()
 
     def _widget(self, selector: str, expect: type):
@@ -737,7 +751,21 @@ class TuiApp(App[None]):
                 widget.show(state, palette, width)
         status = self._widget("#status", widgets.StatusBar)
         if status is not None:
-            status.show(state, palette, (time.monotonic(), width))
+            # 第三个元素是"现在轮到人了"：安静模式那个转圈要靠它停下（见
+            # `_waiting_for_human`）。条形控件解包成 `now, width` 的老形状也照样成立
+            # —— 多出来的这一个只有 StatusBar 认。
+            status.show(state, palette,
+                        (time.monotonic(), width, self._waiting_for_human()))
+
+    def _waiting_for_human(self) -> bool:
+        """现在是不是**轮到人**了（审批 / 提问面板压在最上面）。
+
+        安静模式那一格转圈要用它：**等人按键时不转** —— 那时候 agent 已经停在那儿
+        等回话了，转圈说的是一件不存在的事。判据只认那两个面板，`/theme` 那种选择
+        面板不算（那是在操作界面，而 agent 该跑还是跑）。
+        """
+        return any(isinstance(screen, (widgets.PermissionPanel, widgets.QuestionPanel))
+                   for screen in self.screen_stack)
 
     def _say(self, text: str, role: str = view_state.ROLE_RULE) -> None:
         """往会话里说一句界面自己的话（命令回显、提示）。
@@ -802,21 +830,70 @@ class TuiApp(App[None]):
 
         **正文块走 Markdown，思考链走行。** 这一点由 `add_stream` 里那个 `kind` 决定，
         坐标就是 delta 自己的 `channel`（协议按字段名分流，见 `schema/outbound`）。
+
+        **安静模式下思考链不铺开**：它只占一行（`live_thinking_line`），由这一拍和
+        消息泵那一拍一起换帧（`_tick_quiet`）。正文那一半一个字都不变 —— 安静模式
+        压的是"过程"，答案该有多长还是多长。
         """
         view_state.stream_delta(self.state, message)
         channel = message.get("channel")
         text = message.get("text") or ""
         kind = {"text": "answer", "reasoning": "think"}.get(channel or "")
+        if kind == "think":
+            # **计数器在分岔之前加**：它回答的是"刚才到底流过思考链没有"
+            # （验收脚本 `scripts/verify_tui.py` 用它等它开始流），而那个事实和
+            # 界面用哪种画法无关。
+            self.thinking_deltas += 1
         log = self._log()
         if log is None or kind is None or not text:
+            return
+        if kind == "think" and self.state.quiet:
+            self._live_think_run = message.get("run_id", "")
+            self._tick_quiet()
             return
         # 那一行怎么排（正文原样、思考链压平换行）是 `view_state.stream_lines` 的
         # 判断，这里只负责把它递给控件 —— 和事件那条路"渲染是纯函数"同一条规矩。
         lines = view_state.stream_lines(message)
         if lines:
-            if kind == "think":
-                self.thinking_deltas += 1
             log.add_stream(kind, lines[0][1], self.palette, run_id=message.get("run_id", ""))
+
+    def _tick_quiet(self) -> None:
+        """安静模式每 50ms 那一趟：**让思考那一行动起来 / 把它定格**。
+
+        两个职责，都是"屏幕上必须有什么在动"这条的落地：
+
+          * **还在跑** → 换一帧转圈（字符数跟着这一轮累计的思考链走）。它挂在消息泵
+            上、而不是"-每收到一块 delta 才更新一次"：思考链断流那几秒（模型在一段
+            长思考里、或者工具正在跑）恰恰是最像卡死的时候；
+          * **已经收尾** → 把那一行定格成最终形态并缴掉记号。
+
+        最后那一步是**自愈**，不是重复劳动：`ui(run_finished)` 可能比 `run_finished`
+        那条事件先到，而它会把流式累计清空（`view_state.streamed_answer`）——
+        于是 `_close_live_thinking` 的判据不成立，那一行会停在一帧转圈上，
+        看起来像"它还在想"。这里按"回合已经不在跑了"收掉它。
+
+        **非安静模式一次都不做**：那一行根本不存在，而动效是安静模式专有的
+        （开着的那些模式里，屏幕上本来就有铺开的思考正文在长）。
+        """
+        if not self.state.quiet or not self._live_think_run:
+            return
+        log = self._log()
+        if log is None:
+            return
+        state = self.state
+        run_id = self._live_think_run
+        # 字符数取**完整的那一份**（`model_call` 给的 reasoning）优先：它和收尾后
+        # 折叠行上那个数必须对得上，否则"边想边涨到 1,284，停下变成 1,190"。
+        text = state.thinking.get(run_id, ("", False))[0] or state.stream_reasoning
+        if not state.agent.is_busy:
+            log.finish_thinking(run_id, text)
+            self._live_think_run = ""
+            return
+        # **轮到人的时候不转**（只留字符数）：那一行人已经停下来等回话了，而转圈
+        # 说的恰恰是"它还在跑"。人一按键它就接着转。
+        spin = "" if self._waiting_for_human() else view_state.spinner_frame(
+            time.monotonic())
+        log.upsert_line(view_state.live_thinking_line(text, spin, run_id))
 
     def _close_live_thinking(self, run_id: str) -> None:
         """一轮结束了：把**还在流的思考过程**收成折叠的那一行。
@@ -831,6 +908,11 @@ class TuiApp(App[None]):
           * **`Ctrl+T` 会失灵**：它按 `ROLE_THINK_HEAD` 那一行找折叠块
             （`TurnBlock.toggle_thinking`），而流式那块的行全是 `THINK_BODY`
             —— 展开键会从它上面滑过去、去动 `model_call` 画的另一个折叠行。
+
+        **安静模式下"收"的意思是另一件事**：那一行本来就是折叠的（只是带着转圈和
+        实时字符数），所以这里要做的是**把转圈定格**（`finish_thinking`）——
+        定格之后它和 `Ctrl+T` 认的那一行**是同一行**（role 相同、还有身份），
+        于是展开键照旧管用。
 
         ## 为什么判据是 `stream_reasoning`，而正文用 `state.thinking`
 
@@ -851,7 +933,14 @@ class TuiApp(App[None]):
         log = self._log()
         if log is None:
             return
+        # **两条形态都要收，因为屏幕上可能两条都有**（`/quiet` 是运行中能切的）：
+        #   * 安静模式：只有一行（`finish_thinking` 把转圈定格）；
+        #   * 非安静模式：铺开的那一块（`close_stream`，老行为）。
+        # 两条都调，各自"没那一块"时返回 False —— 比在这里判"现在是什么模式"稳：
+        # 切过模式的回合里，两种块可能同时留在屏幕上。
+        log.finish_thinking(run_id, text)
         log.close_stream("think", text)
+        self._live_think_run = ""
 
     def _on_delta_reset(self, message: dict[str, Any]) -> None:
         """重试 / 重发：把**这一步**画出来的那半截丢掉。
@@ -995,6 +1084,9 @@ class TuiApp(App[None]):
         block: widgets.TurnBlock | None = None
         if kind == "run_started":
             turn = self.state.current_turn
+            # 新一轮：上一条还在长的思考（如果有）已经不属于现在了 —— 而它要么已经
+            # 被 `run_finished` 定格过，要么是一条我们从没画出来的残影。
+            self._live_think_run = ""
             if turn is not None:
                 # 界面自己数秒（"本轮 1.4s"）—— 纯函数里不取时间，所以起点在这儿记。
                 turn.started_at = time.monotonic()
@@ -1021,6 +1113,21 @@ class TuiApp(App[None]):
                 target = block or log.current_turn_block
                 if target is not None:
                     target.set_head(line)
+                continue
+            if line.role == view_state.ROLE_TOOL_BRIEF_DONE:
+                # 安静模式的结果**不是新的一行**：它接在同一个 `call_id` 的调用那一行
+                # 后面（`view_state.merge_anchored` 拼，控件按身份找那一行）。
+                #
+                # 找不到那一行时**照常画出来**（`replace_line` 返回 False）：屏幕上会
+                # 多一条只有结果的一行，而那远好过"这次调用到底成没成"没有答案。
+                # 它会发生的场合只有"这次调用不是在当前这一轮里画的"（换过会话、
+                # 或者结果晚于下一轮的开头），而那时候少一条结果更要紧。
+                if log.replace_line(line):
+                    continue
+                body.append(view_state.seg(
+                    (f"  ← [{message.get('tool', '?')}] ", view_state.ROLE_PROCESS),
+                    *line.segments,
+                ))
                 continue
             body.append(line)
         log.add_lines(body, self.palette)
@@ -1337,6 +1444,8 @@ class TuiApp(App[None]):
             self._command_theme(rest)
         elif command == "/autopilot":
             self._command_autopilot()
+        elif command == "/quiet":
+            self._command_quiet(rest)
         elif command == "/mcp":
             self._command_mcp(rest)
         else:
@@ -1612,6 +1721,62 @@ class TuiApp(App[None]):
         self._autopilot_wanted = not self.state.autopilot
         self._client.set_autopilot(self._autopilot_wanted)
 
+    def _command_quiet(self, rest: str) -> None:
+        """`/quiet [on|off]`：切换**安静模式** —— 工具调用压成一行、思考只留一行。
+
+        ## 它和 `/autopilot` 的分别：**这一格的真值就在界面手里**
+
+        `/autopilot` 只发请求、等 runtime 的快照回来才敢说"开了"，因为那一格决定
+        runtime 接下来会不会问你 —— 界面自己改了就会"灯亮着、其实还在逐条问"。
+        安静模式**改的只是这个界面怎么画**：它没有第二份事实可对，所以当场改、
+        当场回声是正确的，也不需要发任何协议消息（`--runtime-stdio` 那边压根不知道
+        有这回事）。三个前端各画各的，这一格将来也不该被 Web 前端继承。
+
+        ## 不带参数是切换（和 `/autopilot` 一样），带 on/off 是明确设成那个值
+
+        两种写法都有用：随手切一下是常态，而"我到底开着没有"这件事不该逼人去记
+        （`/thinking` 也是这么分的）。**认不出来的写法一律不猜** —— 和 `/model`
+        打错名字那条同一条规矩。
+
+        ## 已经画出来的东西不回填
+
+        切的是**之后的画法**：屏幕上那些回合是当时按当时的模式画出来的，而重画它们
+        要留下"每一轮的原始事件"（这一版没有）。所以回声那句里明说"只影响之后画的"，
+        免得用户以为这个开关坏了。
+        """
+        word = rest.strip().lower()
+        if word in ("on", "off"):
+            want = word == "on"
+        elif word:
+            self._say(f"认不出这个写法：{rest}（/quiet 直接切换，"
+                      f"或者 /quiet on / /quiet off）")
+            return
+        else:
+            want = not self.state.quiet
+        self.state.quiet = want
+        if want:
+            self._say_lines([
+                view_state.seg(
+                    ("安静模式 ", view_state.ROLE_RULE),
+                    ("开", view_state.ROLE_WAITING),
+                    ("（工具调用压成一行、结果显示在同一行里；思考过程只留一行）",
+                     view_state.ROLE_RULE),
+                ),
+                view_state.Line(
+                    "  只影响之后画出来的东西；再执行一次 /quiet 关掉"
+                    "（/quiet off 也行）", view_state.ROLE_RULE),
+            ])
+        else:
+            self._say_lines([view_state.seg(
+                ("安静模式 ", view_state.ROLE_RULE),
+                ("关", view_state.ROLE_WAITING),
+                ("（恢复逐条显示：工具调用、权限、结果各占一行）",
+                 view_state.ROLE_RULE),
+            )])
+        # 状态栏那一枚「安静」只在开着时占一格（`quiet_badge`），所以这里要重画一次
+        # —— 下一拍（50ms 后）也会画，但"按了键要立刻有反应"是这一屏的规矩。
+        self._refresh_chrome()
+
     def _command_mcp(self, rest: str) -> None:
         """`/mcp [load|unload <名字>]`。
 
@@ -1870,7 +2035,8 @@ class TuiApp(App[None]):
 
 
 def run_tui(session: str | None = None, *, autopilot: bool = False,
-            theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True) -> int:
+            theme_key: str = theme_mod.DEFAULT_THEME, stream: bool = True,
+            quiet: bool = False) -> int:
     """`main.py --tui` 走这里。
 
     ## 配置错时压根走不到这里
@@ -1892,7 +2058,7 @@ def run_tui(session: str | None = None, *, autopilot: bool = False,
     返回值是子进程的退出码（界面正常收场时是 0）。
     """
     app = TuiApp(session=session, autopilot=autopilot, theme_key=theme_key,
-                 stream=stream)
+                 stream=stream, quiet=quiet)
     app.run()
     client = app._client
     return 0 if client is None or client.exit_code in (None, 0) else client.exit_code

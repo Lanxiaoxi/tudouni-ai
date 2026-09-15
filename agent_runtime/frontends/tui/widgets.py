@@ -44,6 +44,12 @@ ROLE_ATTR: dict[str, str] = {
     view_state.ROLE_PROCESS: "ink3",
     view_state.ROLE_TOOL: "accent",
     view_state.ROLE_RESULT: "ok",
+    # 安静模式那两条：颜色其实由分段给（工具名按风险上色、结果记号 `✓`/`✗` 各有各的
+    # 色），这两条只在"整行一个 role"的时候才用得上 —— 留着是为了让"角色 → 颜色"
+    # 这张表**没有落不下的角色**（缺一个的话，`paint` 会悄悄退回 `ink3`，
+    # 而那种错看起来只是"这一行颜色有点淡"）。
+    view_state.ROLE_TOOL_BRIEF: "accent",
+    view_state.ROLE_TOOL_BRIEF_DONE: "accent",
     view_state.ROLE_RISK_MEDIUM: "warn",
     view_state.ROLE_RISK_HIGH: "danger",
     view_state.ROLE_THINK_HEAD: "ink4",
@@ -231,11 +237,12 @@ class SessionBar(TwoPart):
 
 
 class StatusBar(TwoPart):
-    """底部那一行：**agent 在干什么**（左）+ **autopilot 开关 + 这一轮的成本**（右）。
+    """底部那一行：**agent 在干什么**（左）+ **模式指示灯 + 这一轮的成本**（右）。
 
     它是**投影**（见 `view_state.ViewState.status_left / status_right /
-    autopilot_badge`），不是第二份事实。`payload` 是界面的 wall clock ——
-    "本轮 1.4s"要随秒走动，而那个数只能由界面自己数（纯函数里不取时间）。
+    autopilot_badge / quiet_badge`），不是第二份事实。`payload` 是界面的 wall clock ——
+    "本轮 1.4s"要随秒走动，而那个数只能由界面自己数（纯函数里不取时间）；
+    **安静模式下同一份时钟还决定转圈转到第几帧**（`view_state.spinner_frame`）。
 
     右边那一段**以两个空格开头**：左段是 `1fr`，内容长的时候会被裁到边界上，
     于是"第 3 / 30 步"和"自动放行 关"会挤在一起（实测：看不出这两段是两件事）。
@@ -250,10 +257,20 @@ class StatusBar(TwoPart):
         # 那个记号是**界面自己造的"转圈"**（没有流式，一次往返是秒级）：它的颜色
         # 跟着 phase 走，所以"在跑 / 答完了 / 被砍断"一眼能分开 —— 而文字部分
         # 一律是次级正文色，免得整行都在喊。
-        now, width = payload if payload else (None, None)
+        #
+        # **安静模式下它会真的转起来**（`spinner_frame`）：那时候工具行和思考行都只
+        # 有一行，这一格是屏幕上唯一在动的东西，而"它在想"和"它卡死了"必须分得开。
+        # 非安静模式一个字都不改（`spin` 是空串，记号照旧是那个静态的 `●`）。
+        #
+        # `payload` 的第三个元素是"现在轮到人了"（审批/提问面板压在最上面）：
+        # 那时候**停下**（`app._waiting_for_human`）—— agent 已经停在那儿等你回话了。
+        now, width, *rest = payload if payload else (None, None)
+        waiting = bool(rest and rest[0])
         narrow = width is not None and width < view_state.NARROW_COLUMNS
+        spin = view_state.spinner_frame(now) \
+            if (state.quiet and now is not None and not waiting) else ""
         left = Text()
-        mark, _, rest = state.status_left().partition(" ")
+        mark, _, rest = state.status_left(spin).partition(" ")
         left.append(mark, style=_phase_color(palette, state.agent.phase))
         left.append(f" {rest}", style=palette.ink2)
 
@@ -262,6 +279,13 @@ class StatusBar(TwoPart):
         # 手写第二份角色到颜色的映射。
         right = Text("  ")
         right.append_text(paint(palette, state.autopilot_badge(narrow)))
+        # 安静模式那一枚**只在开着时出现**（`quiet_badge` 返回 None 就是"关着"）：
+        # 它和 autopilot 那一格的取舍不同，理由写在 `view_state.quiet_badge` 里 ——
+        # 于是关掉它的时候，这一行和加这个开关之前一个字符都不差。
+        quiet_badge = state.quiet_badge()
+        if quiet_badge is not None:
+            right.append("  ·  ", style=palette.ink4)
+            right.append_text(paint(palette, quiet_badge))
         # 后台任务那枚徽标**只在真有东西悬着时出现**（`jobs_badge` 返回 None 就是
         # 一格都不占）—— 所以平时这一行和加这个功能之前一模一样。
         #
@@ -352,6 +376,16 @@ class LineBlock(Static):
 
     def set_lines(self, lines: list[view_state.Line]) -> None:
         self.lines = list(lines)
+        self.refresh_text()
+
+    def set_line(self, index: int, line: view_state.Line) -> None:
+        """把**第几行**换成另一个形态（安静模式的原地回填，见 `TurnBlock.replace_anchored`）。
+
+        **只换那一行、整块重画**：这一块是连续的同类行（几个工具行常常并在一块里），
+        整块重画的代价是重新拼一遍那几行 —— 而"只把那一行渲染出来再贴回去"要在这里
+        维护一份和 `paint_lines` 重复的渲染路径，那才是真的贵（改了一处另一处不跟）。
+        """
+        self.lines[index] = line
         self.refresh_text()
 
     def refresh_text(self) -> None:
@@ -806,6 +840,49 @@ class TurnBlock(Vertical):
             for chunk in self.chunks if chunk["kind"] != "answer"
             for line in chunk["block"].lines
         )
+
+    # -- 原地回填（安静模式）---------------------------------------------------
+
+    def replace_anchored(self, line: view_state.Line) -> bool:
+        """把新来的这一行**顶掉它认的那一行**。返回"换掉了吗"。
+
+        判据全在 `view_state.same_anchored_line`（纯函数：身份 + 方向），所以这里不认识
+        "工具"和"思考" —— 它只负责在一堆行里找那一行、把 `merge_anchored` 拼好的
+        结果放回去。**从后往前找**：同一批里两条一样的调用（`read_file a.py` 两次）
+        身份不同（`call_id` 不同），但"最近一条还没结果的"才是对的那一条。
+
+        **正文块要跳过**：它没有 `.lines`（和 `has_thinking` 同一条判据）。
+        """
+        for chunk in reversed(self.chunks):
+            if chunk["kind"] == "answer":
+                continue
+            block: LineBlock = chunk["block"]
+            for index, old in enumerate(block.lines):
+                if view_state.same_anchored_line(line, old):
+                    block.set_line(index, view_state.merge_anchored(old, line))
+                    return True
+        return False
+
+    def upsert_anchored(self, line: view_state.Line) -> None:
+        """有就换掉、没有就追加。
+
+        **安静模式下思考那一行从无到有要走这条**：第一块思考链到达时才画出那一行
+        （此前屏幕上没有它 —— 模型可能一步都不吐思考），而它的每一次"换帧"都必须是
+        **换**，不是接着追加（追加会一行一行堆起来，那正是安静模式要消灭的东西）。
+        """
+        if not self.replace_anchored(line):
+            self.add([line])
+
+    def finish_thinking(self, anchor: str, text: str) -> bool:
+        """一轮收尾：把还在长的那一行思考**定格**成折叠形态（转圈停下）。
+
+        `anchor` 是 `run_id`：还在长的那一行和收尾后的这一行是同一行的两种形态
+        （`same_anchored_line` 靠身份 + 方向认出来）。找不到那一行（非安静模式、
+        或者用户中途按 `Ctrl+T` 把它展开成了正文块）就返回 False，由调用方走
+        `close_stream` 那条老路。
+        """
+        return self.replace_anchored(
+            view_state.folded_thinking(text, anchor=anchor))
 
     def repaint(self, palette: theme_mod.Theme) -> None:
         self._palette = palette
@@ -1542,6 +1619,34 @@ class ConversationLog(VerticalScroll):
         if self._welcome is None:
             self._scroll_end()
             self.call_after_refresh(self._scroll_end)
+
+    # -- 原地回填（安静模式）---------------------------------------------------
+
+    def replace_line(self, line: view_state.Line) -> bool:
+        """把一条认身份的线**换掉它认的那一行**（安静模式：工具结果回填到调用行上）。
+
+        **只找当前这个回合块**：安静模式下工具行属于正在跑的那一轮，而 `anchor` 是
+        `call_id` —— 它不认得回合（那是 `run_id` 的事）。晚到的结果（`tool_result`
+        比下一轮的 `run_started` 还晚）在真实时序里不会发生，真发生了也只是"那一行
+        没找到"，由调用方退化成单独一行。
+        """
+        current = self.current_turn_block
+        return current is not None and current.replace_anchored(line)
+
+    def upsert_line(self, line: view_state.Line) -> None:
+        """同上，但**没有就画出来**（安静模式下思考那一行从无到有）。"""
+        current = self.current_turn_block
+        if current is not None:
+            current.upsert_anchored(line)
+
+    def finish_thinking(self, run_id: str, text: str) -> bool:
+        """一轮收尾：把还在长的那一行思考定格成折叠形态（见 `TurnBlock.finish_thinking`）。
+
+        按 `run_id` 找回合块（和 `add_stream` 同一条理由：delta 是异步来的，
+        `run_finished` 可能比最后一块先到）。
+        """
+        block = self.turn_block_for(run_id) or self.current_turn_block
+        return block is not None and block.finish_thinking(run_id, text)
 
     def _scroll_end(self) -> None:
         if self.is_mounted:

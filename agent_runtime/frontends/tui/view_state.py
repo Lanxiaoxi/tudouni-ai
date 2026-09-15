@@ -26,14 +26,26 @@
 
 `Line` 是 `str` 的子类，**这是刻意的**：老的单测写的是 `"没有执行" in line`，而
 `in` 对 `str` 子类照样成立 —— 于是"升级成结构化行"这件事没有把已有断言全推倒。
-多出来的两样东西：
+多出来的三样东西：
 
   * `role`：这一行是**哪一类**（正文 / 过程行 / 工具行 / 风险行 / 回合头……）。
     调用方按它选颜色，**不许按它做判定**（它是显示状态）；
   * `segments`：一行里分段着色（`→ [1] read_file(...)` 的高风险尾巴是另一档色）。
-    为 None 表示"整行一个 role"，这也是绝大多数行。
+    为 None 表示"整行一个 role"，这也是绝大多数行；
+  * `anchor`：这一行**认哪个身份**（`call_id` / `run_id`）。它只有一个用途 ——
+    **原地回填**：安静模式（`--quiet` / `/quiet`）下一次工具调用先占一行，结果回来时
+    按这个身份找到那一行、把结果接上去（`same_anchored_line` / `merge_anchored`）。
+    空串（默认）表示这一行不参与回填，也就是这一版之前的每一行。
+
+## 安静模式（`quiet`）为什么落在这个文件里
+
+"工具行压成一行""思考只留一行"都是**排版判断**（哪几个字、按什么顺序、什么身份），
+而且它们要能被直接单测 —— 和这个文件里别的函数一模一样。所以它在这儿，不在控件里。
+真正的**动效**（转圈换帧、把结果接到那一行上）属于显示状态，住在 `app.py` / `widgets.py`。
 """
 
+import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -64,6 +76,11 @@ ROLE_ANSWER = "answer"        # agent 的正文（● …）
 ROLE_PROCESS = "process"      # 过程行（· 模型 1.2s …）
 ROLE_TOOL = "tool"            # 工具调用行（→ [1] read_file(…)）
 ROLE_RESULT = "result"        # 工具结果行（← [1] ✓ 8,412 字符 41ms）
+# 安静模式下的工具行：**一次调用只占一行**（`→ [write_file] hello.c`），结果回来时
+# 接在它后面（`… ✓ 16 字符 1ms`）。两个 role 分开是**回填的判据**：`…_DONE` 那一行
+# 要顶掉它前面那条还没结果的（见 `same_anchored_line`）。
+ROLE_TOOL_BRIEF = "tool_brief"            # 安静模式：调用已发出、结果还没回来
+ROLE_TOOL_BRIEF_DONE = "tool_brief_done"  # 安静模式：结果已经接在那一行上了
 ROLE_RISK_MEDIUM = "risk_medium"   # MEDIUM 风险那一小段
 ROLE_RISK_HIGH = "risk_high"       # HIGH 风险那一小段
 ROLE_THINK_HEAD = "think_head"   # 思考折叠行（▸ 思考过程（1,284 字符 …））
@@ -104,29 +121,85 @@ TODO_MARK = {"completed": "✓", "in_progress": "◐", "pending": "○"}
 
 
 class Line(str):
-    """一行字 + 它属于哪一类 + （可选）分段着色。
+    """一行字 + 它属于哪一类 + （可选）分段着色 + （可选）它认哪个身份。
 
     **它是 `str`**：`"没有执行" in line` 对老断言照样成立（见模块 docstring）。
     """
 
     role: str
     segments: list[tuple[str, str]] | None
+    anchor: str
 
     def __new__(cls, text: str, role: str = ROLE_PROCESS,
-                segments: list[tuple[str, str]] | None = None) -> "Line":
+                segments: list[tuple[str, str]] | None = None,
+                anchor: str = "") -> "Line":
         obj = super().__new__(cls, text)
         obj.role = role
         obj.segments = segments
+        obj.anchor = anchor
         return obj
 
 
-def seg(*parts: tuple[str, str]) -> Line:
+def seg(*parts: tuple[str, str], role: str = "", anchor: str = "") -> Line:
     """**分段行**：`seg(("→ ", ROLE_PROCESS), ("read_file", ROLE_TOOL), …)`。
 
     文本是各段的拼接，所以 `in` / `len` 这些仍然按整行算 —— 分段只是画法。
     第一段的 role 兼作整行的 role（当整行需要一档兜底色时用它）。
+
+    `role` 只在**整行的身份和第一段的颜色不是一回事**时才给：安静模式那两条回填行
+    的第一段是结果记号（`✓` 是成功色），而整行要认成"这次调用的最终形态"。
+    `anchor` 是那一行的身份（见 `Line`）。
     """
-    return Line("".join(text for text, _ in parts), parts[0][1], list(parts))
+    return Line("".join(text for text, _ in parts),
+                role or parts[0][1], list(parts), anchor)
+
+
+# --- 原地回填（安静模式）-------------------------------------------------------
+
+# 一条"认身份"的行**顶掉哪几种行**，以及顶掉之后**怎么并**。
+#
+# 方向是**单向**的，这一点不能省：
+#   * `ROLE_TOOL_BRIEF_DONE`（结果那一截）只顶"还没结果的调用行"，而且**往后接**
+#     —— 那一行还有工具名和主要内容，结果不能把它们挤掉；
+#   * `ROLE_THINK_HEAD`（折叠的思考行）顶**同一种形态的自己**（转圈换帧 / 收尾定格），
+#     整行换掉 —— 它两次说的都是"这一轮想了多少"，只是字符数不同。
+#
+# 单向的后果是**重放安全**：同一条 `tool_result` 再来一次时，屏幕上那一行已经不是
+# `ROLE_TOOL_BRIEF` 了（它变成了 `_DONE`），于是那一次不回填 —— 否则结果会接两遍
+# （`✓ 8 字符 1.2s   ✓ 8 字符 1.2s`，看起来像工具跑了两次）。
+_ANCHORED_REPLACES: dict[str, tuple[frozenset[str], str]] = {
+    ROLE_TOOL_BRIEF_DONE: (frozenset({ROLE_TOOL_BRIEF}), "append"),
+    ROLE_THINK_HEAD: (frozenset({ROLE_THINK_HEAD}), "replace"),
+}
+
+
+def same_anchored_line(new: Line, old: Line) -> bool:
+    """新来的这一行是不是**要顶掉**旧的这一行。**纯函数**（回填的判据）。
+
+    两条都要成立：**身份相同**（同一个 `call_id` / `run_id`），而且**旧的正是新的一种
+    目标**（见上面那张表）。只按身份判的话，一次调用的结果会被接到另一个回合的同名
+    身份上；不认方向的话，重放的结果会接两遍。
+
+    `anchor` 为空的行**永远不参与**：老模式（非安静）画出来的折叠行没有身份，
+    它们不该被安静模式的行顶掉（反之亦然，`/quiet` 是运行中能切的）。
+    """
+    if not new.anchor or new.anchor != old.anchor:
+        return False
+    targets = _ANCHORED_REPLACES.get(new.role)
+    return targets is not None and old.role in targets[0]
+
+
+def merge_anchored(old: Line, new: Line) -> Line:
+    """把新来的这一条并到旧那一行上 → **这一行最终长什么样**。**纯函数。**
+
+    "往后接"（工具的结果）：旧行 + 三个空格 + 结果那一段（分段也接起来，颜色各归各的）；
+    "整行换掉"（思考那一行）：见上面那张表。
+    """
+    _targets, how = _ANCHORED_REPLACES.get(new.role, (frozenset(), "replace"))
+    if how != "append":
+        return new
+    parts = [*(old.segments or []), ("   ", ROLE_RULE), *(new.segments or [])]
+    return Line(f"{old}   {new}", new.role, parts, new.anchor)
 
 
 # 引用块左边那条竖线。**它跟着思维链正文一起走**，所以两条构造路径（事件到达时
@@ -198,6 +271,27 @@ def clip(text: str, limit: int) -> tuple[str, bool]:
 def indent(text: str, prefix: str = "  │ ") -> str:
     """给多行文本加前缀。工具结果是一整块，不缩进的话它和对话正文混在一起。"""
     return "\n".join(prefix + line for line in text.splitlines())
+
+
+# --- "它还在动"的记号（安静模式）------------------------------------------------
+
+# 转圈的那十帧。**用盲文字符**：它们在等宽字体里都是一格宽（不会像某些图形字符
+# 那样在 CJK 字体下变成双宽而把状态栏顶歪），而且和这一屏上别的记号不是一个形状族
+# —— 一眼分得出"这是动的东西"。
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# 一帧多久。十个帧 × 90ms ≈ 一秒转一圈：再快就变成一个抖动的点，再慢就像卡住了。
+SPINNER_SECONDS = 0.09
+
+
+def spinner_frame(now: float, *, seconds: float = SPINNER_SECONDS) -> str:
+    """时钟 → 这一帧的字。**纯函数**（`now` 由界面传进来，见 `Turn.started_at` 的理由）。
+
+    为什么它不是"每次读时 +1"：帧号必须**只由时刻决定** —— 两处都要画同一个转圈时
+    （状态栏那一格和思考那一行），各自 +1 会让它们转得不一样快；而界面每 50ms 的
+    那一趟并不均匀（忙的时候会晚到），按次数推进会看起来一卡一卡。
+    """
+    index = int(now / seconds) % len(SPINNER_FRAMES)
+    return SPINNER_FRAMES[index]
 
 
 # --- 欢迎屏（空态）的那几段文字 ------------------------------------------------
@@ -409,6 +503,17 @@ class ViewState:
     # 它**不属于某一个会话**（它是整个进程的模式，换会话时 bootstrap 带着它走），
     # 所以 `reset_for_session()` 不清它。
     autopilot: bool = False
+    # 安静模式（`--quiet` / `/quiet`）：**一次工具调用只占一行、思考只留一行**。
+    #
+    # 和 autopilot 那一格**根本的不同**：autopilot 是 runtime 的事实（它决定工具
+    # 要不要被问），所以它只有 `ui state` 一个来源、界面不许先改；而这一格是
+    # **这个界面自己的显示偏好** —— 界面就是它的真值来源，所以 `/quiet` 当场改、
+    # 当场回声，不需要任何协议往返（Web 前端将来也不该被它管）。
+    #
+    # 它**不属于某一个会话**（和 `rail_open` / `theme` 同一条），所以
+    # `reset_for_session()` 不清它：换个会话就悄悄变回详细模式，是那种"看起来
+    # 完全正常"的坏味道。
+    quiet: bool = False
     # `/model` 那张清单（`init.model_catalog`）：`[{"id", "label", "window",
     # "summary", "note", "current"}]` + 认下的旧名字。
     #
@@ -482,6 +587,10 @@ class ViewState:
         **`autopilot` 也不清**（同样在上面那段之外）：它是整个进程的模式，而且
         runtime 那边换会话时是**带着它**装的（`bootstrap.autopilot`）—— 这里清成
         False 会和 runtime 分家，症状是"换了个会话，灯灭了但工具照样不问"。
+
+        **`quiet` 同样不清**（理由和 `rail_open` / `theme` 一类）：它是界面自己的
+        显示偏好，换会话不该把它翻回去。清掉的症状很轻但很讨厌 —— 用户按过一次
+        `/quiet`，换一个会话之后发现"它又变吵了"，而没有任何一行字解释为什么。
         """
         self.agent = agent_state.initial()
         self.answers.clear()
@@ -544,7 +653,7 @@ class ViewState:
 
     # -- 状态栏 ----------------------------------------------------------------
 
-    def status_left(self) -> str:
+    def status_left(self, spin: str = "") -> str:
         """状态栏左边：**agent 在干什么 + 走到第几步**。
 
         它是**投影**：`agent.activity` 直接来自最近一条事件，这里只是加上步数。
@@ -554,6 +663,13 @@ class ViewState:
         **终态要说得出话**：`run_finished` 会把 `activity` 清空（回合结束了，没有
         "正在做什么"），所以那几种情况由 phase 补一个说法 —— 否则状态栏会剩下一个
         光秃秃的记号（"✓ "），看起来像坏了。
+
+        `spin` 是安静模式那一帧转圈（`spinner_frame`，界面按自己的时钟算好传进来）。
+        **它只在回合真的在跑时替换掉那个记号**（`is_busy`）—— 空闲、已收尾时它一动
+        都不动。而"**轮到人按键了**"这一档不在这里判：协议里没有那个 phase
+        （`protocol/state.py` 只认事件），屏幕上它的样子是审批面板压在最上面，
+        所以那一条由 App 判（`TuiApp._waiting_for_human`，它干脆不传 `spin`）。
+        非安静模式一个字都不传，于是那一格和加这个功能之前完全一样。
         """
         mark = {
             agent_state.IDLE: "○",
@@ -565,6 +681,8 @@ class ViewState:
             agent_state.FAILED: "✗",
             agent_state.CANCELLED: "—",
         }.get(self.agent.phase, "·")
+        if spin and self.agent.is_busy:
+            mark = spin
         settled = {
             agent_state.FINISHED: "已答",
             agent_state.LIMITED: "步数用尽",
@@ -648,6 +766,21 @@ class ViewState:
             return Line(f"{word} 开", ROLE_WARN)
         return Line(f"{word} 关", ROLE_RULE)
 
+    def quiet_badge(self) -> Line | None:
+        """状态栏那一枚「安静」指示灯；**关着时返回 None（一格都不占）**。
+
+        ## 它和 autopilot 那一枚的规矩刻意不同
+
+        autopilot 那一格决定"**接下来还会不会问你**"，所以两种状态都必须在场 ——
+        空着会被读成"没画出来"，而那不是一回事。安静模式是一条**显示偏好**：
+        它开着的时候，线上一眼就能看出来（工具行只剩一行、思考只有一行），
+        所以只在开着时占一格；关着的时候状态栏和加这个开关之前**一个字符都不差**。
+
+        （`--quiet` 起的那一次也一样看得见：状态栏写着「安静」，于是"为什么这次
+        工具输出这么少"在屏幕上就有答案。）
+        """
+        return Line("安静", ROLE_RULE) if self.quiet else None
+
     def jobs_badge(self, compact: bool = False) -> Line | None:
         """状态栏那一枚后台任务徽标；**一件都不悬着时返回 None**（一格都不占）。
 
@@ -717,6 +850,19 @@ def render_event(state: ViewState, message: dict[str, Any]) -> list[Line]:
 
     返回 `list[Line]` 而不是直接往控件里写，是为了让它能被单测 —— 而"事件怎么变成
     给人看的字"恰恰是这个界面里最值得测的部分（它全是判断，没有布局）。
+
+    ## 安静模式（`state.quiet`）在这里分岔，一共三处
+
+      1. **工具调用一行**（`_tool_brief_line`），结果回来时是**一条要回填的行**
+         （`_tool_brief_done_line`）—— 它不是新的一行，调用方要按 `anchor` 找到
+         原来那一行接上去；
+      2. **静默那几种放行**（`auto_allowed` / `autopilot` / `rule_allowed` /
+         `command_allowed`）不画权限行：没有人参与的那几种放行，在安静模式下是纯
+         噪声。**等人、被拒绝、策略禁止照旧显示** —— 那几条是"这一轮为什么停在这儿"
+         唯一的出口；
+      3. 思考链那一段**不在这里分岔**：非流式那条路本来就是折叠的（决策 17）。
+         安静模式管的是**流式**那一条（它平时是铺开的），而那是 `app.py` 的事
+         （`_on_delta` + `_tick_quiet`）。
     """
     kind = message.get("kind")
     out: list[Line] = []
@@ -756,7 +902,10 @@ def render_event(state: ViewState, message: dict[str, Any]) -> list[Line]:
         call_id = message.get("call_id", "")
         if call_id and isinstance(index, int):
             state.calls[call_id] = (index, tool)
-        out.append(_tool_call_line(state, index, tool, message.get("arguments", "")))
+        if state.quiet:
+            out.append(_tool_brief_line(state, tool, message.get("arguments", ""), call_id))
+        else:
+            out.append(_tool_call_line(state, index, tool, message.get("arguments", "")))
 
     elif kind == "tool_result":
         call_id = message.get("call_id", "")
@@ -764,14 +913,21 @@ def render_event(state: ViewState, message: dict[str, Any]) -> list[Line]:
         index = known[0] if known else message.get("tool_index")
         tool = known[1] if known else message.get("tool", "?")
         status = message.get("status")
-        out.append(_tool_result_line(index, tool, message))
-        if status == "denied":
-            # **拒绝要单独说一句**：它是"没执行"，和"执行了但出错"完全不同，
-            # 而两者在 `chars` 上看不出来。
-            out.append(Line("      （被拒绝，没有执行）", ROLE_DENIED))
+        if state.quiet:
+            # **结果不另起一行**：它是接在调用那一行后面的（按 `call_id` 找，见
+            # `same_anchored_line`）。所以这一行只有结果那一截。
+            out.append(_tool_brief_done_line(tool, message))
+        else:
+            out.append(_tool_result_line(index, tool, message))
+            if status == "denied":
+                # **拒绝要单独说一句**：它是"没执行"，和"执行了但出错"完全不同，
+                # 而两者在 `chars` 上看不出来。（安静模式下那一行自己写着"被拒绝"，
+                # 所以这里不用补。）
+                out.append(Line("      （被拒绝，没有执行）", ROLE_DENIED))
 
     elif kind == "permission":
-        out.append(_permission_line(message))
+        if not (state.quiet and _permission_is_silent(message)):
+            out.append(_permission_line(message))
 
     elif kind == "tool_batch":
         calls = message.get("calls")
@@ -833,7 +989,7 @@ def _model_line(state: ViewState, message: dict[str, Any]) -> Line:
     return seg(*parts)
 
 
-def folded_thinking(text: str) -> Line:
+def folded_thinking(text: str, anchor: str = "") -> Line:
     """折叠形态的那一行：`  ▸ 思考过程（401 字符 · Ctrl+T 展开）`。
 
     **四个地方要用它**，所以它必须只有一个来源（实测踩过：折叠这一行在
@@ -848,11 +1004,41 @@ def folded_thinking(text: str) -> Line:
     字符数由调用方 `len()` 出来 —— 不让子进程多发一个 `reasoning_chars`：
     那是同一份事实的第二个来源，而两侧对"一个字符"的口径未必一致（emoji、代理对），
     一个"字符数对不上"的 bug 查起来毫无价值。
+
+    `anchor` 只有安静模式那条路给（那一行的身份是 `run_id`）：还在长的那一行和
+    收尾后的这一行是**同一行的两种形态**，靠它俩对上（见 `same_anchored_line`）。
+    别的调用方不给，于是那些行不参与回填 —— 这是对的，它们各自只画一次。
     """
     return seg(
         ("  ▸ 思考过程", ROLE_THINK_HEAD),
         (f"（{len(text)} 字符 · Ctrl+T 展开）", ROLE_RULE),
+        anchor=anchor,
     )
+
+
+def live_thinking_line(text: str, spin: str, anchor: str) -> Line:
+    """安静模式下**还在长**的那一行思考：`  ▸ 思考过程 ⠋ 1,284 字符`。
+
+    ## 为什么不铺开（安静模式的核心那一条）
+
+    非安静模式下，流式那一轮的思考过程是**铺开**的正文（"它正在想"的观感），
+    收尾时才收成折叠的一行（`TurnBlock.close_stream`）。安静模式要的正好相反：
+    从第一块开始就只占一行。
+
+    ## 转圈是必须的，不是装饰
+
+    安静模式下工具行和思考行都只有一行，屏幕上**没有别的东西在动** —— 而一次模型
+    往返是秒级（`doc/TUI-design.md` 第八节末尾那条）。不转的话，"它在想"和"它卡死了"
+    在屏幕上长得一模一样。
+
+    字符数从 `text` 来（**调用方给**，可能是流式累计、也可能是 `model_call` 带回来的
+    完整那份），所以它是一路涨上去的：看得见它在长，比转圈本身更让人放心。
+    """
+    parts: list[tuple[str, str]] = [("  ▸ 思考过程", ROLE_THINK_HEAD)]
+    if spin:
+        parts.append((f" {spin}", ROLE_WAITING))
+    parts.append((f" {count_text(len(text))} 字符", ROLE_RULE))
+    return seg(*parts, role=ROLE_THINK_HEAD, anchor=anchor)
 
 
 def expanded_thinking_head() -> Line:
@@ -940,6 +1126,196 @@ def _tool_call_line(state: ViewState, index: Any, tool: str, arguments: str) -> 
     return seg(*parts)
 
 
+# --- 安静模式：一次调用一行 ----------------------------------------------------
+#
+# 「主要内容」取哪个参数。**表是按工具名点名的**，因为"这一段调用在干什么"只有
+# 工具自己知道：`read_file` 的要点是 path，`shell` 的是 command，`ask_user` 的是
+# 问题本身。
+#
+# 为什么不在协议上加一个字段让 runtime 发过来（那本来更"正确"）：这一格**只影响
+# 这一个前端的排版**，而协议的每一个字段都要三个前端 + schema + 文档一起背
+# （见 `protocol/schema`）—— 代价和"少画几行字"不成比例。真正的风险是**表会旧**，
+# 所以下面留了兜底：表里没有的工具（MCP 那些，以及将来新加的）取第一个像"主要内容"
+# 的字符串，再不然取原始载荷。它最坏的结果是"这一行不那么准"，不是"这一行空了"。
+_BRIEF_KEYS: dict[str, str] = {
+    "read_file": "path",
+    "write_file": "path",
+    "edit_file": "path",
+    "list_files": "path",
+    "grep": "pattern",
+    "shell": "command",
+    "shell_background": "command",
+    "job_output": "job_id",
+    "job_kill": "job_id",
+    "load_skill": "name",
+    "fetch_web": "url",
+    "web_search": "query",
+    "ask_user": "question",
+    "todo_write": "todos",
+}
+
+# 兜底时按这个顺序找。**比"取第一个字符串"稳一点**：MCP 工具的 schema 是别人写的，
+# 键序不保证，而这里那几个词在任何一份工具 schema 里都最像"干的是哪件事"。
+_BRIEF_FALLBACK_KEYS: tuple[str, ...] = (
+    "path", "file", "command", "pattern", "query", "url", "name", "question", "prompt",
+)
+
+# 列表类参数的说法：任务列表说"条任务"，别的说"项"。
+_BRIEF_LIST_TEXT: dict[str, str] = {"todo_write": "条任务"}
+
+# 这一行的长度预算。**它是给"一行"定的**：状态栏左边、工具行、回合头挤在同一屏上，
+# 而一串 200 字符的命令会把这一行撑到折行（折了就又变成两行了）。
+BRIEF_LIMIT = 60
+
+# 载荷被截断时（`agents.agent.AUDIT_PREVIEW_LIMIT`）从这里捞。**这不是过度设计**：
+# `write_file` 的 content 动辄几千字符，于是**绝大多数写文件的调用**在事件里的载荷
+# 都是截断的（`json.loads` 必然失败）—— 而 path 恰好排在 content 前面。
+_JSON_STRING = re.compile(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _brief_value(value: Any) -> str:
+    """一个参数值 → 那一行里的几个字。**纯函数。**"""
+    if isinstance(value, str):
+        # **换行压平**：这一行只能是一行（`stream_chunk_text` 那条规矩的另一处）。
+        text = " ".join(value.split())
+        return text if len(text) <= BRIEF_LIMIT else text[:BRIEF_LIMIT] + "…"
+    if isinstance(value, list):
+        return f"{len(value)} 项"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _brief_from_json(tool: str, text: str) -> tuple[str, Any] | None:
+    """载荷能解析成对象时：`(键, 值)`（按上面的表挑）。**纯函数。**
+
+    挑不出来（一个字符串值都没有）时返回 `None`，让调用方走兜底那一条 ——
+    宁可显示原始载荷，也不要显示一个空括号。
+    """
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    preferred = _BRIEF_KEYS.get(tool)
+    if preferred and preferred in data:
+        return preferred, data[preferred]
+    for key in _BRIEF_FALLBACK_KEYS:
+        if key in data:
+            return key, data[key]
+    for key, value in data.items():
+        if isinstance(value, str):
+            return key, value
+    return None
+
+
+def _brief_from_preview(tool: str, text: str) -> str:
+    """载荷**被截断**时（不是合法 JSON）从字面上捞一条。**纯函数。**
+
+    捞不到就原样贴（还带着 `…(共 N 字符)` 那句）：那一行至少说了"它调了哪个工具"，
+    而"内容认不出来"不该让这一行走形。
+    """
+    preferred = _BRIEF_KEYS.get(tool)
+    wanted = {*_BRIEF_FALLBACK_KEYS, preferred} - {None}
+    first = ""
+    for match in _JSON_STRING.finditer(text):
+        key, raw = match.group(1), match.group(2)
+        try:
+            value = json.loads(f'"{raw}"')
+        except ValueError:  # pragma: no cover - 正则已经把坏转义挡住了
+            value = raw
+        if key in wanted:
+            return _brief_value(value)
+        if not first:
+            first = _brief_value(value)
+    return first or _brief_value(text)
+
+
+def tool_brief(tool: str, arguments: str) -> str:
+    """安静模式那一行里的「主要内容」：`write_file` + `{"path": …}` → `hello.c`。
+
+    三步，每一步都为了"这一行不能是空的、也不能离谱"：
+
+      1. 载荷是合法 JSON 对象 → 按 `_BRIEF_KEYS` 挑（挑不到就按偏爱顺序兜底）；
+      2. 被截断了 → 从字面上捞第一条像样的 `"键": "值"`；
+      3. 都不行 → 原始载荷（截短 + 压平）。
+
+    `todo_write` 那种列表参数说 `3 条任务`，不是一个 JSON 数组 —— 这一行要的是
+    "它要动几件事"。
+    """
+    if not arguments:
+        return ""
+    picked = _brief_from_json(tool, arguments)
+    if picked is None:
+        return _brief_from_preview(tool, arguments)
+    _key, value = picked
+    if isinstance(value, list):
+        return f"{len(value)} {_BRIEF_LIST_TEXT.get(tool, '项')}"
+    return _brief_value(value)
+
+
+def _brief_tool_role(state: ViewState, tool: str) -> str:
+    """安静模式里工具名那一档色 —— **风险靠颜色，不靠文字**。
+
+    和 `_risk_suffix` 同一条取向（LOW 不着色也不写字），但这里连中高风险的字也去掉：
+    一行的预算全给了"它对谁做了什么"，而"这条要不要问我"在审批面板上会明说。
+    颜色留着，于是"满屏 warning 色"这件事还是看得见。
+    """
+    risk = state.tool_risks.get(tool, "")
+    if risk == "high":
+        return ROLE_RISK_HIGH
+    if risk == "medium":
+        return ROLE_RISK_MEDIUM
+    return ROLE_TOOL
+
+
+def _tool_brief_line(state: ViewState, tool: str, arguments: str,
+                     call_id: str) -> Line:
+    """安静模式的调用行：`  → [write_file] hello.c`。**一次调用一行。**
+
+    `anchor` 是那次调用的 `call_id`：结果回来时靠它找回这一行（`same_anchored_line`）。
+    `call_id` 为空（老 runtime 没发这个键）时这一行照画，只是结果会另起一行 ——
+    宁可在极老的 runtime 上退化成两行，也不要"猜一个身份"把结果贴到别的调用上。
+    """
+    parts: list[tuple[str, str]] = [
+        ("  → ", ROLE_PROCESS),
+        (f"[{tool}]", _brief_tool_role(state, tool)),
+    ]
+    brief = tool_brief(tool, arguments)
+    if brief:
+        parts.append((f" {brief}", ROLE_PROCESS))
+    return seg(*parts, role=ROLE_TOOL_BRIEF, anchor=call_id)
+
+
+def _tool_brief_done_line(tool: str, message: dict[str, Any]) -> Line:
+    """安静模式的结果**尾巴**：`✓ 16 字符   1ms`。
+
+    它刻意**不带前缀**（工具名、主要内容）：那一行已经画在屏幕上了，这一段是接上去
+    的（拼接由控件做，见 `merge_anchored`）—— 所以这里只回答"再接一段什么"。
+
+    `tool` 只在回填不上时用得上（那种情况下这一条会被当成独立的一行画出来，
+    `App` 那一侧补一个工具名，免得屏幕上是孤零零一个 `✓`）。
+    三种非 ok 的状态各有各的说法：**被拒绝**和**参数不合法**都不是"跑完了"，
+    它们和"执行出错"是三件事（和 `protocol/state.py` 那张表同一套措辞）。
+    """
+    call_id = message.get("call_id", "")
+    status = message.get("status")
+    chars = count_text(message.get("chars", 0))
+    span = ms_text(message.get("duration_ms"))
+    if status == "ok":
+        parts = [("✓ ", ROLE_RESULT), (f"{chars} 字符   {span}", ROLE_RULE)]
+    elif status == "denied":
+        parts = [("✗ ", ROLE_DENIED), ("被拒绝，没有执行", ROLE_RULE)]
+    elif status == "invalid_args":
+        parts = [("✗ ", ROLE_DENIED), ("参数不合法，没有执行", ROLE_RULE)]
+    else:
+        parts = [("! ", ROLE_WARN), (f"执行出错（{chars} 字符）", ROLE_RULE)]
+    return seg(*parts, role=ROLE_TOOL_BRIEF_DONE, anchor=call_id)
+
+
 def _tool_result_line(index: Any, tool: str, message: dict[str, Any]) -> Line:
     status = message.get("status")
     mark, role = {
@@ -955,6 +1331,27 @@ def _tool_result_line(index: Any, tool: str, message: dict[str, Any]) -> Line:
         (f"{count_text(message.get('chars', 0))} 字符", ROLE_PROCESS),
         (f"   {ms_text(message.get('duration_ms'))}", ROLE_RULE),
     )
+
+
+# 安静模式下**不画权限行**的那几种放行。它们是 `security/gate.py` 里"没有任何人
+# 参与"的四种：等级自动、autopilot、以前按过 t、命中命令前缀规则。
+#
+# 另外四种（`approved` / `user_denied` / `policy_denied` / `no_asker`）照旧显示，
+# 理由各不相同而且都很硬：
+#   * `approved` 是**人按过键**这件事的痕迹，而且那一行还带着"你看了 2.4s · 已记住 …"
+#     —— "我刚才顺手放行了什么"是回头要查的；
+#   * 后三种是**没执行**：屏幕上必须留一条"这一轮为什么停在这儿"。
+_SILENT_OUTCOMES = frozenset({"auto_allowed", "autopilot", "rule_allowed",
+                              "command_allowed"})
+
+
+def _permission_is_silent(message: dict[str, Any]) -> bool:
+    """这一条权限事件在安静模式下要不要**整个省掉**。**纯函数。**
+
+    判据只看 `outcome`（`gate.py` 那张表里的字面量），**不看文字**：`rule` 那个字段
+    只在 `command_allowed` 上有值，拿它当判据会漏掉另外三种。
+    """
+    return str(message.get("outcome", "")) in _SILENT_OUTCOMES
 
 
 def _permission_line(message: dict[str, Any]) -> Line:
@@ -1739,6 +2136,11 @@ COMMANDS: tuple[Command, ...] = (
     # 选择不看每一条**"—— 语义变了所以结论才改，理由留在 app.py 的
     # `_command_autopilot` 和 doc/TUI-design.md 那一节里。
     Command("/autopilot", "自动放行开关"),
+    # 安静模式。**它和 `/autopilot` 长得像，但一个字的语义都不共用**：那一格是
+    # runtime 的模式（工具要不要问人），这一格是这个界面怎么画（一次调用占几行）。
+    # 所以它不带"开关在谁手里"那套讲究 —— 界面当场改、当场回声。
+    Command("/quiet", "安静模式开关", True,
+            "不带参数切换；/quiet on 或 /quiet off 直接设成那个值"),
     # 下面三条是**只读**的（`/model` 带参数才会改一个会话级设置）。
     #
     # `/status` 和 `/tools` 此前只有"另开一个终端跑 `--audit` / 看启动横幅"这两条
