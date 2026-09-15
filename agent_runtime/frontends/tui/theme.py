@@ -1,4 +1,4 @@
-"""TUI 的配色层：**14 套主题，纯数据。**
+"""TUI 的配色层：**11 套主题，纯数据。**
 
 ## 这个文件为什么存在（以及为什么它不认识 Textual）
 
@@ -13,30 +13,50 @@
 
 ## 名字是两套：中文那两格和英文那两格
 
-14 套各有 `name`/`source`（中文）和 `name_en`/`source_en`（英文），取哪一套由
+每套各有 `name`/`source`（中文）和 `name_en`/`source_en`（英文），取哪一套由
 `name_in(lang)` / `source_in(lang)` 决定（`lang` 来自 `i18n.current()`，也就是
 `ui.language`）。它们**不走 `i18n` 的两张目录表**：这两格是长在主题上的数据（和色值
 同级），而"`/theme` 要同时认中文名和英文名"这条规矩只有在这里说得清（见 `resolve`）。
 
-## 14 套是怎么来的
+## 11 套是怎么来的
 
-  * `P1`–`P9`：**土豆泥的九套色卡**，按「5 色 → 界面九色」的规则扩展过
-    （源文件 `配色Token-你的九套-9色.json`，每个值都带 lineage）。这九套的九个
-    色值**原样照搬**，一个都不改 —— 它们是对比度校过的。
+  * `P3 / P5 / P6 / P7 / P9`：**土豆泥九套色卡里留下来的五套**，按「5 色 → 界面九色」
+    的规则扩展过（源文件 `配色Token-你的九套-9色.json`，每个值都带 lineage）。这五套的
+    九个色值**原样照搬**，一个都不改 —— 它们是对比度校过的。
+    （`P1 暖橄榄 / P2 海蓝橙 / P4 暖光 / P8 藏青陶土` 四套是用户裁掉的，连同它们
+    在整个列表里的展示序号一起；留下来的 key 一个没改，所以 `/theme 7` 照旧是 `P7`。）
   * `A`–`E`：设计稿 F7 的**五套候选方案**（石墨琥珀 / 极地冷 / 墨绿仪器 / 紫夜 /
     纯碳）。它们的 `bg/chrome/ink/accent/warn/danger/ok/ink3` 来自 F7 卡片上印的
     色值，`surface/line/ink2` 三格 F7 没印字，是**从卡片上那三条色块取样的**
     （取样值记在 `source` 里，便于日后核对）。
+  * `P3-T` / `A-T`：**两套透明版**（见下一节），其余九格全部从它们各自的原版抄来。
+
+## 透明版：只有最底层那一格是终端自己的底色
+
+很多 CLI 的 TUI 看起来是"透"的 —— 终端底板什么色，对话区就什么色。做法是
+`Palette.transparent`：它把那套配色的 **`bg`（窗口底 / 对话区）换成一个特殊值
+`ansi_default`**，也就是"终端自己的默认底色"（Textual 的 `Color` 里有 `ansi=-1`
+这一格，写出去是 SGR 49 而不是一个真彩色）。Textual 8 的 `Screen.render()` 认得它，
+所以对话区那一大片**不涂任何颜色**，露出来的就是终端自己的底板。
+
+**只有 `bg` 那一格透。** 顶栏 / 状态栏 / 输入框（`chrome`）、命令面板（`elevated`）、
+思考块与代码块（`sunk`）、左栏（`rail`）都还是实色 —— 派生角色全部从**原版那套的
+`bg`** 算出来，不认 `ansi_default`（一个非色值没法拿去插值）。这是刻意的：
+层次感全靠这几块底色的差，全透了就只剩文字和边框，左栏那种"安静的一块"会消失。
+
+**代价也说清楚**：透出来的是终端底板，那就**不再由我们保证对比度**了。一套深色主题
+配一个亮底板（或者反过来，`P3 粉紫` 是亮色主题配深底板）会难读 —— 这是这个功能
+本身的性质，不是可以在这里修掉的东西。选它的人自己看得到。
 
 ## 派生角色：为什么不是"每套再手写八个色值"
 
 九套 token 只给了九个角色，而界面要用十几个（左栏底、弹层底、思考块底、细描边、
-占位色……）。**手写会引入 14×8 = 112 个没人校对过的色值**，而且每套的观感会开始
+占位色……）。**手写会引入 11×8 = 88 个没人校对过的色值**，而且每套的观感会开始
 漂。所以除 token 之外的角色一律**按固定规则从 token 推导**（见下面 `_derive`），
-规则只有三条，而且对 14 套一视同仁：
+规则只有三条，而且对每一套一视同仁：
 
   1. **抬高明度**（rail / elevated）：往正文色方向插值 —— 深色主题是变亮，
-     亮色主题（只有 `P3 粉紫` 一套）是变暗，方向由 `dark` 决定；
+     亮色主题（`P3 粉紫` 和它的透明版 `P3-T` 两套）是变暗，方向由 `dark` 决定；
   2. **压低明度**（sunk）：往底色之外的那一端插值，用在思考内容块那种"陷进去"的底；
   3. **弱化**（hairline / ink4 / accent_soft / danger_soft / skill）：往底色方向
      插值 —— 保留色相，降对比。
@@ -61,13 +81,13 @@ DEFAULT_THEME = "A"
 
 @dataclass(frozen=True)
 class Palette:
-    """一套主题的九个 token + 两个补充角色。**色值全部原样，不做二次调整。**"""
+    """一套主题的九个 token（+ 两个透明版的标记）。**色值全部原样，不做二次调整。**"""
 
     key: str
     name: str
     source: str
     dark: bool
-    bg: str          # 窗口底 / 对话区
+    bg: str          # 窗口底 / 对话区（透明版是 `ansi_default`）
     chrome: str      # 顶杠、状态栏、输入行
     surface: str     # 面板底（比 chrome 再上一档）
     line: str        # 描边与分隔线（带色相，是这套主题性格的一部分）
@@ -79,7 +99,19 @@ class Palette:
     danger: str      # HIGH 风险 / 拒绝
     ok: str          # 工具成功返回
 
-    # 英文名与英文出处。**它们在最后、而且带默认值**：14 套是按位置构造的，插在中间
+    # --- 变体：透明版（目前只有 `A-T` / `P3-T` 两套，见模块 docstring）----------
+    #
+    # **为什么这两格也在这里、而不是另开一张表**：透明版的另外九格和原版**一个字
+    # 都不许差**，而"差没差"这件事只有在同一张表里才看得出来（`_transparent` 就是从
+    # 原版那一条算出来的），这两格是它的标记。
+    transparent: bool = False
+    """这套是不是"透明版"（`bg` 是终端自己的底色而不是一个色值）。"""
+
+    base_bg: str = ""
+    """**原版那套的 `bg`**，只用来算派生角色。透明版自己那位是非色值（`ansi_default`），
+    拿去插值会抛 —— 而左栏、思考块、命令面板这些该跟着原版走，不该跟着终端底板走。"""
+
+    # 英文名与英文出处。**它们在最后、而且带默认值**：这些表是按位置构造的，插在中间
     # 会把每一个 `Palette(...)` 的位置参数全部错位。
     #
     # 为什么名字不走 `i18n` 的两张目录表：这两格是**长在主题上的数据**（和色值同级），
@@ -109,6 +141,10 @@ def _hex(rgb: tuple[float, float, float]) -> str:
 
 def blend(base: str, toward: str, amount: float) -> str:
     """在 `base` 和 `toward` 之间插值。`amount=0` 给 `base`，`=1` 给 `toward`。
+
+    **两个入参都必须是真色值（`#RRGGBB`）。** 透明版那套的 `bg` 是 `ansi_default`
+    ——"终端自己的底色"不是一个能拿来插值的数，所以透明版算派生角色时用的是它原版的
+    `base_bg`（见 `Palette.base_bg` 和 `Theme.__post_init__`）。
 
     **不用 HSL/HSV**：那会在灰阶附近产生意料之外的色相（两个中性色之间插值应该
     还是中性色，而 HSL 会绕着色环跑一圈）。RGB 线性插值在"往底色压暗"和"往正文
@@ -164,17 +200,25 @@ class Theme:
         for name in ("bg", "chrome", "surface", "line", "ink", "ink2", "ink3",
                      "accent", "warn", "danger", "ok", "dark"):
             object.__setattr__(self, name, getattr(p, name))
+        # **插值的基准色**：透明版是 `ansi_default`（不是色值），派生角色全按它原版的
+        # `base_bg` 算 —— 于是"透明版"和"原版"的差别只剩最底下那一大片。
+        base = p.base_bg or p.bg
         # 深色主题往黑走、亮色主题往白走 —— 方向只有一个来源（`dark`）。
         down = "#000000" if p.dark else "#FFFFFF"
-        object.__setattr__(self, "rail", blend(p.bg, p.ink, 0.045))
-        object.__setattr__(self, "elevated", blend(p.bg, p.ink, 0.10))
-        object.__setattr__(self, "sunk", blend(p.bg, down, 0.35))
-        object.__setattr__(self, "hairline", blend(p.bg, p.ink, 0.14))
-        object.__setattr__(self, "ink4", blend(p.bg, p.ink, 0.30))
-        object.__setattr__(self, "accent_soft", blend(p.bg, p.accent, 0.42))
-        object.__setattr__(self, "danger_soft", blend(p.bg, p.danger, 0.42))
+        object.__setattr__(self, "rail", blend(base, p.ink, 0.045))
+        object.__setattr__(self, "elevated", blend(base, p.ink, 0.10))
+        object.__setattr__(self, "sunk", blend(base, down, 0.35))
+        object.__setattr__(self, "hairline", blend(base, p.ink, 0.14))
+        object.__setattr__(self, "ink4", blend(base, p.ink, 0.30))
+        object.__setattr__(self, "accent_soft", blend(base, p.accent, 0.42))
+        object.__setattr__(self, "danger_soft", blend(base, p.danger, 0.42))
         object.__setattr__(self, "skill", blend(p.line, p.ink, 0.20))
-        object.__setattr__(self, "rail_bar", blend(p.line, p.bg, 0.30))
+        object.__setattr__(self, "rail_bar", blend(p.line, base, 0.30))
+
+    @property
+    def transparent(self) -> bool:
+        """这套是不是透明版（`bg` 是终端自己的底色）。"""
+        return self.palette.transparent
 
     # -- 给 Textual 的那一半 ----------------------------------------------------
 
@@ -226,32 +270,24 @@ class Theme:
         }
 
 
-# --- 14 套 ---------------------------------------------------------------------
+# --- 11 套 ---------------------------------------------------------------------
 #
-# 九套色卡（P1–P9）：色值来自 `配色Token-你的九套-9色.json`，**一字不改**。
+# 五套色卡（P3 / P5 / P6 / P7 / P9）：色值来自 `配色Token-你的九套-9色.json`，
+#   **一字不改**（P1 / P2 / P4 / P8 那四套是用户裁掉的，key 里留下的号不重排）。
 # 五套候选（A–E）：色值来自设计稿 F7 的卡片（`surface/line/ink2` 三格是取样的）。
+# 两套透明版（P3-T / A-T）：**由原版复制而来**，见下面 `_transparent`。
+
+# `bg` 在透明版上的值。**这不是一个颜色，是"别涂底"**：Textual 的 `Color` 用
+# `ansi=-1` 表示它，最终写出去的是 SGR 49（终端默认背景），而 `Screen.render()`
+# 会把它让给 App —— 于是终端自己的底板透上来。
+ANSI_DEFAULT = "ansi_default"
 
 _PALETTES: tuple[Palette, ...] = (
-    Palette("P1", "暖橄榄", "色卡①", True,
-            bg="#242F1A", chrome="#2F3925", surface="#3A4330", line="#556136",
-            ink="#FEF9DE", ink2="#A7A890", ink3="#727861",
-            accent="#D6975B", warn="#C06E31", danger="#D9453C", ok="#6FBF8B",
-            name_en="Warm Olive", source_en="Card ①"),
-    Palette("P2", "海蓝橙", "色卡②", True,
-            bg="#092A3D", chrome="#153547", surface="#214051", line="#2793B1",
-            ink="#85C2E0", ink2="#53859F", ink3="#366178",
-            accent="#FDAF31", warn="#F77C26", danger="#D9453C", ok="#6FBF8B",
-            name_en="Sea Blue & Orange", source_en="Card ②"),
     Palette("P3", "粉紫", "色卡③ · 亮色主题", False,
             bg="#EAF2FE", chrome="#E1E8F4", surface="#D8DEEA", line="#C5ABD3",
             ink="#363044", ink2="#7E7E8E", ink3="#A9ACBB",
             accent="#8E5E6E", warn="#9582A1", danger="#C0362E", ok="#57956D",
             name_en="Pink Violet", source_en="Card ③ · light theme"),
-    Palette("P4", "暖光", "色卡④", True,
-            bg="#053F5C", chrome="#124964", surface="#1F536C", line="#428EBD",
-            ink="#9FE7F5", ink2="#61A4B8", ink3="#3C7B93",
-            accent="#F28B21", warn="#F7AD19", danger="#DF645C", ok="#6FBF8B",
-            name_en="Warm Light", source_en="Card ④"),
     Palette("P5", "夜紫柔彩", "色卡⑤", True,
             bg="#1E0A26", chrome="#291631", surface="#34223C", line="#F2B28D",
             ink="#F2CEE6", ink2="#9D8099", ink3="#6A516B",
@@ -268,11 +304,6 @@ _PALETTES: tuple[Palette, ...] = (
             ink="#FFFFFF", ink2="#A2A2A2", ink3="#6A6A6A",
             accent="#7670EF", warn="#E8C05A", danger="#D76A7B", ok="#74B5B3",
             name_en="Indigo Night", source_en="Card ⑦"),
-    Palette("P8", "藏青陶土", "色卡⑧", True,
-            bg="#273F75", chrome="#32497C", surface="#3D5383", line="#797784",
-            ink="#EDE6D8", ink2="#A9B2C8", ink3="#7584A7",
-            accent="#BEAB73", warn="#C87A60", danger="#D2705E", ok="#6FBF8B",
-            name_en="Navy Clay", source_en="Card ⑧"),
     Palette("P9", "森绿石", "色卡⑨", True,
             bg="#2F443A", chrome="#394D44", surface="#43564E", line="#507550",
             ink="#D5D1C7", ink2="#93998F", ink3="#6B776D",
@@ -306,9 +337,50 @@ _PALETTES: tuple[Palette, ...] = (
             name_en="Pure Carbon", source_en="F7-E · the accent is white"),
 )
 
+
+def _transparent(base: Palette) -> Palette:
+    """**原版 → 透明版**：只把 `bg` 换成终端自己的底色，别的九格一个字节都不动。
+
+    这就是"透明版不是第十套配色，而是同一套配色少涂一层"这句话的实现：色值来自
+    `base` 的同一份数据（不是抄一遍），所以原版改了、透明版不可能漂。
+
+    key 是 `<原 key>-T`（`A-T` / `P3-T`）：既看得出它是谁的透明版，也能直接当 key 打。
+    名字是 `<原名> · 透明` —— `resolve` 的"名字里的一段"那一路于是能认 `透明` 两个字
+    （两套都含它，靠"最精确的那条赢"落到具体某一套，见 `resolve`）。
+    """
+    return Palette(
+        f"{base.key}-T",
+        f"{base.name} · 透明",
+        f"{base.source} · 透明版",
+        base.dark,
+        bg=ANSI_DEFAULT,
+        chrome=base.chrome,
+        surface=base.surface,
+        line=base.line,
+        ink=base.ink,
+        ink2=base.ink2,
+        ink3=base.ink3,
+        accent=base.accent,
+        warn=base.warn,
+        danger=base.danger,
+        ok=base.ok,
+        transparent=True,
+        base_bg=base.bg,
+        name_en=f"{base.name_en} · Clear",
+        source_en=f"{base.source_en} · clear variant",
+    )
+
+
+# 透明版**追加在末尾**（而不是插在原版旁边）：`ORDER` 就是 `--tui`/`/theme` 列表的
+# 展示顺序，而"后面多出来的两套是透明版"比"每两套里夹一个"好找。序号跟着走：11/12。
+# **不放进上面那张表**，因为那张表的每一项都是"从色卡/卡片抄来的原始色值"，而这两套
+# 是从表里的某一项算出来的 —— 分开写，"抄来的"和"推出来的"就一眼分得开。
+# 索引从 0 起：第 1 项是 `P3`，第 6 项是 `A`。
+_PALETTES += (_transparent(_PALETTES[0]), _transparent(_PALETTES[5]))
+
 THEMES: dict[str, Theme] = {p.key: Theme(p) for p in _PALETTES}
 
-# 展示顺序就是上面这张表的顺序：先九套色卡（1–9），再五套候选（A–E）。
+# 展示顺序就是上面那张表的顺序：五套色卡（1–5）、五套候选（6–10）、两套透明版（11–12）。
 ORDER: tuple[str, ...] = tuple(p.key for p in _PALETTES)
 
 
@@ -326,16 +398,29 @@ def resolve(query: str) -> str | None:
 
     认的方式（按优先级，这是 `/theme` 的全部交互设计）：
 
-      1. key 本身（`p7` / `a`，大小写不敏感）；
-      2. 序号（`7` → `P7`，`13` → `D`）—— 14 套的展示顺序；
-      3. 名字里的一段（`靛` → `P7`，`墨绿` → `C`）。
+      1. key 本身（`p7` / `a`，大小写不敏感；透明版是 `a-t` / `p3-t`，
+         `at` / `p3t` 也认 —— 中间的连字符是给人看的，不该变成必须打的字）；
+      2. 序号（`7` → `P7`，`12` → `A-T`）—— 11 套的展示顺序；
+      3. 名字里的一段（`靛` → `P7`，`墨绿` → `C`，`透明` → 见下）。
 
-    第 2 条用**展示序号**而不是 key 里的数字：`A`–`E` 五套没有数字，而"第 13 套"
+    第 2 条用**展示序号**而不是 key 里的数字：`A`–`E` 那几套没有数字，而"第 12 套"
     在 `/theme` 的列表里是有意义的（列表就是按这个序打的）。
 
     **第 3 条两套名字都认**（中文名和英文名）：界面语言和用户的肌肉记忆是两件事 ——
     切到英文之后 `/theme 靛夜` 突然失灵，是最容易被当成 bug 的那种回归。英文名那一路
     大小写不敏感（`indigo` / `Indigo` 都行）。
+
+    ## 多个都命中时：**最精确的那一条赢**
+
+    有了透明版之后这条规则才真正被用上：`石墨琥珀 · 透明` 这个名字**含** `石墨琥珀`，
+    所以打 `琥珀` 两个字两套都命中 —— 从前那种"命中多于一条就返回 None"会把它变成
+    "没有这套配色"，而它明明在列表里。改成两步：**以它开头的赢**，其次**短的那条赢**。
+    于是 `/theme 琥珀` 是原版 `A`（`石墨琥珀` 以它开头，而 `石墨琥珀 · 透明` 只是含它），
+    要透明版就打 `/theme 透明`（两套透明版都含它，取展示顺序靠前的 `P3-T`）或者直接
+    `/theme a-t`。**不猜全名**仍然是规矩 —— `/theme 琥珀色` 照样一个都不命中。
+
+    名字一样长的（`透明` 命中两套透明版）**再按展示顺序取靠前的那一条**：这条规则
+    只为了让结果稳定，不是为了"更对" —— 两套透明版的区分只能靠 key。
     """
     text = query.strip()
     if not text:
@@ -343,21 +428,34 @@ def resolve(query: str) -> str | None:
     upper = text.upper()
     if upper in THEMES:
         return upper
+    # 去掉连字符再来一次：`at` / `p3t` / `a_t` 都落到 `A-T` / `P3-T` 上。
+    squashed = upper.replace("-", "").replace("_", "")
+    for key in ORDER:
+        if key.replace("-", "").replace("_", "") == squashed:
+            return key
     if text.isdigit():
         index = int(text) - 1
         if 0 <= index < len(ORDER):
             return ORDER[index]
     needle = text.lower()
-    hits = [key for key in ORDER
-            if needle in THEMES[key].palette.name.lower()
-            or needle in THEMES[key].palette.name_en.lower()]
-    if len(hits) == 1:
-        return hits[0]
+    hits = [(key, name) for key in ORDER
+            for name in (THEMES[key].palette.name,
+                         THEMES[key].palette.name_en)
+            if name and needle in name.lower()]
+    if hits:
+        # 排序键（越靠前越"精确"）：
+        #   1. 名字**以它开头**的赢 —— `琥珀` 开头的是 `石墨琥珀`，`石墨琥珀 · 透明`
+        #      不是（它是"含"）；
+        #   2. 短的那条赢 —— `Pink Violet` 比 `Pink Violet · Clear` 精确；
+        #   3. 还平就按展示顺序 —— 唯一的作用是让"命中一样长"时结果稳定。
+        return min(hits, key=lambda hit: (not hit[1].lower().startswith(needle),
+                                          len(hit[1]),
+                                          ORDER.index(hit[0])))[0]
     return None
 
 
 def listing(lang: str | None = None) -> str:
-    """`/help` 和 `/theme` 用的那句清单：`1 P1 暖橄榄 · 2 P2 海蓝橙 · …`。
+    """`/help` 和 `/theme` 用的那句清单：`1 P3 粉紫 · 2 P5 夜紫柔彩 · …`。
 
     名字按当前语言出（`lang=None` 就是进程定的那套）；**序号和 key 不跟着变** ——
     它们是"打哪一串字能选中它"，跟语言无关。

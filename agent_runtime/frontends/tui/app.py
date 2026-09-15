@@ -32,10 +32,16 @@
 
 ### 4. 配色是运行时可换的（`/theme`）
 
-14 套主题在 `theme.py` 里是纯数据，`_register_themes()` 把它们注册成 Textual 主题
+12 套主题在 `theme.py` 里是纯数据，`_register_themes()` 把它们注册成 Textual 主题
 （每个 token 变成一个 `$td-*` CSS 变量），而**自定义颜色的那些零件**（会话流、
 左栏、状态栏）在换主题时要重画自己 —— `_repaint_all()` 就是那一步。CSS 变量那部分
 由 Textual 自己重算，所以只有"用 Rich 手绘颜色的地方"需要这一趟。
+
+其中 `A-T` / `P3-T` 两套是**透明版**：它们的 `td-bg` 是 `ansi_default`（终端自己的
+底色），所以对话区那一大片不涂色。别的角色照旧是实色 —— 见 `theme.py` 的模块
+docstring。这里还多一件事：Textual 默认那个 `ANSIToTruecolor` 过滤器会把
+`ansi_default` 换成它猜的一个真彩色，所以得换成 `_KeepDefaultBackground`（见那个类
+的 docstring —— 那是"透明版看起来还是一块实心"的全部原因）。
 """
 
 import queue
@@ -43,8 +49,13 @@ import sys
 import time
 from typing import Any
 
+from rich.color import Color as RichColor
+from rich.color import ColorType
+from rich.segment import Segment
+from rich.style import Style as RichStyle
 from textual.app import App
 from textual.containers import Horizontal, Vertical
+from textual.filter import ANSIToTruecolor
 from textual.theme import Theme as TextualTheme
 from textual.widgets import Static
 
@@ -106,6 +117,34 @@ def _version() -> str:
     而它现在只负责取一次。
     """
     return version.current()
+
+
+class _KeepDefaultBackground(ANSIToTruecolor):
+    """和 Textual 自带的那个过滤器只差一处：**`default` 底色不许被换成真彩色**。
+
+    ## 为什么非改不可（透明版能不能成立就系在这儿）
+
+    透明版的 `$td-bg` 是 `ansi_default` —— "别涂底，用终端自己的". 这个意图一路走到
+    驱动那儿都是对的（`Screen.render()` 给的是 `Blank`，Rich 那边是 `Color('default')`），
+    但 Textual 8 默认挂着一个 `ANSIToTruecolor` 过滤器，它把**每一个没有 triplet 的颜色**
+    都换成真彩色（`filter.py`：`if bgcolor.triplet is None: bgcolor = RichColor.from_triplet(
+    bgcolor.get_truecolor(terminal_theme, foreground=False))`）。而 `default` 的
+    "真彩色"就是它自己那套终端主题里猜的底板色 —— MONOKAI 主题猜 `#0C0C0C`。
+
+    于是透明版最后画出来的是 `48;5;232`（一个具体的黑），**不是"不涂"**：实测就是这个
+    症状 —— 界面上看仍然是实心的一块，只是从套色变成了近黑。
+
+    ## 为什么只放过 `bgcolor`
+
+    前景色的 `default`（"用终端自己的字色"）**照旧换成真彩色**：那是 Textual 自己
+    控件的常规行为，动了它会让别的零件变色。只放底色这一格，是因为"底色"正是透明版
+    唯一要表达的东西 —— 放过它，屏幕底那一层就真的交给终端了。
+    """
+
+    def truecolor_style(self, style: RichStyle, background: RichColor) -> RichStyle:
+        if style.bgcolor is not None and style.bgcolor.type == ColorType.DEFAULT:
+            return style
+        return super().truecolor_style(style, background)
 
 
 class TuiApp(App[None]):
@@ -535,7 +574,7 @@ class TuiApp(App[None]):
         return theme_mod.get(self.theme)
 
     def _register_themes(self) -> None:
-        """14 套设计稿配色 → 14 个 Textual 主题。
+        """11 套设计稿配色 → 11 个 Textual 主题。
 
         每个 token 同时出现在两个地方，而且**都是必要的**：
 
@@ -545,6 +584,9 @@ class TuiApp(App[None]):
 
         漏掉后者会得到一个"自己的行是对的、按钮还是默认蓝"的界面 —— 而那种不一致
         在暗色主题上尤其脏。
+
+        `background` 那一格是**透明版的全部机关**：透明版的 `bg` 是 `ansi_default`，
+        它一路走到 `Screen.render()`，于是屏幕底那一层交给终端自己（见 `theme.py`）。
         """
         for key in theme_mod.ORDER:
             palette = theme_mod.THEMES[key]
@@ -603,7 +645,22 @@ class TuiApp(App[None]):
         # 键位提示**不在这里**：它住在欢迎屏底下那个「提示」框里（`widgets.HintPanel`）
         # —— 说过第一句话之后这一屏就收了，而 `/help` 仍然列着完整的键位表。
 
+    def _keep_default_background(self, theme: Any) -> None:
+        """把列表里那个 ANSI→真彩色过滤器换成**不碰 `default` 底色**的版本。
+
+        装的时候用户还没机会换主题（`App.__init__` 装的是基类那一个），所以 `on_mount`
+        要主动换一次；之后每次换主题由 `_refresh_truecolor_filter` 接住。
+        """
+        for index, filter in enumerate(getattr(self, "_filters", ())):
+            if isinstance(filter, ANSIToTruecolor):
+                self._filters[index] = _KeepDefaultBackground(
+                    theme, enabled=filter.enabled)
+                return
+
     def on_mount(self) -> None:
+        # **透明版的底色不能被 Textual 的 ANSI→真彩色过滤器吃掉**（见
+        # `_KeepDefaultBackground`）。过滤器是 `App.__init__` 里装好的，这里换掉。
+        self._keep_default_background(self.ansi_theme)
         # 键位说明按**当前语言**换一遍（类体里那三格是文案键，见 `BINDINGS` 上面那段）。
         widgets.localize_bindings(self, widgets.translated_bindings(self.BINDINGS))
         # `/` 打开的命令面板和输入行是同一个东西的两面：面板默认藏着。
@@ -616,6 +673,22 @@ class TuiApp(App[None]):
         self.set_interval(0.05, self._pump)
         self.query_one("#input", widgets.PromptArea).focus()
         self._refresh_chrome()
+
+    def _refresh_truecolor_filter(self, theme: Any) -> None:
+        """Textual 换终端主题时重装那个过滤器 —— **但装的得是我们的那一个**。
+
+        基类这个方法（`App._refresh_truecolor_filter`）靠 `isinstance(filter,
+        ANSIToTruecolor)` 找到那一格，然后**直接塞一个新的 `ANSIToTruecolor` 进去** ——
+        我们的子类正好被它认出来，于是每次换主题（`app.theme = ...` 会走到这里）都被
+        降级回基类：透明版的底又变回一个具体的黑。所以这里整段重写：找法照旧，
+        换上去的是 `_KeepDefaultBackground`。
+        """
+        ansi_color = self.native_ansi_color
+        for index, filter in enumerate(self._filters):
+            if isinstance(filter, ANSIToTruecolor):
+                self._filters[index] = _KeepDefaultBackground(
+                    theme, enabled=not ansi_color)
+                return
 
     # -- ClientHooks（**在读线程里被调用，只许入队**） -------------------------
 
@@ -1585,8 +1658,8 @@ class TuiApp(App[None]):
         清单"，它是把那条抄写的路去掉。
 
         `/theme` 那一条**看错了一眼就看得出来**，所以本来可以先不动它；做它的理由是另一半：
-        清单上那些名字（`石墨琥珀`、`P1 暖橄榄`）此前也只是为了**照着打一遍**，而 14 套的
-        序号和 key 都很容易记错（`/theme 10` 是 `A`，不是 `P10`）。两条的差别落在"选完关不关
+        清单上那些名字（`石墨琥珀`、`P3 粉紫`）此前也只是为了**照着打一遍**，而 11 套的
+        序号和 key 都很容易记错（`/theme 6` 是 `A`，不是 `P6`）。两条的差别落在"选完关不关
         面板"上（见下面 `runtime_backed`）。
 
         ## 带参数时不自作聪明
@@ -1915,8 +1988,8 @@ class TuiApp(App[None]):
 
         轮换听起来方便，但它把"我现在是哪一套"变成了一个必须靠记忆的状态 ——
         而列一次清单的成本是零。选择面板比清单更省事：清单上那些名字（`石墨琥珀`、
-        `P1 暖橄榄`）本来也只是为了**照着打一遍**，而 14 套的序号和 key 都很容易记错
-        （`/theme 10` 是 `A`，不是 `P10`）。
+        `P3 粉紫`）本来也只是为了**照着打一遍**，而 11 套的序号和 key 都很容易记错
+        （`/theme 6` 是 `A`，不是 `P6`）。
 
         ## 它和 `/model` 那条面板有一处**刻意的不一样**
 
@@ -1941,10 +2014,10 @@ class TuiApp(App[None]):
         )])
 
     def _theme_options(self) -> list[view_state.Option]:
-        """14 套 → 选择面板的候选。顺序就是展示顺序（`theme_mod.ORDER`）。
+        """11 套 → 选择面板的候选。顺序就是展示顺序（`theme_mod.ORDER`）。
 
-        序号那一列也在，因为它就是 `/theme <序号>` 收的那个数（`/theme 10` → `A`）
-        —— 面板上写着 `10 A 石墨琥珀`，命令写法那条路就不用另外解释了。
+        序号那一列也在，因为它就是 `/theme <序号>` 收的那个数（`/theme 6` → `A`）
+        —— 面板上写着 ` 6 A 石墨琥珀`，命令写法那条路就不用另外解释了。
         `source`（`色卡⑦` / `F7-D · Tokyo Night 血统`）放进 note：那一句话是"这套
         从哪来的"，它属于**选中那一条**，挂在每一行里会把名字那一列挤歪。
         """
