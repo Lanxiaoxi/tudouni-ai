@@ -102,6 +102,49 @@ def make_session_opener(server: ProtocolServer, booted) -> OpenSession:
     return open_session
 
 
+# --- 将来要报"启动到哪一步了"的话，接口在这里 ---------------------------------
+#
+# **今天不接，而且是有意的。** 界面那 1.9 秒的空窗里，真正"在装配"的阶段只占
+# 73 毫秒 —— 实测（本机，走 `tests/fakes.model_registry` 那条离线路由）：
+#
+#     boot()                3.2 ms     （扫技能目录 + 建 store/logs）
+#     resolve_session()     0.6 ms
+#     open_runtime()       68.8 ms     （读配置 → 模型 client → 工具注册表 →
+#                                        权限 → 记忆 → Agent）
+#     ui_state(catalog)     0.2 ms
+#     其余 ≈ 1.8 s                     （Python 冷启动 + import：`openai` 一项
+#                                        861 ms，其中 `openai.types` 517 ms）
+#
+# 也就是说阶段报出来是**几毫秒一闪**：屏幕上什么都不会变，而每多一条协议消息就
+# 多一份要维护的两端契约。所以启动期那句"正在启动 runtime…"由父进程自己说就够了
+# （见 `view_state.ViewState.booting`）。
+#
+# ## 真正需要它的是 MCP 的惰性加载
+#
+# `composition.McpHost.load()` 要起一个子进程（远程是建连接、stdio 是 `npx` 冷启动），
+# 那是这个代码库里**唯一已知会花好几秒**的操作（`mcp.host.loaded` 那条注释里写着）。
+# 它今天由 `/mcp load` 触发，将来也可能在启动时预挂 —— 两种情况下"正在连 kb…"
+# 都是有内容可报的，而它也是这套通道唯一值得的客户。
+#
+# ## 接线点与协议改动（真要做时按这个顺序）
+#
+#   1. 这里给 `boot()` / `open_runtime()` 各加一个 `on_progress(stage: str)` 回调。
+#      两处都是纯同步调用，所以在**每个阶段之前**报（报"要做什么"，而不是"做完了"）
+#      —— MCP 那种"报完还要等 3 秒"的场景才不会看起来像卡在上一句上；
+#   2. `boot()` 现在只扫一次目录（`skills/loader.py` 的 `SkillCatalog.reload()`），
+#      要细分就把回调透传进那里 —— 这也是唯一一处"扫目录"的代价所在。
+#   3. 协议**复用 `ui` 那条消息**（`kind="boot"` + `stage`），不新增消息类型 ——
+#      这样 `tests/test_protocol_schema.py` 里"真实消息逐字段比对"那三条不用动
+#      （`ui` 不在那组参数里）。要同步改三处：`protocol/messages.py` 的 `UI_BOOT`
+#      常量、`protocol/schema/outbound.schema.json` 里 `ui.fields.kind.enum`、
+#      `doc/protocol.md` 的 3.x 那节；
+#   4. **文案不进协议**：`stage` 只发机器可读的标记（`config` / `boot` / `tools` /
+#      `mcp:<名字>`），前端自己映射 i18n —— "前端只讲协议"那条设计原则（决策 18）
+#      的意思就是文本不该从 runtime 流过去；
+#   5. 父进程那一侧：`_on_ui` 里多一个分支把它存进 `ViewState`，启动态那行改用它
+#      （`_on_init` 一收就清 —— 之后来的 `boot` 阶段一律没有意义）。
+
+
 def main(session_id: str | None = None, *, autopilot: bool = False,
          debug: bool = False, stream: bool = True,
          lang: str | None = None) -> int:

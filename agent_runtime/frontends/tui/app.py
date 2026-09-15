@@ -83,6 +83,17 @@ _PALETTE_MAX_ROWS = len(view_state.COMMANDS) + 3 + 1
 # 平时（没有后台任务）这条消息**一次都不会发**，所以它不占任何常态成本。
 _STATE_REFRESH_SECONDS = 2.0
 
+# **等 `init` 超过这么久就改口。** 状态栏在启动态下本来写的是"正在启动 runtime…"，
+# 而它是一句**没有时限的承诺**：子进程真卡住（或者还没到 `init` 就死了）时，那句话说
+# 到天荒地老也还是它。超过这个阈值就换成"还没回应 + 去看 stderr"——**转圈照转**，
+# 因为"没回应"不等于"死了"。
+#
+# 为什么是 10 秒：正常空窗实测约 1.9 秒（见 `view_state.ViewState.booting`），
+# 所以 10 秒 = 正常值的 5 倍 —— 冷机器、杀毒软件扫 `_internal/`、网络盘上的家目录
+# 都有余量；而它又短到"用户已经准备按 Ctrl+C"之前就会改口。**这个数不该再往上调**：
+# 它的意义是"比这更久就是不对劲了"，不是"最多等这么久"。
+_BOOT_SLOW_SECONDS = 10.0
+
 
 def _version() -> str:
     """欢迎屏上那个版本号。**一个事实，实现搬到了 `agent_runtime/version.py`。**
@@ -466,6 +477,11 @@ class TuiApp(App[None]):
         # 安静模式（`--quiet` 起的那一次，运行中还能用 `/quiet` 切）。**它是显示偏好，
         # 不进协议** —— 和 `autopilot` 那一格的分别写在 `ViewState.quiet` 里。
         self.state = view_state.ViewState(quiet=quiet)
+        # 启动态的起点。**`state.booting` 由这里置起**（见 `_refresh_chrome` 里那一问
+        # 和 `_on_init` 里那一收）：`on_mount` 一起子进程就该说"还在等 init"，
+        # 而收到 `init` 之前状态栏按 `agent.phase` 推算出来的"空闲"是假话。
+        self.state.booting = True
+        self._boot_started = time.monotonic()
         # 安静模式下**还在长的那一行思考**属于哪个 run（空 = 现在没有）。
         #
         # 为什么要在 App 上记一个：那一行每 50ms 要换一帧转圈，而"现在有没有一行
@@ -771,8 +787,14 @@ class TuiApp(App[None]):
             # 第三个元素是"现在轮到人了"：安静模式那个转圈要靠它停下（见
             # `_waiting_for_human`）。条形控件解包成 `now, width` 的老形状也照样成立
             # —— 多出来的这一个只有 StatusBar 认。
-            status.show(state, palette,
-                        (time.monotonic(), width, self._waiting_for_human()))
+            #
+            # 第四个是"启动等太久了没有"：**墙上时钟只在这一层读**（`ViewState`
+            # 是纯的，见 `Turn.started_at` 同一条规矩），它只换文案、不停转圈。
+            # 同一个 `now` 喂给两处（转圈那一帧和这个判据）—— 分两次取时间会让
+            # 同一帧上有两个"现在"。
+            now = time.monotonic()
+            slow = self.state.booting and now - self._boot_started >= _BOOT_SLOW_SECONDS
+            status.show(state, palette, (now, width, self._waiting_for_human(), slow))
 
     def _waiting_for_human(self) -> bool:
         """现在是不是**轮到人**了（审批 / 提问面板压在最上面）。
@@ -980,6 +1002,14 @@ class TuiApp(App[None]):
 
     def _on_init(self, message: dict[str, Any]) -> None:
         state = self.state
+        # **第一条 `init` 就是"启动完了"的证据**（所以启动态在这一行收掉，而且排在
+        # 所有 `return` 之前：下面几条早退都不该让状态栏继续说"正在启动"）。
+        #
+        # 判据不是"子进程起来了"而是"它回过话了"：真正能用的东西（会话 id、模型、
+        # 工具清单、权限范围）全在这一条里，而在这之前界面上一个都拿不出来。
+        # **换会话时不会再回到启动态**：那时候子进程活着、只是重发一组开场消息，
+        # 屏幕上本来就有内容，退回一屏"正在启动"只会把已有的会话遮掉。
+        state.booting = False
         new_session = message.get("session_id", "")
         # **换会话 = 换一屏。** 判定放在这里、而不是在"用户敲了 `/new`"那一刻，是
         # 有意的：换会话可能失败（权限文件坏了、MCP 起不来），而失败时 runtime 那

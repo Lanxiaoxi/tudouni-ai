@@ -135,6 +135,11 @@ CATALOG: dict[str, str] = {
     "status.settled.cancelled": "已中断",
     "status.idle": "空闲",
     "status.idle.new": "空闲 · 说出一句话后才开始",
+    # 启动态那两句话（`ViewState.booting`）：**短到不被状态栏裁掉**——那一条是
+    # `nowrap + clip`，长了就只剩半句，而半句真话比不说更坏。第二句点明"去看哪里"，
+    # 因为那时能给出原因的地方只有终端的 stderr。
+    "status.boot.starting": "正在启动 runtime…",
+    "status.boot.slow": "runtime 还没回应（原因见终端 stderr）",
     "status.step": "第 {step} / {total} 步",
     "status.context.none": "上下文  —",
     "status.context.plain": "上下文 {used} / {total}",

@@ -201,6 +201,7 @@ async def main() -> int:
 
     from textual.widgets import Button
 
+    from agent_runtime.frontends.tui import widgets as tui_widgets
     from agent_runtime.frontends.tui.app import TuiApp
 
     # `python scripts/verify_tui.py --quiet` 跑**安静模式**那一遍。
@@ -214,8 +215,23 @@ async def main() -> int:
     ok = True
     try:
         async with app.run_test(size=(100, 30)) as pilot:
+            # --- 0. 启动态 ---
+            #
+            # 这一条**必须抢在握手之前**：`init` 一到 `booting` 就没了，而它正是
+            # "空窗那一屏不许说空闲"那个改动的验收点。界面刚挂载时子进程才起来，
+            # 所以这里**不推泵**（`_drive` 会一路推到手为止）—— 只让出一轮事件循环
+            # 让 `on_mount` 跑完。
+            await pilot.pause()
+            boot_line = str(app.query_one("#status", tui_widgets.StatusBar)
+                            .render_parts(app.state, app.palette, (1234.5, 100))[0])
+            print("=== 启动 ===")
+            print(f"  状态栏 {boot_line!r}  booting={app.state.booting}")
+            assert app.state.booting, "界面挂载之后、init 之前该是启动态"
+            assert "正在启动" in boot_line, boot_line
+
             # --- 1. 握手 ---
             await _drive(app, pilot, lambda: bool(app.state.session_id))
+            assert not app.state.booting, "init 到了就该收掉启动态"
             print("=== 握手 ===")
             print(f"  会话 {app.state.session_id}  模型 {app.state.model}  "
                   f"最多 {app.state.max_steps} 步  工具 {len(app.state.tool_risks)} 个")

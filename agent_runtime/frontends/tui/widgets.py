@@ -293,17 +293,23 @@ class StatusBar(TwoPart):
         #
         # **安静模式下它会真的转起来**（`spinner_frame`）：那时候工具行和思考行都只
         # 有一行，这一格是屏幕上唯一在动的东西，而"它在想"和"它卡死了"必须分得开。
-        # 非安静模式一个字都不改（`spin` 是空串，记号照旧是那个静态的 `●`）。
+        # 非安静模式的回合里一个字都不改（`spin` 是空串，记号照旧是那个静态的 `●`）
+        # —— **唯一的例外是启动态**（`state.booting`），见下面 `spinner_on`。
         #
         # `payload` 的第三个元素是"现在轮到人了"（审批/提问面板压在最上面）：
         # 那时候**停下**（`app._waiting_for_human`）—— agent 已经停在那儿等你回话了。
+        # 第四个元素是"启动态超时了没有"（`app._BOOT_SLOW_SECONDS`）：它只换文案，
+        # 转圈照转（见 `status_left` 的 docstring）。
         now, width, *rest = payload if payload else (None, None)
         waiting = bool(rest and rest[0])
+        boot_slow = bool(len(rest) > 1 and rest[1])
         narrow = width is not None and width < view_state.NARROW_COLUMNS
-        spin = view_state.spinner_frame(now) \
-            if (state.quiet and now is not None and not waiting) else ""
+        # **启动态也要转**（`state.booting`），不只是安静模式下的回合：那 1.9 秒里
+        # 屏幕上如果没有东西在动，这块画布看起来就是卡死的 —— 而它其实正在忙。
+        spinner_on = (state.quiet or state.booting) and now is not None and not waiting
+        spin = view_state.spinner_frame(now) if spinner_on else ""
         left = Text()
-        mark, _, rest = state.status_left(spin).partition(" ")
+        mark, _, rest = state.status_left(spin, boot_slow).partition(" ")
         left.append(mark, style=_phase_color(palette, state.agent.phase))
         left.append(f" {rest}", style=palette.ink2)
 

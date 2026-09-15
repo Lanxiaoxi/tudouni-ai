@@ -566,6 +566,26 @@ class ViewState:
     # 判据不能是"收到过 delta 没有"—— 一次一个字都没吐的流式回合（比如模型直接
     # 调工具）没有 delta，而它并不需要任何提示。
     stream_enabled: bool = False
+    # **runtime 子进程还没回过 `init`**（`TuiApp` 在 `on_mount` 里置 True，收到第一条
+    # `init` 时置 False）。它和 `quiet` / `autopilot` 一样**不属于任何一个会话**，所以
+    # `reset_for_session()` 不清它 —— 换会话时子进程还活着，不该再回到启动态。
+    #
+    # ## 为什么需要它
+    #
+    # 空窗实测约 1.9 秒（几乎全是子进程 import `openai` 那棵树：`boot()` 3.2ms /
+    # `resolve_session()` 0.6ms / `open_runtime()` 68.8ms，其余都在 import 上 ——
+    # 那份量法见 `protocol/channels.py` 里那段"将来要报阶段时报什么"）。
+    # 而在这段时间里 `agent.phase` 是**初始的 IDLE**，
+    # 于是状态栏写的是 `○ 空闲 · 说出一句话后才开始` —— 那**不是"还没就绪"的委婉
+    # 说法，是一句假话**：会话、模型、工具清单、权限范围此刻一个字都还没到，用户
+    # 这时候提问也发不出去。
+    #
+    # ## 为什么默认 False
+    #
+    # 它是**前台会话期**才有的事实，而 `ViewState` 是纯视图、被大量单元测试直接构造
+    # （`ViewState(session_id=...)` 那种）。默认 True 会让那些"空闲"断言全红，而且
+    # 红得没道理 —— 默认值该表达的是"没有人在等启动"。
+    booting: bool = False
 
     def reset_for_session(self) -> None:
         """把**属于某一个会话**的东西全清掉，只留下界面自己的开关。
@@ -659,7 +679,7 @@ class ViewState:
 
     # -- 状态栏 ----------------------------------------------------------------
 
-    def status_left(self, spin: str = "") -> str:
+    def status_left(self, spin: str = "", boot_slow: bool = False) -> str:
         """状态栏左边：**agent 在干什么 + 走到第几步**。
 
         它是**投影**：`agent.activity` 直接来自最近一条事件，这里只是加上步数。
@@ -670,13 +690,25 @@ class ViewState:
         "正在做什么"），所以那几种情况由 phase 补一个说法 —— 否则状态栏会剩下一个
         光秃秃的记号（"✓ "），看起来像坏了。
 
-        `spin` 是安静模式那一帧转圈（`spinner_frame`，界面按自己的时钟算好传进来）。
-        **它只在回合真的在跑时替换掉那个记号**（`is_busy`）—— 空闲、已收尾时它一动
-        都不动。而"**轮到人按键了**"这一档不在这里判：协议里没有那个 phase
+        `spin` 是那一帧转圈（`spinner_frame`，界面按自己的时钟算好传进来）。
+        **回合那一路它只在真的在跑时替换掉那个记号**（`is_busy`）—— 空闲、已收尾时
+        它一动都不动。而"**轮到人按键了**"这一档不在这里判：协议里没有那个 phase
         （`protocol/state.py` 只认事件），屏幕上它的样子是审批面板压在最上面，
         所以那一条由 App 判（`TuiApp._waiting_for_human`，它干脆不传 `spin`）。
-        非安静模式一个字都不传，于是那一格和加这个功能之前完全一样。
+
+        ## 启动态（`self.booting`）是**第一优先**
+
+        它排在 `agent.phase` 之前：那一段里 phase 是初始的 IDLE，而"空闲"是假话
+        （见 `booting` 那一格）。`boot_slow` 由 App 按墙上时钟判（阈值也在那儿 ——
+        纯函数不取时间），它只换一句话：**转圈照转**，因为"没回应"不等于"死了"，
+        而屏幕上一动不动的样子恰恰是我们想避免的那个观感。
         """
+        if self.booting:
+            # 这一格**没有任何 agent 事实可投影**：说得出的只有"还没收到 init"。
+            key = "status.boot.slow" if boot_slow else "status.boot.starting"
+            # `.strip()` 而不是 `.rstrip()`：不传转圈时（纯函数那一层的调用方不传）
+            # 左边那个空格会留在开头，而它会被后面 `partition(" ")` 当成"空记号"。
+            return f"{spin} {i18n.t(key)}".strip()
         mark = {
             agent_state.IDLE: "○",
             agent_state.WORKING: "●",

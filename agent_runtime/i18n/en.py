@@ -132,6 +132,8 @@ CATALOG: dict[str, str] = {
     "status.settled.cancelled": "Interrupted",
     "status.idle": "Idle",
     "status.idle.new": "Idle · starts after your first message",
+    "status.boot.starting": "Starting the runtime…",
+    "status.boot.slow": "No response from the runtime yet (see terminal stderr)",
     "status.step": "step {step} / {total}",
     "status.context.none": "context  —",
     "status.context.plain": "context {used} / {total}",
