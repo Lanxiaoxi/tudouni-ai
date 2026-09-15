@@ -69,7 +69,7 @@ MODELS_EXAMPLE_NAME = userconfig.EXAMPLE_FILE_NAME
 # 太像，一个装名字、一个装值），而旧代码只会说"没有密钥"，用户手里明明有一把填进去的
 # 密钥，于是只能来问"为什么"。
 _PROVIDER_KEYS = frozenset({
-    "display_name", "base_url", "api_key", "models",
+    "display_name", "base_url", "api_key", "models", "verify",
 })
 # 模型那几个**可选**的说明性字段（`label` / `summary` / `note`）与 `vision` 仍然收下 ——
 # 它们是 `/model` 那份清单要显示的东西。模板里不出现它们（那才是给人抄的那份，越短越好），
@@ -149,6 +149,7 @@ class Provider:
     api_key: str
     models: tuple[ModelRef, ...] = ()
     display_name: str = ""
+    verify: bool = True  # 是否验证 SSL 证书，默认为 True
 
     @property
     def title(self) -> str:
@@ -396,6 +397,7 @@ def load(path: Path | None = None) -> Registry:
             api_key=key,
             models=models,
             display_name=_text(item, "display_name", where=where),
+            verify=_flag(item, "verify", where=where, default=True),
         ))
         if not key:
             problems.append(

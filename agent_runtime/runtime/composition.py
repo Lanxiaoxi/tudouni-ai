@@ -1678,6 +1678,7 @@ class ChosenModel(NamedTuple):
     id: str
     window: int | None
     default_effort: str
+    provider_verify: bool = True
 
 
 def _chosen(ref: catalog.ModelRef, provider: catalog.Provider) -> ChosenModel:
@@ -1688,6 +1689,7 @@ def _chosen(ref: catalog.ModelRef, provider: catalog.Provider) -> ChosenModel:
         id=ref.id,
         window=ref.window,
         default_effort=ref.default_effort,
+        provider_verify=provider.verify,
     )
 
 
@@ -1909,7 +1911,7 @@ def open_runtime(
         api_key=chosen.provider_key,
         base_url=chosen.provider_base_url,
         model=chosen.id,
-        http_client=httpx.Client(),
+        http_client=httpx.Client(verify=chosen.provider_verify),
         provider=chosen.provider,
         # 会话级的思考设置（`/thinking` `/effort` 写的那个）。
         thinking=session_model.thinking,
