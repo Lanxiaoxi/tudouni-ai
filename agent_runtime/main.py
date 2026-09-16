@@ -20,6 +20,11 @@ Agent Runtime 主入口。
 
 import sys
 
+# Windows 下强制 UTF-8 编码，避免打包后 --help 因中文编码报错
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # **这里不再动 `sys.path`。**
 #
 # 以前有三行 bootstrap：算出包目录、再算出它的上一层、把上一层插进 `sys.path`。那是
