@@ -16,6 +16,7 @@
 """
 
 import json
+import re
 
 import pytest
 
@@ -380,6 +381,39 @@ def test_every_step_of_the_ladder_actually_reduces_the_payload(workdir):
     assert sizes[0] == 8000
     assert sizes == sorted(sizes, reverse=True), f"降级没有让载荷变小：{sizes}"
     assert sizes[-1] < 500, f"缩到 preview 之后应当只剩几百字符：{sizes}"
+
+
+def test_a_capped_range_never_promises_lines_it_did_not_send(workdir):
+    """表头里的行号区间**必须和内容对得上**。
+
+    这条是实测撞出来的：`range` 档的表头写着"第 1-23 行"，而字符预算在第 23 行的
+    第 14 个字符处就把内容切断了 —— 模型从这两句话里看不出那是断的，于是它会以为
+    自己读到了完整的第 23 行。
+
+    所以字符那一侧**只切在行边界上**：放不下的那一行整个不给，表头里的 `end_line`
+    跟着退到最后一个真的给出去的行。代价是最后一行少掉，换来的是区间永远说得对。
+    """
+    store, manager, renderer = build(workdir)
+    lines = "".join(f"line{i:03d}: 这一行有二十来个字符，够长\n" for i in range(1, 121))
+    artifact = put(store, manager, lines, type="file",
+                   metadata={"path": "main.py", "lines": 120})
+    item = manager.item(artifact.artifact_id)
+    item.representation = Representation.RANGE
+    item.options = {"start_line": 1, "end_line": 120, "max_chars": 500}
+
+    rendered = renderer.render_item(item)
+
+    head, _, body = rendered.partition("\n")
+    promised = re.search(r"第 (\d+)-(\d+) 行", head)
+    assert promised, head
+    first, last = int(promised.group(1)), int(promised.group(2))
+    body_lines = body.split("\n")
+
+    # 内容行数 == 承诺的行数，而且每一行都是**完整**的一行
+    assert len(body_lines) == last - first + 1, (head, len(body_lines))
+    assert body_lines == [f"line{i:03d}: 这一行有二十来个字符，够长"
+                          for i in range(first, last + 1)]
+    assert body_lines[-1].endswith("够长"), "最后一行被切成了半行"
 
 
 def test_a_single_line_artifact_still_shrinks(workdir):

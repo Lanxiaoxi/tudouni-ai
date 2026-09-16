@@ -454,8 +454,16 @@ def _clip(
 ) -> Snippet:
     """把一段行拼成文本，并在需要时按字符预算截断。**两件事一起算，因为它们互相影响。**
 
-    切断之后 `end_line` 必须跟着改：模型是照着这个区间判断"我看到的是哪一部分"的，
-    报一个比实际内容长的区间等于让它以为自己读到了更多。
+    ## 切断只切在行边界上
+
+    字符预算用完之后**不补半行**：`end_line` 是模型据以判断"我看到的是哪一部分"
+    的依据，而带半行的区间会让它以为自己读到了整行。实测撞到过一处：表头写
+    "第 1-23 行"，内容到第 23 行的第 14 个字符就没了 —— 而模型从这两句话里看不出
+    那是断的。
+
+    代价是最后那一行整个不给（一行特别长时可能少掉不少内容），换来的是**区间永远
+    说得对**。真的一行都放不下（单行 10 万字符那种）时给这一行的头一段，并标一个
+    省略号 —— 那时"哪些行"本来就没意义，而"它被截了"必须看得出来。
 
     `max_chars = None` 表示不设字符上限（`full` 档和"用户明确要这一段"时就是它）。
     """
@@ -475,39 +483,22 @@ def _clip(
             used += head + len(line)
             end = first + offset
             continue
-        # 这一行放不下了。**分两种，必须分开**：
-        #
-        #   * 已经有内容了 ⇒ 到此为止（切断在行边界上，模型看到的是完整的行）；
-        #   * 一行都还没放下（**第一行本身就超预算** —— 压缩过的 JSON、一整份
-        #     拼出来的日志、任何没有换行的输出）⇒ 给这一行的头一段。
-        #
-        # 只处理前一种是最容易犯的错：那种正文的行数永远是 1，于是"降级"一遍
-        # 一遍地返回全文，而档位确实变了 —— 从日志和档位上都看不出问题。
-        if not kept:
-            kept.append(line[: max(1, max_chars - head)])
-            end = first + offset
         cut = True
+        if not kept:
+            # **第一行本身就超预算** —— 压缩过的 JSON、一整份拼出来的日志、任何
+            # 没有换行的输出。只处理"已经有内容"那一支的话，"降级"会一遍一遍地
+            # 返回全文，而档位确实变了 —— 从日志和档位上都看不出问题。
+            kept.append(line[: max(1, max_chars - head)] + "…")
+            end = first + offset
         break
 
-    text = "\n".join(kept)
-    if cut and max_chars is not None and len(text) > max_chars:
-        # 头一段本身也可能超出（多行的小碎片累加），再按总预算夹一次 —— 只在
-        # 真的超了的时候动，否则会把正常的分行原样截断。
-        text = _head_slice(text, max_chars)
     return Snippet(
-        text=text,
+        text="\n".join(kept),
         start_line=first,
         end_line=end,
         truncated=cut or first > 1 or last < total,
         total_lines=total,
     )
-
-
-def _head_slice(text: str, limit: int) -> str:
-    """取前 `limit` 个字符并留一个省略号。**只在这一层用**（`tools/text.py` 那个
-    `truncate` 是"取头尾两段"，服务于另一个目的：那里模型的下一步是"用更精确的
-    查询再来一次"，而这里是"省 token"）。"""
-    return text[:limit] + "…"
 
 
 def _split_lines(text: str) -> list[str]:
