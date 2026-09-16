@@ -104,8 +104,9 @@
       "kind": {
         "type": "string",
         "enum": ["run_started", "model_call", "tool_call", "tool_result",
-                 "permission", "tool_batch", "run_finished", "delta_reset"],
-        "doc": "**就是 audit/events.py 那几种**，不新造。`delta_reset` 是流式加进来的第八种：它记的是\"重试/重发之前，界面上那段增量作废了\"——**审计里没有 delta 的正文**（那会让日志变成第二个会话文件），所以这一条是\"屏幕上出现过的东西后来被丢了\"唯一的痕迹。"
+                 "permission", "tool_batch", "run_finished", "delta_reset",
+                 "context_degraded"],
+        "doc": "**就是 audit/events.py 那几种**，不新造。`delta_reset` 是流式加进来的第八种：它记的是\"重试/重发之前，界面上那段增量作废了\"——**审计里没有 delta 的正文**（那会让日志变成第二个会话文件），所以这一条是\"屏幕上出现过的东西后来被丢了\"唯一的痕迹。`context_degraded` 是 Context 预算加进来的第九种：它记的是\"这一步因为超预算把哪些 Artifact 降了档\"（`full→range→preview→metadata→removed`），字段是 items/estimated/limit/changes —— **正文不进审计**（它还在盘上，抄一遍就是第二个会话文件）。"
       },
       "session_id": {"type": "string"},
       "run_id": {"type": "string"},

@@ -12,6 +12,11 @@ from pydantic import ValidationError
 
 from agent_runtime.agents.retry import Attempt, call_with_retry
 from agent_runtime.audit import event
+from agent_runtime.context.processor import (
+    ToolExecution,
+    ToolResultProcessor,
+    default_processor,
+)
 from agent_runtime.models.base import ChatModel
 from agent_runtime.models.types import DeltaSink, ModelFatalError, TokenUsage
 from agent_runtime.security.asker import ApprovalAsker
@@ -24,6 +29,8 @@ from agent_runtime.state.reasoning import DEFAULT_EFFORT, DEFAULT_THINKING
 from agent_runtime.tools.tool import InvalidArgsError, Tool, ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
+    from agent_runtime.context.manager import ContextManager
+    from agent_runtime.context.renderer import ContextRenderer
     from agent_runtime.models.types import ModelResponse
 
 
@@ -85,6 +92,70 @@ _TOOL_LEVEL_ERRORS = (
     IsADirectoryError,
     json.JSONDecodeError,
 )
+
+
+# --- 一次请求的载荷 ---------------------------------------------------------
+
+# 哪些消息属于 **stable 区**（"尽量不变"的那一半），以及它们的优先级。
+#
+# 它有明确的判据，而不是"看着办"：
+#
+#   * **系统提示词**（第一条 system）—— 整段请求里唯一逐字节稳定的部分。它 pinned
+#     是必须的：预算再紧也不能把行为准则挤掉。
+#   * **本回合的用户任务**（第一条 user）—— 整个回合都在为它干活。它 pinned 的
+#     理由和系统提示词一样，而且更硬：模型看不到任务就没法做对任何事。
+#
+# 其余一律 dynamic。**为什么后续轮次里的用户消息不算 stable**：`run()` 每被调一次
+# 就追加一条 user，而一条**新**消息加在中间会让它后面的一切都变 —— 那是缓存的
+# 代价，不是我们能选的（它就是用户刚说的话）。
+STABLE_ZONE = "stable"
+DYNAMIC_ZONE = "dynamic"
+SYSTEM_ZONE = "system"
+
+
+def message_marks(messages: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """给一批消息算出它们的 zone / priority / pinned。
+
+    **按位置算，不按内容算**：`run()` 每回合都会 append 一条 user，而"哪一条才是
+    这个回合的任务"只有位置知道（第一次调用之前就在历史里的那条）。按内容算
+    （比如"最长的那条"）在同一个会话里聊上十轮之后必然会指错。
+    """
+    marks: dict[int, dict[str, Any]] = {}
+    first_system = _index_of_role(messages, "system")
+    if first_system is not None:
+        marks[first_system] = {"zone": SYSTEM_ZONE, "pinned": True, "priority": 100}
+    # 第一条 user —— 它在第一次 run() 里被 append，早于任何工具结果。
+    first_user = _index_of_role(messages, "user")
+    if first_user is not None:
+        marks[first_user] = {"zone": STABLE_ZONE, "pinned": True, "priority": 50}
+    return marks
+
+
+def _index_of_role(messages: list[dict[str, Any]], role: str) -> int | None:
+    for index, message in enumerate(messages):
+        if message.get("role") == role:
+            return index
+    return None
+
+
+def _arguments_of(call: dict[str, Any]) -> dict[str, Any]:
+    """模型给的参数（JSON 字符串）解析成 dict。**解析不了就返回空 dict。**
+
+    `_prepare` 走的是同一次解析，失败时会被记成"工具执行失败"。这里再解析一次是
+    为了给 Artifact 的 metadata 带上一份参数 —— 而**这里不许抛**：一条参数坏掉的
+    调用只是没有 metadata 可记，它不该让"把结果写进历史"这件事也失败（那会让
+    会话停在一个带 `tool_calls` 却没有结果的半截状态上，API 直接 400）。
+    """
+    raw = call.get("arguments")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
 def _is_fatal(exc: BaseException) -> bool:
@@ -335,6 +406,8 @@ class Agent:
         autopilot: bool = False,
         should_stop: "Callable[[], bool] | None" = None,
         session_model: SessionModel | None = None,
+        context: "ContextManager | None" = None,
+        processor: "ToolResultProcessor | None" = None,
     ):
         # 前三个是【能力】：每个应用构造一次，长期复用、可以跨会话共享。
         self.model = model
@@ -414,6 +487,21 @@ class Agent:
         # 为 None 表示"这个 Agent 不关心会话级模型选择"（测试、一次性任务）。代价是
         # 那种会话里换模型不会在历史里留痕 —— 而那正是 None 的含义，不是漏了什么。
         self.session_model = session_model
+
+        # 第九个注入点：**Context 系统**。
+        #
+        # 它为 None 时行为逐字节回到重构之前：工具结果原样进 messages，载荷就是
+        # messages 加尾部那条提醒。这不是兼容层，而是这个类**唯一说得出道理的
+        # 默认值** —— Agent 不该自己造一个 ArtifactStore（它不知道工作区在哪、
+        # 也不知道会话 id），而"没有 Context"这件事本身是成立的（测试、一次性
+        # 任务、`--history` 那种根本不发请求的路径都用得上）。
+        #
+        # 有它时，工具结果的正文进 ArtifactStore，messages 里只留一句引用，而发给
+        # 模型的载荷由 ContextRenderer 按档位现渲染（见 `_payload`）。
+        self.context = context
+        # 工具执行 → Artifact 的那一层。**跟 context 一起注入**：没有 context 时
+        # 它没有落点（Artifact 收进哪儿去？），所以那时它一定不被用到。
+        self.processor = processor or default_processor()
 
     @property
     def model_name(self) -> str:
@@ -564,6 +652,14 @@ class Agent:
         """
         if self.on_checkpoint is None:
             return
+        # 落盘之前把 Context 状态挂上。**"挂上"而不是"每次深拷一份"**：两者指向
+        # 同一个对象，而 store 只在 version 变了之后才写 ctx 记录（见 state/store.py），
+        # 所以正常路径上这一次赋值是零成本的。
+        #
+        # 为什么要在这里再赋一次（run() 开头已经赋过）：工具结果刚好在这个时刻
+        # 进了 Context（`_tool_message` 里那个 `add`），而那正是落盘点要记住的东西。
+        if self.context is not None:
+            session.context = self.context.state
         try:
             self.on_checkpoint(session)
         except Exception as exc:
@@ -819,6 +915,126 @@ class Agent:
         parts.append(self._budget_reminder(max_steps, step)["content"])
         return {"role": "user", "content": "\n\n".join(parts)}
 
+    # --- Context：把历史渲染成这次请求的载荷 --------------------------------
+
+    def _renderer(self, session: Session) -> "ContextRenderer | None":
+        """造一个把 `session.messages` 渲染成载荷的渲染器。**没有 Context 就是 None。**
+
+        造一个新的而不是缓存一个：渲染器只有两个字段（store / manager），无状态，
+        而缓存它就得处理"会话被换掉了"这件事 —— 那是上一版 `Session` 从 Agent
+        里搬出去时踩过的同一个坑。每步造一次的代价是两次属性赋值。
+        """
+        if self.context is None:
+            return None
+        from agent_runtime.context.renderer import ContextRenderer
+
+        return ContextRenderer(self.context.store, self.context)
+
+    def _note_text(self, session: Session, max_steps: int, step: int) -> str:
+        """载荷末尾那条临时提醒的正文。**逐轮的，所以不进历史**（见 `_budget_reminder`）。"""
+        return self._status_note(session, max_steps, step)["content"]
+
+    def _calibrate(self, session: Session, usage: TokenUsage | None) -> None:
+        """把估算比例对着实测值修一下。**没有 Context 或没有用量就什么都不做。**
+
+        为什么只修比例、不把实测值当成"当前 Context 有多大"：实测值说的是**上一次
+        请求**，而两次请求之间 Context 变了（这一步的工具结果刚进来）。拿它当当前
+        值会在工具结果很大的时候严重低估 —— 而低估是危险的那一侧。
+        """
+        if self.context is None or usage is None or not usage.prompt_tokens:
+            return
+        self.context.calibrate(usage.prompt_tokens)
+
+    def _payload(
+        self, session: Session, max_steps: int, step: int
+    ) -> list[dict[str, Any]]:
+        """这次请求真正发出去的 messages。
+
+        **两条路，形状一样**：
+
+          * 有 Context ⇒ 历史按档位渲染（tool 消息的内容从 ArtifactStore 现取），
+            临时提醒由渲染器追加在末尾；
+          * 没有 Context ⇒ 历史原样，临时提醒由这里追加。
+
+        两条路的**顺序和形状逐字节一致**，区别只在 tool 消息的正文从哪来。这一点
+        是刻意的：Context 是"内容的来源"的替换，不是载荷形状的替换（见
+        `context/renderer.py` 的模块 docstring）。
+
+        临时提醒**不进 `session.messages`**，所以它每一轮都要重新拼 —— 而它也有
+        可能是唯一让这次请求超预算的那一条，所以它进 Context 的账本（见下面的
+        `set_notes`）。
+        """
+        note = self._note_text(session, max_steps, step)
+        renderer = self._renderer(session)
+        if renderer is None:
+            return [*session.messages, {"role": "user", "content": note}]
+
+        # 预算：先按当前档位算出这次要花多少，超了就降级（只降不升，见 budget.py）。
+        # **每步都调**，但只有真的超了才会动 —— 动过之后版本号变了，那条
+        # `context_degraded` 事件里会记下来。
+        self.context.set_notes([note])
+        degraded = self.context.fit(renderer.render_item)
+        if degraded:
+            self._emit(
+                "context_degraded", session, "", step,
+                items=len(degraded),
+                estimated=self.context.last_estimate,
+                limit=self.context.budget.effective_limit,
+                changes=[f"{d.artifact_id}:{d.before.value}->"
+                         f"{d.after.value if d.after else 'removed'}"
+                         for d in degraded][:20],
+            )
+        session.context = self.context.state
+        return renderer.build(session.messages,
+                              tail={"role": "user", "content": note})
+
+    def mark_context_messages(self, session: Session) -> None:
+        """把"哪几条消息属于 stable 区"标进 Context。**每个回合开头调一次。**
+
+        为什么不在 `add()` 的时候标：一条消息进历史的那一刻还不知道它将来是不是
+        "这个回合的任务"（第一条 user 在第一次 `run()` 里才出现，而那时
+        `session.messages` 里已经有 system 了）。位置的判据只有整份历史在手时才算
+        得出来，所以它在回合开头统一算一次（`message_marks`）。
+
+        **它只对有 Artifact 的消息生效**（tool 消息），因为 stable/system 那两条
+        判据（系统提示词、第一条 user）**各自都不是 Artifact**：
+
+          * 系统提示词就是那条 `role="system"` 消息，渲染时原样通过，没有档位可言；
+          * 第一条 user 也只是历史里的一条消息 —— 它会被挤掉吗？**不会**：预算那一层
+            只看 Context 里的条目，而历史里的普通消息根本不参与降级。
+
+        所以「本回合的任务不许被挤掉」这条保证在这里是**天然成立**的，不需要一条
+        ContextItem 去表达它。真正需要 pinned 的是**工具结果里那些来自任务本身的
+        Artifact**（比如一开始 `read_file` 读进来的项目说明）—— 它们才是会被降级的
+        东西，而 `mark_context_messages` 会把它们标成 stable+pinned。
+
+        **它不覆盖已经进过 Context 的条目**：`add` 是幂等的、但会把档位重置成
+        full —— 那正是"只降不升"要防的抖动。所以已经在里面的原样不动。
+        """
+        if self.context is None:
+            return
+        for index, mark in message_marks(session.messages).items():
+            message = session.messages[index]
+            artifact_id = self._artifact_of(message)
+            if artifact_id is None:
+                # 这一条不是 Artifact（系统提示词、第一条 user）—— 它**已经**不会被
+                # 挤掉（见 docstring），所以这里什么都不必做。
+                continue
+            if self.context.item(artifact_id) is None:
+                self.context.add(
+                    artifact_id,
+                    zone=mark["zone"],
+                    priority=mark["priority"],
+                    pinned=mark["pinned"],
+                    notify=False,
+                )
+
+    @staticmethod
+    def _artifact_of(message: dict[str, Any]) -> str | None:
+        from agent_runtime.context import ref as _ref
+
+        return _ref.artifact_id_of(message)
+
     def run(self, session: Session, user_input: str, max_steps: int = 80) -> str:
         # 回合的起点：run_finished 里的 duration_ms 从这里算起。放在最前面（而不是从
         # 第一次模型请求算起）是因为"这一轮花了多久"要含上追加消息、落盘这些开销 ——
@@ -849,6 +1065,21 @@ class Agent:
             self.session_model.record_use()
         # 用户这句话**排在换模型那句话之后**：见上面第一条。
         messages.append({"role": "user", "content": user_input})
+
+        # **Context 与历史对齐，然后才落盘。**
+        #
+        # 两件事，顺序不能换：
+        #
+        #   1. `mark_context_messages` 给系统提示词和**第一条** user 立 stable/pinned
+        #      标记（见 `message_marks`：判据是位置，而位置整份历史在手时才算得出来）；
+        #   2. `session.context` 指向 manager 的状态 —— 落盘那条路读的是 Session，
+        #      而它不该知道 ContextManager 存在（见 state/store.py）。
+        #
+        # 对齐放在 `_checkpoint` **之前**：那样第一次落盘就带着完整的 Context 状态，
+        # 中途被杀也能恢复成"当时真的发生过什么"。
+        if self.context is not None:
+            self.mark_context_messages(session)
+            session.context = self.context.state
         self._checkpoint(session)
 
         # 一次 run 的所有事件共用同一个 run_id。没有它，日志里就分不清哪几条事件
@@ -887,7 +1118,7 @@ class Agent:
             response = self._complete_with_retry(
                 session, run_id, step + 1,
                 # 载荷尾部那条临时提醒是按本次请求拼的，不写回 messages —— 见 _status_note
-                [*messages, self._status_note(session, max_steps, step)],
+                self._payload(session, max_steps, step),
                 tool_schemas,
                 run_started,
             )
@@ -896,6 +1127,11 @@ class Agent:
                 f"   ← 模型返回  content={'有' if response.content else '无'}  "
                 f"tool_calls={len(response.tool_calls)}"
             )
+            # **用 provider 实测的输入 token 数校准预算的估算。**
+            # 它放在这里（而不是收尾时）：`response.usage` 是唯一一次实测机会，
+            # 而"下一步要不要降级"就靠这次校准。没有它，估算器只能靠猜 —— 而
+            # 猜偏的方向决定后果（估高了白降级，估低了请求 400）。
+            self._calibrate(session, response.usage)
             # 思维链**不在这里打了** —— 它现在整段进审计（上面 `_attempt_reporter`），
             # 而同一份正文有两条出口正是 README 第 3 条设计原则反对的事。想读它就去
             # `--audit` 或者直接读 `.tudouni/logs/<id>.jsonl` 里那条 model_call。
@@ -940,11 +1176,7 @@ class Agent:
             outcomes = self._run_batch(response.tool_calls, session, run_id, step + 1)
 
             for call, outcome in zip(response.tool_calls, outcomes):
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": outcome.text,
-                })
+                messages.append(self._tool_message(call, outcome, session, step + 1))
 
             # ★ 唯一的常规落盘点：到这里 assistant 的每个 tool_call 都有了对应的
             #   tool 结果，messages 重新一致。崩溃恢复最多退回上一个 ★，不会拿到
@@ -965,6 +1197,47 @@ class Agent:
         raise StepLimitExceeded(max_steps, last_tools)
 
     # --- 一批工具调用 -------------------------------------------------------
+
+    def _tool_message(
+        self,
+        call: dict[str, Any],
+        outcome: _Outcome,
+        session: Session,
+        step: int,
+    ) -> dict[str, Any]:
+        """一条工具结果该长什么样 —— **这是它唯一的构造点**。
+
+        有 Context 时，正文收进 ArtifactStore，消息里只留一句引用（见
+        `context/ref.py`）；没有 Context 时，正文原样留在消息里（重构之前的行为）。
+
+        **`tool_call_id` 一条都不能少。** provider 要求每个 `tool_calls` 都有对应的
+        结果，少一条就 400 —— 而且那个错误看起来像"上下文太长"。所以无论走哪条
+        路，这个方法都必须返回一条完整的 tool 消息。
+        """
+        if self.context is None:
+            return {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": outcome.text,
+            }
+
+        from agent_runtime.context import ref as _ref
+
+        execution = ToolExecution(
+            tool=call["name"],
+            arguments=_arguments_of(call),
+            result=ToolResult(outcome.text, outcome.audit),
+            status=outcome.status,
+        )
+        artifact = self.processor.process(self.context.store, execution)[0]
+        self.context.add(artifact.artifact_id, notify=False)
+        return {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "content": _ref.build(artifact.artifact_id, artifact.chars, call["name"]),
+            # **显式的 id 字段**：程序不该靠解析一段人话找 Artifact（见 ref.py）。
+            "artifact_id": artifact.artifact_id,
+        }
 
     def _parallel_safe(self, call: dict) -> bool:
         """这条调用所在的工具声明了"能并行"吗。

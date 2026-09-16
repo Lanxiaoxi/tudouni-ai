@@ -35,6 +35,12 @@ import httpx
 from agent_runtime import paths
 from agent_runtime.agents import Agent
 from agent_runtime.audit import JsonlSink
+from agent_runtime.context import (
+    ArtifactStore,
+    ContextBudget,
+    ContextManager,
+    default_processor,
+)
 from agent_runtime.models import OpenAICompatibleModel
 from agent_runtime.runtime.channels import Channels, resolve_memory_factory
 from agent_runtime import i18n
@@ -827,6 +833,15 @@ class Runtime:
     memory: ApprovalMemory
     agent: Agent
 
+    # Context 系统。**它是"活的对象"**（和 `_mcp` 同一类）：预算降级会就地改
+    # `manager.state`，而界面要读它（`/context`、左栏那块）。类型写成具体类而不是
+    # `Any`：`/context` 那条命令要调它的 `stats()` / `items()`，而那两个方法是这个
+    # 功能的全部接口。
+    context: ContextManager | None = None
+    # 恢复会话时"正文已经取不到"的那些 artifact_id。**它不是错误、也不是空**
+    # （空表示一切正常，而不是"没检查"）—— 启动时的那几行 Notice 读它。
+    missing_artifacts: tuple[str, ...] = ()
+
     # `/model` 那张清单（`state/catalog.py` 的目录）。它排在装配出来的零件之后，
     # 因为有默认值：加一个模型是改配置文件的事，不该逼每一个构造点都跟着改一行。
     #
@@ -1171,6 +1186,12 @@ class Runtime:
             },
             "counters": dict(counts or {}),
             "usage": dict(usage or {}),
+            # Context 系统那几笔账。**放在这一屏里而不是只留给 `/context`**：
+            # `/status` 是"它现在什么状态"那一条命令，而"模型看得见多少东西、
+            # 有多少被预算压掉了"正是那个问题的一部分。
+            #
+            # `None` = 这个 Runtime 没有 Context（见 `ui_state` 里同一格的理由）。
+            "context": self.context.stats() if self.context is not None else None,
             "meta": {
                 "max_steps": self.max_steps,
                 "stream": bool(self.stream),
@@ -1595,6 +1616,16 @@ class Runtime:
             # 快照在每次工具返回、每次 `/status`、每次 `/mcp` 之后都会发一份。所以
             # "我按了开关，界面什么时候变"这件事不需要单独的通道。
             "mcp": self._mcp.rows() if self._mcp is not None else [],
+            # Context 系统那几笔账（`Artifacts (23) / Context (8)` 那种）。
+            #
+            # **它是最小的一份数据**（几个整数），而它回答的是这一栏里最贵的一个
+            # 问题："模型此刻到底看得见多少东西"。`open` / `compact` 的差别就是
+            # 预算压得紧不紧：两者相等说明一份都没被挤出去。
+            #
+            # `None` = 这个 Runtime 没有 Context（老版本的装配路径、以及测试里那些
+            # 手搓的替身）。界面按"没有这一块"渲染，而不是按零 —— 零会让它显示
+            # "Artifacts 0"，而那不是事实，是"不知道"。
+            "context": self.context.stats() if self.context is not None else None,
         }
         if with_catalog:
             state["skill_catalog"] = [
@@ -2033,6 +2064,17 @@ def open_runtime(
         # 取（见 protocol/channels.py），所以这里不需要额外接线。
         asker = channels.asker_factory(memory, mcp_trust_group)
 
+        # Context 系统：**在这一层造，因为它是装配的知识**。
+        #
+        # 三件事各有归属，没有一件是 Agent 该知道的：
+        #   * Artifact 落在哪（`<工作区>/.tudouni/artifacts/<会话>/`）—— 那是
+        #     `paths` 的知识；
+        #   * 预算的窗口来自**这个会话选的那个模型**，而"选了哪个模型"是上面刚
+        #     解析出来的；
+        #   * 老会话的兼容（把历史里 tool 消息的正文重新收成 Artifact）要读整份
+        #     messages，而它只有在会话定下来之后才有。
+        context_manager, missing_artifacts = _open_context(session, chosen)
+
         # 六个注入点，同一个原则：判定留在 Agent 内部，执行交给注入的实现。
         # （提问通道不在这个表里，但它在上面装配工具时就注入了 —— 它不属于 Agent：
         # Agent 只看见一次普通的工具调用，ask_user 会不会阻塞在人的输入上，
@@ -2064,6 +2106,10 @@ def open_runtime(
             # 第八个注入点：这个会话选的是哪个模型。Agent 用它做两件事 ——
             # 换过模型时在历史里留一句话、每轮记下"实际用了谁"。
             session_model=session_model,
+            # 第九个注入点：Context 系统。工具结果的正文此后进 ArtifactStore，
+            # 历史里只留一句引用，而载荷由 ContextRenderer 按档位现渲染。
+            context=context_manager,
+            processor=default_processor(),
         )
     except Exception:
         # 装配失败时**必须把这些收掉**再往外抛：http client 是我们建的，而 MCP 的
@@ -2092,6 +2138,8 @@ def open_runtime(
         policy=policy,
         memory=memory,
         agent=agent,
+        context=context_manager,
+        missing_artifacts=tuple(missing_artifacts),
         autopilot=autopilot,
         debug=debug,
         stream=stream,
@@ -2105,6 +2153,54 @@ def open_runtime(
         _jobs=job_board,
     )
     return runtime
+
+
+def _open_context(
+    session: Session, chosen: ChosenModel
+) -> tuple[ContextManager, list[str]]:
+    """这个会话的 Context 系统。返回 `(manager, 正文丢了的那些 artifact_id)`。
+
+    ## 三条路径，都要走通
+
+      1. **新会话**（`session.context is None` 且没有 tool 消息）—— 一片空。
+      2. **恢复的新格式会话**（会话文件里有 ctx 记录）—— 状态原样读回来，档位
+         保持不变（**这一点是缓存稳定的前提**：重开会话不该让已经降过档的 Artifact
+         又变回 full）。
+      3. **恢复的老格式会话**（文件是重构之前写的，tool 消息里存的是全文）——
+         `hydrate()` 把那些正文重新收成 Artifact 并建 `full` 档条目。于是"老会话
+         接着聊"不需要第二套渲染路径。
+
+    ## 为什么"正文丢了"要一路带出去
+
+    Artifact 目录可能被人删掉，而会话文件还在（它是另一个文件）。那时候正确的行为
+    是"把那些 Artifact 当成不存在"并让渲染说一句"取不到了"（见
+    `renderer.missing_line`）—— 而不是让整个会话打不开，也**不是静默**：调用方会
+    把它报成一条 Notice。
+    """
+    store = ArtifactStore(paths.session_artifacts_dir(session.session_id))
+    missing = store.load()
+
+    # `chosen.window` 就是窗口（`ChosenModel` 上已经有这一格 —— 它是从
+    # `catalog.ModelRef.window` 抄过来的"当前可用"版本）。为 None = 配置里没写，
+    # 那时预算整体关掉（见 `budget.ContextBudget`）。
+    #
+    # **换模型之后这里不会跟着变**：预算是在装配那一刻定下来的，`/model` 换到
+    # 另一个窗口的模型之后仍按旧窗口算。方向是有意选的 —— 旧窗口更小时偏保守
+    # （提前降级，可用），更大时偏激进（该降的没降，可能超窗）。要修的话得让
+    # Agent 在每次请求前问一次当前窗口，而那会给"预算"引入一个每步都在变的分母
+    # —— 那正是缓存抖动。V1 认下这个偏差，把它写在明处。
+    budget = ContextBudget(max_tokens=chosen.window)
+    if session.context is None:
+        manager = ContextManager(store, budget=budget)
+        # 老会话（或者从来没有过 Context 的新会话 —— 那时这条循环一次都不走）。
+        # `hydrate` 建出来的条目带着一个新版本号，而会话文件里还没有 ctx 记录
+        # （`_written_context_version` 返回 None），所以**第一次检查点就会把它写
+        # 下去** —— 这里不需要额外落一次盘。
+        manager.hydrate(session.messages)
+        session.context = manager.state
+    else:
+        manager = ContextManager(store, state=session.context, budget=budget)
+    return manager, missing
 
 
 def _session_notes(

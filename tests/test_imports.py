@@ -145,7 +145,19 @@ _CONTRACT_MODULES = {"agent_runtime.tools", "agent_runtime.tools.tool"}
 _EXEMPT_FILES = {"main.py", "frontends/cli/__init__.py", "runtime/config.py"}
 
 # 盯住的包：这些是"运行时内核"，它们的 import 面应该只有契约。
-_PACKAGES = ("security", "agents", "state", "audit", "skills", "models")
+_PACKAGES = ("security", "agents", "state", "audit", "skills", "models", "context")
+
+# `context/` 是**后来加进这一组**的（上下文管理那一版），而它进得来是有判据的：
+#
+#   * 它对外只依赖 `tools.tool` 那一个契约（`processor.py` 要用 `ToolResult`），
+#     和 `security/` 依赖 `Tool` 是同一类事；
+#   * 它**不认识** runtime / protocol / frontends，也不认识 state ——
+#     `state/store.py` 反过来认识它是刻意的（会话文件里要存 ContextState），
+#     而那条边是**延迟 import**（见那里的 `_context_state`），所以"state 不依赖
+#     context"这句在模块加载期是真的。
+#
+# 反过来的方向（`tools/` 认识 `context/`）是禁止的：那会让"工具结果处理器"变成一个
+# 谁都要认识的东西，而它现在只在装配那一层接起来。
 
 
 def _internal_imports(path: Path) -> list[tuple[int, str]]:
@@ -325,6 +337,29 @@ def test_frontends_do_not_import_runtime_internals():
                 f"{_relative(path)}:{lineno} 从 {module} import 了东西 —— "
                 f"前端只能通过 protocol/ 说话（决策 18）"
             )
+
+
+def test_the_frontends_do_not_reach_into_the_context_layer():
+    """前端只准通过协议认识 Context（`ui_state.context` 那几个整数）。
+
+    **判据是 `ContextManager`，不是"任何 agent_runtime.context"**：那一包里
+    `ref` / `models` 是纯数据（一个正则、几个 dataclass），前端拿去解析一句引用
+    完全正当 —— 而"前端自己读 ArtifactStore 并按档位渲染"就完全是另一回事了：
+    那等于在前端里重写一遍 `ContextRenderer`，而两份渲染早晚会漂，症状是
+    "界面上看到的和模型看到的不一样"。
+
+    CLI 那一支有决策 19 的口子（它直连 runtime），所以它不在这条里 —— 它已经
+    在 `_FRONTEND_EXEMPT` 里了，而它用 `ArtifactStore` 是为了 `--history` 里那行
+    说明（读的是元数据，不是渲染）。
+    """
+    for subdir in ("protocol", "frontends/tui"):
+        for path in _source_files(subdir):
+            for lineno, module in _internal_imports(path):
+                assert module != "agent_runtime.context.manager", (
+                    f"{_relative(path)}:{lineno} 直接碰了 ContextManager —— "
+                    f"前端只该读协议里的那几个数（ui_state.context），"
+                    f"渲染是 runtime 那边的事"
+                )
 
 
 def test_the_frontend_exemption_is_only_the_cli():

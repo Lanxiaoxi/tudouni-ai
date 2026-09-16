@@ -177,6 +177,29 @@ def workspace_runtime_dir() -> Path:
     return workspace_dir() / RUNTIME_DIR_NAME
 
 
+# Artifact 正文那一片，以及它下面一层"一个会话一个目录"。
+#
+# **它们在这里而不是在 `composition` 里**：那个目录的位置是"这个运行时把东西放在
+# 哪"这件事的一部分，而这个模块是那件事唯一的说法（会话在 `sessions/`、审计在
+# `logs/`、后台任务在 `jobs/` —— 四个并列，各自由自己的模块拼）。
+ARTIFACTS_DIR_NAME = "artifacts"
+
+
+def workspace_artifacts_dir() -> Path:
+    """`<工作区>/.tudouni/artifacts` —— 全部会话的 Artifact 正文。"""
+    return workspace_runtime_dir() / ARTIFACTS_DIR_NAME
+
+
+def session_artifacts_dir(session_id: str) -> Path:
+    """一个会话的 Artifact 目录。
+
+    它**只拼一段名字、不校验**：合法性由 `state/store.py` 的 `_path` 统一把关
+    （`is_valid_session_id`），而这里再判一次就是同一条规则的第二份实现 —— 两份
+    早晚会走岔，然后一个组件接受、另一个拒绝。
+    """
+    return workspace_artifacts_dir() / session_id
+
+
 # --- 工作区安不安全 -------------------------------------------------------------
 #
 # 三个原因码。**它们是机器认的标识，给人看的话在 `composition.check_workspace()`** ——
@@ -231,14 +254,17 @@ def unsafe_workspace(path: Path | None = None) -> str:
 
 
 __all__ = [
+    "ARTIFACTS_DIR_NAME",
     "RUNTIME_DIR_NAME",
     "TUDOUNI_DIR_NAME",
     "UNSAFE_ABOVE_HOME",
     "UNSAFE_HOME",
     "UNSAFE_ROOT",
     "package_dir",
+    "session_artifacts_dir",
     "unsafe_workspace",
     "user_config_dir",
+    "workspace_artifacts_dir",
     "workspace_dir",
     "workspace_runtime_dir",
 ]

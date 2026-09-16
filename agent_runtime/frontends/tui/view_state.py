@@ -2436,6 +2436,34 @@ def render_status(state: ViewState, message: dict[str, Any]) -> list[Line]:
         context = i18n.t("status.context.no_window", used=tokens_text(used))
     out.append(_kv(i18n.t("status.kv.context"), context))
 
+    # Context 系统那几笔账。**和上面那一行不是一回事，所以两行都要有**：
+    # 上面是"上一次请求实测发了多少 token"（provider 说的），这一行是"Context
+    # 系统管着多少份信息、其中几份真的会发出去"（本地估算 + 档位）。
+    # 只报前面那个的话，降级发生时看不出有多少被压掉了。
+    ctx = status.get("context")
+    if ctx:
+        out.append(_kv(
+            i18n.t("status.kv.artifacts"),
+            i18n.t("status.artifacts.value",
+                   total=ctx.get("artifacts", 0),
+                   open=ctx.get("open", 0),
+                   compact=ctx.get("compact", 0),
+                   removed=ctx.get("removed", 0),
+                   pinned=ctx.get("pinned", 0)),
+            ROLE_RULE,
+        ))
+        limit = ctx.get("limit_tokens") or 0
+        estimate = ctx.get("estimated_tokens") or 0
+        out.append(_kv(
+            i18n.t("status.kv.budget"),
+            i18n.t("status.budget.ratio", used=tokens_text(estimate),
+                   limit=tokens_text(limit),
+                   percent=f"{estimate / limit * 100:.0f}")
+            if limit else i18n.t("status.budget.no_window",
+                                 used=tokens_text(estimate)),
+            ROLE_RULE,
+        ))
+
     if usage.get("prompt"):
         rate = f"{usage.get('cached', 0) / usage['prompt']:.0%}"
         out.append(_kv(i18n.t("status.kv.input_total"),

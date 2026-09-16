@@ -1438,8 +1438,18 @@ state/             状态层
   store.py           JsonSessionStore：原子写、id 白名单、容忍未知字段
 
 audit/             审计层
-  events.py          事件构造（七个 kind 的公共字段）
+  events.py          事件构造（九个 kind 的公共字段 —— 含流式的 delta_reset
+                     和 Context 预算的 context_degraded）
   jsonl.py           JsonlSink：只追加的 .jsonl，天然抗崩溃
+
+context/           上下文层 —— **工具结果不再直接进历史**（见「上下文管理」）
+  models.py          Artifact / ContextItem / ContextState / ContextNote —— 纯数据，JSON 可序列化
+  artifact_store.py  Artifact 的落盘、读取、按行/按字符切片。**不认识 Context**
+  processor.py       一次工具执行 → Artifact（策略按工具名可定制）
+  manager.py         Context 状态：谁在里面、什么档位、超预算时动谁（**不知道正文长什么样**）
+  budget.py          token 估算 + 降级顺序（full→range→preview→metadata→移出）+ 实测校准
+  renderer.py        Context → LLM messages。**唯一**知道一份 Artifact 该长成什么样的地方
+  ref.py             历史里那句引用的格式（**唯一定义处**）+ 解析
 
 agents/            编排层
   agent.py           Agent：一个回合的循环（一批工具调用：默认串行，整批只读才并发）；
@@ -1454,11 +1464,11 @@ doc/                   design（TUI-design.md）、契约（protocol.md）、输
 tests/                 全套测试（含"每个模块都能导入"的冒烟测试；时间靠注入的假时钟断言）
 ```
 
-**内核那八个为什么不平铺成"一个 kernel/"**：它们不是一个东西，是**八个各自变化的
+**内核那九个为什么不平铺成"一个 kernel/"**：它们不是一个东西，是**九个各自变化的
 领域** —— 加一类工具只动 `tools/`、调提示词只动 `prompts/`、改权限粒度只动 `security/`、
-换网关只动 `models/`。合成一个目录不会让读者少理解任何东西，只是换个地方放同样的
-复杂度。反过来那三块（`runtime` / `protocol` / `frontends`）各自**整体**因为一件事变化，
-所以各自是一个目录 —— 这个不对称是有意的。
+换网关只动 `models/`、换上下文策略只动 `context/`。合成一个目录不会让读者少理解任何东西，
+只是换个地方放同样的复杂度。反过来那三块（`runtime` / `protocol` / `frontends`）各自
+**整体**因为一件事变化，所以各自是一个目录 —— 这个不对称是有意的。
 
 ## 依赖方向
 
@@ -1471,10 +1481,11 @@ tests/                 全套测试（含"每个模块都能导入"的冒烟测�
 第二层                  tools    → skills
                         security → tools（只准 tools.tool）
                         audit    → state
+                        context  → tools（只准 tools.tool，为了 ToolResult）
                         runtime/ → 上面全部 + tools.mcp
                         （config 也在这里：它 → security.commands 和 tools.mcp，
                           后者是**点名例外**，见下）
-第三层                  agents   → audit, models, security, state, tools
+第三层                  agents   → audit, context, models, security, state, tools
                         runtime/ → agents
 第四层                  protocol/ → runtime/ + agents（只用到类型和异常）
 第五层                  frontends/ → protocol/
@@ -1482,9 +1493,15 @@ tests/                 全套测试（含"每个模块都能导入"的冒烟测�
 ```
 
 **内核不认识上层**：`agents` / `models` / `tools` / `state` / `security` / `audit` /
-`skills` 里对 `runtime` / `protocol` / `frontends` 的 import **一条都没有**，由
-`tests/test_imports.py` 盯着。破掉的后果不是"坏了"，而是内核悄悄依赖上某个前端 ——
+`skills` / `context` 里对 `runtime` / `protocol` / `frontends` 的 import **一条都没有**，
+由 `tests/test_imports.py` 盯着。破掉的后果不是"坏了"，而是内核悄悄依赖上某个前端 ——
 那时候 `--list`（一个只读会话文件的子命令）会连带把整个装配层和界面层拖进来。
+
+**`state` 认识 `context` 是刻意的，而且那条边是延迟的**：会话文件里要存
+`ContextState`（`state/store.py` 的 `ctx` 记录），所以 `_context_state` 里那一句是
+**函数内** import —— 模块加载期那条边不存在，于是"state 不依赖 context"在 import
+图上仍然是真的。反过来的方向一条都没有：`context/` **完全不认识 `state`**（它连
+`Session` 是什么都不知道），而那是它能不能被单独测试的前提。
 
 **前端也不许 import `runtime/` 内部**，唯一例外是 CLI 直连（决策 19，写在
 `doc/TUI-design.md`）。这一条是"前端 = 协议的一个客户端"的全部内容，也是将来加
@@ -1493,10 +1510,10 @@ Web 前端的前提 —— 所以那个例外被一条单独的测试盯着"例�
 工具层内部也是单向的：`builtin/` 里每个工具 → `tools/tool.py`（契约），没有一个工具
 import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也不反向依赖它。
 
-**这些边界由 `tests/test_imports.py` 七条测试盯着**（"能导入"那条冒烟测试不算在内）：
+**这些边界由 `tests/test_imports.py` 十二条测试盯着**（"能导入"那条冒烟测试不算在内）：
 
   * `skills/` 不 import 任何内部模块（否则会成环）；
-  * `security/` `agents/` `state/` `audit/` `skills/` `models/` —— 这六个（测试里叫
+  * `security/` `agents/` `state/` `audit/` `skills/` `models/` `context/` —— 这七个（测试里叫
     `_KERNEL_PACKAGES`）**除了 `tools.tool` 之外不许从 `tools/` 认识别的东西**。
     具体工具和外部来源是装配处（`runtime/composition.py`）的事。以前这条只靠"记得"
     维持，而它破掉时**什么都不会坏**，只是让每一次权限裁决都顺手拖进 httpx 和整个技能包；
@@ -1506,6 +1523,11 @@ import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也
   * `protocol/` 不许 import 任何前端 —— 方向搞反的代价是隐形的：协议里 import 一个
     TUI widget 也能跑，只是从此 Web 那一侧依赖上了一个终端库；
   * `frontends/` 不许 import `runtime/`；
+  * `protocol/` 和 `frontends/tui/` **不许碰 `context.manager`** —— 前端只该读协议里的
+    那几个数（`ui_state.context`）。自己拿 `ContextManager` 去渲染载荷，等于在前端里
+    重写一遍 `ContextRenderer`，而两份渲染早晚会漂，症状是"界面上看到的和模型看到的
+    不一样"。（`context.ref` / `context.models` 是纯数据，谁都可以用 —— 判据是管理器，
+    不是整个包。）
   * `textual` 只准出现在 `frontends/tui/app.py` 和 `widgets.py` 两个文件里 ——
     这条保证老 CLI 和协议子进程都不加载一个 TUI 框架。（`tui/theme.py` 是**纯数据**，
     一个 textual 的 import 都没有，所以它不需要进那张白名单 —— 它要能被直接单测。）
@@ -1521,7 +1543,7 @@ import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也
 
 ### 1. 判定留在内部，沟通交给注入的实现
 
-七个注入点，同一条原则：
+九个注入点，同一条原则：
 
 | 注入点 | Agent 知道 | 注入的实现知道 |
 |---|---|---|
@@ -1530,6 +1552,10 @@ import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也
 | `on_checkpoint` | 什么时候保存是安全的 | 存到哪、什么格式 |
 | `on_event` | 发生了什么 | 记到哪、什么格式 |
 | `on_delta` | 模型正在吐什么（正文 / 思考链） | 送给谁（协议版发 `t:"delta"` / 将来的 Web 发 SSE） |
+| `session_notes` | 每次请求末尾要贴上当前会话状态 | 那段状态长什么样（任务 / 技能 / 后台任务） |
+| `should_stop` | 在哪个位置问、停了之后做什么 | 要不要停 |
+| `session_model` | 换过模型要留一句话、这一轮用了谁 | 选的是哪条路由上的哪个模型 |
+| `context` / `processor` | 载荷从哪来（历史 + Context） | Artifact 落在哪、预算多大、怎么降级 |
 
 好处是具体的：权限策略变成纯函数可以单测；多轮循环留在 Agent 外面，所以 Web 版
 （每回合一次 HTTP 请求、根本没有循环）不需要改 Agent。
@@ -1540,9 +1566,16 @@ import 另一个工具；`text.py` 是被四个工具共用的纯函数，谁也
 上千块，而 `on_event` 的实现（`JsonlSink`）每条一次 open/write/close —— 抄进审计
 等于把日志变成第二个会话文件。审计里记的是汇总（`model_call.streamed_chars` 那三个）。
 
-`session_notes`（任务列表每轮重新贴上去的那一份）是第六个：Agent 只知道"每次请求末尾要
-把当前会话状态贴上"，至于那段状态长什么样、怎么渲染，是 `tools/builtin/todo.py` 的知识。
-表里没列的第七个是 `should_stop`（"要不要停"由外面决定，怎么停在 Agent 里）。
+`session_notes`（任务列表每轮重新贴上去的那一份）往后那几个原来只在正文里列着，
+现在一起收进表里：第六个 `session_notes`、第七个 `should_stop`、第八个
+`session_model`（`/model` 那个选择）。
+
+**第九个是 `context`（`ContextManager`），而它和上面几个有一处不同**：前几个注入的是
+"某件事怎么做"，它注入的是**整条载荷从哪来**（见「上下文管理」）。所以它有一个上面
+几个都没有的性质：**为 None 时行为逐字节回到重构之前**（工具结果原样进 messages）。
+那不是兼容层，而是这个类唯一说得出道理的默认值 —— Agent 不该自己造一个
+`ArtifactStore`（它不知道工作区在哪），而"没有 Context"这件事本身是成立的（测试、
+一次性任务）。它和 `processor` 一起注入，因为后者没有前者就没有落点。
 
 `questioner`（提问通道）是**同一条原则再往下沉一层**：这一层"内部"是工具自己，而不是
 Agent —— 所以它不在上表里，因为 Agent 根本不知道有这回事（它只看见一次普通的工具调用，
@@ -1737,6 +1770,81 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 「并行省」多少（它是派生值，不参与上面那个相加）。旧日志里没有 `tool_batch` 事件，
 走的还是老算法，数字一个都不变。
 
+## 上下文管理（Artifact / Context）
+
+**一次工具调用的结果不再直接躺进对话历史。** 它先变成一份 **Artifact**（正文落在
+`.tudouni/artifacts/` 里），历史里只留下一句引用，而"这一轮到底让模型看见什么"由
+Context 那一层决定：
+
+```
+ToolResult → ToolResultProcessor → Artifact → ArtifactStore
+                                                   │
+                                            ContextManager
+                                                   │
+                                            ContextBudget
+                                                   │
+                                            ContextRenderer
+                                                   │
+                                              LLM Request
+```
+
+### 为什么
+
+过去是这样：`read_file` 返回 12 万字符 → 那 12 万字符此后**每一轮请求都重发一遍**，
+哪怕模型早就不需要它了。一个长任务跑几十步，token 就是这么堆上去的。
+
+分开之后：
+
+```
+History    一次 read_file 就是一句引用（几十字节）  —— "发生过什么"
+Context    模型**此刻**要看见的那一段              —— "现在让它看什么"
+```
+
+`--history` 里那句引用长这样，后面跟一行说明它指向什么（多少字符、哪个文件、正文在哪）：
+
+```
+  4 tool      ← [artifact art_4d78c011ed25 · 12480 字符 · read_file]
+                （Artifact art_4d78c011ed25：12480 字符，main.py，1600 行，正文在 …）
+```
+
+### 四档详略，超预算时**先降级、最后才删**
+
+```
+full → range → preview → metadata → 移出 Context
+```
+
+`range` 和 `preview` 都会在载荷里**写明自己只是哪一段**（`第 1800-1900 行（共 5000 行）`）
+—— 模型看到半份内容却以为看到了全部，是这一层唯一会静默出错的地方。降到 `metadata`
+就只剩"有这么一份东西、它多大、在哪"；再不够才把它移出 Context（**正文仍然在盘上**，
+模型可以自己再读一次）。
+
+触发条件是**预算**（当前模型的 `context_window`），不是"聊了多少轮"。几条不能商量的：
+
+1. **只降不升。** 降过的档位不会因为下一轮 token 又够了而弹回来 —— 那会让渲染出来的
+   prompt 每轮都不同，而 provider 按最长公共前缀算缓存，前缀里第一个变化的字节之后
+   全部按未命中计费（官方价里贵约 50 倍）。
+2. **一次只降一档。** 降到刚好够就停，而不是一步到底。
+3. **窗口不知道就不降级。** 配置里没写 `context_window` 时预算整体关掉 —— 一个假的上限
+   比没有上限更坏（它会去压一个本来塞得下的 Context，而"为什么模型看不到全文"
+   变成一个查不出来的现象）。
+4. **降级要留下痕迹。** 每一步降了什么进审计（`context_degraded`），`/status` 里也有
+   一行 `资料 Artifact N 份 · 进过 Context M 份 · 这次发 K 份 · 挤掉 …`。
+
+### 它不改变模型看到的东西
+
+`full` 档渲染出来的 tool 正文与重构之前**逐字节一致**（不加表头），系统提示词仍然是
+一条独立的 `role="system"`，工具结果仍然是 `role="tool"` 且带着原来的 `tool_call_id`。
+这次重构换的是**内容的来源**，不是载荷的形状 —— provider 的 tool 配对要求和前缀缓存的
+语义都靠这条。
+
+### 老会话照常能接着聊
+
+重构之前落盘的会话里，tool 消息存的是全文。恢复它们时会走 `ContextManager.hydrate`：
+把那些正文重新收成 Artifact 并建 `full` 档条目（也就是当时的行为）。所以恢复旧会话
+不需要第二套渲染路径。正文目录被人删掉时，那些引用会渲染成一句"内容已经取不到了
+—— 需要的话请重新执行一次那个工具"，而不是一个空串（空串会被模型读成"这个工具什么
+都没返回"）。
+
 ## 数据落在哪里
 
 **两层，判据是一句话：换个目录干活，这件事会不会变。**
@@ -1766,7 +1874,8 @@ debug** 的每一次工具调用都成立。所以拼长文本（以及拼思维
 | 路径 | 内容 | 进版本库吗 |
 |---|---|---|
 | `.tudouni/permissions.json` | 权限策略：哪些工具免审批、哪些直接拒绝 | 否 |
-| `.tudouni/sessions/` | 会话状态（含工具读到的文件正文） | 否 |
+| `.tudouni/sessions/` | 会话状态（**只留引用**：工具结果的正文不在这里，见「上下文管理」） | 否 |
+| `.tudouni/artifacts/<会话 id>/` | 工具结果的**正文**（`manifest.json` 是索引，`refs/` 里一份一个文件） | 否 |
 | `.tudouni/logs/` | 审计轨迹（含工具参数预览） | 否 |
 | `.tudouni/skills/` | **项目级技能**：模型按需读取的步骤文件（`SKILL.md`） | 否 —— 见下面那条 |
 | `.tudouni/jobs/<会话 id>/` | 后台命令的输出（每个任务一个 `.out`）。**正常结束时清掉；异常退出留下的残留下次启动时清掉** | 否 |

@@ -269,6 +269,12 @@ CATALOG: dict[str, str] = {
     "status.context.ratio": "{used} / {window} ({percent}%)",
     "status.context.no_window": "{used} (this model's window is not in the catalog, "
                                "so no percentage)",
+    "status.kv.artifacts": "Material",
+    "status.artifacts.value": "{total} artifacts · {open} entered context · "
+                              "{compact} sent now · {removed} evicted · {pinned} pinned",
+    "status.kv.budget": "Budget",
+    "status.budget.ratio": "est. {used} / {limit} ({percent}% of usable budget)",
+    "status.budget.no_window": "est. {used} (window unknown, no degradation)",
     "status.usage.input": "{tokens} tokens (cache hit {cached}, rate {rate})",
     "status.usage.output": "{tokens} tokens",
     "status.usage.none": "No successful model call yet",

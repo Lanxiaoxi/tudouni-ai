@@ -23,11 +23,12 @@
 所以改成**只追加**：一份会话一个 `.jsonl`，每条记录一行，
 `save()` 只写"上次之后新增的那一段"。第 i 步写出去的是 O(1)，二次项消失。
 
-## 三条记录，以及为什么是三条
+## 四条记录，以及为什么是四条
 
     {"t":"head","version":1,"session_id":"s"}          整个文件只有第一行
     {"t":"meta","m":{...}}                              metadata 的**全量**快照
     {"t":"msg", "m":{...}}                             一条消息
+    {"t":"ctx", "c":{...}}                              ContextState 的**全量**快照
 
 **为什么 messages 可以只记增量**：全项目改 `messages` 只有 `agents/agent.py` 里
 四处，全是 `.append()` —— 没有回改、没有删除、没有重排。所以"上次写了多少条"
@@ -44,7 +45,8 @@
 一条 meta 记录只有几百字节到几 KB，而一次落盘的消息增量动辄几百 KB，
 省它换一个静默错，不划算。
 
-**重放规则因此只有三条**：head 取第一条、meta 取最后一条、msg 全部按顺序累加。
+**重放规则因此是四条**：head 取第一条、meta 取最后一条、ctx 取最后一条、
+msg 全部按顺序累加。
 
 ## 崩溃安全：比整份重写更强，而不是更弱
 
@@ -69,15 +71,23 @@
 就那样留在磁盘上；想留着就手动改个后缀，想清掉就删掉整个目录。
 """
 
+from __future__ import annotations
+
 import json
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple
 
 from agent_runtime import i18n
 
 from .session import Session, is_valid_session_id
+
+if TYPE_CHECKING:
+    # 只在类型检查时引。运行时 `context.models` 不 import `state`，所以这里也
+    # 不需要为它建依赖边 —— ContextState 是个纯数据类，而 `store` 对它的用法
+    # 只有 to_json / from_json 两个方法调用。
+    from agent_runtime.context.models import ContextState
 
 
 STATE_VERSION = 1
@@ -87,10 +97,11 @@ STATE_VERSION = 1
 # 同时它也是"哪些文件是会话"的判据（`list_ids` 按它 glob）。
 SUFFIX = ".jsonl"
 
-# 记录的种类。见模块 docstring 里那三条重放规则。
+# 记录的种类。见模块 docstring 里那四条重放规则。
 HEAD = "head"
 META = "meta"
 MSG = "msg"
+CTX = "ctx"
 
 
 class _Replayed(NamedTuple):
@@ -99,6 +110,7 @@ class _Replayed(NamedTuple):
     head: dict[str, Any]        # 第一行那条 head（原样，用来读 version）
     messages: list[dict[str, Any]]
     metadata: dict[str, Any]    # 最后一条 meta 记录说的（没有就是空 dict）
+    context: ContextState | None  # 最后一条 ctx 记录说的（没有就是 None）
 
 
 class JsonSessionStore:
@@ -122,6 +134,12 @@ class JsonSessionStore:
         # 是存储层自己的记账，两者混在一起就是 `test_step_count_is_derived` 那条
         # 反对的东西（存成字段就有了两份，早晚不一致）。
         self._watermark: dict[str, int] = {}
+        # session_id -> 已经写下去的那个 ContextState.version。
+        #
+        # **和上面的水位是同一类记账**（缓存，不是第二份事实）：文件里那条 ctx
+        # 记录自己带着 version，所以缓存丢了只会多写一条记录，不会写错。
+        # `None` 也是一个有意义的值（"我还没往文件里写过 ctx"）。
+        self._context_version: dict[str, int] = {}
 
     # -- 路径 ------------------------------------------------------------------
 
@@ -195,6 +213,14 @@ class JsonSessionStore:
         lines.extend(_dump({"t": MSG, "m": message})
                      for message in session.messages[watermark:])
 
+        # ContextState **只在版本变了之后写**：它可能有一百多条 items，而多数
+        # 检查点上一条档位都没动过（version 没变就是"没动过"）。这和 metadata
+        # 每次必写不同，理由也写在那段注释里 —— 两者的差别是"改动的频率"，而
+        # 这个判断有 `version` 这个明确的判据，不需要跟上次比内容。
+        written_version = self._written_context_version(session.session_id)
+        if session.context is not None and session.context.version != written_version:
+            lines.append(_dump({"t": CTX, "c": session.context.to_json()}))
+
         try:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write("".join(lines))
@@ -213,6 +239,26 @@ class JsonSessionStore:
             raise
 
         self._watermark[session.session_id] = len(session.messages)
+        if session.context is not None:
+            self._context_version[session.session_id] = session.context.version
+
+    def _written_context_version(self, session_id: str) -> int | None:
+        """文件里那条 ctx 记录说的版本。**没写过就是 None。**
+
+        和 `_watermark_of` 同一个形状：缓存里有就用，没有就去文件里读一遍（只
+        发生在这个 store 实例第一次见到这个会话的时候）。**读的是文件而不是
+        `session.context`** —— 后者正是要被判断的东西。
+        """
+        if not self._path(session_id).exists():
+            self._context_version.pop(session_id, None)
+            return None
+        if session_id in self._context_version:
+            return self._context_version[session_id]
+        replayed = self._replay(self._path(session_id))
+        version = None if replayed.context is None else replayed.context.version
+        if version is not None:
+            self._context_version[session_id] = version
+        return version
 
     def _watermark_of(self, session_id: str) -> int:
         """这个会话已经写下去多少条消息。`-1` 表示文件还不存在。
@@ -265,6 +311,7 @@ class JsonSessionStore:
             "session_id": session_id,
             "messages": replayed.messages,
             "metadata": replayed.metadata,
+            "context": replayed.context,
         }
         return Session(**{k: v for k, v in raw.items() if k in known})
 
@@ -282,6 +329,10 @@ class JsonSessionStore:
         head: dict[str, Any] | None = None
         messages: list[dict[str, Any]] = []
         metadata: dict[str, Any] = {}
+        # 懒引一次：`context.models` 只在真有 ctx 记录时才需要（多数会话文件里
+        # 没有它，或者有；这次 import 很便宜，但它让"state 不依赖 context"这条
+        # 边界在运行时也是真的 —— 只有读到那种记录时才会建立那条边）。
+        context: "ContextState | None" = None
 
         with handle:
             for line in handle:
@@ -312,6 +363,11 @@ class JsonSessionStore:
                     value = record.get("m")
                     if isinstance(value, dict):
                         messages.append(value)
+                elif kind == CTX:
+                    # 和 meta 同一条规则：最后一条说了算（降级会原地改档位）。
+                    value = record.get("c")
+                    if isinstance(value, dict):
+                        context = _context_state(value)
                 # 不认识的 t 直接跳过：将来加的记录种类不该让旧程序读不了
                 # —— 这和"只挑认识的 Session 字段"是同一条规矩。
 
@@ -320,7 +376,8 @@ class JsonSessionStore:
                 f"{path} 不是一份会话文件：里面没有 {HEAD} 记录"
                 f"（那必须是第一行）。"
             )
-        return _Replayed(head=head, messages=messages, metadata=metadata)
+        return _Replayed(head=head, messages=messages, metadata=metadata,
+                         context=context)
 
     def read(self, session_id: str) -> Iterator[dict[str, Any]]:
         """对偶的读取 API：逐条吐出记录本身，**不做重放**。
@@ -337,6 +394,18 @@ class JsonSessionStore:
                     yield json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+
+def _context_state(data: dict[str, Any]) -> "ContextState":
+    """把一条 ctx 记录还原成 `ContextState`。
+
+    **import 放在函数里**（而不是模块顶部）：`context.models` 是纯数据、没有
+    副作用，但"state 这个包不依赖 context"是一条值得在结构上看得见的边界 ——
+    顶层 import 会让它变成一条真的依赖边，而这里只有"读到 ctx 记录"才需要它。
+    """
+    from agent_runtime.context.models import ContextState
+
+    return ContextState.from_json(data)
 
 
 def _dump(record: dict[str, Any]) -> str:

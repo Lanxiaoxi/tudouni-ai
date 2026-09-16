@@ -20,10 +20,14 @@ DEEPSEEK_API_KEY 时会先看到"新会话"再看到报错。现在子命令分�
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 from agent_runtime import i18n
+from agent_runtime import paths
 from agent_runtime.agents import RunCancelled, StepLimitExceeded
 from agent_runtime.audit import JsonlSink
+from agent_runtime.context import ArtifactStore
+from agent_runtime.context import ref
 from agent_runtime.models.types import ModelFatalError, ModelTransientError
 from agent_runtime.runtime.composition import Runtime
 from agent_runtime.runtime.config import MCP_FILE
@@ -389,9 +393,31 @@ def print_skills(loader: SkillLoader) -> None:
 
 
 def print_history(session: Session) -> None:
-    """把对话过程打出来。内容只留预览 —— messages 里可能躺着上万字符的文件正文。"""
+    """把对话过程打出来。内容只留预览 —— 历史里可能躺着上万字符的文件正文。
+
+    ## 重构之后多了两件事
+
+    工具结果的正文**不在历史里了**（它进了 ArtifactStore，tool 消息里只剩一句
+    引用），所以这里多打一行说明那份引用**指向什么** —— 否则 `--history` 就只剩
+    `[artifact art_xxx · 12480 字符 · read_file]` 这种没人看得懂的行。
+
+    那一行读的是**盘上的 Artifact 索引**（不是历史）：正文有多少、是哪个文件的、
+    还在不在。**它不读正文** —— 那正是这个重构的目的，而 `--history` 的用途是
+    "看发生过什么"，不是"把几 MB 正文再打一遍"。
+
+    索引读不动时（目录被人删了）只写一句"取不到"：`--history` 是排障用的命令，
+    它不该因为另一个目录不存在就整个失败。
+    """
     print(f"会话 {session.session_id!r}：{len(session.messages)} 条消息，{session.step_count()} 步")
     print("-" * 72)
+
+    store = None
+    try:
+        store = ArtifactStore(paths.session_artifacts_dir(session.session_id))
+        store.load()
+    except Exception:
+        store = None
+
     for i, msg in enumerate(session.messages):
         role = msg["role"]
         preview = str(msg.get("content") or "").replace("\n", "\\n")[:76]
@@ -404,8 +430,30 @@ def print_history(session: Session) -> None:
                 print(f"{i:3} {role:9} → 调用 {fn['name']}({fn['arguments'][:64]})")
         elif role == "tool":
             print(f"{i:3} {role:9} ← {preview}")
+            detail = _artifact_note(store, msg)
+            if detail:
+                print(f"{i:3} {'':9}   {detail}")
         else:
             print(f"{i:3} {role:9} {preview}")
+
+
+def _artifact_note(store: Any, message: dict[str, Any]) -> str:
+    """那句引用指向的那份 Artifact —— 一行摘要，或者是"取不到"。"""
+    artifact_id = ref.artifact_id_of(message)
+    if artifact_id is None:
+        return ""
+    if store is None:
+        return f"（Artifact {artifact_id}：索引读不动）"
+    artifact = store.get(artifact_id)
+    if artifact is None:
+        return f"（Artifact {artifact_id}：正文已经不在磁盘上了）"
+    where = artifact.metadata.get("path") or artifact.source.path \
+        or artifact.metadata.get("url") or ""
+    suffix = f"，{where}" if where else ""
+    lines = artifact.metadata.get("lines")
+    if lines:
+        suffix += f"，{lines} 行"
+    return f"（Artifact {artifact_id}：{artifact.chars} 字符{suffix}，正文在 {artifact.content_ref}）"
 
 
 def print_audit(sink: JsonlSink, session_id: str) -> None:
@@ -633,6 +681,27 @@ def _print_status(runtime: Runtime) -> None:
     else:
         context = f"{used} token（这个模型的窗口不在目录里，不报占比）"
     print(f"  上下文      {context}", file=sys.stderr)
+
+    # Context 系统那几笔账。**和上面那一行不是一回事**：上面是"上一次请求实测发了
+    # 多少 token"（provider 说的），这里是"Context 系统认为自己管着多少份信息、
+    # 其中有几份真的会被发出去"（本地估算 + 档位）。
+    #
+    # 两个数都要有：只报上面那个，降级发生时看不出"有多少被压掉了"；只报下面这个，
+    # 估算和实测的偏差就没有对账的地方。
+    ctx = data.get("context")
+    if ctx:
+        print(f"  资料        Artifact {ctx['artifacts']} 份 · "
+              f"进过 Context {ctx['open']} 份 · 这次发 {ctx['compact']} 份"
+              + (f"（挤掉 {ctx['removed']}）" if ctx["removed"] else "")
+              + f" · pinned {ctx['pinned']}", file=sys.stderr)
+        estimate = ctx.get("estimated_tokens") or 0
+        limit = ctx.get("limit_tokens") or 0
+        if limit:
+            print(f"  预算        估算 {estimate}/{limit} token"
+                  f"（占 {estimate / limit * 100:.0f}% 的可用额度）", file=sys.stderr)
+        else:
+            print(f"  预算        估算 {estimate} token"
+                  f"（这个模型的窗口不知道，不降级）", file=sys.stderr)
 
     if usage.get("prompt"):
         rate = f"{usage['cached'] / usage['prompt']:.0%}"

@@ -35,11 +35,17 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_runtime import i18n
 from agent_runtime import paths
 from agent_runtime.state import agents_md
+
+if TYPE_CHECKING:
+    # **只在类型检查时 import。** `context/` 这一包不 import `state/`（依赖方向是
+    # 单向的：Context 不认识会话），而这里反过来引它一次只为了标注类型。运行时不
+    # 引是为了避免"import state → import context → import …"这种环。
+    from agent_runtime.context.models import ContextState
 
 
 # 提示词文件的位置。**它跟着代码走，不跟着工作区走** —— 所以取的是 `package_dir()`
@@ -143,11 +149,27 @@ class Session:
     有了两份，早晚不一致 —— 而且步数一旦持久化，语义会从"这一轮走了几步"悄悄
     变成"这个会话一共走了几步"，于是会话跑到一定轮次后会莫名其妙地"超过最大
     执行步数"，一步都不肯走。
+
+    ## 第四类：`context`
+
+    它**不是**第三类那种杂项，所以单独一格而不是塞进 `metadata`。区别在于谁读它：
+
+      * `metadata` 是**会话的语义**，会被工具层读到（任务列表、已加载技能都住在
+        那里，`SessionNotes` 的签名就是 `Mapping[str, Any]`）；
+      * `context` 是 **Context 系统的内部状态**（哪些 Artifact 进了 Context、各以
+        什么档位）。工具层不该看见它，而把它混进 metadata 之后，任务列表那份代码
+        会顺带把几十条 ContextItem 一起读一遍 —— 两个模块的耦合就是这么长出来的。
+
+    它的类型是 `ContextState | None`：`None` 表示"这个会话还没碰过 Context"
+    （老会话文件、或者一个只被 `--history` 读过的会话）。**不给默认的 ContextState()**
+    —— 一个空的 ContextState 会被落盘成一条"Context 是空的"的记录，而那和
+    "这里没有 Context 这回事"是两件事。
     """
 
     session_id: str
     messages: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    context: "ContextState | None" = None
 
     @classmethod
     def new(cls, session_id: str, workspace: str | Path | None = None) -> "Session":

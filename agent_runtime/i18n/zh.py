@@ -258,6 +258,12 @@ CATALOG: dict[str, str] = {
     "status.context.unknown": "—（还没成功调用过模型）",
     "status.context.ratio": "{used} / {window}（{percent}%）",
     "status.context.no_window": "{used}（这个模型的窗口不在目录里，不报占比）",
+    "status.kv.artifacts": "资料",
+    "status.artifacts.value": "Artifact {total} 份 · 进过 Context {open} 份 · "
+                              "这次发 {compact} 份 · 挤掉 {removed} · pinned {pinned}",
+    "status.kv.budget": "预算",
+    "status.budget.ratio": "估算 {used} / {limit}（占可用额度 {percent}%）",
+    "status.budget.no_window": "估算 {used}（窗口不知道，不降级）",
     "status.usage.input": "{tokens} token（命中缓存 {cached}、命中率 {rate}）",
     "status.usage.output": "{tokens} token",
     "status.usage.none": "还没有成功调用过模型",

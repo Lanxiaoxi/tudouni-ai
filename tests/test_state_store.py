@@ -165,6 +165,11 @@ def test_a_crash_mid_write_leaves_everything_earlier_intact(workdir, monkeypatch
             self._handle.close()
             return False
 
+        def __iter__(self):
+            # 抛不抛是在 `write` 上模拟的，读这一侧必须和真句柄一样能迭代
+            # —— `load()` 在 `patch` 还生效的时候就会被调到。
+            return iter(self._handle)
+
         def write(self, data):
             self._handle.write(data[: len(data) // 2])
             self._handle.flush()
@@ -432,8 +437,15 @@ def test_new_session_ids_are_unique_and_sortable(workdir):
 
 
 def test_step_count_is_derived(workdir):
-    """步数不落盘：存成字段就有了两份，而且语义会从"这一轮"变成"整个会话"。"""
-    assert set(Session.__dataclass_fields__) == {"session_id", "messages", "metadata"}
+    """步数不落盘：存成字段就有了两份，而且语义会从"这一轮"变成"整个会话"。
+
+    `context` 也在这一格里，但它不是反例：它记的是 **Context 系统的状态**
+    （哪些 Artifact 进了 Context、各以什么档位），而步数能从这个集合的补集里推出来
+    —— 恰好相反，这条断言的用意正是"派生值一个都不许进来"。真正的判据是"它能不能
+    从 messages 数出来"：步数能，Context 状态不能。
+    """
+    assert set(Session.__dataclass_fields__) == {"session_id", "messages", "metadata",
+                                                "context"}
     session = Session("s", [{"role": "assistant", "content": "a"},
                             {"role": "user", "content": "u"},
                             {"role": "assistant", "content": "b"}])
