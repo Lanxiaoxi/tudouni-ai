@@ -11,7 +11,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tudouni-ai"
-version = "1.0.0"
+version = "2.0.0"
 description = "Minimal agent runtime with a pluggable chat-model adapter and tool registry"
 # 下界由代码决定，不是随意的：@dataclass(slots=True) 与运行时求值的 `X | None`
 # 注解都要求 3.10+；实际解释器由 .python-version 固定为 3.12。
