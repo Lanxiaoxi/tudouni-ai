@@ -691,16 +691,17 @@ def test_the_todo_block_counts_and_marks_each_item():
 
 # --- 配色与命令面板（纯数据那一半） -------------------------------------------
 
-def test_there_are_twelve_themes_and_the_default_one_is_graphite_amber():
-    """留下来的五套色卡（P3/P5/P6/P7/P9）+ 设计稿 F7 的五套（A–E）+ 两套透明版。
+def test_there_are_thirteen_themes_and_the_default_one_is_graphite_amber():
+    """留下来的五套色卡（P3/P5/P6/P7/P9）+ 设计稿 F7 的五套（A–E）+ 三套透明版。
 
     色卡里 `P1 暖橄榄 / P2 海蓝橙 / P4 暖光 / P8 藏青陶土` 四套是用户裁掉的：
     **key 不重排**（留下来的号一个没改），而展示序号是列表位置算出来的 ——
-    所以 `/theme 1` 现在落到 `P3` 上、`/theme 6` 才是默认那套 `A`。
+    所以 `/theme 1` 现在落到 `P3` 上、`/theme 6` 才是默认那套 `A`、`/theme 13` 是
+    最后追加的那套深透明 `A-T2`。
     """
-    assert len(theme_mod.ORDER) == 12
+    assert len(theme_mod.ORDER) == 13
     assert theme_mod.ORDER == ("P3", "P5", "P6", "P7", "P9",
-                               "A", "B", "C", "D", "E", "P3-T", "A-T")
+                               "A", "B", "C", "D", "E", "P3-T", "A-T", "A-T2")
     assert theme_mod.DEFAULT_THEME == "A"
     palette = theme_mod.get("A")
     assert palette.name == "石墨琥珀"
@@ -720,12 +721,14 @@ def test_there_are_twelve_themes_and_the_default_one_is_graphite_amber():
 def test_the_two_clear_variants_only_change_the_background():
     """`A-T` / `P3-T`：**除了 `bg` 之外**每一格都和原版一模一样。
 
-    这条是这个功能的全部承诺 —— 透明版不是第十一套配色，是同一套配色少涂一层。
+    这条是这两套的全部承诺 —— 透明版不是第十一套配色，是同一套配色少涂一层。
     所以按住"九个 token 逐格相等"来断言，而不是只看一眼颜色差不多。
 
     `bg` 是 `ansi_default`（终端自己的底色），而派生角色**按原版的 `bg` 算**
     （`ansi_default` 不是一个能拿去插值的色值）：左栏、思考块、命令面板全都跟原版
     对齐 —— 全透的话这些块就没了。
+
+    **深一档那套（`A-T2`）不在这条里**：它多交了一格（`chrome`），见下一条。
     """
     for base_key, clear_key in (("A", "A-T"), ("P3", "P3-T")):
         base, clear = theme_mod.get(base_key), theme_mod.get(clear_key)
@@ -733,6 +736,8 @@ def test_the_two_clear_variants_only_change_the_background():
         assert base.palette.transparent is False
         assert clear.bg == theme_mod.ANSI_DEFAULT
         assert base.bg.startswith("#")
+        # "只透最底下那一层"的数据形态：`clear_roles` 是空的。
+        assert clear.palette.clear_roles == ()
         for attr in ("chrome", "surface", "line", "ink", "ink2", "ink3",
                      "accent", "warn", "danger", "ok", "dark"):
             assert getattr(clear, attr) == getattr(base, attr), (clear_key, attr)
@@ -748,29 +753,96 @@ def test_the_two_clear_variants_only_change_the_background():
         assert clear.palette.name_en.endswith("Clear")
 
 
+def test_the_deep_clear_variant_also_hands_the_bars_to_the_terminal():
+    """`A-T2 石墨琥珀 · 深透明`：**在 `A-T` 之上再交 `chrome` / `surface` 两格**。
+
+    ## 这条盯的是"深一层"到底深在哪
+
+    用户点名的那一套：`A-T` 只有对话区那一片底是终端的，而屏幕上最显眼的其实是
+    两处实色 —— 顶栏 / 会话头 / 状态栏 / 输入框那四条色带（`chrome`），以及开场那
+    三个方块「开始 / 最近 / 提示」（`surface`）。所以这里按**两件事**断言，两件都必要：
+
+      1. 它和 `A-T` 的差别**只有那两格** —— 别的 token（`line` / `ink` / `sunk` / …）
+         连同派生角色逐个相等。**框线照旧是主题色**（`line` / `hairline`，输入框上下
+         那两条 `accent`、那三个框的圆角边也是 `accent`），文字照旧是琥珀那套；
+      2. 那两格**真的是 `ansi_default`**（不是抄了一个近似的深色）—— 一路走到
+         `$td-chrome` / `$td-surface`，横栏、三个框于是和对话区连成一整块。
+
+    为什么盯 `A-T` 而不是盯 `A`：这一套是从浅的那套派生的（`_transparent(A-T, …)`），
+    所以"差了哪几格"这句话只有在"以 `A-T` 为基准"时才说得准。
+    """
+    light = theme_mod.get("A-T")
+    deep = theme_mod.get("A-T2")
+    assert deep.palette.transparent is True
+    assert deep.bg == theme_mod.ANSI_DEFAULT
+    assert deep.chrome == theme_mod.ANSI_DEFAULT
+    assert deep.surface == theme_mod.ANSI_DEFAULT
+    # (1) 除了交出去的那两格，一格都不差 —— 浅的那套自己多透的格子也照旧继承下来。
+    assert deep.palette.clear_roles == ("chrome", "surface")
+    assert light.palette.clear_roles == ()
+    for attr in ("line", "ink", "ink2", "ink3",
+                 "accent", "warn", "danger", "ok", "dark"):
+        assert getattr(deep, attr) == getattr(light, attr), attr
+    for attr in ("rail", "elevated", "sunk", "hairline", "ink4",
+                 "accent_soft", "danger_soft", "skill", "rail_bar"):
+        assert getattr(deep, attr) == getattr(light, attr), attr
+    # 它和原版 `A` 的色值血缘也还在（派生角色的基准色是原版的 `bg`，没被浅的那套
+    # 的 `ansi_default` 覆盖掉）。
+    base = theme_mod.get("A")
+    for attr in ("rail", "elevated", "sunk", "hairline", "ink4"):
+        assert getattr(deep, attr) == getattr(base, attr), attr
+    assert deep.palette.base_bg == base.bg
+    # (2) CSS 变量那两格是"终端自己的底色"，不是近似色。
+    variables = deep.variables()
+    assert variables["td-chrome"] == theme_mod.ANSI_DEFAULT
+    assert variables["td-surface"] == theme_mod.ANSI_DEFAULT
+    assert variables["td-bg"] == theme_mod.ANSI_DEFAULT
+    # 横栏、开场那三个框的底和对话区于是**是同一个东西**（都是"别涂"）。
+    assert variables["td-chrome"] == variables["td-bg"] == variables["td-surface"]
+    # 框线那一格没有被顺手透掉（用户要的是"框线要主题色"）。
+    assert variables["td-line"] == base.line
+    assert variables["td-hairline"].startswith("#")
+    # 名字 / 出处：列表里第三套透明版，看得出它是谁的、也看得出它更深一档。
+    assert deep.name == "石墨琥珀 · 深透明"
+    assert "透明版" in deep.palette.source
+    assert deep.palette.name_en == "Graphite Amber · Deep Clear"
+
+
 def test_every_theme_carries_all_roles():
     """九个 token 齐全，而派生角色确实**落在两个端点之间**（不是随手写的字面量）。"""
     for key in theme_mod.ORDER:
         palette = theme_mod.get(key)
-        for attr in ("chrome", "surface", "line", "ink", "ink2", "ink3",
-                     "accent", "warn", "danger", "ok"):
-            value = getattr(palette, attr)
-            assert value.startswith("#") and len(value) == 7, (key, attr, value)
-        # `bg` 是唯一允许"不是色值"的一格：透明版把它交给终端自己。
+        # 透明版允许把某几格**交给终端**（`ansi_default`）—— 但只允许它声明的那几格：
+        # `bg` 是所有透明版都透的那一格，`clear_roles` 里是"还多透了哪几格"。
+        # 声明之外的一格都不许"不是色值"，否则一次手滑就能把实色主题透掉一块。
+        clear = set(palette.clear_roles)
         if palette.transparent:
-            assert palette.bg == theme_mod.ANSI_DEFAULT
-        else:
-            assert palette.bg.startswith("#") and len(palette.bg) == 7, (key, palette.bg)
+            clear.add("bg")
+        for attr in ("chrome", "surface", "line", "ink", "ink2", "ink3",
+                     "accent", "warn", "danger", "ok", "bg"):
+            value = getattr(palette, attr)
+            if attr in clear:
+                assert value == theme_mod.ANSI_DEFAULT, (key, attr, value)
+            else:
+                assert value.startswith("#") and len(value) == 7, (key, attr, value)
+        # 只有透明版才准声明"交给终端"的格子（实色主题里那些格子必须是色值）。
+        if not palette.transparent:
+            assert palette.palette.clear_roles == (), key
         assert palette.rail != palette.bg
         assert palette.hairline != palette.bg
         # 变量表齐全（CSS 里用到的每一个 `$td-*` 都得在这儿）。
         variables = palette.variables()
+        cleared = {f"td-{role}" for role in palette.clear_roles}
         for name in ("td-chrome", "td-surface", "td-line", "td-ink",
                      "td-ink2", "td-ink3", "td-accent", "td-warn", "td-danger",
                      "td-ok", "td-rail", "td-elevated", "td-sunk", "td-hairline",
                      "td-ink4", "td-accent-soft", "td-danger-soft", "td-skill",
                      "td-rail-bar"):
-            assert variables[name].startswith("#"), (key, name)
+            if name in cleared:
+                # 声明要透的那几格：变量表里也必须是"别涂"，而不是某个近似的色值。
+                assert variables[name] == theme_mod.ANSI_DEFAULT, (key, name)
+            else:
+                assert variables[name].startswith("#"), (key, name)
         assert variables["td-bg"] == palette.bg, key
 
 
@@ -794,6 +866,11 @@ def test_theme_resolve_accepts_key_number_name_and_nothing_else():
     assert theme_mod.resolve("6") == "A"
     assert theme_mod.resolve("9") == "D"
     assert theme_mod.resolve("12") == "A-T"
+    # 深一档那套（13）：key / 序号 / 名字里那两个字都能选中它。
+    assert theme_mod.resolve("13") == "A-T2"
+    assert theme_mod.resolve("a-t2") == "A-T2"
+    assert theme_mod.resolve("AT2") == "A-T2"
+    assert theme_mod.resolve("深") == "A-T2"
     assert theme_mod.resolve("靛") == "P7"
     assert theme_mod.resolve("墨绿") == "C"
     assert theme_mod.resolve("a") == "A"
@@ -818,9 +895,12 @@ def test_resolve_picks_the_most_exact_name_when_two_match():
     # 原版赢（`石墨琥珀` 以 `琥珀` 开头，透明版只是含它）。
     assert theme_mod.resolve("琥珀") == "A"
     assert theme_mod.resolve("violet") == "P3"      # Pink Violet < … · Clear
-    # 只有透明版含这三个字的两套都命中，取展示顺序靠前的。
+    # 只有透明版含这三个字的三套都命中，取最短的（`粉紫 · 透明`）。
     assert theme_mod.resolve("透明") == "P3-T"
     assert theme_mod.resolve("clear") == "P3-T"
+    # 深一档那套：`深透明` / `Deep Clear` 都只有它含，所以它是唯一命中。
+    assert theme_mod.resolve("深透明") == "A-T2"
+    assert theme_mod.resolve("deep") == "A-T2"
     # 该不认识的一个都没多认：拼一半的名字不是名字（它照旧返回 None）。
     assert theme_mod.resolve("琥珀色") is None
     assert theme_mod.resolve("暖橄榄") is None
@@ -893,6 +973,122 @@ async def test_the_clear_variant_leaves_the_screen_background_to_the_terminal(mo
         opaque_line = app.query_one("#log").render_line(0)
         assert [segment.style.bgcolor for segment in opaque_line
                 if segment.style is not None][0].triplet is not None
+
+
+@pytest.mark.anyio
+async def test_the_deep_clear_variant_paints_neither_the_bars_nor_the_input_box(monkeypatch):
+    """`A-T2`：**顶栏 / 会话头 / 状态栏 / 输入框一个都不涂**，而框线照旧是主题色。
+
+    ## 这条就是"深一层"的验收
+
+    用户点名的效果是屏幕上那四条横色带消失（它们本来和对话区不是一片），而**框线
+    要留着**、还是主题色。所以这里按两半断言：
+
+      * 浅的那套（`A-T`）：对话区透了，横栏和那三个框还是实色（`ansi is None`）；
+      * 深的那套（`A-T2`）：它们全变成 `ansi == -1`（"别涂"），对话区照旧；
+      * 而框线**两套都是主题色**（输入框上下两条 `accent`、那三个框的圆角边也是
+        `accent`、左栏右边那条是 `hairline`）—— "框线要主题色"这条要求写在这儿，
+        免得下一次谁顺手把它也透了。
+
+    ## 为什么要量到"合成之后的整屏"
+
+    控件自己的 `render_line` 只是**内容那一层**：它上面还要盖屏幕的底、再走一遍
+    每个控件的过滤器（`StylesCache.render_widget`），而"这一块是不是一片实色"是在那
+    之后才定下来的。所以这条测试按 `render_strips()` 断言 —— 那是驱动真正拿到的
+    那一份。**实测它还逮到过一件事**：`NO_COLOR` 在环境里的话，Textual 会挂一个
+    `Monochrome` 过滤器把"默认底色"也换成黑（那是"别用颜色"的正当行为），于是整条
+    断言会在一个和配色无关的环境变量下变红 —— 这条测试量的是颜色，所以先把那个变量
+    摘掉。
+    """
+    # `App.__init__` 就是在这个变量上决定挂不挂 `Monochrome` 的，所以要在造 App 之前。
+    from rich.color import Color as RichColor
+    from rich.color import ColorType
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    app = _build_app(monkeypatch)
+    # 横栏那几条 + 输入框（`chrome` 这个 token 收的全部地方）。
+    bars = ("#top", "#session", "#status", "#input-box", "#input")
+    # 开场那三个框（`surface` 收的地方）—— 它们的名字就是 welcome 那三个类。
+    boxes = (".start-box", ".recent-box", ".hint-box")
+
+    def composited_backgrounds(selector: str, row_offset: int = 0) -> set:
+        """那一块**合成之后**某一行的底色（整屏那一份，不是控件内容那一份）。"""
+        row = app.query_one(selector).region.y + row_offset
+        strip = app.screen._compositor.render_strips()[row]
+        return {segment.style.bgcolor for segment in strip
+                if segment.style is not None and segment.style.bgcolor is not None}
+
+    def all_clear(selectors, row_offset: int = 0) -> None:
+        """这几块整行都是"别涂"（`default`，而且是**真的量过**的那一层）。"""
+        for selector in selectors:
+            assert composited_backgrounds(selector, row_offset) == \
+                {RichColor.parse("default")}, selector
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        # 欢迎屏要等 `init`（见 `test_tui_boot.py`），而"开始 / 最近 / 提示"就是它。
+        app._inbox.put(("message", _init_message("s")))
+        await _settle(app, pilot)
+        assert len(app.query(".welcome-box")) == 3, "开场那三个框要在这一屏上"
+
+        app.theme = "A-T"
+        await _settle(app, pilot)
+        assert app.screen.styles.background.ansi == -1
+        for selector in bars:
+            assert app.query_one(selector).styles.background.ansi is None, selector
+        for selector in boxes:
+            assert app.query_one(selector).styles.background.ansi is None, selector
+        # 合成之后也一样：三条横栏是实色（`default` 一格都没有）；那三个框各自那一行
+        # 上**有框自己的底色**（同一行剩下的格子是框外的对话区，那一层在 `A-T` 里
+        # 本来就是透的，所以这里认的是"框的那一格在不在"，不是"整行都是实色"）。
+        for selector in ("#top", "#session", "#status"):
+            backgrounds = composited_backgrounds(selector)
+            assert backgrounds and all(bg.type != ColorType.DEFAULT for bg in backgrounds), \
+                (selector, backgrounds)
+        for selector in boxes:
+            backgrounds = composited_backgrounds(selector, 1)  # +1 跳过顶边那条框线
+            assert RichColor.parse(app.palette.surface) in backgrounds, \
+                (selector, backgrounds)
+        # 输入框上下那两条线是 accent（浅的那套没动它）。
+        assert app.query_one("#input-box").styles.border_top[1].hex.lower() \
+            == app.palette.accent.lower()
+
+        app.theme = "A-T2"
+        await _settle(app, pilot)
+        # 对话区那一大片照旧交给终端……
+        assert app.screen.styles.background.ansi == -1
+        # ……而横栏和那三个框也终于和它一样了（在此之前它们是实色）。
+        for selector in bars + boxes:
+            assert app.query_one(selector).styles.background.ansi == -1, selector
+        # **合成之后整行都是"别涂"**：这就是用户在终端里看到的那一件事，也是这一套
+        # 和 `A-T` 的全部差别。`#log` 那一行也在里面 —— 那一行上正好摆着那两个框。
+        all_clear(("#top", "#session", "#status", "#log"))
+        all_clear(boxes, 1)
+        # 框线还是主题色：输入框上下两条是 `accent`，那三个框的圆角边也是 `accent`，
+        # 左栏右边那条是 `hairline`。**它们一个都没被顺手透掉。**
+        input_box = app.query_one("#input-box").styles
+        assert input_box.border_top[1].hex.lower() == app.palette.accent.lower()
+        assert input_box.border_bottom[1].hex.lower() == app.palette.accent.lower()
+        for selector in boxes:
+            assert app.query_one(selector).styles.border_top[1].hex.lower() \
+                == app.palette.accent.lower(), selector
+        assert app.query_one("#rail").styles.border_right[1].hex.lower() \
+            == app.palette.hairline.lower()
+        # `#input` 那一格是个**有意的例外**：光标本身就是一个反白色块（Textual 的
+        # caret），它是"我现在在这儿"的唯一信号，不该跟着透。所以这里只要求它别把
+        # 整行涂上底 —— 有底的段最多一格，也就是那个光标。
+        caret = [segment.style.bgcolor
+                 for segment in app.query_one("#input").render_line(0)
+                 if segment.style is not None and segment.style.bgcolor is not None
+                 and segment.style.bgcolor.type != ColorType.DEFAULT]
+        assert len(caret) <= 1, caret
+
+        # 换回实色那套，横栏跟着变回实色（"透"不是一个装上去就摘不掉的开关）。
+        app.theme = "A"
+        await _settle(app, pilot)
+        for selector in bars:
+            assert app.query_one(selector).styles.background.ansi is None, selector
+        for selector in boxes:
+            assert app.query_one(selector).styles.background.ansi is None, selector
 
 
 def test_every_palette_has_an_english_name_and_source():
@@ -1475,7 +1671,7 @@ async def test_each_rail_block_has_a_left_colour_bar(monkeypatch):
 async def test_the_selected_option_is_marked_and_reversed(monkeypatch):
     """F4 的选中项：`▌` 标记 + **整行反白**（底色铺满，不是只有文字那一段）。
 
-    反白在每一套主题下都自带对比（它就是前景背景互换），而色块底要和 12 套主题的
+    反白在每一套主题下都自带对比（它就是前景背景互换），而色块底要和 13 套主题的
     正文色逐一对一遍。`▌` 是给单色终端的形状信号。
     """
     from agent_runtime.frontends.tui import widgets as widgets_module
@@ -2800,8 +2996,8 @@ async def test_ctrl_t_toggles_the_turn_you_are_looking_at(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_theme_command_switches_all_twelve_live(monkeypatch):
-    """`/theme`：12 套在运行中换，而且**换完立刻重画**（不是等下一次事件）。
+async def test_theme_command_switches_all_thirteen_live(monkeypatch):
+    """`/theme`：13 套在运行中换，而且**换完立刻重画**（不是等下一次事件）。
 
     不带参数从前是"列一张清单"，现在弹选择面板（`OptionPicker`）。所以这条测试
     跟着改成：候选**把每一套都摆出来**（含序号和 key），选中之后配色**当场**换掉、
@@ -2823,19 +3019,25 @@ async def test_theme_command_switches_all_twelve_live(monkeypatch):
         status = app.query_one("#status")
         assert status.display is True
 
-        # 透明版也能在运行中换（`bg` 那一格交给终端）。
+        # 透明版也能在运行中换（`bg` 那一格交给终端）；深一档那套连横栏也交出去。
         app.submit("/theme a-t")
         await _settle(app, pilot)
         assert app.theme == "A-T"
         assert app.palette.transparent is True
+        assert app.palette.clear_roles == ()
+        app.submit("/theme 深")
+        await _settle(app, pilot)
+        assert app.theme == "A-T2"
+        assert app.palette.transparent is True
+        assert app.palette.clear_roles == ("chrome", "surface")
 
         # 认不出的名字不改配色，只说话。
         app.submit("/theme 不存在的颜色")
         await _settle(app, pilot)
-        assert app.theme == "A-T"
+        assert app.theme == "A-T2"
         assert "没有这套配色" in _log_text(app)
 
-        # 不带参数 = 弹选择面板，12 套都在（序号 + key + 名字）。
+        # 不带参数 = 弹选择面板，13 套都在（序号 + key + 名字）。
         app.submit("/theme")
         await _settle(app, pilot)
         assert isinstance(app.screen, widgets.OptionPicker)
@@ -2844,10 +3046,14 @@ async def test_theme_command_switches_all_twelve_live(monkeypatch):
         for index, key in enumerate(theme_mod.ORDER, 1):
             assert f"{index:>2} {key} {theme_mod.get(key).name}" in picker_text
         # 当前那一套带 `●`（候选里一定有它，不标出来"选了却没反应"看起来像坏了）。
+        # **认的是"标出来的就是现在这套"**，而不是某一套的名字：名字写死的话，
+        # 上面换了哪一套这条就得跟着改（深透明那套的名字还含"石墨琥珀 · 透明"的
+        # 前半段，写死会变成一个看着对、其实指着别处的断言）。
         from agent_runtime.frontends.tui import view_state
-        assert any(option.line.role == view_state.ROLE_WAITING
-                   and "石墨琥珀 · 透明" in str(option.line)
-                   for option in app._theme_options())
+        marked = [str(option.line) for option in app._theme_options()
+                  if option.line.role == view_state.ROLE_WAITING]
+        assert len(marked) == 1, marked
+        assert app.palette.name in marked[0]
 
         # 选中当场生效：把光标挪回原版那一套（`A`），按下去之后配色换回去、面板收掉
         # —— "选了一个已经在用的"不该变成一个什么都没发生。

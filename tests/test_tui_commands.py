@@ -503,10 +503,12 @@ async def test_the_theme_picker_applies_at_once_and_closes(monkeypatch):
         app.submit("/theme")
         await _settle(app, pilot)
         assert isinstance(app.screen, widgets.OptionPicker)
-        # 12 套都在，而且带展示序号（`/theme 6` 收的就是那个数）。
+        # 13 套都在，而且带展示序号（`/theme 6` 收的就是那个数）。
         text = _picker_text(app)
         assert " 1 P3 粉紫" in text and " 6 A 石墨琥珀" in text
         assert "11 P3-T 粉紫 · 透明" in text and "12 A-T 石墨琥珀 · 透明" in text
+        # 深一档那套排在最后（13）：名字里"深"字是它和 12 的分界，面板上看得出来。
+        assert "13 A-T2 石墨琥珀 · 深透明" in text
         assert app._client.sent == [], "本地操作，不进 runtime"
 
         # 把光标挪到 `C 墨绿仪器` 再确认：配色当场换、面板当场收、回声进会话流。

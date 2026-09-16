@@ -32,16 +32,19 @@
 
 ### 4. 配色是运行时可换的（`/theme`）
 
-12 套主题在 `theme.py` 里是纯数据，`_register_themes()` 把它们注册成 Textual 主题
+13 套主题在 `theme.py` 里是纯数据，`_register_themes()` 把它们注册成 Textual 主题
 （每个 token 变成一个 `$td-*` CSS 变量），而**自定义颜色的那些零件**（会话流、
 左栏、状态栏）在换主题时要重画自己 —— `_repaint_all()` 就是那一步。CSS 变量那部分
 由 Textual 自己重算，所以只有"用 Rich 手绘颜色的地方"需要这一趟。
 
-其中 `A-T` / `P3-T` 两套是**透明版**：它们的 `td-bg` 是 `ansi_default`（终端自己的
-底色），所以对话区那一大片不涂色。别的角色照旧是实色 —— 见 `theme.py` 的模块
-docstring。这里还多一件事：Textual 默认那个 `ANSIToTruecolor` 过滤器会把
-`ansi_default` 换成它猜的一个真彩色，所以得换成 `_KeepDefaultBackground`（见那个类
-的 docstring —— 那是"透明版看起来还是一块实心"的全部原因）。
+其中 `P3-T` / `A-T` / `A-T2` 三套是**透明版**：它们的 `td-bg` 是 `ansi_default`
+（终端自己的底色），所以对话区那一大片不涂色；`A-T2` 还把 `td-chrome`（顶栏 / 会话头 /
+状态栏 / 输入框）和 `td-surface`（开场那三个框：开始 / 最近 / 提示）也交出去，于是
+那几块和对话区连成一整块。别的角色照旧是实色 —— 见 `theme.py` 的模块 docstring。
+这里还多一件事：Textual 默认那个
+`ANSIToTruecolor` 过滤器会把 `ansi_default` 换成它猜的一个真彩色，所以得换成
+`_KeepDefaultBackground`（见那个类的 docstring —— 那是"透明版看起来还是一块实心"
+的全部原因）。
 """
 
 import queue
@@ -574,7 +577,7 @@ class TuiApp(App[None]):
         return theme_mod.get(self.theme)
 
     def _register_themes(self) -> None:
-        """11 套设计稿配色 → 11 个 Textual 主题。
+        """13 套设计稿配色 → 13 个 Textual 主题。
 
         每个 token 同时出现在两个地方，而且**都是必要的**：
 
@@ -585,8 +588,13 @@ class TuiApp(App[None]):
         漏掉后者会得到一个"自己的行是对的、按钮还是默认蓝"的界面 —— 而那种不一致
         在暗色主题上尤其脏。
 
-        `background` 那一格是**透明版的全部机关**：透明版的 `bg` 是 `ansi_default`，
+        `background` 那一格是**透明版的主力机关**：透明版的 `bg` 是 `ansi_default`，
         它一路走到 `Screen.render()`，于是屏幕底那一层交给终端自己（见 `theme.py`）。
+        深一档的那套（`A-T2`）把 `panel` 和 `surface` 也设成 `ansi_default` —— 那两格
+        收的是我们的 `chrome`（顶栏 / 状态栏 / 输入框）和 `surface`（开场那三个框），
+        于是它们也不再涂色。**注意 `surface` 还有第二个消费者**：Textual 自己那套变量
+        里的 `$surface` 是 `Button.-style-default` 的底色，所以深透明那套里默认样式的
+        按钮会变成只有上下半格边框的扁按钮（`theme.py` 的模块 docstring 记了这条代价）。
         """
         for key in theme_mod.ORDER:
             palette = theme_mod.THEMES[key]
@@ -1658,7 +1666,7 @@ class TuiApp(App[None]):
         清单"，它是把那条抄写的路去掉。
 
         `/theme` 那一条**看错了一眼就看得出来**，所以本来可以先不动它；做它的理由是另一半：
-        清单上那些名字（`石墨琥珀`、`P3 粉紫`）此前也只是为了**照着打一遍**，而 11 套的
+        清单上那些名字（`石墨琥珀`、`P3 粉紫`）此前也只是为了**照着打一遍**，而 13 套的
         序号和 key 都很容易记错（`/theme 6` 是 `A`，不是 `P6`）。两条的差别落在"选完关不关
         面板"上（见下面 `runtime_backed`）。
 
@@ -1988,7 +1996,7 @@ class TuiApp(App[None]):
 
         轮换听起来方便，但它把"我现在是哪一套"变成了一个必须靠记忆的状态 ——
         而列一次清单的成本是零。选择面板比清单更省事：清单上那些名字（`石墨琥珀`、
-        `P3 粉紫`）本来也只是为了**照着打一遍**，而 11 套的序号和 key 都很容易记错
+        `P3 粉紫`）本来也只是为了**照着打一遍**，而 13 套的序号和 key 都很容易记错
         （`/theme 6` 是 `A`，不是 `P6`）。
 
         ## 它和 `/model` 那条面板有一处**刻意的不一样**
@@ -2014,7 +2022,7 @@ class TuiApp(App[None]):
         )])
 
     def _theme_options(self) -> list[view_state.Option]:
-        """11 套 → 选择面板的候选。顺序就是展示顺序（`theme_mod.ORDER`）。
+        """13 套 → 选择面板的候选。顺序就是展示顺序（`theme_mod.ORDER`）。
 
         序号那一列也在，因为它就是 `/theme <序号>` 收的那个数（`/theme 6` → `A`）
         —— 面板上写着 ` 6 A 石墨琥珀`，命令写法那条路就不用另外解释了。

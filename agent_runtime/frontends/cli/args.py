@@ -73,8 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--theme", default=None,
-        help="TUI 的配色（11 套：a 石墨琥珀是默认，a-t 是它的透明版 —— 底色交给终端；"
-             "也能给名字，如 --theme 靛夜）。运行中还能用 /theme 换",
+        help="TUI 的配色（13 套：a 石墨琥珀是默认，a-t 是它的透明版 —— 底色交给终端；"
+             "a-t2 更透一档，连顶栏、输入框和开场那三个框也交出去；也能给名字，"
+             "如 --theme 靛夜）。运行中还能用 /theme 换",
     )
     # 界面语言。**它不是给 TUI 一家用的**：runtime 子进程也要照同一套语言写它自己
     # 那几句（启动通知、/model 的回话），所以父进程定了之后要用 `--lang` 传下去
