@@ -1491,7 +1491,7 @@ def workspace_name(state: view_state.ViewState) -> str:
 def model_and_workspace(state: view_state.ViewState) -> str:
     """左栏那一行身份：`deepseek-chat · agent_runtime`。
 
-    **步数预算不在这里**：它在会话头那一行（`最多 80 步`），而这一格要说的是
+    **步数预算不在这里**：它在会话头那一行（`最多 120 步`），而这一格要说的是
     "我在哪儿、用的什么模型"——把三个数挤在一行里，宽屏能看、窄屏全都被省略号吃掉。
     """
     return f"{state.model or '—'}  ·  {workspace_name(state)}"

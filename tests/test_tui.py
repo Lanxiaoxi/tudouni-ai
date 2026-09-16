@@ -16,6 +16,7 @@ import pytest
 from agent_runtime.frontends.tui import theme as theme_mod
 from agent_runtime.frontends.tui import view_state
 from agent_runtime.protocol import state as agent_state
+from agent_runtime.runtime.composition import DEFAULT_MAX_STEPS
 
 
 def _think_lines(turn) -> list:
@@ -189,7 +190,8 @@ def test_status_bar_left_is_a_projection_not_a_second_truth():
     这里只钉一件事：**`activity` 说的是"最近发生了什么"**，不是界面自己编的词。
     没有流式，"模型在想"和"工具在跑"分不出更细的粒度 —— 硬分只能用时间间隔去猜。
     """
-    state = view_state.ViewState(session_id="s1", model="m", max_steps=80)
+    state = view_state.ViewState(session_id="s1", model="m",
+                                 max_steps=DEFAULT_MAX_STEPS)
     assert "空闲" in state.status_left()
 
     state.agent = agent_state.reduce(
@@ -200,7 +202,11 @@ def test_status_bar_left_is_a_projection_not_a_second_truth():
     # **`step` 只在 `run_started` 上更新**，后面的事件带的是同一个 step。
     # 而 step 的语义是"第几次模型往返"，`run_started` 那条是 **0** ——
     # 所以真实的第 2 步长这样（实测踩过：我第一版在这里传了 step=1，
-    # 于是断言写成 `第 2/80 步` 而实际是 `第 1/80 步`）。
+    # 于是断言写成 `第 2/N 步` 而实际是 `第 1/N 步`）。
+    #
+    # `N` 跟着 `DEFAULT_MAX_STEPS` 走，**不写死**：那个数从 80 抬到 120 那一次，
+    # 就是这两条写死 80 的断言在挡路，而它们真正要钉的是"分子分母各自的来源"，
+    # 不是某一次定下来的值。
     state.agent = agent_state.reduce(state.agent, {
         "t": "event", "kind": "run_started", "step": 0,
     })
@@ -210,7 +216,7 @@ def test_status_bar_left_is_a_projection_not_a_second_truth():
     })
     line = state.status_left()
     assert "read_file" in line and "第 2 个" in line
-    assert "第 1 / 80 步" in line
+    assert f"第 1 / {DEFAULT_MAX_STEPS} 步" in line
 
 
 def test_status_bar_right_shows_context_cache_and_audit():

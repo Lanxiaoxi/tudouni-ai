@@ -73,7 +73,10 @@ STATUS = {
                      "permission_waits": 2, "asks": 1},
         "usage": {"prompt": 203_500, "cached": 179_200, "miss": 24_300,
                   "completion": 8_100},
-        "meta": {"max_steps": 80, "stream": True, "autopilot": False,
+        # 这个数**故意不是 `DEFAULT_MAX_STEPS`**：那一行读的是 `/status` 回包里的
+        # `meta.max_steps`，不是界面自己从配置里抄的那个默认值。写成默认值的话，
+        # "它到底读哪儿"就分不出来了。
+        "meta": {"max_steps": 42, "stream": True, "autopilot": False,
                  "tool_count": 14, "audit_path": r"C:\w\.tudouni\logs\x.jsonl"},
     },
     "last_prompt_tokens": 203_500,
@@ -104,7 +107,7 @@ def test_the_status_screen_reports_every_number_with_its_own_unit():
     assert "3 轮 · 9 次模型调用 · 14 次工具调用" in text
     assert "审批 2 次" in text and "提问 1 次" in text
     # 这次运行的环境 + 去处。
-    assert "最多 80 步" in text and "流式" in text and "逐条审批" in text
+    assert "最多 42 步" in text and "流式" in text and "逐条审批" in text
     assert "14 个" in text and "x.jsonl" in text
 
 
