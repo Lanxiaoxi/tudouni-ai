@@ -114,8 +114,9 @@ def todo_note(metadata: Mapping[str, Any]) -> str | None:
     靠"最近一条看起来对"推断现状是不可靠的；更要紧的是它得出现在模型**要决策的那一刻**
     （载荷尾部），而不是几十步之前。
 
-    它**不进 `session.messages`** —— 理由和 `_budget_reminder` 完全一样（见 agent.py）：
-    逐轮变化的东西不该被持久化，也不该去稀释"一条 assistant = 一步"那个派生规则。
+    它**不进 `session.messages`** —— 理由和载荷尾部那条会话状态完全一样（见
+    `Agent._status_note`）：逐轮变化的东西不该被持久化，也不该去稀释"一条
+    assistant = 一步"那个派生规则。
     """
     items = load(metadata)
     if not items:

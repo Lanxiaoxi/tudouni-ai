@@ -18,6 +18,8 @@ import httpx
 import pytest
 
 from agent_runtime.agents import Agent
+from agent_runtime.agents import StepLimitExceeded
+from agent_runtime.models.base import ChatModel
 from agent_runtime.models.types import ModelResponse
 from agent_runtime.security import PermissionPolicy
 from agent_runtime.state import JsonSessionStore, Session
@@ -445,33 +447,59 @@ def test_missing_prompt_file_gives_an_actionable_error(workdir):
     assert "系统提示词文件不存在" in str(exc.value)
 
 
-def test_budget_reminder_counts_the_current_step_in():
-    """剩余步数是**含本次**的 —— 差一会让模型提前收工。"""
-    assert Agent._budget_reminder(20, 0)["content"] == "剩余步数：20（含本次）"
-    assert Agent._budget_reminder(20, 19)["content"] == "剩余步数：1（含本次）"
+def test_the_budget_is_stated_once_in_the_prompt_not_per_request():
+    """**有限的执行预算只写在系统提示词里，一次。**
+
+    演进过程值得记下来，因为它试过三种写法：
+
+      1. 每一步在载荷末尾报一个递减的绝对值（`剩余步数：80`、`79`…）。问题是
+         **模型拿这个数没办法** —— 没有任何动作能让它变大，它也无从知道步数花在
+         哪儿了。于是几十轮之后它就被学会了忽略；
+      2. 改成"剩 5 步时给一次警报"。好一些，但它仍然是每轮都在拼一条临时消息，
+         而"该不该收尾"的判据本来就不该是一个计数器；
+      3. **现在**：策略写在系统提示词里（静态、逐字节不变、于是命中缓存前缀），
+         而硬上限由循环兜着（`StepLimitExceeded`，而且它可续）。
+
+    这条测试钉住第 3 种：提示词里有那句话，而载荷里**一次都没有**步数。
+    """
+    prompt = load_system_prompt()
+
+    assert "执行预算" in prompt
+    assert "避免过度的工具调用" in prompt
 
 
-def test_reminder_reaches_the_model_but_never_the_session(registry):
-    """步数提示逐轮变化，所以它只该活在请求里。"""
+def test_no_step_count_is_ever_injected_into_the_payload(registry):
+    """载荷里**任何一步都不许出现步数** —— 它已经不是上下文的一部分了。"""
 
-    model = ScriptedModel([
-        ModelResponse(content=None, tool_calls=[tool_call("list_files", {})], usage=usage()),
-        ModelResponse(content="完成", usage=usage()),
-    ])
-    agent = Agent(model, registry, PermissionPolicy({RiskLevel.LOW}),
-                  asker=lambda t, a: False)
+    class _AlwaysCalls(ChatModel):
+        """每一步都要调工具 —— 用来撞步数上限，并记下每次请求的载荷。"""
+
+        def __init__(self):
+            self.seen_messages: list[list[dict]] = []
+
+        def complete(self, messages, tools=None):
+            self.seen_messages.append(list(messages))
+            return ModelResponse(content=None,
+                                 tool_calls=[tool_call("list_files", {}, "c1")],
+                                 usage=usage())
+
+    model = _AlwaysCalls()
+    agent = Agent(model, registry, PermissionPolicy({RiskLevel.LOW}))
     session = Session.new("s")
-    agent.run(session, "列目录", max_steps=5)
+    with pytest.raises(StepLimitExceeded):
+        agent.run(session, "列目录", max_steps=3)
 
-    # 模型每轮都看到了，而且数字在减少
-    sent = [
-        message["content"]
-        for payload in model.seen_messages
-        for message in payload
-        if message["role"] == "user" and str(message["content"]).startswith("剩余步数")
-    ]
-    assert sent == ["剩余步数：5（含本次）", "剩余步数：4（含本次）"]
+    for payload in model.seen_messages:
+        for message in payload:
+            # 系统消息**不算** —— 那句话正是加在它里面的（那是策略，静态、只写一次）
+            if message.get("role") == "system":
+                continue
+            content = str(message.get("content") or "")
+            assert "步数" not in content, f"载荷里出现了步数提示：{content!r}"
+            assert "该收尾了" not in content, f"载荷里出现了收尾警报：{content!r}"
 
-    # 会话里一个字都没有 —— 否则文件变胖、--history 全是碎话，
-    # 而且「一条 assistant = 一步」这个派生规则会被 user 消息稀释
-    assert not any("剩余步数" in str(m.get("content")) for m in session.messages)
+    # 会话里当然更不能有（理由和上面那条一样：它逐轮变化，本来就不该被持久化）
+    # —— 包括那条 system 消息：它在**历史**里，但它是策略而不是步数播报
+    assert not any("步数：8" in str(m.get("content")) for m in session.messages)
+    assert not any(m.get("role") == "user" and "步数" in str(m.get("content"))
+                   for m in session.messages)

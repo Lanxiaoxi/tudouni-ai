@@ -158,6 +158,19 @@ def _arguments_of(call: dict[str, Any]) -> dict[str, Any]:
     return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
+def _last_tool_index(messages: list[dict[str, Any]]) -> int:
+    """最后一条 tool 结果在第几条。**没有就返回 `-1`。**
+
+    步数警报要挂在它后面（见 `Agent._payload`），所以"最后一条在哪"需要一个确定的
+    答案 —— 而"往末尾找第一条 tool"（`reversed`）和"从头扫一遍"在这里必须给出同一
+    个结果，否则同一个回合的两次请求会把警报插到不同位置，而那会让前缀缓存整个作废。
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "tool":
+            return index
+    return -1
+
+
 def _is_fatal(exc: BaseException) -> bool:
     """区分"重试也没用"和"重试用完了"。
 
@@ -878,42 +891,39 @@ class Agent:
         # 值"这件事在类型上成立，而不是靠读者推理。
         raise ModelError("模型调用重试逻辑异常：未预期的出路")
 
-    @staticmethod
-    def _budget_reminder(max_steps: int, step: int) -> dict[str, str]:
-        """一条只在本次请求里有效的步数提示。
+    def _status_note(self, session: Session) -> dict[str, str] | None:
+        """这次请求尾部那条临时消息：会话状态（注入的那几段）。
 
-        **它不进 session.messages。** 三个理由：会话文件会平白多出几十条 user
-        消息；step_count() 靠「一条 assistant = 一步」派生，掺进 user 消息之后
-        「聊了多少轮」的语义就糊了；而且它逐轮变化，本来就不该被持久化。
+        ## 步数不在这里 —— 一次都不在
 
-        也放不进系统提示词 —— 它逐轮衰减，等于每一轮都把缓存前缀打断一次。所以它
-        只能挂在载荷最末尾：那是整段对话里单价最贵的位置，却也正是唯一该变化的位置。
-        （一个回合 20 步 ≈ 200 个 token，相对于一次 read_file 动辄上万字符可以忽略。）
+        它以前是载荷末尾那句逐轮递减的 `剩余步数：80（含本次）`，后来改成"剩 5 步时
+        给一次警报"，现在**整个去掉了**。理由是一条比"怎么措辞更好"更基本的判据：
 
-        第 1 步它会紧跟真正的用户消息，形成连续两条 user。DeepSeek 的 OpenAI 兼容
-        接口接受这个形状，Aider 和 OpenHands 也都是逐轮往尾部追加提醒；但若将来换到
-        强制 user/assistant 交替的 provider，这里要改成挂到最后一条 tool 结果上。
+            **模型拿这个数没办法。** 没有任何动作能让它变大，它也无从知道步数花在
+            哪儿了 —— 所以逐轮报它是一个只能让人焦虑、不能改变行为的信息。
+
+        真正能改变行为的东西是**策略**，而策略是静态的：提示词里那句"你当前有有限的
+        执行预算，请优先完成用户目标，避免过度的工具调用"（`prompts/system.zh.md`）
+        一次说清，此后每一轮都成立、且**逐字节不变**（于是它在缓存前缀里命中）。
+
+        代价说清楚：模型**看不到**自己还剩几步，所以它不会为"最后 3 步"改变打法。
+        换来的是：不再有噪音、不再有那个冒充 user 的第二条消息、而"该不该收尾"的
+        判据回到它本来就该是的那一个 —— 任务做完没有。硬上限仍然由循环兜着
+        （`StepLimitExceeded`，而且它可续：会话是完好的）。
+
+        **合成一条，而不是各挂一条。** 载荷尾部因此只有一条临时消息，形状固定 ——
+        连续几条 user 是没必要去赌 provider 宽容度的形状。
+
+        整条都不进 `session.messages`：会话文件会平白多出几十条 user 消息，而
+        `step_count()` 靠"一条 assistant = 一步"派生，掺进 user 之后"聊了多少轮"
+        的语义就糊了。而且那几段逐轮变化，本来就不该被持久化。
         """
-        return {"role": "user", "content": f"剩余步数：{max_steps - step}（含本次）"}
-
-    def _status_note(
-        self, session: Session, max_steps: int, step: int
-    ) -> dict[str, str]:
-        """这次请求尾部那条临时消息：会话状态（注入的）+ 步数预算。
-
-        **合成一条，而不是各挂一条。** 载荷尾部因此仍然只有一条临时消息（第 1 步是
-        "用户消息 + 这一条"），形状和只有步数提示时一模一样 —— 连续三条 user 是没必要
-        去赌 provider 宽容度的形状，而这个项目的第 1 步本来就已经是两条 user 了。
-
-        整条都不进 session.messages，理由见 _budget_reminder。
-        """
-        parts: list[str] = []
-        if self.session_notes is not None:
-            note = self.session_notes(session.metadata)
-            if note:
-                parts.append(note)
-        parts.append(self._budget_reminder(max_steps, step)["content"])
-        return {"role": "user", "content": "\n\n".join(parts)}
+        if self.session_notes is None:
+            return None
+        note = self.session_notes(session.metadata)
+        if not note:
+            return None
+        return {"role": "user", "content": note}
 
     # --- Context：把历史渲染成这次请求的载荷 --------------------------------
 
@@ -930,9 +940,13 @@ class Agent:
 
         return ContextRenderer(self.context.store, self.context)
 
-    def _note_text(self, session: Session, max_steps: int, step: int) -> str:
-        """载荷末尾那条临时提醒的正文。**逐轮的，所以不进历史**（见 `_budget_reminder`）。"""
-        return self._status_note(session, max_steps, step)["content"]
+    def _note_text(self, session: Session) -> str | None:
+        """载荷末尾那条会话状态。**逐轮的，所以不进历史。**
+
+        没有可注入的会话状态时返回 `None` —— 那时载荷末尾一条临时消息都不加。
+        """
+        note = self._status_note(session)
+        return note["content"] if note is not None else None
 
     def _calibrate(self, session: Session, usage: TokenUsage | None) -> None:
         """把估算比例对着实测值修一下。**没有 Context 或没有用量就什么都不做。**
@@ -945,38 +959,50 @@ class Agent:
             return
         self.context.calibrate(usage.prompt_tokens)
 
-    def _payload(
-        self, session: Session, max_steps: int, step: int
-    ) -> list[dict[str, Any]]:
+    def _payload(self, session: Session, *, run_id: str = "") -> list[dict[str, Any]]:
         """这次请求真正发出去的 messages。
 
         **两条路，形状一样**：
 
-          * 有 Context ⇒ 历史按档位渲染（tool 消息的内容从 ArtifactStore 现取），
-            临时提醒由渲染器追加在末尾；
-          * 没有 Context ⇒ 历史原样，临时提醒由这里追加。
+          * 有 Context ⇒ 历史按档位渲染（tool 消息的内容从 ArtifactStore 现取）；
+          * 没有 Context ⇒ 历史原样。
 
         两条路的**顺序和形状逐字节一致**，区别只在 tool 消息的正文从哪来。这一点
         是刻意的：Context 是"内容的来源"的替换，不是载荷形状的替换（见
         `context/renderer.py` 的模块 docstring）。
 
-        临时提醒**不进 `session.messages`**，所以它每一轮都要重新拼 —— 而它也有
-        可能是唯一让这次请求超预算的那一条，所以它进 Context 的账本（见下面的
-        `set_notes`）。
+        载荷末尾那条会话状态（任务列表 / 技能 / 后台任务）**不进
+        `session.messages`**：它逐轮变化，本来就不该被持久化。它进 Context 的账本
+        （见下面的 `set_notes`）—— 它也有可能是唯一让这次请求超预算的那部分。
+
+        **步数不在载荷里**（见 `_status_note`）：那是静态策略，写在系统提示词里。
         """
-        note = self._note_text(session, max_steps, step)
         renderer = self._renderer(session)
+        note = self._note_text(session)
+        notes = [note] if note else []
+
+        messages: list[dict[str, Any]] = []
+        for message in session.messages:
+            if renderer is None or message.get("role") != "tool":
+                messages.append(message)
+            else:
+                rendered = dict(message)
+                rendered["content"] = renderer.render_tool_content(message)
+                messages.append(rendered)
+
         if renderer is None:
-            return [*session.messages, {"role": "user", "content": note}]
+            if note:
+                messages.append({"role": "user", "content": note})
+            return messages
 
         # 预算：先按当前档位算出这次要花多少，超了就降级（只降不升，见 budget.py）。
         # **每步都调**，但只有真的超了才会动 —— 动过之后版本号变了，那条
         # `context_degraded` 事件里会记下来。
-        self.context.set_notes([note])
+        self.context.set_notes(notes)
         degraded = self.context.fit(renderer.render_item)
         if degraded:
             self._emit(
-                "context_degraded", session, "", step,
+                "context_degraded", session, run_id, 0,
                 items=len(degraded),
                 estimated=self.context.last_estimate,
                 limit=self.context.budget.effective_limit,
@@ -985,8 +1011,9 @@ class Agent:
                          for d in degraded][:20],
             )
         session.context = self.context.state
-        return renderer.build(session.messages,
-                              tail={"role": "user", "content": note})
+        if note:
+            messages.append({"role": "user", "content": note})
+        return messages
 
     def mark_context_messages(self, session: Session) -> None:
         """把"哪几条消息属于 stable 区"标进 Context。**每个回合开头调一次。**
@@ -1117,8 +1144,8 @@ class Agent:
 
             response = self._complete_with_retry(
                 session, run_id, step + 1,
-                # 载荷尾部那条临时提醒是按本次请求拼的，不写回 messages —— 见 _status_note
-                self._payload(session, max_steps, step),
+                # 载荷尾部那条会话状态是按本次请求拼的，不写回 messages —— 见 _status_note
+                self._payload(session, run_id=run_id),
                 tool_schemas,
                 run_started,
             )

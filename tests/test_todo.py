@@ -192,15 +192,17 @@ def test_the_model_sees_the_current_list_in_every_request():
     assert seen[1] != []
     assert "[进行中] 写 tools/todo.py" in seen[1][0]
     assert "[待办] 写测试" in seen[1][0]
-    # 和步数提示合成同一条临时消息：载荷尾部始终只有一条
-    assert "剩余步数" in seen[1][0]
+    # **末尾只有这一条**：步数提示不再逐轮出现（它只在剩 5 步时给一次警报，而且
+    # 挂在最后一条 tool 结果上）—— 所以载荷尾部那条临时消息就是这段会话状态。
+    assert len(seen[1]) == 1
+    assert model.seen_messages[1][-1]["role"] == "user"
 
 
 def test_the_list_never_enters_the_session_messages():
     """注入的那一份只活在请求里 —— 落盘的是工具调用本身，不是这段提示。
 
-    和步数提示同一条约定（见 test_prompt.py 里那条）。两条理由：会话文件不该平白多出
-    几十条 user 消息；而且列表逐轮变化，本来就不该被持久化成历史的一部分。
+    和会话状态那几段同一条约定（见 `Agent._status_note`）。两条理由：会话文件不该
+    平白多出几十条 user 消息；而且列表逐轮变化，本来就不该被持久化成历史的一部分。
     """
     session = Session.new("s")
     run_agent(session, session_notes=todo_note)

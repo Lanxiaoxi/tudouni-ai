@@ -223,7 +223,10 @@ def test_the_note_reaches_the_model_in_every_request(board):
     """一段贴在请求末尾的文本，模型**每一步**都看得到 —— 而不是让它去翻历史。
 
     和任务列表走的是同一条通道（`agent.session_notes` → `_status_note`），所以这里
-    只验"它确实进了载荷、而且和步数提示合成同一条临时消息"。
+    只验"它确实进了载荷、而且贴在末尾"。
+
+    载荷尾部**只有这一条临时消息**：步数提示已经不在这里了（它是静态策略，写在
+    系统提示词里 —— 见 `prompts/system.zh.md` 和 `tests/test_prompt.py`）。
     """
     session = Session.new("s")
     model = ScriptedModel([
@@ -241,13 +244,16 @@ def test_the_note_reaches_the_model_in_every_request(board):
     )
     agent.run(session, "起个后台任务")
 
+    payload = model.seen_messages[1]
     injected = [
-        str(m.get("content")) for m in model.seen_messages[1]
+        str(m.get("content")) for m in payload
         if m["role"] == "user" and "## 后台任务" in str(m.get("content"))
     ]
     assert injected, "第二步的请求里必须带着后台任务那一段"
     assert "在跑" in injected[0]
-    assert "剩余步数" in injected[0], "和步数提示合成同一条，载荷尾部只有一条临时消息"
+    # 而且它在载荷最末尾（那是"模型做决策那一瞬间"该看到的位置）
+    assert payload[-1]["role"] == "user"
+    assert "## 后台任务" in str(payload[-1]["content"])
 
 
 def test_the_note_never_enters_the_session_messages(board):
