@@ -1035,7 +1035,7 @@ class Agent:
 
         return _ref.artifact_id_of(message)
 
-    def run(self, session: Session, user_input: str, max_steps: int = 80) -> str:
+    def run(self, session: Session, user_input: str, max_steps: int = 120) -> str:
         # 回合的起点：run_finished 里的 duration_ms 从这里算起。放在最前面（而不是从
         # 第一次模型请求算起）是因为"这一轮花了多久"要含上追加消息、落盘这些开销 ——
         # 它们没被单独埋点，交给 CLI 那行汇总里的"未归因"去吸收，比假装它们不存在诚实。
