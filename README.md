@@ -1831,6 +1831,12 @@ full → range → preview → metadata → 移出 Context
    变成一个查不出来的现象）。
 4. **降级要留下痕迹。** 每一步降了什么进审计（`context_degraded`），`/status` 里也有
    一行 `资料 Artifact N 份 · 进过 Context M 份 · 这次发 K 份 · 挤掉 …`。
+5. **账本里含历史本身。** 预算不只看 Context 里那些 Artifact —— 系统提示词、用户和助手
+   的每一句话、每条 tool 消息那行引用**同样占窗口**，所以它们一起进账
+   （`Agent._fixed_payload_tokens` 算，`ContextManager.fit(extra=…)` 扣）。少了这一半，
+   长会话会走到"Artifact 全降到 0 仍然超窗"的境地，而那个 400 从 Context 的账本上
+   看不出来 —— 真正超窗的是历史。`context_degraded` 里的 `fixed` 就是这一半，它回答
+   "这一轮是被历史挤的，还是被 Artifact 挤的"（两者的处置完全不同）。
 
 ### 它不改变模型看到的东西
 

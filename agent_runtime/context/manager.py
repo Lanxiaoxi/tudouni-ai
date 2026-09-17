@@ -278,12 +278,28 @@ class ContextManager:
 
     # -- 预算 ------------------------------------------------------------------
 
-    def fit(self, render: Callable[[ContextItem], str | None]) -> list[Degraded]:
+    def fit(
+        self,
+        render: Callable[[ContextItem], str | None],
+        *,
+        extra: int = 0,
+    ) -> list[Degraded]:
         """把 Context 降到预算之内，返回这一步降了什么。
 
         `render` 是"按当前档位渲染成文本"的口子（由 renderer 给，见 `budget.py`）。
         降级的**改写**在这里做，因为"降一档之后 options 该怎么变"是 Context 状态
         的知识（`_degrade`）。
+
+        `extra` 是**载荷里降不动的那些内容**的 token 数（调用方算好）：系统提示词、
+        用户/助手消息、以及每条 tool 消息那行引用。它们不在 `state.items` 里（那些
+        是 Artifact），却和 Artifact 挤同一个窗口 —— **不扣掉就等于在算一本缺了
+        一半的账**：历史越长，算出来的"还塞得下"越假，最后把 Artifact 全降到 0 也
+        还是超窗，而 provider 只会回一个看起来像"上下文太长"的 400。
+
+        默认 0 = "这次没有固定开销"（测试、以及 `scripts/walkthrough_context.py`
+        那种只演 Context 本身的场合）。**它不是"不必算"，只是调用方说没有。**
+        本模块不自己去翻 messages：那形状是 renderer / agent 的知识，见模块
+        docstring 那条"管状态、不管渲染"的分界。
 
         **每一步都调它，但只有超预算时才会真的变。** 已经降下去的不回升
         （见 `budget.py` 的模块 docstring）。
@@ -291,7 +307,7 @@ class ContextManager:
         budget = self.budget
         if not budget.enabled:
             # 窗口未知：只报数。
-            self.last_estimate = self.estimate(render)
+            self.last_estimate = self.estimate(render, extra=extra)
             self.last_degraded = []
             return []
 
@@ -301,13 +317,13 @@ class ContextManager:
             render,
             degrade=self._degrade,
             remove=self._evict,
-            extra=self._notes_tokens(),
+            extra=extra + self._notes_tokens(),
             # **一次只降一档**：见 `budget.fit` 的 `single_step` 那段。降到刚好
             # 够就停 —— 多降的那几档是白丢的信息。
             single_step=True,
         )
         after = _fingerprint(self.state)
-        self.last_estimate = self.estimate(render)
+        self.last_estimate = self.estimate(render, extra=extra)
         if before != after:
             # 档位变了 ⇒ 渲染出来的 prompt 变了 ⇒ 这是一个新版本。**版本号变了的
             # 后果之一是它会被重新落盘**（见 state/store.py 的 context 记录）。
@@ -315,9 +331,20 @@ class ContextManager:
             self._notify()
         return self.last_degraded
 
-    def estimate(self, render: Callable[[ContextItem], str | None]) -> int:
-        """当前 Context 大概占多少 token（含临时内容）。"""
-        total = self.budget.estimate_items(self.state.live(), render)
+    def estimate(self, render: Callable[[ContextItem], str | None],
+                 *, extra: int = 0) -> int:
+        """当前这一轮请求大概占多少 token（含临时内容和固定开销）。
+
+        `extra` 的口径和 `fit` 的那个完全一样（调用方算好的"降不动的那部分"），
+        传同一个值给两边才成立 —— `fit` 拿它做决定、这里拿它报数，**两处差一个数
+        就会让"按估算报出来的余量"和"按估算做的降级"对不上**，而那种症状是
+        "明明还有余量却在降级"（或者反过来）。
+
+        它也喂 `calibrate`（`last_estimate` 是那里那个 estimated）。所以少了 `extra`
+        不只是报数偏小：**provider 实测的 `prompt_tokens` 是含固定开销的**，比例
+        会被算高，于是此后每一次降级都偏狠。
+        """
+        total = extra + self.budget.estimate_items(self.state.live(), render)
         for note in self.state.notes:
             total += MESSAGE_OVERHEAD + self.budget.tokens(note.text)
         return total

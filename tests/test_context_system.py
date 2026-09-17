@@ -707,6 +707,78 @@ def test_the_task_message_is_not_degradable(workdir):
     assert manager.items(), "工具结果应当进了 Context（它才是被降级的对象）"
 
 
+def test_the_history_itself_counts_against_the_budget(workdir):
+    """**不降级 ≠ 不计量。** 历史消息原样进载荷，但它们照样占窗口。
+
+    上一条钉的是"任务消息不会被挤掉"，这一条钉的是它的另一半：**它必须被算进
+    预算**。少了这一半，账本里就只剩 Artifact 那一半，于是长会话跑到后面必然出现
+    这个形状 ——
+
+        Artifact 单独看塞得下 ⇒ 判定"不用降级" ⇒ 真实载荷超窗 ⇒ provider 400
+
+    而那个 400 看起来像"上下文太长"，翻遍 Context 的账本却看不出是谁超的：真正
+    超窗的（系统提示词 + 几十轮历史）一个字都没进那本账，把 Artifact 全降到 0 也
+    还是超。
+
+    这里钉两件事，缺一不可：
+      * `_fixed_payload_tokens` 把"降不动的那部分"算了出来；
+      * `_payload` **真的把它交给了预算** —— 少了这一传，上面那个 400 就原样回来。
+    """
+    store, manager, renderer = build(workdir)
+    artifact = put(store, manager, "x" * 400, type="file",
+                   metadata={"path": "a.py", "lines": 10})
+    item = manager.item(artifact.artifact_id)
+
+    # `Session.new` 自带系统提示词，再补一条够长的用户任务 —— 两者都不该进 Context，
+    # 却都该进预算。
+    session = Session.new("s")
+    session.messages.append({"role": "user", "content": "这个回合的任务。" * 40})
+
+    # 模型不参与这件事（只调 `_payload`，不跑 run），随便给一个 ChatModel 子类。
+    agent = Agent(TwoStepModel(""), ToolRegistry(), PermissionPolicy({RiskLevel.LOW}),
+                  context=manager, processor=default_processor())
+
+    fixed = agent._fixed_payload_tokens(session)
+    assert fixed > 0, "系统提示词 + 用户任务没被算进来"
+
+    # 窗口正好卡在中间：只看 Artifact 时"塞得下"，算上历史就超。
+    manager.budget = ContextBudget(max_tokens=fixed + 100, reserve=0, headroom=0.0)
+    assert manager.estimate(render_all(renderer)) <= manager.budget.effective_limit, \
+        "旧口径（只看 Artifact）应当判成塞得下 —— 那正是这个 bug 的样子"
+    assert manager.estimate(render_all(renderer), extra=fixed) > manager.budget.effective_limit, \
+        "算上历史之后必须判成超了"
+
+    # 而 Agent 走的是第二条路。它没降级的话，上面那笔超窗的载荷就真的发出去了。
+    agent._payload(session)
+    assert item.representation is not Representation.FULL, \
+        "历史没进预算 ⇒ 该降的没降（P0 复现）"
+
+
+def test_a_tool_call_arguments_are_counted_too(workdir):
+    """**模型自己给出的参数也算载荷**，尤其是 `write_file` 的 content。
+
+    助手上一步那句"我要调 write_file，内容是……"会一路留在历史里、此后每一轮都
+    原样重发。只统计消息的 `content` 会把它整个漏掉，而它可能是几千字符的一份文件
+    正文 —— 漏掉它就等于给预算开了个随参数变大的口子。
+    """
+    store, manager, _ = build(workdir)
+    session = Session.new("s")
+    session.messages.append({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "write_file",
+                         "arguments": json.dumps({"content": "x" * 4000})},
+        }],
+    })
+
+    agent = Agent(TwoStepModel(""), ToolRegistry(), PermissionPolicy({RiskLevel.LOW}),
+                  context=manager, processor=default_processor())
+
+    assert agent._fixed_payload_tokens(session) >= 4000 * 0.25
+
+
 def test_context_survives_a_resume(workdir):
     """恢复会话之后：正文还在，**档位也还在**（不能弹回 full）。"""
     content = "B" * 4000

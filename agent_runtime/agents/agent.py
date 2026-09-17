@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from agent_runtime.agents.retry import Attempt, call_with_retry
 from agent_runtime.audit import event
+from agent_runtime.context.budget import MESSAGE_OVERHEAD
 from agent_runtime.context.processor import (
     ToolExecution,
     ToolResultProcessor,
@@ -999,13 +1000,20 @@ class Agent:
         # **每步都调**，但只有真的超了才会动 —— 动过之后版本号变了，那条
         # `context_degraded` 事件里会记下来。
         self.context.set_notes(notes)
-        degraded = self.context.fit(renderer.render_item)
+        # 载荷里降不动的那一半（系统提示词、历史消息、tool 消息的引用行）先算出来
+        # 交给预算 —— 少了它，"还塞得下"这个判断是假的，见 _fixed_payload_tokens。
+        fixed = self._fixed_payload_tokens(session)
+        degraded = self.context.fit(renderer.render_item, extra=fixed)
         if degraded:
             self._emit(
                 "context_degraded", session, run_id, 0,
                 items=len(degraded),
                 estimated=self.context.last_estimate,
                 limit=self.context.budget.effective_limit,
+                # 固定开销单独报一个数：事后要能分清这一轮是被**历史**挤的，还是被
+                # Artifact 挤的。两者的处置完全不同 —— 前者该换会话或清历史，后者
+                # 才是降级本身在正常工作。
+                fixed=fixed,
                 changes=[f"{d.artifact_id}:{d.before.value}->"
                          f"{d.after.value if d.after else 'removed'}"
                          for d in degraded][:20],
@@ -1014,6 +1022,65 @@ class Agent:
         if note:
             messages.append({"role": "user", "content": note})
         return messages
+
+    def _fixed_payload_tokens(self, session: Session) -> int:
+        """一次请求里**降不动的那部分**占多少 token。
+
+        ## 它为什么必须存在
+
+        预算那一层只能降 Context 里的 Artifact（`state.items`），而载荷里还有一整半
+        不是 Artifact 的东西：系统提示词、用户和助手的每一句话、以及每条 tool 消息
+        那行 `[artifact art_x · 12480 字符 · read_file]` 引用。它们**同样占窗口**，
+        却谁也不计量。
+
+        症状在长会话里必然出现：Artifact 全降到 0 之后预算仍说"塞不下"，却无处可降
+        —— 真正超窗的是那堆历史。provider 回一个 400，看起来像"上下文太长"，但翻遍
+        Context 的账本都看不出是谁超的。
+
+        ## 三个口径上的讲究
+
+          * **tool 消息只算引用行，不算正文。** 正文在渲染时才从 ArtifactStore 取
+            出来，那一份由 `ContextBudget.estimate_items` 计量 —— 这里再算一遍就是
+            同一个东西记两笔。**例外是带不上 `artifact_id` 的 tool 消息**（老会话，
+            或者 `hydrate` 没覆盖到的那些）：渲染时它们是**原样透传**的
+            （`renderer.render_tool_content` 的 case 4），所以那种必须按全文计 ——
+            漏了就是低估，而低估是危险的那一侧。
+          * **`tool_calls` 的参数要算。** 助手上一步说"我要调 write_file"时带的那份
+            JSON 会一路留在历史里（此后每一轮都重发），它可能很长（一份文件正文）；
+            只算文本内容会把它整个漏掉。
+          * **偏大是安全的。** 估高了只是提前降级一点，估低了是请求直接失败
+            （见 `budget.py` 模块 docstring 里那条"估低 ⇒ 400"）。
+
+        开销上它是每步一次的线性扫描，量级和 `estimate_items` 扫全部 Artifact 正文
+        是同一档 —— 后者本来就在做同一件事，所以这里没有引入新的量级。
+        """
+        assert self.context is not None, "_fixed_payload_tokens 只在有 Context 时被调用"
+        budget = self.context.budget
+        total = 0
+        for message in session.messages:
+            if not isinstance(message, Mapping):
+                continue
+            content = message.get("content")
+            text = content if isinstance(content, str) else ""
+            if message.get("role") == "tool":
+                # 这条消息本身的固定开销已经由 estimate_items 记过，这里只补引用行。
+                if self._artifact_of(message) is not None:
+                    total += budget.tokens(text)
+                else:
+                    total += MESSAGE_OVERHEAD + budget.tokens(text)
+                continue
+            total += MESSAGE_OVERHEAD + budget.tokens(text)
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, Mapping):
+                        continue
+                    function = call.get("function")
+                    if not isinstance(function, Mapping):
+                        continue
+                    total += budget.tokens(str(function.get("name") or ""))
+                    total += budget.tokens(str(function.get("arguments") or ""))
+        return total
 
     def mark_context_messages(self, session: Session) -> None:
         """把"哪几条消息属于 stable 区"标进 Context。**每个回合开头调一次。**
