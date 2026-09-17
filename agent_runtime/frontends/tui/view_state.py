@@ -47,6 +47,7 @@
 import json
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -2245,6 +2246,11 @@ COMMANDS: tuple[Command, ...] = (
     # 不该需要离开这个界面。
     Command("/status"),
     Command("/tools"),
+    # 上下文那一对。**`/compact` 是唯一会真跑一次模型的 `/` 命令**（摘要要模型写），
+    # 所以它的回包是异步来的（协议里那条 `ui` / `kind=compacted`）—— 按下去之后
+    # 界面要能继续用，见 `app._command_compact`。
+    Command("/context"),
+    Command("/compact"),
     Command("/model", True),
     # 思考模式那两个旋钮。**分两条命令**（而不是 `effort=off` 兼作开关）：它们是两个
     # 问题 —— "要不要想"和"想多用力" —— 而合成一个之后，"关着的时候强度是什么"就
@@ -2649,6 +2655,124 @@ def render_mcp(message: dict[str, Any]) -> list[Line]:
     out.extend(Line(text, ROLE_WARN if any(m in text for m in warn_marks)
                     else ROLE_PROCESS)
                for text in notes)
+    return out
+
+
+# --- `/context` `/compact` 的渲染 ----------------------------------------------
+
+def compaction_note(result: Mapping[str, Any]) -> tuple[str, str]:
+    """压缩那一次的结果 → `(一句话, 角色)`。**会话流和 CLI 共用这一份。**
+
+    共用是有意的：那句话里每一个数（折了几条、省了多少 token、花了多久）都出自
+    同一次压缩，而两处各拼一份的话，"省了多少"会漂 —— 而它恰恰是用户唯一能据以
+    判断"这次压缩值不值"的数。
+
+    五种结果各有一句，因为**它们对用户的处置完全不同**：真的压了（看那几个数）、
+    没得压（什么都不用做）、正在压（等一等）、没装 Context（这个 runtime 压不了）、
+    出错了（什么都没改，去看 stderr）。合成一句"压缩完成"会把后四种全掩盖掉 ——
+    而那正是这个功能最不该有的失败形态。
+    """
+    status = str(result.get("status") or "")
+    if status == "compacted":
+        seconds = f"{int(result.get('duration_ms') or 0) / 1000:.1f}"
+        common = {
+            "folded": result.get("folded", 0),
+            "total": result.get("total_folded", 0),
+            "messages": result.get("messages", 0),
+            "chars": count_text(int(result.get("summary_chars") or 0)),
+            "seconds": seconds,
+        }
+        before, after = int(result.get("before") or 0), int(result.get("after") or 0)
+        if before and after:
+            return i18n.t("channels.compact.done",
+                          **common, before=tokens_text(before),
+                          after=tokens_text(after)), ROLE_ANSWER
+        return i18n.t("channels.compact.done_no_tokens", **common), ROLE_ANSWER
+    if status == "busy":
+        return i18n.t("channels.compact.busy"), ROLE_WARN
+    if status == "no_context":
+        return i18n.t("channels.compact.no_context"), ROLE_WARN
+    return i18n.t("channels.compact.nothing"), ROLE_RULE
+
+
+def render_context(message: Mapping[str, Any]) -> list[Line]:
+    """`/context` 的回包 → 会话流里那几行。
+
+    ## 为什么单独一条命令，而不是塞进 `/status`
+
+    `/status` 回答"它现在什么状态"（会话 / 模型 / 账 / 环境），而这一屏回答
+    "模型看得见多少东西、有多少被压掉了、历史压到哪了"。后者是**会被反复盯着的
+    数字**（压缩刚跑完、或者怀疑上下文快满的时候），混进那一大屏里反而看不见。
+
+    ## 三个数必须一起出现
+
+    `estimated_tokens` / `limit_tokens` / `compact_threshold` —— 只报第一个的话，
+    "151k 是大还是小"没有答案。第三个尤其要紧：它是**自动压缩那条线**，而用户问
+    "什么时候会自己压"的答案就是它。
+    """
+    ctx = message.get("context") or {}
+    if not ctx:
+        return [Line(i18n.t("context.none"), ROLE_WARN)]
+
+    stats = ctx.get("context") or {}
+    out: list[Line] = [Line(i18n.t("context.title"), ROLE_RULE)]
+
+    used = int(stats.get("estimated_tokens") or 0)
+    limit = int(stats.get("limit_tokens") or 0)
+    line_tokens = int(stats.get("compact_threshold") or 0)
+    window = ctx.get("window")
+    if window:
+        out.append(_kv(i18n.t("context.kv.window"), tokens_text(window)))
+    if limit:
+        out.append(_kv(
+            i18n.t("context.kv.tokens"),
+            i18n.t("context.tokens", used=tokens_text(used),
+                   limit=tokens_text(limit),
+                   percent=f"{used / limit * 100:.0f}"),
+        ))
+        out.append(_kv(
+            i18n.t("context.kv.threshold"),
+            i18n.t("context.threshold", line=tokens_text(line_tokens))
+            if line_tokens else i18n.t("context.no_window"),
+            ROLE_RULE,
+        ))
+    else:
+        # 窗口未知：只报用量、不报占比（错的百分比比没有百分比更坏，和状态栏同一条）。
+        out.append(_kv(i18n.t("context.kv.tokens"),
+                       i18n.t("context.tokens_plain", used=tokens_text(used))))
+        out.append(_kv(i18n.t("context.kv.threshold"),
+                       i18n.t("context.no_window"), ROLE_RULE))
+    out.append(_kv(
+        i18n.t("context.kv.artifacts"),
+        i18n.t("context.artifacts",
+               artifacts=stats.get("artifacts", 0), open=stats.get("open", 0),
+               live=stats.get("items", 0), removed=stats.get("removed", 0),
+               pinned=stats.get("pinned", 0), degraded=stats.get("degraded", 0)),
+        ROLE_RULE,
+    ))
+
+    # 压缩那一半。**没压过就说没压过**，而不是显示一排零 —— 一排零会被读成
+    # "压过、而且什么都没压掉"。
+    if ctx.get("active"):
+        out.append(_kv(
+            i18n.t("context.kv.folded"),
+            i18n.t("context.folded",
+                   folded=ctx.get("folded", 0), messages=ctx.get("messages", 0),
+                   generation=ctx.get("generation", 0)),
+        ))
+        out.append(_kv(
+            i18n.t("context.kv.summary"),
+            i18n.t("context.summary",
+                   id=str(ctx.get("summary_id") or "")[:24],
+                   chars=count_text(int(ctx.get("summary_chars") or 0))),
+            ROLE_RULE,
+        ))
+    else:
+        out.append(_kv(i18n.t("context.kv.folded"),
+                       i18n.t("context.not_folded"), ROLE_RULE))
+    # 最后那句是**代价**，不是装饰：压缩不改历史文件，而"我压了之后原文还在吗"
+    # 是每个人第一次用完都会问的问题。
+    out.append(Line(i18n.t("context.footer"), ROLE_RULE))
     return out
 
 

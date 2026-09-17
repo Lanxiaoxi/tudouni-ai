@@ -103,6 +103,29 @@ IN_STATUS = "status"
 # **请 runtime 回一份工具清单**（`/tools`）。和 `IN_STATUS` 同一条路：
 # 按需发，答案是 `t:"ui", kind:"tools"`。
 IN_TOOLS = "tools"
+# **压一次历史**（TUI 与 CLI 的 `/compact`）。答案是 `t:"ui", kind:"compacted"`。
+#
+# ## 它为什么是一条独立的消息，而不是 `user_message` 的一个变体
+#
+# 它**不产生任何用户消息**（历史里一条都不多），副作用却比"说一句话"大得多：
+# 会调一次模型写摘要、会把一段历史折起来、会改会话的持久化状态。这和
+# `session_switch` 是同一类"消息本身不是内容、而是一个动作"的东西。
+#
+# ## 它为什么会阻塞一会儿
+#
+# 摘要是一次真实的模型往返（几秒到几十秒）。所以它跑在**一条独立线程**上，而
+# 那条线程会先 `_join_turn()` —— 正在跑的那一轮先跑完，否则压缩会切在一个
+# 半截的回合边界上（而那正是 `compaction.fold_point` 要防的事）。
+#
+# 失败不抛：判据写在那条命令的答复里（`status` 那一格），见 `Runtime.compact`。
+IN_COMPACT = "compact"
+# **请 runtime 回一份 Context 的账**（TUI 与 CLI 的 `/context`）。
+#
+# 答案是 `t:"ui", kind:"context"`。它和 `IN_STATUS` 分开而不是并进那一屏：
+# `/status` 回答"它现在什么状态"（会话、模型、账、环境），而这一条回答
+# "模型看得见多少东西、被压掉了多少" —— 后者是一屏**会被人反复盯着看**的数字
+# （压缩刚跑完、或者怀疑上下文快满了的时候），混进那一大屏里反而看不见。
+IN_CONTEXT = "context"
 # **看/改 MCP server 的挂载情况**（TUI 和 CLI 的 `/mcp`）。
 #
 # 一条消息带三个动作（`MCP_LIST` / `MCP_LOAD` / `MCP_UNLOAD`），而不是三条 —— 它们
@@ -136,7 +159,7 @@ IN_SHUTDOWN = "shutdown"
 INBOUND = (IN_USER_MESSAGE, IN_PERMISSION_RESPONSE, IN_QUESTION_RESPONSE,
            IN_SESSION_SWITCH, IN_SESSION_LIST, IN_INTERRUPT, IN_SET_AUTOPILOT,
            IN_SET_MODEL, IN_SET_THINKING, IN_SET_EFFORT, IN_STATUS, IN_TOOLS,
-           IN_MCP, IN_REFRESH_STATE, IN_SHUTDOWN)
+           IN_MCP, IN_COMPACT, IN_CONTEXT, IN_REFRESH_STATE, IN_SHUTDOWN)
 
 # 出站（runtime → 前端）十一种。**`/status` 和 `/tools` 不在这里** —— 它们复用
 # `t:"ui"` 那条通道（多两种 `kind`），因为它们是"给界面看的东西"，性质和面板快照
@@ -196,11 +219,13 @@ DECISIONS = (ALLOW, DENY, ALWAYS, ALWAYS_GROUP)
 #     再写一份就是同一份事实的第二个来源；
 #   * `status` —— `/status` 那一屏（回答入站的 `status`）；
 #   * `tools` —— `/tools` 那份清单（回答入站的 `tools`）；
-#   * `mcp` —— `/mcp` 那份清单（回答入站的 `mcp`）。
+#   * `mcp` —— `/mcp` 那份清单（回答入站的 `mcp`）；
+#   * `compacted` —— `/compact` 那一次的结果（回答入站的 `compact`）；
+#   * `context` —— `/context` 那一屏（回答入站的 `context`）。
 #
-# 后三种**只在被问的时候才发**（它们要读审计日志、要遍历工具注册表、要问 MCP 宿主），
-# 而 `state` 是"每次工具返回都补一份"的常驻快照。这个区别就是它们为什么不合并成
-# 一种 kind。
+# 后五种**只在被问的时候才发**（它们要读审计日志、要遍历工具注册表、要问 MCP 宿主、
+# 要真跑一次模型），而 `state` 是"每次工具返回都补一份"的常驻快照。这个区别就是它们
+# 为什么不合并成一种 kind。
 #
 # `tools` 和 `mcp` 看起来像同一件事的两半（都是"有哪些工具"），所以为什么是两个
 # kind 要说清：**问的人不同**。`tools` 回答"这个工具会不会问我"（策略与记忆），
@@ -211,8 +236,11 @@ UI_STATE = "state"
 UI_STATUS = "status"
 UI_TOOLS = "tools"
 UI_MCP = "mcp"
+UI_COMPACTED = "compacted"
+UI_CONTEXT = "context"
 
-UI_KINDS = (UI_RUN_FINISHED, UI_STATE, UI_STATUS, UI_TOOLS, UI_MCP)
+UI_KINDS = (UI_RUN_FINISHED, UI_STATE, UI_STATUS, UI_TOOLS, UI_MCP,
+            UI_COMPACTED, UI_CONTEXT)
 
 
 def load_schema(name: str) -> dict[str, Any]:

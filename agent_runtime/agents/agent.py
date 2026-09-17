@@ -12,14 +12,21 @@ from pydantic import ValidationError
 
 from agent_runtime.agents.retry import Attempt, call_with_retry
 from agent_runtime.audit import event
+from agent_runtime.context import compaction
 from agent_runtime.context.budget import MESSAGE_OVERHEAD
+from agent_runtime.context.models import ArtifactSource
 from agent_runtime.context.processor import (
     ToolExecution,
     ToolResultProcessor,
     default_processor,
 )
 from agent_runtime.models.base import ChatModel
-from agent_runtime.models.types import DeltaSink, ModelFatalError, TokenUsage
+from agent_runtime.models.types import (
+    DeltaSink,
+    ModelError,
+    ModelFatalError,
+    TokenUsage,
+)
 from agent_runtime.security.asker import ApprovalAsker
 from agent_runtime.security.gate import check_permission
 from agent_runtime.security.memory import ApprovalMemory
@@ -178,6 +185,19 @@ def _is_fatal(exc: BaseException) -> bool:
     两者在审计里必须是不同的 stop_reason：前者要用户改配置，后者可以直接再试。
     """
     return isinstance(exc, ModelFatalError)
+
+
+def _discard_attempt(attempt: Attempt) -> None:
+    """丢弃一次尝试的报告。**只给历史压缩那次内务调用用。**
+
+    `call_with_retry` 的 `on_attempt` 是必填的（重试策略那一层靠它留痕），而压缩
+    那一次调用**没有自己的事件类别**：它的成败与耗时由 `context_compacted` 那条
+    事件承载，再记一条 `model_call` 只会让"这一轮模型被调了几次"这个数变成
+    "用户看得见的步数 + 看不见的内务"，而那个数在成本汇总里会被读成模型多答了一轮。
+
+    做成一个具名函数而不是 `lambda _: None`：它在调用点读起来是一句**有意的决定**
+    （"这次尝试不留痕"），而不是一个看起来像占位符的 lambda。
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,6 +536,13 @@ class Agent:
         # 工具执行 → Artifact 的那一层。**跟 context 一起注入**：没有 context 时
         # 它没有落点（Artifact 收进哪儿去？），所以那时它一定不被用到。
         self.processor = processor or default_processor()
+
+        # 压缩的**重入闸**。两条路都可能同时压：回合线程（自动、每一步之前）和
+        # TUI 那条分离线程（手动 `/compact`）。重入的后果见 `_compact` 的 docstring。
+        #
+        # 用"试一下就跳过"而不是锁：压缩不是必须马上做的事，而让 `/compact` 等一个
+        # 正在跑的回合会把界面卡住 —— 那比"这一次没压"贵得多。
+        self._compacting = False
 
     @property
     def model_name(self) -> str:
@@ -976,14 +1003,29 @@ class Agent:
         `session.messages`**：它逐轮变化，本来就不该被持久化。它进 Context 的账本
         （见下面的 `set_notes`）—— 它也有可能是唯一让这次请求超预算的那部分。
 
+        ## 压缩过的会话多一步：折叠区换成摘要
+
+        `session.messages` 里**一条都没少**（见 `context/compaction.py` 的原则 3），
+        变的是这里 —— 折叠区那几条不再进载荷，那个位置站着一条摘要消息：
+
+            system │ 摘要(user) │ 未折叠的原文 │ 尾部会话状态
+
+        于是"模型不必每次都把过去的全部细节带在脑子里"在载荷上真的成立，而磁盘上
+        那份完整历史一个字都没动。
+
         **步数不在载荷里**（见 `_status_note`）：那是静态策略，写在系统提示词里。
         """
         renderer = self._renderer(session)
         note = self._note_text(session)
         notes = [note] if note else []
 
+        # 摘要那一条（没压过就是 None）。它**排在系统提示词之后** —— 那一条是整段
+        # 请求的第一节，也是唯一能稳定命中前缀缓存的部分（见 `compaction.folded_view`）。
+        summary = self._summary_message(session)
+        view = self._folded_view(session, summary)
+
         messages: list[dict[str, Any]] = []
-        for message in session.messages:
+        for message in view:
             if renderer is None or message.get("role") != "tool":
                 messages.append(message)
             else:
@@ -1000,8 +1042,9 @@ class Agent:
         # **每步都调**，但只有真的超了才会动 —— 动过之后版本号变了，那条
         # `context_degraded` 事件里会记下来。
         self.context.set_notes(notes)
-        # 载荷里降不动的那一半（系统提示词、历史消息、tool 消息的引用行）先算出来
-        # 交给预算 —— 少了它，"还塞得下"这个判断是假的，见 _fixed_payload_tokens。
+        # 载荷里降不动的那一半（系统提示词、历史消息、tool 消息的引用行、摘要）先
+        # 算出来交给预算 —— 少了它，"还塞得下"这个判断是假的，见
+        # _fixed_payload_tokens。
         fixed = self._fixed_payload_tokens(session)
         degraded = self.context.fit(renderer.render_item, extra=fixed)
         if degraded:
@@ -1037,6 +1080,10 @@ class Agent:
         —— 真正超窗的是那堆历史。provider 回一个 400，看起来像"上下文太长"，但翻遍
         Context 的账本都看不出是谁超的。
 
+        **压缩过的会话里它算的是折叠之后的那一份**（摘要 + 未折叠的原文），而不是
+        整份历史 —— 不然一次压缩省下来的那几万 token 会在这里被原样算回去，于是
+        "压了等于没压"，而症状是降级照旧一路往下砍。
+
         ## 三个口径上的讲究
 
           * **tool 消息只算引用行，不算正文。** 正文在渲染时才从 ArtifactStore 取
@@ -1057,11 +1104,24 @@ class Agent:
         assert self.context is not None, "_fixed_payload_tokens 只在有 Context 时被调用"
         budget = self.context.budget
         total = 0
-        for message in session.messages:
+        summary = self._summary_message(session)
+        if summary is not None:
+            # 摘要那一条**不是 Artifact**（它替换的是历史，不是某条工具结果），所以
+            # 它不归 `estimate_items` 管 —— 这里按普通消息算，和载荷末尾那条会话
+            # 状态是同一个口径。
+            total += MESSAGE_OVERHEAD + budget.tokens(str(summary.get("content") or ""))
+        for message in self._folded_view(session, summary):
             if not isinstance(message, Mapping):
                 continue
             content = message.get("content")
             text = content if isinstance(content, str) else ""
+            # **系统提示词跳过。** 它由 `_folded_view` 带了进来（那是对的：载荷里
+            # 必须有它），但它**不是 Artifact**，也不在 `state.items` 里 —— 上面那条
+            # 摘要的账已经记过一条普通消息了，这里再记一遍就是同一个东西记两笔。
+            # 症状很具体：压缩之后 `after` 反而**大于** `before`（摘要是新加的正文，
+            # 而系统提示词被算了两次），于是"这次压缩省了多少"永远是负的。
+            if message.get("role") == "system":
+                continue
             if message.get("role") == "tool":
                 # 这条消息本身的固定开销已经由 estimate_items 记过，这里只补引用行。
                 if self._artifact_of(message) is not None:
@@ -1081,6 +1141,358 @@ class Agent:
                     total += budget.tokens(str(function.get("name") or ""))
                     total += budget.tokens(str(function.get("arguments") or ""))
         return total
+
+    # --- 历史压缩（Context Compaction）---------------------------------------
+
+    def _compaction(self, session: Session) -> compaction.Compaction | None:
+        """这个会话压缩到哪了。**没压过就是 None**（于是渲染走的是老路）。"""
+        return compaction.load(session.metadata)
+
+    def _folded_view(
+        self, session: Session, summary: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """这一次请求要看的**全部历史消息**：系统提示词 + 摘要 + 未折叠的原文。
+
+        抽出来是因为有两个调用点必须看到**同一份**序列：拼载荷的（`_payload`）和
+        算固定开销的（`_fixed_payload_tokens`）。两处各算一次"从第几条开始、摘要在
+        哪儿"就是同一份事实的第二个来源，而它们分家的症状是"预算按一份数算、
+        发出去的是另一份"。
+
+        `summary` 由调用方传（而不是在这里再算一次）：`_summary_message` 要读
+        ArtifactStore，而那两个调用点里有一个**本来就要**那个对象（拼载荷要把它插进去）
+        —— 让它算两遍就是两次读盘。
+        """
+        state = self._compaction(session)
+        folded = state.folded_messages if state is not None else 0
+        return compaction.folded_view(session.messages, folded, summary)
+
+    def _summary_message(self, session: Session) -> dict[str, Any] | None:
+        """要替换折叠区的那条摘要消息。**没压过、或者摘要取不到就是 None。**
+
+        摘要是**一份 Artifact**（原则 3：原始历史仍然存在，摘要只是它的一个视图），
+        所以这里走 `ArtifactStore` 取值。取不到时（Artifact 目录被人删了）如实说
+        一句 —— 返回 None 会让模型以为那段历史什么都没发生，而那正是这一层最坏的
+        失败形态（它会心安理得地把做过的事重做一遍）。
+        """
+        state = self._compaction(session)
+        if state is None or not state.folded_messages:
+            return None
+        if self.context is None:
+            # 没有 Context 就没有 ArtifactStore —— 那时候摘要也没有落脚点，
+            # 而这个方法的所有调用点都在"有 Context"的分支里。
+            return None
+        text = compaction.summary_text(self.context.store, state)
+        if text is None:
+            return {"role": "user", "content": compaction.missing_summary(state)}
+        return compaction.summary_message(text)
+
+    def _measure(self, session: Session) -> int:
+        """一次请求**此刻要花多少 token** —— 和 `_payload` 逐项同口径的完整账。
+
+        它是"压缩前后各量一次"用的那个数（`/compact` 的 `before` / `after`、
+        `context_compacted` 事件、`/context` 那一屏）。三样东西都要它，而三者必须
+        是同一个口径 —— 不然"压了多少"这件事会有三种说法。
+
+        ## 为什么不能拿 `context.last_estimate` 充数
+
+        那个数是**上一次 `_payload`** 留下的，而压缩那一步夹在两次 `_payload` 中间：
+        拿它当"压缩前"，量的是上一次请求（那时候历史更短），于是压缩的收益会被算成
+        负数或者零。这是实测踩到的第一个坑。
+
+        ## 为什么不能拿 `_fixed_payload_tokens` 充数
+
+        那个函数**有意不含系统提示词**（它由 `estimate_items` 那边记，见它的
+        docstring），而系统提示词是一千多 token —— 拿一个缺了它的数去和"压缩之后"
+        比，压缩看起来永远是倒亏。这是实测踩到的第二个坑，两个坑的方向正好相反。
+
+        所以这里按 `_payload` 的顺序逐项算一遍：`estimate_items(state.live())`
+        （Artifact 那一半）+ `_fixed_payload_tokens`（历史那一半）+ 系统提示词
+        + 载荷末尾的临时内容。
+
+        没有 Context 时退回 `estimate_tokens` 的裸估算：那种会话里**压缩根本不会
+        发生**（`compact_now` 会如实报 `no_context`），而 `compact_now` 仍然要在
+        改动之前量一次 —— 一个"什么都不做"的回答也该带上那两个数，否则前端那一格
+        就只能显示 0。
+        """
+        renderer = self._renderer(session)
+        if self.context is None or renderer is None:
+            from agent_runtime.context.budget import estimate_tokens
+
+            total = 0
+            for message in session.messages:
+                content = message.get("content")
+                if isinstance(content, str):
+                    total += estimate_tokens(content)
+            return total
+
+        budget = self.context.budget
+
+        # 1) Artifact 那一半：和 `manager.estimate` 用的是同一个函数。
+        total = budget.estimate_items(self.context.state.live(), renderer.render_item)
+        # 2) 历史那一半（工具结果的引用行、用户与助手的话、摘要）。
+        total += self._fixed_payload_tokens(session)
+        # 3) 系统提示词。**它既不是 Artifact、也不在 `_fixed_payload_tokens` 里**
+        #    （见那个函数的 docstring），但它每一轮都在载荷里。
+        if session.messages and session.messages[0].get("role") == "system":
+            content = session.messages[0].get("content")
+            total += MESSAGE_OVERHEAD + budget.tokens(
+                content if isinstance(content, str) else ""
+            )
+        # 4) 载荷末尾那条临时内容（和 `_fixed_payload_tokens` 不重叠：它不进
+        #    `session.messages`，那是 `ContextNote` 的说法）。
+        note = self._note_text(session)
+        if note:
+            total += MESSAGE_OVERHEAD + budget.tokens(note)
+        # 摘要那一半已经由 `_fixed_payload_tokens` 记过（它自己会去取 `summary`），
+        # 这里不再记 —— 那个函数是**唯一**算它的地方。
+        return total
+
+    def _refresh_estimate(self, session: Session) -> bool:
+        """现算一次"这次请求要花多少"，写回 `context.last_estimate`。返回有没有算成。
+
+        **它只在压缩那道判据需要的时候被调**（见 `run()` 里那段）。`_payload` 每一步
+        都会算一次并留下结果，所以正常路径上这个函数一次都不跑 —— 它服务的是
+        "这一轮的第一步"：那时候 `last_estimate` 还是上一次 `run()` 留下的值。
+
+        算法就是 `_measure`（同一份实现，不是第二份）：所以"按估算做的决定"
+        和"按估算报的数"永远是同一个口径 —— 那正是 `manager.estimate` docstring 里
+        那条"两处差一个数"的坑。
+        """
+        if self.context is None or self._renderer(session) is None:
+            return False
+        self.context.last_estimate = self._measure(session)
+        return True
+
+    def _generate_summary(self, digest_prompt: str) -> str:
+        """让当前模型写一份摘要。返回摘要正文。
+
+        ## 为什么复用 `call_with_retry`
+
+        压缩是一次**真实**的模型调用，所以它和普通请求面对的是同一批失败（限流、
+        超时、网关抽风）。重试策略写在 `agents/retry.py` 里，这里再抄一份就等于同一
+        件事有两个实现 —— 而它们分家的症状是"压缩这条路偶尔不重试"，没人查得出来。
+
+        和普通请求有两处**有意的**不同：
+
+          * **不传 `on_delta`**：摘要不是给用户看的回答。让它逐字出现在会话流里
+            会和真正的回答混在一起，而"这段字是谁说的"在那时候已经没有答案了；
+          * **不传 `on_attempt_started`**：那个回调的用途只有一个 —— 流式重发前让
+            界面丢掉半截正文。这里没有流，没什么要丢的。
+
+        ## 失败为什么不在这里抛
+
+        压缩是**可用性优化**，不是这一轮的目的。它失败时正确的动作是"当作没发生"
+        （`_compact` 会原样返回 None），让降级那一档继续兜着 —— 那仍然是一条能干活
+        的路。往上传会让一次限流把整个回合打断，而代价和收益完全不成比例。
+
+        **`RunCancelled` 是例外，它必须原样穿出去**：那是用户按了 Esc，而"用户叫停"
+        这件事不该被我们翻译成"压缩失败然后继续跑"。它继承 `BaseException`，所以
+        下面那个 `except ModelError` 抓不到它 —— 这是有意的，不是漏了。
+        """
+        try:
+            response = call_with_retry(
+                self.model,
+                [
+                    {"role": "system", "content": compaction.prompt()},
+                    {"role": "user", "content": digest_prompt},
+                ],
+                [],                      # 摘要不该调工具 —— 它是整理，不是干活
+                # **这一次尝试不进审计。** `on_attempt` 在普通请求那条路上是
+                # model_call 事件的唯一来源，而压缩那一次调用**本身已经有一条
+                # `context_compacted` 了**（带 duration_ms 和 token 变化）—— 再记一条
+                # model_call 会让"这一轮调了几次模型"变成"用户看到的步数 + 隐藏的
+                # 内务次数"，而那个数在成本汇总里会被读成模型多答了一轮。
+                _discard_attempt,
+                clock=self.clock,
+            )
+        except ModelError as exc:
+            # **确定性的失败和暂时性的失败在这里是同一件事**（都不压）。
+            # 区分它们只对"要不要再试"有意义，而上面那个调用已经把该试的都试过了。
+            self._warn(f"历史压缩失败（这一轮照旧）：{type(exc).__name__}: {exc}")
+            return ""
+        return (response.content or "").strip()
+
+    def compact_now(self, session: Session) -> dict[str, Any]:
+        """手动压一次（`/compact`）。返回**给前端渲染用的事实**，不返回正文。
+
+        和自动那条路走的是**同一个函数**（`_compact`）：判据、边界、摘要提示词、
+        落盘只有一份实现。两条路唯一的区别是"谁决定现在压" —— 阈值或者人。
+
+        返回的字典：
+
+            status        "compacted" / "nothing" / "busy"
+            folded        这一次折掉了多少条
+            total_folded  折完之后一共折了多少条（含以前的）
+            summary_id    这一次生成的摘要 Artifact id
+            summary_chars 摘要多少字符
+            before/after  压缩前后的估算 token
+            duration_ms   这一次花了多久（含摘要那一次模型往返）
+
+        `status="busy"` 是"压缩正跑着，这一次请求没做"（`_compacting` 那道闸），
+        `"nothing"` 是"没有可折的区间"（历史太短、或者折了也没意义）。
+
+        **它不抛失败**：摘要生成失败时按"什么都没发生"返回 `nothing`，而原因已经由
+        `_generate_summary` 打在 stderr 上了。理由是判据不对称 —— 一次失败的压缩既
+        没改状态、也没丢数据，把它变成一条异常只会让前端多一条要处理的路径。
+        """
+        before = self._measure(session)
+        result = self._compact(session, step=0, emit=True)
+        if result is None:
+            # **失败和"没得压"在这里合成同一种回答**，而有意的：两者对用户的处置
+            # 完全一样（什么都不用做），而分开报会让前端多出两条走了也白走的路。
+            # 真正的原因已经打在 stderr 上了（`_generate_summary` / `_compact`），
+            # 排查时看那里 —— 而不是让一句笼统的提示去承载它。
+            return {
+                "status": "busy" if self._compacting else "nothing",
+                "folded": 0,
+                "total_folded": self._folded_count(session),
+                "summary_id": "",
+                "summary_chars": 0,
+                "generation": 0,
+                "before": before,
+                "after": self._measure(session),
+                "duration_ms": 0,
+            }
+        result["status"] = "compacted"
+        result["before"] = before
+        return result
+
+    def _folded_count(self, session: Session) -> int:
+        state = self._compaction(session)
+        return state.folded_messages if state is not None else 0
+
+    def _compact(self, session: Session, *, step: int, emit: bool) -> dict[str, Any] | None:
+        """压一次。返回**这一次做了什么**；没压成（或没得压）返回 None。
+
+        ## 顺序是这个方法的全部讲究
+
+          1. **先算摘要，再落边界。** 反过来（先把边界写下去、再去要摘要）会让一个
+             失败的摘要留下一段"被折掉了但没有摘要"的历史 —— 那比不压更坏；
+          2. **摘要文件先落盘，再改 `session.metadata`。** `ArtifactStore.create`
+             先写正文、再更新 manifest，所以磁盘上任何时刻都不会出现一条指向空气的
+             摘要；而 metadata 是最后一步，它一旦写下去，摘要就一定取得到；
+          3. **最后才 checkpoint**，而且落盘点必须在 `metadata` 改完之后 —— 崩溃
+             恢复时读到的是"压完了"或者"根本没压"，不存在中间态。
+
+        ## `_compacting` 那道闸
+
+        TUI 那条路（分离线程）和回合线程可能同时进来。重入的后果是**两份摘要按不同的
+        边界各自生成**，而先写的那个边界会被后写的盖掉 —— 症状是摘要和边界对不上
+        （模型读到一段不属于它的历史概括）。所以这里用"试一下就跳过"而不是锁：压缩
+        不是必须马上做的事，而等待会让 `/compact` 卡住整个界面。
+        """
+        if self.context is None or self._compacting:
+            return None
+
+        folded_before = self._folded_count(session)
+        point = compaction.fold_point(session.messages, folded_before)
+        if point <= folded_before:
+            self._debug(
+                f"── 压缩：没有可折叠的区间"
+                f"（消息数={len(session.messages)}，已折={folded_before}）"
+            )
+            return None
+
+        state = self._compaction(session)
+        # 压缩前的估算。**在摘要进来之前取**：它和 `after` 的差就是这一次压缩省下来的
+        # 那个数，而两者中间夹着一次真实的模型往返 —— 那段时间里 Context 没变，
+        # 所以这个差值量的是"摘要替换掉的那段历史"本身。
+        before = self._measure(session)
+        self._compacting = True
+        started = self.clock()
+        try:
+            summary = self._generate_summary(
+                self._digest_prompt(session, state, folded_before, point)
+            )
+            if not summary:
+                return None
+
+            # `now` 传实际时间：`updated_at` 是给人看的（"这份摘要是什么时候写的"），
+            # 而 `self.clock` 是单调时钟（`perf_counter`）—— 拿它写进会话文件会得到
+            # 一个 1970 年附近的荒谬时间。耗时仍然用单调时钟算，见 duration_ms。
+            artifact = self.context.store.create(
+                summary,
+                type="summary",
+                source=ArtifactSource(tool="compact"),
+                metadata={
+                    "generation": (state.generation if state is not None else 0) + 1,
+                    "messages": point,
+                    "folded": point - folded_before,
+                    "status": "ok",
+                },
+            )
+            updated = compaction.Compaction(
+                folded_messages=point,
+                summary_id=artifact.artifact_id,
+                generation=(state.generation if state is not None else 0) + 1,
+                updated_at=time.time(),
+            )
+            compaction.store(session.metadata, updated)
+        finally:
+            self._compacting = False
+
+        self._checkpoint(session)
+        duration_ms = int((self.clock() - started) * 1000)
+        after = self._measure(session)
+        if emit:
+            self._emit(
+                "context_compacted", session, "", step,
+                folded=point - folded_before,
+                folded_total=point,
+                messages=len(session.messages),
+                summary_id=artifact.artifact_id,
+                summary_chars=artifact.chars,
+                generation=updated.generation,
+                before=before,
+                after=after,
+                duration_ms=duration_ms,
+                model=self.model_name,
+            )
+        self._debug(
+            f"── 压缩：折掉 {point - folded_before} 条"
+            f"（累计 {point}/{len(session.messages)}）"
+            f"，摘要 {artifact.chars} 字符，耗时 {duration_ms}ms"
+        )
+        return {
+            "folded": point - folded_before,
+            "total_folded": point,
+            "summary_id": artifact.artifact_id,
+            "summary_chars": artifact.chars,
+            "generation": updated.generation,
+            "after": after,
+            "duration_ms": duration_ms,
+        }
+
+    def _digest_prompt(
+        self,
+        session: Session,
+        state: compaction.Compaction | None,
+        folded_before: int,
+        stop: int,
+    ) -> str:
+        """交给摘要模型的那一条消息：**旧摘要 + 这一次要折的那一段骨架**。
+
+        旧摘要必须带上，否则第二次压缩会把它概括过的那段历史整个丢掉 —— 那是这个
+        功能最容易出的静默错误：摘要看着挺像，只是它是**增量**的，而模型以为自己
+        看到的是全部历史。带上之后每次压缩都是"在旧摘要基础上接着写"，语义不丢。
+        """
+        parts: list[str] = []
+        if state is not None and self.context is not None:
+            previous = compaction.summary_text(self.context.store, state)
+            if previous:
+                parts.append(
+                    "## 上一版的摘要（它概括的是更早的那一段历史，"
+                    "请在它的基础上接着往下写，不要丢掉里面的事实）\n\n" + previous
+                )
+        skeleton = compaction.digest_messages(
+            session.messages, start=folded_before, stop=stop,
+            limit=compaction.DIGEST_MAX_CHARS,
+        )
+        parts.append(
+            f"## 这一次要折进摘要的历史骨架（第 {folded_before + 1} 到第 {stop} 条）"
+            f"\n\n{skeleton}"
+        )
+        return "\n\n".join(parts)
 
     def mark_context_messages(self, session: Session) -> None:
         """把"哪几条消息属于 stable 区"标进 Context。**每个回合开头调一次。**
@@ -1208,6 +1620,30 @@ class Agent:
                 f"[{', '.join(m['role'] for m in messages)}]  "
                 f"工具数={len(tool_schemas)}"
             )
+
+            # **历史压缩：降级之前的最后一道兜底。**
+            #
+            # 位置就是"哪儿都不能再挪"的那一处：循环顶部，上一步的工具结果全
+            # append 完了、★ 也落过盘，所以此刻 messages 是一致的 —— 摘要要读的
+            # 正是这份一致的历史，而折叠点也必须切在一条完整的回合边界上。
+            #
+            # 判据只回答"该不该考虑"，"能不能压"由 `_compact` 里的 `fold_point`
+            # 说了算 —— 历史太短、或者折了也没意义时它如实返回，这里什么都不发生。
+            #
+            # **第一步必须现算一次。** `last_estimate` 是上一步算出来的，而它在这一轮
+            # 的第一步上还是上一次 `run()` 留下的那个值 —— 恢复一个长会话时那个值
+            # 是 0（新建的 manager）或者一个工具执行**之前**的数，于是"到线了"在
+            # 这一轮的第一步上永远不成立。代价说清楚：那一次多算一遍（线性扫一遍
+            # 历史），而它买来的是"接上一个长会话之后第一步就压"。
+            #
+            # 失败一律不影响这一轮（见 `_generate_summary`）：压不成，降级那一档
+            # 照旧兜着。所以这里不需要 try。
+            if self.context is not None and (
+                self.context.should_compact()
+                or (step == 0 and self._refresh_estimate(session) and
+                    self.context.should_compact())
+            ):
+                self._compact(session, step=step + 1, emit=True)
 
             response = self._complete_with_retry(
                 session, run_id, step + 1,

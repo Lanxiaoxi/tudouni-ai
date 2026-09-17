@@ -722,6 +722,80 @@ def _print_status(runtime: Runtime) -> None:
     print(f"  审计        {meta['audit_path']}", file=sys.stderr)
 
 
+def _print_context(runtime: Runtime) -> None:
+    """`/context`。和 TUI 那一屏同一份数据（`Runtime.compaction`）。
+
+    **口径必须和 TUI 一致**（见上面那段），所以这里一个数都不自己算 —— 连阈值都
+    是 runtime 给的那条线。不同的只有排法：老 CLI 没有常驻栏，答案直接打到 stderr。
+    """
+    data = runtime.compaction()
+    stats = data.get("context") or {}
+    print("上下文与压缩", file=sys.stderr)
+
+    used = int(stats.get("estimated_tokens") or 0)
+    limit = int(stats.get("limit_tokens") or 0)
+    line = int(stats.get("compact_threshold") or 0)
+    if data.get("window"):
+        print(f"  窗口        {data['window']} token", file=sys.stderr)
+    if limit:
+        print(f"  估算占用    {used}/{limit} token"
+              f"（{used / limit * 100:.0f}%）", file=sys.stderr)
+        if line:
+            print(f"  自动压缩线  {line} token（到这条线时每一步之前自动压一次）",
+                  file=sys.stderr)
+        else:
+            print("  自动压缩线  未知", file=sys.stderr)
+    else:
+        print(f"  估算占用    {used} token"
+              f"（窗口未知 —— 配置里没写 context_window，压缩不会自动触发）",
+              file=sys.stderr)
+    print(f"  Artifact    盘上 {stats.get('artifacts', 0)} 份 · "
+          f"进过 Context {stats.get('open', 0)} 份 · "
+          f"此刻发得出去 {stats.get('items', 0)} 份 · "
+          f"被挤掉 {stats.get('removed', 0)} 份 · "
+          f"pinned {stats.get('pinned', 0)} 份 · "
+          f"本轮降级 {stats.get('degraded', 0)} 份", file=sys.stderr)
+    if data.get("active"):
+        print(f"  历史压缩    已折起最早的 {data.get('folded', 0)}/"
+              f"{data.get('messages', 0)} 条"
+              f"（第 {data.get('generation', 0)} 版摘要 · "
+              f"{data.get('summary_id', '')[:24]}… · "
+              f"{data.get('summary_chars', 0)} 字符）", file=sys.stderr)
+    else:
+        print("  历史压缩    还没压过（历史还短，或者才刚开始）", file=sys.stderr)
+    print("  压缩只换表示方式：磁盘上的历史一条都没删，--history 照旧读得到全文。",
+          file=sys.stderr)
+
+
+def _do_compact(runtime: Runtime) -> None:
+    """`/compact`。**这一支是同步的**（和 TUI 那条异步的路不同）。
+
+    TUI 走协议、答复是异步来的（摘要要跑一次模型），而这里直连 runtime，本来就在
+    一个交互式循环里 —— 所以老老实实等它跑完，然后当场把结果打出来。两处**共用
+    同一个实现**（`Runtime.compact`），所以口径不会漂。
+
+    五种结果各说各的（真的压了 / 没得压 / 正在压 / 没装 Context / 出错），理由见
+    `view_state.compaction_note`。
+    """
+    result = runtime.compact()
+    status = str(result.get("status") or "")
+    if status == "compacted":
+        before, after = int(result.get("before") or 0), int(result.get("after") or 0)
+        saved = f"，估算 {_tokens_text(before)} → {_tokens_text(after)} token" \
+            if before and after else ""
+        print(f"[压缩] 折掉 {result.get('folded', 0)} 条"
+              f"（累计 {result.get('total_folded', 0)}/{result.get('messages', 0)}），"
+              f"摘要 {result.get('summary_chars', 0)} 字符{saved}；"
+              f"耗时 {_ms_text(int(result.get('duration_ms') or 0))}。"
+              f"原文一条都没删。", file=sys.stderr)
+    elif status == "busy":
+        print("[压缩] 上一次还在跑，这一次跳过了。", file=sys.stderr)
+    elif status == "no_context":
+        print("[压缩] 这个 runtime 没有上下文管理，压不了。", file=sys.stderr)
+    else:
+        print("[压缩] 没有可折叠的区间（历史还短，或者上次刚压过）。", file=sys.stderr)
+
+
 def _print_tools(runtime: Runtime) -> None:
     """`/tools`。工具名、风险、**会不会问你** —— 三列，和 TUI 那份清单同一个来源。"""
     rows = runtime.tool_rows()
@@ -888,6 +962,10 @@ def _handle_slash_command(runtime: Runtime, line: str) -> bool:
     rest = rest.strip()
     if command == "/status":
         _print_status(runtime)
+    elif command == "/context":
+        _print_context(runtime)
+    elif command == "/compact":
+        _do_compact(runtime)
     elif command == "/tools":
         _print_tools(runtime)
     elif command == "/mcp":
@@ -967,8 +1045,9 @@ def run_repl(runtime: Runtime) -> None:
     sink, context_tokens = runtime.logs, runtime.context_tokens
 
     print("输入内容回车发送。空行、exit、quit 或 Ctrl+C 退出。", file=sys.stderr)
-    print("（/status 看状态、/tools 看工具与权限、/model 换模型、"
-          "/thinking 开关思考、/effort 改强度；其他 / 开头的行会原样发给模型）",
+    print("（/status 看状态、/context 看上下文与压缩、/compact 压一次历史、"
+          "/tools 看工具与权限、/model 换模型、/thinking 开关思考、/effort 改强度；"
+          "其他 / 开头的行会原样发给模型）",
           file=sys.stderr)
     print(file=sys.stderr)
     while True:

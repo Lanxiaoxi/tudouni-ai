@@ -1711,7 +1711,7 @@ async def test_the_selected_option_is_marked_and_reversed(monkeypatch):
 
 
 def test_the_command_palette_filters_by_prefix_only():
-    """**只按前缀匹配**：命令一共十三条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
+    """**只按前缀匹配**：命令一共十七条，模糊匹配会让"我打错了"和"它猜对了"长得一样。"""
     assert [c.name for c in view_state.filter_commands("/")] == \
         [c.name for c in view_state.COMMANDS]
     assert [c.name for c in view_state.filter_commands("/re")] == ["/resume"]
@@ -1724,8 +1724,11 @@ def test_the_command_palette_filters_by_prefix_only():
     assert "/theme" in names and "/skills" in names
     # 末尾这几条"看/改当前设置"的命令**都在面板里** —— 一个"打得出来但面板里
     # 看不见"的命令，等于把发现它的成本推给记忆。
-    assert names[-6:] == ["/status", "/tools", "/model", "/thinking", "/effort",
-                          "/mcp"]
+    #
+    # `/context` `/compact` 插在 `/tools` 后面（它们和 `/status` `/tools` 是同一类
+    # "看一眼现状 / 动一下上下文"的命令）。
+    assert names[-8:] == ["/status", "/tools", "/context", "/compact", "/model",
+                          "/thinking", "/effort", "/mcp"]
     # **`/list` 在第二期被去掉了**：它和"`/resume` 不带参数"是同一个出口，而两条
     # 命令指向同一件事时，人要先猜哪一条才对。这条断言钉的就是"别再把它加回来"。
     assert "/list" not in names
@@ -1844,6 +1847,13 @@ class FakeClient:
 
     def ask_tools(self) -> None:
         self.sent.append({"t": "tools"})
+
+    def ask_context(self) -> None:
+        self.sent.append({"t": "context"})
+
+    def compact(self) -> None:
+        # **没有参数** —— 压多少、折到第几条由 runtime 定（见 `/compact` 那条命令）。
+        self.sent.append({"t": "compact"})
 
     def mcp(self, action: str, servers: tuple[str, ...] = ()) -> None:
         self.sent.append({"t": "mcp", "action": action,

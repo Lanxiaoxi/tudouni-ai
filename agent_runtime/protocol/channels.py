@@ -344,6 +344,15 @@ class ProtocolServer:
         # 所以发给前端的事件流仍然严格有序。
         self._turn_thread: threading.Thread | None = None
 
+        # 正在跑的那一次历史压缩（`/compact`）。**和 `_turn_thread` 是两条独立的
+        # 线程**：压缩必须先 `_join_turn()`（它要切在一个完整的回合边界上），而
+        # 它自己可能跑几十秒（摘要是一次真实的模型往返）。
+        #
+        # 它单独记一份是为了让读取循环在**两条命令连着按**时能 join 上一次 ——
+        # 否则第二次的边界会和第一次的摘要打架（`Agent._compact` 里那道重入闸会
+        # 拦下并报 busy，但让第二次命令安静地变成 busy 不如先等它跑完）。
+        self._compact_thread: threading.Thread | None = None
+
         # **两根锁，管的不是一件事。**
         #
         #   * `_send_lock` —— 写 stdout。回合跑在 `turn` 线程，而读循环在主线程
@@ -495,6 +504,13 @@ class ProtocolServer:
             thread.join()
         self._turn_thread = None
 
+    def _join_compact(self) -> None:
+        """等上一次压缩跑完。**和 `_join_turn` 同一条规矩**（见那里）。"""
+        thread = self._compact_thread
+        if thread is not None and thread.is_alive():
+            thread.join()
+        self._compact_thread = None
+
     def _dispatch(self, message: dict[str, Any]) -> bool:
         """处理一条入站消息。返回 False 表示该收摊了。"""
         try:
@@ -597,6 +613,16 @@ class ProtocolServer:
 
         if kind == messages.IN_TOOLS:
             self._send_tools()
+            return True
+
+        if kind == messages.IN_CONTEXT:
+            # 纯只读的一条：和 `/status` 一样**不 join 正在跑的那一轮** ——
+            # "跑着的时候看一眼上下文有多大"正是它最有用的时候。
+            self._send_context()
+            return True
+
+        if kind == messages.IN_COMPACT:
+            self._start_compact()
             return True
 
         if kind == messages.IN_MCP:
@@ -939,6 +965,86 @@ class ProtocolServer:
             "last_prompt_tokens": summary["last_prompt_tokens"],
             "context_tokens": runtime.context_tokens,
         })
+
+    # -- 历史压缩（`/compact` `/context`）--------------------------------------
+
+    def _send_context(self) -> None:
+        """回一份 Context 的账（`ui` / `kind=context`）。**只读，不 join 回合。**
+
+        和 `/status` 同一条：这几个数最有用的时候正是"它跑着、我想看看上下文满没满"，
+        而那时候去 join 等于让一条只读命令卡住整个界面。
+        """
+        runtime = self.runtime
+        if runtime is None:
+            self._notice("warn", "context", i18n.t("channels.context.no_session"))
+            return
+        self.send({
+            "v": messages.VERSION,
+            "t": messages.OUT_UI,
+            "kind": messages.UI_CONTEXT,
+            "context": runtime.compaction(),
+        })
+
+    def _start_compact(self) -> None:
+        """`/compact`：**先等这一轮跑完，再在另一条线程上压。**
+
+        ## 为什么要 `_join_turn()`
+
+        折叠点必须落在一条 `user` 消息之前（见 `context/compaction.py` 的模块
+        docstring）：从中间切开会留下一条带 `tool_calls` 却没有配对的 tool 结果的
+        assistant 消息，而那种历史**此后每一轮都发不出去**（provider 直接 400，
+        而且那个错误看起来像"上下文太长"）。正在跑的那一轮恰好就在那个窗口里
+        （它 appends 了 assistant、结果还没回来），所以这里必须等。
+
+        ## 为什么另起一条线程
+
+        摘要是一次真实的模型往返。在当前线程里等它，读循环就停了 —— 而那意味着
+        这几十秒里界面发不出任何东西（连"正在压缩"都发不出去）。这和 `_run_turn`
+        是同一条取舍：**动作异步做，答复异步发**。
+
+        ## 为什么先 `_join_compact()`
+
+        连着按两次 `/compact` 时，第二次要等第一次跑完再开始。不等的话第二次会
+        撞上 `Agent._compact` 里那道重入闸、拿到一个 `busy`，而"我按了两下、
+        第二下什么都没发生"在界面上和"卡住了"长得一样。
+        """
+        if self.runtime is None:
+            self._notice("warn", "compact", i18n.t("channels.compact.no_session"))
+            return
+        self._join_turn()
+        self._join_compact()
+        self._compact_thread = threading.Thread(
+            target=self._run_compact, name="compact", daemon=True,
+        )
+        self._compact_thread.start()
+
+    def _run_compact(self) -> None:
+        """在工作线程里压一次，然后把结果发出去（`ui` / `kind=compacted`）。
+
+        **任何异常都不往外抛**：压缩是可用性优化，而它失败时正确的动作是"当作没
+        发生"（降级那一档照旧兜着）。`Runtime.compact` 已经把该吞的都吞了，这里
+        那层 `except` 兜的是我们自己的 bug —— 一条命令的 bug 不该让整个进程带着
+        一条 traceback 死掉，而协议那条流上也没有"异常"这种消息。
+        """
+        try:
+            result = self.runtime.compact()
+        except Exception as exc:                      # noqa: BLE001 —— 见 docstring
+            self._notice("warn", "compact",
+                         i18n.t("channels.compact.failed",
+                                problem=f"{type(exc).__name__}: {exc}"))
+            return
+        self.send({
+            "v": messages.VERSION,
+            "t": messages.OUT_UI,
+            "kind": messages.UI_COMPACTED,
+            "compaction": result,
+            # **压缩之后立刻附一份账**：压完最想问的就是"现在还剩多少"，
+            # 而让用户再打一次 `/context` 是把一件已经知道的事推给他。
+            "context": self.runtime.compaction(),
+        })
+        # 左栏那几个数（消息数、上下文占比）跟着变了，补一份快照 —— 和
+        # `_set_model` 改完设置补一份是同一条规矩：**界面按 runtime 说的显示。**
+        self.send(self._state_message())
 
     def _send_tools(self) -> None:
         """回一份工具清单（`ui` / `kind=tools`）。"""

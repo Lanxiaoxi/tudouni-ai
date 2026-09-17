@@ -1207,6 +1207,68 @@ class Runtime:
             },
         }
 
+    # -- 历史压缩（`/compact` `/context`）--------------------------------------
+
+    def compact(self) -> dict[str, Any]:
+        """手动压一次历史（`/compact`）。**这是那条命令唯一的实现。**
+
+        做成 Runtime 上的一个方法（而不是让两个前端各自去调 `agent.compact_now`），
+        理由和 `/status` 那条一模一样：**数据口径只该有一处**。会话在哪、摘要怎么
+        生成、审计怎么写，都是这一层知道的事 —— 而 TUI 走协议、CLI 直连，两条路
+        必须落在同一个函数上，否则"同一个命令在两个界面里行为不同"是迟早的事。
+
+        它**不抛失败**：没有会话、没有 Context、没有可折的区间、或者摘要那次模型
+        调用失败，一律由那份返回结果如实说出来（见 `Agent.compact_now` 的
+        docstring）。所以调用方不需要 try —— 而"需要 try 才不会崩"正是这条命令
+        最不该有的性质。
+        """
+        if self.context is None:
+            return {"status": "no_context", "folded": 0, "total_folded": 0,
+                    "summary_id": "", "summary_chars": 0, "generation": 0,
+                    "before": 0, "after": 0, "duration_ms": 0}
+        return self.agent.compact_now(self.session)
+
+    def compaction(self) -> dict[str, Any]:
+        """压缩那笔账：**现在压到哪了、上下文离那条线还有多远。**
+
+        给 `/context` 渲染用。它是**两条来源的合并**，因为这两样事实的主人不同：
+
+          * `folded` / `summary_id` / `generation` / `updated_at` 住在
+            `session.metadata` 里（那是会话自己的事实，见 `context/compaction.py`）；
+          * `estimated_tokens` / `limit_tokens` / `compact_threshold` 住在 Context
+            Manager 上（那是"这一刻有多大"的事实，每一轮都在变）。
+
+        合并发生在**这里**而不是前端：前端要的是"这一屏该说什么"，而它不该知道
+        这两半各自住在谁身上 —— 那是内部结构的细节（和 `/status` 不自己读审计日志
+        是同一条规矩）。
+
+        `active=False` 表示这个会话还没压过。那时候 `folded` 是 0 而 `summary_id`
+        是空串 —— 前端据此决定整段要不要显示。
+        """
+        from agent_runtime.context import compaction as _compaction
+
+        state = _compaction.load(self.session.metadata)
+        context = self.context.stats() if self.context is not None else None
+        folded = state.folded_messages if state is not None else 0
+        return {
+            "active": bool(state is not None and state.active),
+            "folded": folded,
+            "messages": len(self.session.messages),
+            "summary_id": state.summary_id if state is not None else "",
+            "generation": state.generation if state is not None else 0,
+            "updated_at": state.updated_at if state is not None else 0.0,
+            "summary_chars": self._summary_chars(state.summary_id if state else ""),
+            "window": self.context_tokens,
+            "context": context,
+        }
+
+    def _summary_chars(self, artifact_id: str) -> int:
+        """摘要正文多少字符。**取不到就是 0** —— 那一格只用来显示，不值得为它抛。"""
+        if self.context is None or not artifact_id:
+            return 0
+        artifact = self.context.store.get(artifact_id)
+        return artifact.chars if artifact is not None else 0
+
     def tool_rows(self) -> list[dict[str, Any]]:
         """`/tools` 那一屏：每个工具 + 它的权限。
 

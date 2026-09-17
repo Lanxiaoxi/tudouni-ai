@@ -1293,6 +1293,23 @@ class TuiApp(App[None]):
             self.state.tools = [dict(row) for row in message.get("tools") or []]
             self._say_lines(view_state.render_tools(self.state, message))
             return
+        if message.get("kind") == messages.UI_CONTEXT:
+            self._say_lines(view_state.render_context(message))
+            return
+        if message.get("kind") == messages.UI_COMPACTED:
+            # `/compact` 的结果（异步来的）。**两件事一起做**：
+            #
+            #   1. 那句话进会话流（折了几条、省了多少、花了多久）—— 它是"我刚按了
+            #      什么、结果如何"的记录；
+            #   2. 紧跟着那块账也画一遍：压完最想问的就是"现在还剩多少"，而让用户
+            #      再打一次 `/context` 是把一件已经知道的事推给他。
+            #
+            # **历史画面一个字都不改**（`session_load` 那一屏是磁盘上那份历史，而
+            # 压缩一条都不动它）—— 见 doc/protocol.md 3.13。
+            note, role = view_state.compaction_note(message.get("compaction") or {})
+            self._say_lines([view_state.Line(note, role)])
+            self._say_lines(view_state.render_context(message))
+            return
         if message.get("kind") == messages.UI_MCP:
             # `/mcp` 的回包。**两件事一起做**：
             #
@@ -1563,6 +1580,10 @@ class TuiApp(App[None]):
             self._command_status()
         elif command == "/tools":
             self._command_tools()
+        elif command == "/context":
+            self._command_context()
+        elif command == "/compact":
+            self._command_compact()
         elif command == "/model":
             self._command_model(rest)
         elif command == "/thinking":
@@ -1594,6 +1615,37 @@ class TuiApp(App[None]):
         if self._client is None:
             return
         self._client.ask_status()
+
+    def _command_context(self) -> None:
+        """`/context`：**请 runtime 说这一屏**，和 `/status` 同一条规矩。
+
+        那几个数一半住在会话里（压缩折到第几条、摘要多大），一半住在 Context
+        Manager 里（此刻多大、降级了几份）。界面自己拼就得把两处都读一遍，而其中
+        一处（`session.messages` 的长度）在协议上根本没有出口 —— 所以这里只发一条
+        请求，答案到了由 `_on_ui` 渲染进会话流。
+        """
+        if self._client is None:
+            return
+        self._client.ask_context()
+
+    def _command_compact(self) -> None:
+        """`/compact`：**发出去就回来，答复等一下才到。**
+
+        摘要是一次真实的模型往返（几秒到几十秒），而 runtime 那一侧把它放在一条
+        独立线程上（见 `protocol/channels.py` 的 `_start_compact`）。所以这里**不能**
+        等答复 —— 等下去就是界面卡住几十秒。按下之后先回声一句"开始压了"，结果由
+        `ui` / `kind=compacted` 那条消息渲染。
+
+        这也意味着**重复按是有意义的**（真的想再压一次），所以不做"正在压就禁用"
+        那种本地状态：那一份状态和 runtime 的真相会分家，而分家的症状是"按了没反应"。
+        """
+        if self._client is None:
+            return
+        # 先回声一句：摘要要跑一次真实的模型往返，而这几十秒里界面上必须有东西
+        # 说明"我按下的那一下生效了"。**它是界面自己说的话**（不是 runtime 回的
+        # 那句话）—— 所以它不进 i18n 的 `channels.*` 那一组。
+        self._say(i18n.t("cmd.compact.waiting"))
+        self._client.compact()
 
     def _command_tools(self) -> None:
         """`/tools`：同上，问 runtime 要那份带权限的清单。

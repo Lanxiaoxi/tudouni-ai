@@ -308,6 +308,23 @@ class ProtocolClient:
         """
         self.send({"t": messages.IN_TOOLS})
 
+    def ask_context(self) -> None:
+        """请 runtime 回一份 Context 的账（TUI 的 `/context`，回包 `ui` / `kind=context`）。
+
+        和 `ask_status` 同一条：那几个数一半在会话里、一半在 Context Manager 里，
+        而两处都只有 runtime 看得见。**按需发**（它不挂在任何快照上）。
+        """
+        self.send({"t": messages.IN_CONTEXT})
+
+    def compact(self) -> None:
+        """压一次历史（TUI 的 `/compact`，回包 `ui` / `kind=compacted`）。
+
+        **它不是一条"请求-响应"**：摘要要跑一次真实的模型往返（几秒到几十秒），
+        所以 runtime 把它放在另一条线程上，答复是**异步**来的。发完这条就返回 ——
+        界面上那几十秒必须还能用（见 `frontends/tui/app.py` 的 `_command_compact`）。
+        """
+        self.send({"t": messages.IN_COMPACT})
+
     def mcp(self, action: str, servers: tuple[str, ...] | list[str] = ()) -> None:
         """看/改 MCP server 的挂载（TUI 与 CLI 的 `/mcp`，回包 `ui` / `kind=mcp`）。
 

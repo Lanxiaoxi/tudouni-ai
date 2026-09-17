@@ -71,6 +71,25 @@ DEFAULT_RESERVE = 4096
 # 多一点（比如工具结果的表头）就越界。10% 是一份便宜的保险。
 DEFAULT_HEADROOM = 0.1
 
+# 历史压缩（`context/compaction.py`）的触发线：**占 `effective_limit` 的几成**。
+#
+# ## 为什么分母是 `effective_limit` 而不是裸窗口
+#
+# `effective_limit` 已经是"窗口 - 回答预留 - 余量"了，也就是**这一层真正允许用的
+# 那部分**。拿裸窗口当分母会把触发点定在它之外（200K 窗口下 `effective_limit` 是
+# 176K，而裸窗口的 90% 是 180K）—— 那意味着压缩永远发生在降级已经跑过一轮之后，
+# 而"最后兜底"这个定位要求它落在**降级快降不动了**的时候。
+#
+# ## 为什么是 0.9
+#
+# 降级是从 `effective_limit` 那个点开始的（`fit` 超了就降）。压缩比它早 10% 触发，
+# 于是它有一整段缓冲：常见形状下，压缩一发生就根本轮不到降级动刀 —— 而那是好事，
+# Artifact 的档位保住了，前缀缓存也少抖一次。
+#
+# 不设成更低（比如 0.7）的理由：摘要是一次真实的模型往返，而它会把整个前缀缓存
+# 作废一次。压得太早就变成"每一步都在为一件还没发生的事买单"。
+DEFAULT_COMPACT_RATIO = 0.9
+
 # `estimate_tokens` 的签名。换一个真的 tokenizer 只要换这一处。
 Estimator = Callable[[str], int]
 
@@ -140,6 +159,19 @@ class ContextBudget:
         assert self.max_tokens is not None
         usable = self.max_tokens - self.reserve
         return max(0, int(usable * (1.0 - self.headroom)))
+
+    @property
+    def compact_threshold(self) -> int:
+        """到多少 token 该去做历史压缩（`DEFAULT_COMPACT_RATIO` 那一档）。
+
+        **它是"提前量"，不是第二个上限。** 降级仍然在 `effective_limit` 才开始
+        （`fit` 的判据没动），压缩只是在那之前先做一次更划算的事 —— 把旧历史换成
+        摘要，而不是让 Artifact 一档一档地退。
+
+        预算关着（窗口未知）时返回 0：那时连"上下文有多大"都答不出来，谈触发线
+        没有意义，而 `should_compact` 那边有 `enabled` 这道闸。
+        """
+        return int(self.effective_limit * DEFAULT_COMPACT_RATIO)
 
     # -- 估算 ------------------------------------------------------------------
 
@@ -292,6 +324,7 @@ def _degrade_key(item: ContextItem) -> tuple[int, int, int, str]:
 
 __all__ = [
     "ASCII_TOKENS_PER_CHAR",
+    "DEFAULT_COMPACT_RATIO",
     "DEFAULT_HEADROOM",
     "DEFAULT_RESERVE",
     "MESSAGE_OVERHEAD",

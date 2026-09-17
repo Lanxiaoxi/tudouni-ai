@@ -66,6 +66,10 @@ CATALOG: dict[str, str] = {
     "cmd.mcp.hint": "MCP server switch",
     "cmd.mcp.detail": "Without an argument it opens the panel; "
                       "/mcp load|unload <name> changes one directly",
+    "cmd.compact.hint": "Compact the history (nothing deleted)",
+    "cmd.context.hint": "See the context and compaction ledger",
+    "cmd.compact.waiting": "[compact] started (one model call writes the summary; the "
+                           "result arrives shortly)…",
 
     # --- 时间那一格（欢迎屏「最近活动」的左边一列）----------------------------
     # 英文要单复数两条；中文只给一条（见 `tn()`）。
@@ -784,6 +788,45 @@ CATALOG: dict[str, str] = {
     "channels.run_failed": "[turn failed] {problem}",
     "channels.status.no_session": "[status] no session yet.",
     "channels.tools.no_session": "[tools] no session yet.",
+    "channels.compact.no_session": "[compact] no session yet.",
+    "channels.compact.failed": "[compact] failed (nothing was changed): {problem}",
+    "channels.compact.no_context": "[compact] this runtime has no context management, "
+                                   "nothing to compact.",
+    "channels.compact.busy": "[compact] the previous run is still going; skipped this one.",
+    "channels.compact.nothing": "[compact] no range to fold (the history is still short, "
+                                "or it was just compacted).",
+    "channels.compact.done": (
+        "[compact] folded {folded} messages ({total}/{messages}), summary {chars} chars; "
+        "estimate {before} → {after} tokens, {seconds}s. Nothing was deleted."
+    ),
+    "channels.compact.done_no_tokens": (
+        "[compact] folded {folded} messages ({total}/{messages}), summary {chars} chars, "
+        "{seconds}s. Nothing was deleted."
+    ),
+    "channels.context.no_session": "[context] no session yet.",
+
+    # --- `/context` 那一屏（`view_state.render_context`）----------------------
+    "context.title": "Context and compaction",
+    "context.kv.window": "Window",
+    "context.kv.tokens": "Estimate",
+    "context.kv.threshold": "Auto-compact at",
+    "context.kv.artifacts": "Artifacts",
+    "context.kv.folded": "Compaction",
+    "context.kv.summary": "Summary",
+    "context.tokens": "{used} / {limit} ({percent}% of the usable budget)",
+    "context.tokens_plain": "{used} (window unknown, usage only)",
+    "context.threshold": "{line} (at this line the turn compacts once, before each step)",
+    "context.no_window": "unknown (no context_window configured; auto-compaction is off)",
+    "context.artifacts": "{artifacts} on disk · {open} ever in context · "
+                         "{live} sendable now · {removed} evicted · {pinned} pinned · "
+                         "{degraded} degraded this turn",
+    "context.folded": "earliest {folded}/{messages} folded (summary generation "
+                      "{generation})",
+    "context.summary": "{id}… · {chars} chars",
+    "context.not_folded": "not compacted yet (the history is still short)",
+    "context.footer": "Compaction only changes the representation: nothing on disk was "
+                      "deleted, --history still reads the full text.",
+    "context.none": "[context] this runtime has no context management.",
     "channels.mcp.no_session": "[MCP] no session yet.",
     "channels.mcp.no_host": "[MCP] this runtime has no MCP host, mounts cannot be "
                             "changed.",

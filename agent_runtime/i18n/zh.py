@@ -68,6 +68,17 @@ CATALOG: dict[str, str] = {
     "cmd.effort.detail": "不带参数开面板；/effort <档位> 直接改",
     "cmd.mcp.hint": "MCP 服务器开关",
     "cmd.mcp.detail": "不带参数开面板；/mcp load|unload <名字> 直接改",
+    # 压缩那两条。**`/compact` 的 hint 必须说清它是"压历史"** —— 光写"压缩"
+    # 会被读成"压缩文件"（这个界面里也有文件工具）。
+    #
+    # 两条都**没有 detail**：`detail` 是给"带参数的命令"解释用法的（见
+    # `Command.detail` 和 `test_commands_with_arguments_explain_them_in_help_not_in_the_palette`），
+    # 而这两条不带参数 —— 它们那句话的长度上限就是 hint 那一列。
+    "cmd.compact.hint": "压缩历史（原文不删）",
+    "cmd.context.hint": "看上下文与压缩的账",
+    # 界面自己回的那一声。**它不是 runtime 的话**（所以不在 `channels.*` 那一组）：
+    # 它说的是"我按下去了、正在等结果"，而结果是异步来的（见 `_command_compact`）。
+    "cmd.compact.waiting": "[压缩] 开始了（要跑一次模型写摘要，结果稍后到）…",
 
     # --- 时间那一格（欢迎屏「最近活动」的左边一列）----------------------------
     # **中文不用给单复数**：`tn()` 找不到 `.one`/`.other` 就退回这一条。
@@ -705,6 +716,43 @@ CATALOG: dict[str, str] = {
     "channels.run_failed": "[本轮失败] {problem}",
     "channels.status.no_session": "[状态] 还没有会话。",
     "channels.tools.no_session": "[工具] 还没有会话。",
+    # 压缩那两条命令的回话。**`/compact` 的五种结果各有一句**，因为它们对用户的
+    # 处置完全不同：真的压了 / 没得压 / 正在压 / 没装 Context / 那一刻的判决书。
+    "channels.compact.no_session": "[压缩] 还没有会话。",
+    "channels.compact.failed": "[压缩] 出错了（什么都没改）：{problem}",
+    "channels.compact.no_context": "[压缩] 这个 runtime 没有上下文管理，压不了。",
+    "channels.compact.busy": "[压缩] 上一次还在跑，这一次跳过了。",
+    "channels.compact.nothing": "[压缩] 没有可折叠的区间（历史还短，或者上次刚压过）。",
+    "channels.compact.done": (
+        "[压缩] 折掉 {folded} 条（累计 {total}/{messages}），摘要 {chars} 字符；"
+        "估算 {before} → {after} token，耗时 {seconds} 秒。原文一条都没删。"
+    ),
+    "channels.compact.done_no_tokens": (
+        "[压缩] 折掉 {folded} 条（累计 {total}/{messages}），摘要 {chars} 字符，"
+        "耗时 {seconds} 秒。原文一条都没删。"
+    ),
+    "channels.context.no_session": "[上下文] 还没有会话。",
+
+    # --- `/context` 那一屏（`view_state.render_context`）----------------------
+    "context.title": "上下文与压缩",
+    "context.kv.window": "窗口",
+    "context.kv.tokens": "估算占用",
+    "context.kv.threshold": "自动压缩线",
+    "context.kv.artifacts": "Artifact",
+    "context.kv.folded": "历史压缩",
+    "context.kv.summary": "摘要",
+    "context.tokens": "{used} / {limit}（占可用额度 {percent}%）",
+    "context.tokens_plain": "{used}（窗口未知，只报用量）",
+    "context.threshold": "{line}（到这条线时，回合的每一步之前会自动压一次）",
+    "context.no_window": "未知（配置里没写 context_window，压缩不会自动触发）",
+    "context.artifacts": "盘上 {artifacts} 份 · 进过 Context {open} 份 · "
+                         "此刻发得出去 {live} 份 · 被挤掉 {removed} 份 · "
+                         "pinned {pinned} 份 · 本轮降级 {degraded} 份",
+    "context.folded": "已折起最早的 {folded}/{messages} 条（第 {generation} 版摘要）",
+    "context.summary": "{id}… · {chars} 字符",
+    "context.not_folded": "还没压过（历史还短，或者才刚开始）",
+    "context.footer": "压缩只换表示方式：磁盘上的历史一条都没删，--history 照旧读得到全文。",
+    "context.none": "[上下文] 这个 runtime 没有上下文管理。",
     "channels.mcp.no_session": "[MCP] 还没有会话。",
     "channels.mcp.no_host": "[MCP] 这个 runtime 没有 MCP 宿主，改不了挂载。",
     "channels.mcp.unknown_action": "[MCP] 认不出这个动作：{action}（只有 {actions}）",

@@ -248,7 +248,7 @@ class ContextManager:
         return [i for i in self.state.items if i.zone is target and not i.removed]
 
     def stats(self) -> dict[str, Any]:
-        """给界面用的一份摘要（TUI 左栏那块、以及 `/context`）。
+        """给界面用的一份摘要（TUI 左栏那块、以及 `/status`）。
 
         **它只报数，不报正文** —— 这个函数的调用点在每一次状态快照上。
 
@@ -274,7 +274,27 @@ class ContextManager:
             "estimated_tokens": self.last_estimate,
             "limit_tokens": self.budget.effective_limit,
             "degraded": len(self.last_degraded),
+            # 历史压缩那条线（`compaction.py`）。**只报阈值，不报"压过没有"** ——
+            # 那是会话的事（`session.metadata`），Context 这一层不知道历史长什么样，
+            # 见模块 docstring 那条分界。
+            "compact_threshold": self.budget.compact_threshold,
         }
+
+    def should_compact(self) -> bool:
+        """到历史压缩那条线了吗。**它只回答"该不该考虑"，不回答"能不能压"。**
+
+        后者是 `compaction.fold_point` 的事（要拿到整份历史才算得出来），而这一层
+        刻意不认识历史 —— 判据分两处是模块 docstring 那条"管状态、不管渲染"的同一条
+        分界：Context 知道"现在多大"，Agent 知道"历史长什么样"。
+
+        用的是上一次算出来的估算（`last_estimate`，已被 provider 的实测值校准过）。
+        它和"此刻真实大小"的差别就是这一步里新进来的工具结果 —— 而那正是调用方在
+        每一步之前都会重新估一次的原因。预算关着时一律 False：窗口未知的情况下，
+        "到点了"这句话没有意义（见 `ContextBudget.enabled`）。
+        """
+        if not self.budget.enabled:
+            return False
+        return self.last_estimate >= self.budget.compact_threshold
 
     # -- 预算 ------------------------------------------------------------------
 

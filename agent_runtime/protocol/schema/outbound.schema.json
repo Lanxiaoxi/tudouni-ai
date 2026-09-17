@@ -105,8 +105,8 @@
         "type": "string",
         "enum": ["run_started", "model_call", "tool_call", "tool_result",
                  "permission", "tool_batch", "run_finished", "delta_reset",
-                 "context_degraded"],
-        "doc": "**就是 audit/events.py 那几种**，不新造。`delta_reset` 是流式加进来的第八种：它记的是\"重试/重发之前，界面上那段增量作废了\"——**审计里没有 delta 的正文**（那会让日志变成第二个会话文件），所以这一条是\"屏幕上出现过的东西后来被丢了\"唯一的痕迹。`context_degraded` 是 Context 预算加进来的第九种：它记的是\"这一步因为超预算把哪些 Artifact 降了档\"（`full→range→preview→metadata→removed`），字段是 items/estimated/limit/changes —— **正文不进审计**（它还在盘上，抄一遍就是第二个会话文件）。"
+                 "context_degraded", "context_compacted"],
+        "doc": "**就是 audit/events.py 那几种**，不新造。`delta_reset` 是流式加进来的第八种：它记的是\"重试/重发之前，界面上那段增量作废了\"——**审计里没有 delta 的正文**（那会让日志变成第二个会话文件），所以这一条是\"屏幕上出现过的东西后来被丢了\"唯一的痕迹。`context_degraded` 是 Context 预算加进来的第九种：它记的是\"这一步因为超预算把哪些 Artifact 降了档\"（`full→range→preview→metadata→removed`），字段是 items/estimated/limit/changes —— **正文不进审计**（它还在盘上，抄一遍就是第二个会话文件）。`context_compacted` 是历史压缩加进来的第十种：它记的是\"这一次把最早的多少条历史折成了一份摘要\"，字段是 folded/folded_total/messages/summary_id/summary_chars/generation/before/after/duration_ms/model —— **摘要正文同样不进审计**（它是一份 Artifact），所以这一条回答的是\"上下文为什么突然小了\"。"
       },
       "session_id": {"type": "string"},
       "run_id": {"type": "string"},
@@ -121,14 +121,14 @@
     "required": ["v", "t", "kind", "session_id", "run_id", "step", "ts"]
   },
   "ui": {
-    "summary": "只给界面、不进审计的东西。五种 kind，字段按 kind 取。",
+    "summary": "只给界面、不进审计的东西。七种 kind，字段按 kind 取。",
     "fields": {
       "v": {"type": "integer", "const": 1},
       "t": {"type": "string", "const": "ui"},
       "kind": {
         "type": "string",
-        "enum": ["run_finished", "state", "status", "tools", "mcp"],
-        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/jobs/mcp/agents_md/messages/steps/model）；status = `/status` 要的那一屏（回答入站的 status）；tools = `/tools` 的清单（回答入站的 tools）；mcp = `/mcp` 的清单（回答入站的 mcp）。五种都**不进审计**。"
+        "enum": ["run_finished", "state", "status", "tools", "mcp", "compacted", "context"],
+        "doc": "run_finished = 这一轮的正文（answer + run_id）；state = 面板数据快照（todos/skills/skill_catalog/jobs/mcp/agents_md/messages/steps/model）；status = `/status` 要的那一屏（回答入站的 status）；tools = `/tools` 的清单（回答入站的 tools）；mcp = `/mcp` 的清单（回答入站的 mcp）；compacted = `/compact` 那一次的结果（回答入站的 compact，字段 `compaction`）；context = `/context` 那一屏（回答入站的 context，字段 `context`）。七种都**不进审计**。"
       },
       "answer": {
         "type": "string",
@@ -242,6 +242,27 @@
           "**只有 kind=mcp 有**。这一批动作要说的话（一条一句，已经带 `[MCP]` 前缀）。",
           "**它由 runtime 拼**：`清单里没有 server x` / `没连上（…）` 这类句子里的每个事实",
           "（谁在跑、为什么没成）只有 runtime 知道，界面自己拼就是第二份事实。前端把它们贴进会话流。"
+        ]
+      },
+      "compaction": {
+        "type": "object",
+        "doc": [
+          "**只有 kind=compacted 有**。那一次压缩的结果：`status`（compacted / nothing / busy / no_context）、",
+          "`folded`（这一次折掉几条）、`total_folded`（折完之后一共折了多少条）、`summary_id`（这一次生成的摘要 Artifact）、",
+          "`summary_chars`、`generation`、`before` / `after`（压缩前后的估算 token）、`duration_ms`（含摘要那一次模型往返）。",
+          "**`status` 是这一格的要点**：压缩失败和「没有可折的区间」都是 `nothing` —— 两者对用户的处置完全一样，",
+          "而分开报会让前端多出两条走了也白走的路。"
+        ]
+      },
+      "context": {
+        "type": "object",
+        "doc": [
+          "**kind=context 有；kind=compacted 里也附一份**（压缩前后各看一眼才有意义）。两组事实的合并：",
+          "`active` / `folded` / `messages` / `summary_id` / `generation` / `updated_at` / `summary_chars`",
+          "来自 `session.metadata` 里那块压缩状态（它跨进程活着）；`window` 是当前模型的窗口；",
+          "`context` 是 `ContextManager.stats()` 的原样（artifacts / items / open / removed / pinned /",
+          "estimated_tokens / limit_tokens / compact_threshold / degraded / version）。",
+          "**合并发生在 runtime 里**，前端拿到的是可以直接渲染的一份 —— 它不该知道这两半各自住在谁身上。"
         ]
       }
     },

@@ -185,9 +185,9 @@ delta 只是让它更早出现。
    第二个会话文件），所以"屏幕上那段后来作废了"只有这一条能证明。而**它只在真的
    吐过东西时才发**：一次没来得及出字的失败重试不会留下它（记了就是假的）。
 
-### 3.4 `ui` —— 只给界面的东西，五种 `kind`
+### 3.4 `ui` —— 只给界面的东西，七种 `kind`
 
-它和 `t:"event"` 的分工是**一件事**：**`ui` 不进审计**。五种 `kind` 都服从这一条。
+它和 `t:"event"` 的分工是**一件事**：**`ui` 不进审计**。七种 `kind` 都服从这一条。
 
 **`kind:"run_finished"` 带 `answer`**（`Agent.run` 的返回值）。
 
@@ -565,6 +565,51 @@ delta 只是让它更早出现。
 
 **`where` 是给人看的那句话，远程只到 `scheme://host`**：URL 里可能有令牌，而这一格会进
 面板、进快照、进日志。凭据真正出现的地方只有配置里的 `headers`，而它**不进协议**。
+
+### 3.13 `context` / `compact` —— 看上下文，或者压一次历史
+
+```json
+你 → {"v":1,"t":"context"}
+你 ← {"v":1,"t":"ui","kind":"context",
+      "context":{"active":true,"folded":24,"messages":61,"summary_id":"art_9f2c…",
+                 "generation":2,"updated_at":1770000000.0,"summary_chars":1800,
+                 "window":200000,
+                 "context":{"artifacts":31,"items":18,"open":18,"removed":0,
+                            "pinned":3,"estimated_tokens":151000,
+                            "limit_tokens":176331,"compact_threshold":158697,
+                            "degraded":0,"version":12}}}
+
+你 → {"v":1,"t":"compact"}
+你 ← {"v":1,"t":"ui","kind":"compacted",
+      "compaction":{"status":"compacted","folded":24,"total_folded":24,
+                    "summary_id":"art_9f2c…","summary_chars":1800,"generation":1,
+                    "before":204000,"after":151000,"duration_ms":8400},
+      "context":{…同上…}}
+你 ← {"v":1,"t":"ui","kind":"state", …}      // 顺带补一份面板快照（消息数变了）
+```
+
+**`context` 是只读的，也不 join 当前这一轮**（和 3.10 那三条同一条规矩）。它回答的是
+"模型现在看得见多少东西、有多少被预算压掉了、历史压到哪了"。`compact_threshold` 是
+历史压缩那条线（预算上限的 90%）—— 到了它，runtime 会在**回合的每一步之前**自动压一次。
+
+**`compact` 是一个动作，不是一句话。** 它不产生任何用户消息，却会调一次模型写摘要、
+把一段历史折起来、改会话的持久化状态。所以：
+
+  * **它先等当前这一轮跑完。** 折叠点必须落在一条 `user` 消息之前 —— 从中间切开会留下
+    一条带 `tool_calls` 却没有配对结果的 assistant 消息，那种历史此后每一轮都发不出去
+    （400，而那个错误看起来像"上下文太长"）；
+  * **它跑在另一条线程上**，答复是异步来的（`ui` / `kind=compacted`）。摘要是一次真实的
+    模型往返，几秒到几十秒；在那条线程上等它，界面这几十秒什么都发不出去；
+  * **它不改任何一条历史消息。** 摘要是一份 `type=summary` 的 Artifact，而原始历史在磁盘
+    上**一条都不动**（`--history` 照旧读得到全文）。前端因此**不要**去改自己那份
+    `session_load` 的画面 —— 该刷新的是 `context` 和 `state` 那两条。
+
+**压缩失败和"没有可折的区间"都是 `status:"nothing"`**，两者对用户的处置完全一样，而分开
+报会让前端多出两条走了也白走的路。`busy` 是"上一次压缩还在跑"（连着按两下），
+`no_context` 是"这个 runtime 没装配 Context"。**这三种都不是错误**，一条 notice 都不发。
+
+**`folded` / `summary_id` / `generation` 住在会话里，`estimated_tokens` 那一组住在 Context
+里** —— 合并发生在 runtime 那一侧（`Runtime.compaction`），前端拿到的是可以直接渲染的一份。
 
 ## 4. 人机交互：两条会阻塞的消息
 
